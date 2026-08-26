@@ -68,7 +68,8 @@ A fixed human chromosome layout is intentionally absent, the tool is meant to be
 ### CI publish
 
 GitHub Actions (`.github/workflows/ci.yml`) runs lint, tests, and hooks on
-every push and pull request. After those checks pass:
+every push and pull request. Pull requests must change `CHANGELOG.md`. After
+those checks pass:
 
 - A push to `master` builds the Docker image and pushes it to GHCR tagged
   with the commit SHA and `latest`.

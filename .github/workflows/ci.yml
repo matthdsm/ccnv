@@ -12,8 +12,22 @@ permissions:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
+      - name: Require CHANGELOG.md update
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${{ github.event.pull_request.number }}/files" \
+            --paginate --jq '.[].filename')"
+          if ! printf '%s\n' "${files}" | grep -qx CHANGELOG.md; then
+            echo "::error::Pull requests must update CHANGELOG.md"
+            exit 1
+          fi
       - uses: prefix-dev/setup-pixi@v0.9.1
         with:
           cache: true
