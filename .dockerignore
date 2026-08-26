@@ -1,0 +1,15 @@
+.github
+.pixi
+.git
+.pytest_cache
+.ruff_cache
+__pycache__
+*.egg-info
+*.py[cod]
+build
+dist
+tests
+docs
+benchmarks
+.pre-commit-config.yaml
+AGENTS.md
