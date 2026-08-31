@@ -15,8 +15,14 @@ from ccnv.reference import DEFAULT_SEX_CONTIGS, DEFAULT_SEX_SIGNAL_CONTIGS
 from ccnv.schemas import SAMPLE_SCHEMA, ArtifactKind, metadata_for
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def _cli_text(output: str) -> str:
-    return " ".join(re.sub(r"[^A-Za-z0-9.]+", " ", output).split())
+    """Plain CLI text, ignoring Rich color, boxes, and wrapping."""
+
+    plain = _ANSI.sub("", output)
+    return " ".join(re.sub(r"[^\x20-\x7e]+", " ", plain).split())
 
 
 class TestCliPathChecks(unittest.TestCase):
@@ -107,42 +113,42 @@ class TestReferenceSampleExpansion(unittest.TestCase):
     def test_reference_help_shows_typer_defaults(self) -> None:
         result = CliRunner().invoke(app, ["reference", "--help"])
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("[default: X, Y, chrX,", result.output)
-        self.assertIn("chrY]", result.output)
-        self.assertIn("[default: chrY]", result.output)
-        self.assertIn("[default: 5]", result.output)
-        self.assertIn("[default: 300]", result.output)
+        self.assertIn("[default: X, Y, chrX,", _cli_text(result.output))
+        self.assertIn("chrY]", _cli_text(result.output))
+        self.assertIn("[default: chrY]", _cli_text(result.output))
+        self.assertIn("[default: 5]", _cli_text(result.output))
+        self.assertIn("[default: 300]", _cli_text(result.output))
 
     def test_short_help_flag_works_on_app_and_subcommands(self) -> None:
         for args in (["-h"], ["convert", "-h"], ["reference", "-h"], ["predict", "-h"]):
             with self.subTest(args=args):
                 result = CliRunner().invoke(app, args)
                 self.assertEqual(result.exit_code, 0, result.output)
-                self.assertIn("Usage:", result.output)
+                self.assertIn("Usage:", _cli_text(result.output))
 
     def test_help_uses_ccnv_executable_name(self) -> None:
         result = CliRunner().invoke(app, ["-h"])
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("Usage: ccnv", result.output)
+        self.assertIn("Usage: ccnv", _cli_text(result.output))
 
     def test_predict_help_shows_sex_choices_and_defaults(self) -> None:
         result = CliRunner().invoke(app, ["predict", "--help"])
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("[default: auto]", result.output)
-        self.assertIn("<auto|female|male", result.output)
+        self.assertIn("[default: auto]", _cli_text(result.output))
+        self.assertIn("<auto|female|male", _cli_text(result.output))
 
     def test_loglevel_flag_is_on_every_command(self) -> None:
         for command in ("convert", "reference", "predict"):
             with self.subTest(command=command):
                 result = CliRunner().invoke(app, [command, "--help"])
                 self.assertEqual(result.exit_code, 0, result.output)
-                self.assertIn("--loglevel", result.output)
-                self.assertIn("[default: WARNING]", result.output)
+                self.assertIn("--loglevel", _cli_text(result.output))
+                self.assertIn("[default: WARNING]", _cli_text(result.output))
 
     def test_invalid_loglevel_is_rejected(self) -> None:
         result = CliRunner().invoke(app, ["convert", "--loglevel", "verbose"])
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("verbose", result.output)
+        self.assertIn("verbose", _cli_text(result.output))
 
     def test_cli_reference_forwards_sex_cutoff(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -188,7 +194,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 ],
             )
             self.assertNotEqual(result.exit_code, 0)
-            self.assertIn("No such option", result.output)
+            self.assertIn("No such option", _cli_text(result.output))
 
 
 def _write_sample(path: Path) -> Path:

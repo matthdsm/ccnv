@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so canonical filtering is no longer duplicated, and `GenomeProfile` is the
   in-memory layout type. Prediction I/O lives in `ccnv.report`, with result
   types in `ccnv.results`. Bin coordinates are read through `schemas.bin_coordinates`.
-- CLI path-error tests match Typer messages after terminal wrapping.
+- CLI tests compare Rich output after stripping ANSI so CI color does not
+  split flags such as ``--loglevel``.
 
 ### Added
 
