@@ -14,7 +14,6 @@ from ccnv.models import ReadFilters
 from ccnv.reference import DEFAULT_SEX_CONTIGS, DEFAULT_SEX_SIGNAL_CONTIGS
 from ccnv.schemas import SAMPLE_SCHEMA, ArtifactKind, metadata_for
 
-
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
