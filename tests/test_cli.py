@@ -1,3 +1,4 @@
+import re
 import tempfile
 import unittest
 from dataclasses import asdict
@@ -14,13 +15,17 @@ from ccnv.reference import DEFAULT_SEX_CONTIGS, DEFAULT_SEX_SIGNAL_CONTIGS
 from ccnv.schemas import SAMPLE_SCHEMA, ArtifactKind, metadata_for
 
 
+def _cli_text(output: str) -> str:
+    return " ".join(re.sub(r"[^A-Za-z0-9.]+", " ", output).split())
+
+
 class TestCliPathChecks(unittest.TestCase):
     def test_convert_rejects_missing_alignment(self) -> None:
         result = CliRunner().invoke(
             app, ["convert", "/does/not/exist.bam", "--prefix", "out"]
         )
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("does not exist", result.output)
+        self.assertIn("does not exist", _cli_text(result.output))
 
     def test_convert_rejects_missing_fasta(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -36,7 +41,7 @@ class TestCliPathChecks(unittest.TestCase):
                 ],
             )
             self.assertNotEqual(result.exit_code, 0)
-            self.assertIn("does not exist", result.output)
+            self.assertIn("does not exist", _cli_text(result.output))
 
     def test_predict_rejects_missing_sample(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -51,7 +56,7 @@ class TestCliPathChecks(unittest.TestCase):
                 ],
             )
             self.assertNotEqual(result.exit_code, 0)
-            self.assertIn("does not exist", result.output)
+            self.assertIn("does not exist", _cli_text(result.output))
 
 
 class TestReferenceSampleExpansion(unittest.TestCase):
