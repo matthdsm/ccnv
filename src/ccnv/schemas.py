@@ -179,6 +179,19 @@ def validate_schema(schema: pa.Schema, kind: ArtifactKind) -> None:
     validate_metadata(decode_metadata(schema.metadata), kind)
 
 
+def bin_coordinates(table: pa.Table) -> tuple[tuple[str, int, int], ...]:
+    """Return row identity as ``(contig, start, end)`` tuples."""
+
+    return tuple(
+        zip(
+            table.column("contig").to_pylist(),
+            table.column("start").to_pylist(),
+            table.column("end").to_pylist(),
+            strict=True,
+        )
+    )
+
+
 def validate_table(table: pa.Table, kind: ArtifactKind) -> None:
     """Validate schema plus canonical coordinate bounds and row identity."""
 

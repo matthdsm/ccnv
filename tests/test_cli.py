@@ -83,7 +83,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             nested.mkdir(parents=True)
             first = _write_sample(nested / "s1.parquet")
             second = _write_sample(root / "controls" / "s2.parquet")
-            with patch("ccnv.cli.wcx_reference.run") as run:
+            with patch("ccnv.cli.run_reference") as run:
                 result = CliRunner().invoke(
                     app,
                     [
@@ -143,7 +143,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.parquet")
-            with patch("ccnv.cli.wcx_reference.run") as run:
+            with patch("ccnv.cli.run_reference") as run:
                 result = CliRunner().invoke(
                     app,
                     [

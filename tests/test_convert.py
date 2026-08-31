@@ -25,9 +25,10 @@ from ccnv.convert import (
     read_sample_parquet,
     rejection_reason,
     run,
+    select_layout,
     split_thread_budget,
 )
-from ccnv.models import ConvertConfig, ReadFilters, parquet_path
+from ccnv.models import Contig, ConvertConfig, GenomeProfile, ReadFilters, parquet_path
 from ccnv.schemas import (
     COORDINATE_SYSTEM,
     SCHEMA_VERSION,
@@ -466,6 +467,25 @@ class TestParallelBinning(unittest.TestCase):
 
 
 class TestCanonicalContigs(unittest.TestCase):
+    def test_select_layout_drops_non_canonical_names(self) -> None:
+        layout = select_layout(
+            ["chr1", "chrM", "chrX", "scaffold"],
+            [100, 50, 80, 40],
+            all_contigs=False,
+        )
+        self.assertEqual(layout, (Contig("chr1", 100), Contig("chrX", 80)))
+        profile = GenomeProfile(layout)
+        self.assertEqual(profile.names, ("chr1", "chrX"))
+        self.assertEqual(profile.length_map(), {"chr1": 100, "chrX": 80})
+
+    def test_select_layout_keeps_every_contig_when_requested(self) -> None:
+        layout = select_layout(
+            ["chr1", "chrM"],
+            [100, 50],
+            all_contigs=True,
+        )
+        self.assertEqual(tuple(contig.name for contig in layout), ("chr1", "chrM"))
+
     def test_canonical_spellings_are_kept(self) -> None:
         for name in (
             "chr1",

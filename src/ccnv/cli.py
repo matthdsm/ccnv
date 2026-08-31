@@ -6,16 +6,14 @@ import sys
 from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import typer
 
-from ccnv import convert as wcx_convert
-from ccnv import predict as wcx_predict
-from ccnv import reference as wcx_reference
 from ccnv.convert import ConvertError
+from ccnv.convert import run as run_convert
 from ccnv.models import (
     ConvertConfig,
     PredictConfig,
@@ -23,10 +21,14 @@ from ccnv.models import (
     ReferenceConfig,
 )
 from ccnv.predict import PredictError
+from ccnv.predict import run as run_predict
 from ccnv.reference import (
     DEFAULT_SEX_CONTIGS,
     DEFAULT_SEX_SIGNAL_CONTIGS,
     ReferenceError,
+)
+from ccnv.reference import (
+    run as run_reference,
 )
 from ccnv.schemas import ArtifactKind, SchemaError, decode_metadata
 
@@ -215,10 +217,9 @@ def convert(
         all_contigs=all_contigs,
     )
     try:
-        wcx_convert.run(config)
+        run_convert(config)
     except ConvertError as error:
-        typer.secho(str(error), err=True, fg="red")
-        raise typer.Exit(code=1) from error
+        _fail(error, 1)
 
 
 @app.command()
@@ -319,10 +320,9 @@ def reference(
         try:
             sample_paths = expand_sample_inputs(samples)
         except SampleInputError as error:
-            typer.secho(str(error), err=True, fg="red")
-            raise typer.Exit(code=2) from error
+            _fail(error, 2)
     try:
-        wcx_reference.run(
+        run_reference(
             ReferenceConfig(
                 samples=sample_paths,
                 prefix=prefix,
@@ -343,8 +343,7 @@ def reference(
             )
         )
     except ReferenceError as error:
-        typer.secho(str(error), err=True, fg="red")
-        raise typer.Exit(code=1) from error
+        _fail(error, 1)
 
 
 @app.command()
@@ -432,7 +431,7 @@ def predict(
 
     configure_logging(loglevel)
     try:
-        wcx_predict.run(
+        run_predict(
             PredictConfig(
                 sample=sample,
                 reference=reference,
@@ -448,8 +447,12 @@ def predict(
             )
         )
     except PredictError as error:
-        typer.secho(str(error), err=True, fg="red")
-        raise typer.Exit(code=1) from error
+        _fail(error, 1)
+
+
+def _fail(error: BaseException, code: int) -> NoReturn:
+    typer.secho(str(error), err=True, fg="red")
+    raise typer.Exit(code=code) from error
 
 
 if __name__ == "__main__":

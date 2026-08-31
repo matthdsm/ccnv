@@ -14,7 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pysam
 
-from ccnv.models import ConvertConfig, ReadFilters, parquet_path
+from ccnv.models import Contig, ConvertConfig, GenomeProfile, ReadFilters, parquet_path
 from ccnv.schemas import (
     SAMPLE_SCHEMA,
     ArtifactKind,
@@ -126,6 +126,27 @@ def empty_qc() -> dict[str, int]:
     """Return a complete QC counter map with deterministic key order."""
 
     return {name: 0 for name in QC_COUNTERS}
+
+
+def select_layout(
+    names: Sequence[str],
+    lengths: Sequence[int],
+    *,
+    all_contigs: bool,
+) -> tuple[Contig, ...]:
+    """Keep canonical chromosomes unless ``all_contigs`` is set.
+
+    The result may be empty; callers decide how to report that. Header
+    names and lengths must already be aligned.
+    """
+
+    if len(names) != len(lengths):
+        raise ValueError("contig names and lengths must have equal length")
+    return tuple(
+        Contig(name, length)
+        for name, length in zip(names, lengths, strict=True)
+        if all_contigs or is_canonical_contig(name)
+    )
 
 
 def is_canonical_contig(name: str) -> bool:
@@ -248,30 +269,23 @@ def run(config: ConvertConfig) -> None:
             raise ConvertError(
                 f"{alignment} header contains non-positive contig lengths"
             )
-        keep = [
-            config.all_contigs or is_canonical_contig(name) for name in header_names
-        ]
-        names = [
-            name for name, wanted in zip(header_names, keep, strict=True) if wanted
-        ]
-        lengths = [
-            length
-            for length, wanted in zip(header_lengths, keep, strict=True)
-            if wanted
-        ]
-        if not names:
+        layout = select_layout(
+            header_names, header_lengths, all_contigs=config.all_contigs
+        )
+        if not layout:
             raise ConvertError(
                 f"{alignment} header declares no canonical chromosomes; "
                 "pass --all-contigs to bin every contig"
             )
+        profile = GenomeProfile(layout)
         logger.debug(
             "binning %d of %d header contigs; skipped %d non-canonical",
-            len(names),
+            len(layout),
             len(header_names),
-            len(header_names) - len(names),
+            len(header_names) - len(layout),
         )
-        contig_lengths = dict(zip(names, lengths, strict=True))
-        workers, decode_threads = split_thread_budget(config.threads, len(names))
+        contig_lengths = profile.length_map()
+        workers, decode_threads = split_thread_budget(config.threads, len(layout))
         logger.debug(
             "using %d worker processes and %d htslib threads per handle",
             workers,
@@ -291,13 +305,13 @@ def run(config: ConvertConfig) -> None:
                 path=alignment,
                 fmt=fmt,
                 fasta=config.fasta,
-                name=name,
-                length=length,
+                name=contig.name,
+                length=contig.length,
                 bin_size=config.bin_size,
                 filters=config.filters,
                 decode_threads=decode_threads,
             )
-            for name, length in zip(names, lengths, strict=True)
+            for contig in layout
         ]
 
         contig_arrays: list[np.ndarray] = []
@@ -334,7 +348,7 @@ def run(config: ConvertConfig) -> None:
             "path": str(alignment.resolve()),
             "format": fmt,
         },
-        reference_identity=_reference_identity(config.fasta, names),
+        reference_identity=_reference_identity(config.fasta, profile.names),
         qc=qc,
         filters=asdict(config.filters),
     )
@@ -465,21 +479,21 @@ def _sample_table(
     return pa.table(
         {
             "contig": pa.array(
-                np.concatenate(contigs) if contigs else np.array([], dtype=object),
-                type=pa.string(),
+                _concat(contigs, np.array([], dtype=object)), type=pa.string()
             ),
             "start": pa.array(
-                np.concatenate(starts) if starts else np.empty(0, dtype=np.int64),
-                type=pa.int64(),
+                _concat(starts, np.empty(0, dtype=np.int64)), type=pa.int64()
             ),
             "end": pa.array(
-                np.concatenate(ends) if ends else np.empty(0, dtype=np.int64),
-                type=pa.int64(),
+                _concat(ends, np.empty(0, dtype=np.int64)), type=pa.int64()
             ),
             "count": pa.array(
-                np.concatenate(counts) if counts else np.empty(0, dtype=np.uint64),
-                type=pa.uint64(),
+                _concat(counts, np.empty(0, dtype=np.uint64)), type=pa.uint64()
             ),
         },
         schema=SAMPLE_SCHEMA.with_metadata(metadata),
     )
+
+
+def _concat(parts: Sequence[np.ndarray], empty: np.ndarray) -> np.ndarray:
+    return np.concatenate(parts) if parts else empty
