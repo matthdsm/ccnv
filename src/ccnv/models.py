@@ -39,22 +39,16 @@ class GenomeProfile:
         if len(names) != len(set(names)):
             raise ValueError("contig names must be unique")
 
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(contig.name for contig in self.contigs)
 
-@dataclass(frozen=True, slots=True)
-class GenomicBin:
-    """A canonical 0-based, half-open genomic interval."""
+    @property
+    def lengths(self) -> tuple[int, ...]:
+        return tuple(contig.length for contig in self.contigs)
 
-    contig: str
-    start: int
-    end: int
-
-    def __post_init__(self) -> None:
-        if not self.contig:
-            raise ValueError("contig must not be empty")
-        if self.start < 0:
-            raise ValueError("bin start must be non-negative")
-        if self.end <= self.start:
-            raise ValueError("bin end must be greater than start")
+    def length_map(self) -> dict[str, int]:
+        return {contig.name: contig.length for contig in self.contigs}
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,6 +11,7 @@ from ccnv.schemas import (
     SCHEMA_VERSION,
     ArtifactKind,
     SchemaError,
+    bin_coordinates,
     decode_metadata,
     metadata_for,
     validate_schema,
@@ -120,6 +121,32 @@ class TestSchemaContracts(unittest.TestCase):
 
         with self.assertRaisesRegex(SchemaError, "outside"):
             validate_table(table, ArtifactKind.SAMPLE)
+
+    def test_bin_coordinates_are_contig_start_end_tuples(self) -> None:
+        metadata = metadata_for(
+            ArtifactKind.SAMPLE,
+            contig_lengths={"chr1": 200, "chr2": 80},
+            values={
+                "bin_size": 100,
+                "source_identity": {},
+                "reference_identity": {},
+                "qc": {},
+                "filters": asdict(ReadFilters()),
+            },
+        )
+        table = pa.table(
+            {
+                "contig": ["chr1", "chr2"],
+                "start": pa.array([0, 0], type=pa.int64()),
+                "end": pa.array([100, 80], type=pa.int64()),
+                "count": pa.array([1, 2], type=pa.uint64()),
+            },
+            schema=SAMPLE_SCHEMA.with_metadata(metadata),
+        )
+        self.assertEqual(
+            bin_coordinates(table),
+            (("chr1", 0, 100), ("chr2", 0, 80)),
+        )
 
 
 if __name__ == "__main__":

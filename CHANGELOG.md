@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Convert and FASTA reference now share one contig-layout selector (`select_layout`)
+  so canonical filtering is no longer duplicated, and `GenomeProfile` is the
+  in-memory layout type. Prediction I/O lives in `ccnv.report`, with result
+  types in `ccnv.results`. Bin coordinates are read through `schemas.bin_coordinates`.
+- CLI tests compare Rich output after stripping ANSI so CI color does not
+  split flags such as ``--loglevel``.
+
 ### Added
 
 - `ccnv convert`: stream BAM/CRAM into versioned sample Parquet, auto-index

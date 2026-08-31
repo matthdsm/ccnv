@@ -15,12 +15,13 @@ import pysam
 from numpy.typing import NDArray
 from sklearn.decomposition import PCA
 
-from ccnv.convert import bin_intervals, is_canonical_contig
+from ccnv.convert import bin_intervals, select_layout
 from ccnv.models import ReferenceConfig, parquet_path
 from ccnv.schemas import (
     REFERENCE_SCHEMA,
     ArtifactKind,
     SchemaError,
+    bin_coordinates,
     decode_metadata,
     metadata_for,
     validate_table,
@@ -83,7 +84,7 @@ def run(config: ReferenceConfig) -> None:
             n_samples=n_samples,
             all_contigs=config.all_contigs,
         )
-        if config.sex_contigs is None or config.sex_contigs == DEFAULT_SEX_CONTIGS:
+        if _uses_default_sex_contigs(config.sex_contigs):
             config = replace(config, sex_contigs=())
     else:
         logger.debug("loading %d sample parquet files", len(config.samples))
@@ -172,19 +173,15 @@ def _fasta_contigs(path: Path, *, all_contigs: bool) -> tuple[list[str], list[in
         header_lengths = [int(length) for length in handle.lengths]
     finally:
         handle.close()
-    keep = [all_contigs or is_canonical_contig(name) for name in header_names]
-    names = [name for name, wanted in zip(header_names, keep, strict=True) if wanted]
-    lengths = [
-        length for length, wanted in zip(header_lengths, keep, strict=True) if wanted
-    ]
-    if not names:
+    if any(length <= 0 for length in header_lengths):
+        raise ReferenceError(f"{fasta} contains non-positive contig lengths")
+    layout = select_layout(header_names, header_lengths, all_contigs=all_contigs)
+    if not layout:
         raise ReferenceError(
             f"{fasta} declares no canonical chromosomes; "
             "pass --all-contigs to include every contig"
         )
-    if any(length <= 0 for length in lengths):
-        raise ReferenceError(f"{fasta} contains non-positive contig lengths")
-    return names, lengths
+    return [contig.name for contig in layout], [contig.length for contig in layout]
 
 
 def validate_cohort(
@@ -217,7 +214,7 @@ def validate_cohort(
         bin_size = metadata["bin_size"]
         if not isinstance(contig_lengths, dict) or not isinstance(bin_size, int):
             raise ReferenceError(f"{path}: sample metadata is incomplete")
-        bins = _bin_identity(table)
+        bins = bin_coordinates(table)
         if expected_bins is None:
             expected_bins = bins
             expected_lengths = {
@@ -553,17 +550,6 @@ def _read_sample(path: Path) -> pa.Table:
         raise ReferenceError(f"{path}: cannot read sample Parquet ({error})") from error
 
 
-def _bin_identity(table: pa.Table) -> tuple[tuple[str, int, int], ...]:
-    return tuple(
-        zip(
-            table.column("contig").to_pylist(),
-            table.column("start").to_pylist(),
-            table.column("end").to_pylist(),
-            strict=True,
-        )
-    )
-
-
 def _resolve_contig_roles(
     cohort: Cohort,
     config: ReferenceConfig,
@@ -573,7 +559,7 @@ def _resolve_contig_roles(
     requested_sex = (
         None if config.sex_contigs is None else tuple(dict.fromkeys(config.sex_contigs))
     )
-    if requested_sex is None or requested_sex == DEFAULT_SEX_CONTIGS:
+    if _uses_default_sex_contigs(requested_sex):
         sex_contigs = tuple(name for name in DEFAULT_SEX_CONTIGS if name in available)
     else:
         sex_contigs = requested_sex
@@ -622,7 +608,7 @@ def _resolve_sexes(
 def _resolve_sex_signal(cohort: Cohort, config: ReferenceConfig) -> str | None:
     available = set(cohort.contigs)
     requested = config.sex_signal_contig
-    if requested is None or requested == DEFAULT_SEX_SIGNAL_CONTIGS[0]:
+    if _uses_default_sex_signal(requested):
         for name in DEFAULT_SEX_SIGNAL_CONTIGS:
             if name in available:
                 return name
@@ -630,6 +616,14 @@ def _resolve_sex_signal(cohort: Cohort, config: ReferenceConfig) -> str | None:
     if requested not in available:
         raise ReferenceError(f"unknown sex-signal contig {requested!r}")
     return requested
+
+
+def _uses_default_sex_contigs(requested: tuple[str, ...] | None) -> bool:
+    return requested is None or requested == DEFAULT_SEX_CONTIGS
+
+
+def _uses_default_sex_signal(requested: str | None) -> bool:
+    return requested is None or requested == DEFAULT_SEX_SIGNAL_CONTIGS[0]
 
 
 def _validate_sex_cutoff(cutoff: float | None) -> None:

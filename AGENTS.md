@@ -48,6 +48,8 @@ A fixed human chromosome layout is intentionally absent, the tool is meant to be
 
 - `src/ccnv/cli.py`: The `ccnv` Typer entry point and subcommands.
 - `src/ccnv/predict.py`: Functional logic for the predict stage.
+- `src/ccnv/report.py`: BED, Parquet, and SVG writers for prediction artifacts.
+- `src/ccnv/results.py`: Typed bin/segment/output objects shared by predict and report.
 - `src/ccnv/convert.py`: Functional logic for the convert stage.
 - `src/ccnv/reference.py`: Functional logic for creating reference files.
 - `src/ccnv/segment.py`: Weighted L2 cost and Binseg segmentation.
