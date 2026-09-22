@@ -24,7 +24,7 @@ ccnv convert ALIGNMENT [--prefix PREFIX] [options]
 | --- | --- | --- |
 | `ALIGNMENT` | required | BAM or CRAM. A missing index is created automatically. CRAM also needs `--fasta`. |
 | `--prefix` | alignment stem | Output prefix. Writes `<prefix>.parquet`. |
-| `--bin-size` | `100000` | Target bin size in bases. The last bin on each contig may be shorter. |
+| `--bin-size` | `5000` | Target bin size in bases. The last bin on each contig may be shorter. |
 | `--fasta` | unset | Reference FASTA required for CRAM. Must exist. |
 | `--min-mapq` | `1` | Minimum mapping quality to keep. |
 | `--keep-duplicates` | off | Keep SAM duplicate reads. |
@@ -134,3 +134,5 @@ Prediction writes:
 
 BED coordinates are 0-based, half-open, with contig names from the sample
 genome. Called segments also appear in `_calls.bed`.
+        int, typer.Option(min=1, help="Target bin size in bases for --fasta")
+    ] = 5000,

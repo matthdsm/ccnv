@@ -145,7 +145,7 @@ def convert(
     ] = None,
     bin_size: Annotated[
         int, typer.Option(min=1, help="Target bin size in bases")
-    ] = 100_000,
+    ] = 5000,
     fasta: Annotated[
         Path | None,
         typer.Option(
@@ -254,7 +254,7 @@ def reference(
     ] = None,
     bin_size: Annotated[
         int, typer.Option(min=1, help="Target bin size in bases for --fasta")
-    ] = 100_000,
+    ] = 5000,
     all_contigs: Annotated[
         bool,
         typer.Option(
