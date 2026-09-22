@@ -35,12 +35,9 @@ ccnv convert ALIGNMENT [--prefix PREFIX] [options]
 | `-t`, `--threads` | CPU count | CPU budget split between contig worker processes and per-handle BAM/CRAM decode threads. `1` bins serially with a single htslib thread. A budget of 8 on many contigs uses 4 workers × 2 decode threads. |
 | `--loglevel` | `WARNING` | Logging verbosity for convert steps. |
 
-Only canonical chromosomes are binned: autosomes 1-22 plus X and Y, written as
-UCSC (`chr1`, `chrX`), plain NCBI/Ensembl (`1`, `X`), or RefSeq accessions
-(`NC_000001.11` through `NC_000024.10`, any version suffix). The `chr` prefix and
-the letter case are both ignored, so `CHR7` and `y` are canonical.
+Only canonical chromosomes are binned: autosomes 1-22 plus X and Y, written as UCSC (`chr1`, `chrX`) or plain NCBI/Ensembl (`1`, `X`) accessions. The `chr` prefix and the letter case are both ignored, so `CHR7` and `y` are canonical.
 
-Everything else is skipped: mitochondrial contigs (`chrM`, `MT`, `NC_012920.1`),
+Everything else is skipped: mitochondrial contigs (`chrM`, `MT`),
 `_alt`, `_decoy`, and `_random` scaffolds, unplaced `chrUn_*` scaffolds, and
 `chrEBV`. Skipped contigs are absent from the bins, from `contig_lengths`, and
 from `reference_identity.contig_order`, and their reads are never read. Convert

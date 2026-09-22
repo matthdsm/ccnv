@@ -24,11 +24,6 @@ from ccnv.schemas import (
 
 logger = logging.getLogger(__name__)
 
-CANONICAL_AUTOSOMES: Final[int] = 22
-_REFSEQ_CHROMOSOME: Final[re.Pattern[str]] = re.compile(r"NC_0000(\d{2})\.\d+")
-_REFSEQ_LAST: Final[int] = 24
-"""``NC_000023`` is X and ``NC_000024`` is Y; mitochondrial DNA is ``NC_012920``."""
-
 QC_COUNTERS: Final[tuple[str, ...]] = (
     "header_mapped",
     "header_unmapped",
@@ -150,20 +145,14 @@ def select_layout(
 
 
 def is_canonical_contig(name: str) -> bool:
-    """Report whether a contig is a canonical autosome or sex chromosome.
-
-    Accepts UCSC (``chr1``, ``chrX``), plain NCBI/Ensembl (``1``, ``X``), and
-    RefSeq accession (``NC_000001.11``) spellings. Mitochondrial contigs, ALT
-    and decoy scaffolds, unplaced scaffolds, and EBV are not canonical.
+    """
+    Report whether a contig is a canonical autosome or sex chromosome.
+    Accepts UCSC (``chr1``, ``chrX``) and plain NCBI/Ensembl (``1``, ``X``) spellings.
+    Mitochondrial contigs, ALT and decoy scaffolds, unplaced scaffolds, and EBV are not canonical.
     """
 
     bare = name[3:] if name[:3].lower() == "chr" else name
-    if bare.isdigit():
-        return 1 <= int(bare) <= CANONICAL_AUTOSOMES
-    if bare.upper() in {"X", "Y"}:
-        return True
-    match = _REFSEQ_CHROMOSOME.fullmatch(name)
-    return match is not None and 1 <= int(match.group(1)) <= _REFSEQ_LAST
+    return bare.isdigit() or bare.upper() in {"X", "Y"}
 
 
 def bin_intervals(length: int, bin_size: int) -> tuple[np.ndarray, np.ndarray]:
