@@ -25,7 +25,7 @@ Copynumber-CNV is a bioinformatics tool for Copy Number Variation (CNV) analysis
 1. **Convert:** Stream a BAM/CRAM once per contig, creating a pysam index when
    missing, filter reads, calculate binned counts with NumPy, and write
    canonical sample Parquet plus deterministic QC metadata. Only canonical
-   chromosomes (1-22, X, Y in UCSC, plain, or RefSeq `NC_0000NN.V` spelling) are
+   chromosomes (1-22, X, Y in UCSC or plain spelling) are
    binned unless `--all-contigs` is set; mitochondrial, ALT, decoy, random,
    unplaced, and EBV contigs are skipped. `-t/--threads` is a CPU budget split
    between contig worker processes and per-handle htslib decode threads; output

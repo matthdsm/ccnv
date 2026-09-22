@@ -6,3 +6,7 @@ __pycache__/
 *.py[cod]
 build/
 dist/
+./*.cram
+./*.crai
+./*.npz
+./*.parquet
