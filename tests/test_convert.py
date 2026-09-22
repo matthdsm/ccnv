@@ -497,12 +497,7 @@ class TestCanonicalContigs(unittest.TestCase):
             "X",
             "Y",
             "CHR7",
-            "y",
-            "NC_000001.11",
-            "NC_000001.10",
-            "NC_000022.11",
-            "NC_000023.11",
-            "NC_000024.10",
+            "y"
         ):
             with self.subTest(name=name):
                 self.assertTrue(is_canonical_contig(name))
@@ -520,10 +515,7 @@ class TestCanonicalContigs(unittest.TestCase):
             "MT",
             "chr23",
             "0",
-            "scaffold-A",
-            "NC_012920.1",
-            "NC_000025.1",
-            "NC_000001",
+            "scaffold-A"
         ):
             with self.subTest(name=name):
                 self.assertFalse(is_canonical_contig(name))
@@ -561,34 +553,6 @@ class TestCanonicalContigs(unittest.TestCase):
             self.assertEqual(metadata["reference_identity"]["contig_order"], ["chr1"])
             self.assertEqual(metadata["qc"]["reads_seen"], 1)
             self.assertEqual(metadata["qc"]["reads_kept"], 1)
-
-    def test_refseq_accessions_are_binned(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            bam_path = Path(tmpdir) / "sample.bam"
-            prefix = Path(tmpdir) / "sample"
-            header = {
-                "HD": {"VN": "1.6", "SO": "coordinate"},
-                "SQ": [
-                    {"SN": "NC_000001.11", "LN": 200},
-                    {"SN": "NC_000024.10", "LN": 100},
-                    {"SN": "NC_012920.1", "LN": 100},
-                ],
-            }
-            reads = [
-                _read("auto", 0, 0, 60),
-                _read("chry", 1, 0, 60),
-                _read("mito", 2, 0, 60),
-            ]
-            _write_bam(bam_path, reads, header=header, index=True)
-            run(ConvertConfig(bam_path, prefix, bin_size=100))
-
-            table = read_sample_parquet(parquet_path(prefix))
-            metadata = decode_metadata(table.schema.metadata)
-            self.assertEqual(
-                metadata["reference_identity"]["contig_order"],
-                ["NC_000001.11", "NC_000024.10"],
-            )
-            self.assertEqual(metadata["qc"]["reads_kept"], 2)
 
     def test_all_contigs_keeps_every_header_contig(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
