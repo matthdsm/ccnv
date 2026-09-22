@@ -23,9 +23,9 @@ classifiers = [
 dependencies = [
     "numpy",
     "polars",
+    "polars-bio",
     "polars-runtime-compat",
     "pyarrow",
-    "pysam",
     "ruptures",
     "scikit-learn",
     "scipy",
@@ -40,20 +40,19 @@ where = ["src"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge", "bioconda"]
-platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+platforms = ["linux-64", "osx-arm64"]
 
 [tool.pixi.dependencies]
 numpy = "*"
 polars = "*"
 polars-runtime-compat = "*"
 pyarrow = "*"
-pysam = "*"
 python = "3.12.*"
 ruptures = "*"
-samtools = "*"
 scikit-learn = "*"
 scipy = "*"
 typer = "*"
+polars-bio = ">=0.35.1,<0.36"
 
 [tool.pixi.pypi-dependencies]
 ccnv = { path = ".", editable = true }

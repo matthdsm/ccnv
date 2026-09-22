@@ -1,12 +1,14 @@
+import json
 import tempfile
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import polars as pl
+import polars_bio as pb
 import pyarrow as pa
-import pysam
 from published_fixtures import (
     CHR21_LENGTH,
     PUBLISHED_BIN_SIZE,
@@ -14,6 +16,7 @@ from published_fixtures import (
     PUBLISHED_CRAM_URL,
     ensure_published_fasta,
     ensure_published_file,
+    write_fai,
 )
 from typer.testing import CliRunner
 
@@ -30,7 +33,6 @@ from ccnv.convert import (
     rejection_reason,
     run,
     select_layout,
-    split_thread_budget,
 )
 from ccnv.models import Contig, ConvertConfig, GenomeProfile, ReadFilters, parquet_path
 from ccnv.schemas import (
@@ -216,36 +218,24 @@ class TestReadFilters(unittest.TestCase):
 
 
 class TestConvertAlignment(unittest.TestCase):
-    def test_alignment_handle_closes_when_validation_fails(self) -> None:
-        class FakeAlignment:
-            closed = False
-
-            @staticmethod
-            def has_index() -> bool:
-                return False
-
-            def close(self) -> None:
-                self.closed = True
-
+    def test_alignment_validation_fails_on_empty_header(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "sample.bam"
             bam_path.touch()
-            alignment = FakeAlignment()
             with (
-                patch("ccnv.convert._open_alignment", return_value=alignment),
+                patch("ccnv.convert._scan_alignment", return_value=(None, [], [])),
                 self.assertRaises(ConvertError),
             ):
                 run(ConvertConfig(bam_path, Path(tmpdir) / "out", bin_size=100))
-            self.assertTrue(alignment.closed)
 
-    def test_missing_bam_index_is_created(self) -> None:
+    def test_unindexed_bam_converts_without_creating_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "sample.bam"
             prefix = Path(tmpdir) / "sample"
             _write_bam(bam_path, [_read("r1", 0, 0, 10)], index=False)
             self.assertFalse(_has_alignment_index(bam_path))
             run(ConvertConfig(bam_path, prefix, bin_size=100))
-            self.assertTrue(_has_alignment_index(bam_path))
+            self.assertFalse(_has_alignment_index(bam_path))
             table = read_sample_parquet(parquet_path(prefix))
             self.assertEqual(table.column("count").to_pylist(), [1, 0, 0])
 
@@ -256,26 +246,26 @@ class TestConvertAlignment(unittest.TestCase):
             with self.assertRaisesRegex(ConvertError, r"CRAM.*--fasta"):
                 run(ConvertConfig(cram_path, Path(tmpdir) / "out", bin_size=100))
 
-    def test_missing_cram_index_is_created(self) -> None:
+    def test_cram_missing_fasta_index_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             fasta = Path(tmpdir) / "ref.fa"
             fasta.write_text(">chr1\n" + "A" * 250 + "\n")
-            pysam.faidx(str(fasta))
-            bam_path = Path(tmpdir) / "sample.bam"
             cram_path = Path(tmpdir) / "sample.cram"
-            _write_bam(bam_path, [_read("r1", 0, 0, 60)], index=True)
-            with (
-                pysam.AlignmentFile(str(bam_path), "rb") as bam,
-                pysam.AlignmentFile(
-                    str(cram_path),
-                    "wc",
-                    header=bam.header,
-                    reference_filename=str(fasta),
-                ) as cram,
-            ):
-                for read in bam:
-                    cram.write(read)
-            self.assertFalse(_has_alignment_index(cram_path))
+            cram_path.touch()
+            with self.assertRaisesRegex(ConvertError, r"FASTA index not found"):
+                run(
+                    ConvertConfig(
+                        cram_path, Path(tmpdir) / "out", bin_size=100, fasta=fasta
+                    )
+                )
+
+    def test_cram_converts_with_fasta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta = Path(tmpdir) / "ref.fa"
+            fasta.write_text(">chr1\n" + "A" * 250 + "\n")
+            write_fai(fasta)
+            cram_path = Path(tmpdir) / "sample.cram"
+            _write_cram(cram_path, [_read("r1", 0, 0, 60)], fasta)
             prefix = Path(tmpdir) / "sample"
             run(
                 ConvertConfig(
@@ -285,7 +275,6 @@ class TestConvertAlignment(unittest.TestCase):
                     fasta=fasta,
                 )
             )
-            self.assertTrue(_has_alignment_index(cram_path))
             table = read_sample_parquet(parquet_path(prefix))
             self.assertEqual(sum(table.column("count").to_pylist()), 1)
 
@@ -463,7 +452,6 @@ class TestConvertAlignment(unittest.TestCase):
                 )
             messages = "\n".join(captured.output)
             self.assertIn("opening alignment", messages)
-            self.assertIn("already has an index", messages)
             self.assertIn("binned contig chr1", messages)
             self.assertIn("writing sample parquet", messages)
 
@@ -530,30 +518,23 @@ class TestParallelBinning(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
             ConvertConfig(Path("a.bam"), Path("out"), bin_size=100, threads=0)
 
-    def test_thread_budget_splits_workers_and_decode_threads(self) -> None:
-        cases = (
-            (1, 24, 1, 1),
-            (8, 1, 1, 8),
-            (8, 24, 4, 2),
-            (16, 24, 8, 2),
-            (4, 24, 2, 2),
-            (3, 24, 3, 1),
-            (8, 3, 3, 2),
-        )
-        for budget, n_tasks, workers, decode in cases:
-            with self.subTest(budget=budget, n_tasks=n_tasks):
-                self.assertEqual(
-                    split_thread_budget(budget, n_tasks), (workers, decode)
-                )
-                self.assertLessEqual(workers * decode, budget)
+    def test_scan_alignment_forwards_threads(self) -> None:
+        with (
+            patch("ccnv.convert.pb.set_option") as set_option,
+            patch("ccnv.convert.pb.scan_bam"),
+            patch(
+                "ccnv.convert.pb.get_metadata",
+                return_value={
+                    "header": {
+                        "reference_sequences": '[{"name": "chr1", "length": 250}]'
+                    }
+                },
+            ),
+        ):
+            from ccnv.convert import _scan_alignment
 
-    def test_open_alignment_forwards_htslib_threads(self) -> None:
-        with patch("ccnv.convert.pysam.AlignmentFile") as alignment_file:
-            from ccnv.convert import _open_alignment
-
-            _open_alignment(Path("sample.bam"), "bam", None, threads=4)
-            alignment_file.assert_called_once()
-            self.assertEqual(alignment_file.call_args.kwargs["threads"], 4)
+            _scan_alignment(Path("sample.bam"), "bam", None, threads=4)
+            set_option.assert_called_with(pb.POLARS_BIO_MAX_THREADS, "4")
 
 
 class TestCanonicalContigs(unittest.TestCase):
@@ -710,6 +691,15 @@ class TestConvertPublishedCram(unittest.TestCase):
             self.assertEqual(metadata["qc"]["reads_kept"], 1_049_534)
 
 
+@dataclass
+class _Read:
+    name: str
+    reference_id: int
+    start: int
+    mapq: int
+    is_duplicate: bool = False
+
+
 def _read(
     name: str,
     reference_id: int,
@@ -717,20 +707,14 @@ def _read(
     mapq: int,
     *,
     is_duplicate: bool = False,
-) -> pysam.AlignedSegment:
-    read = pysam.AlignedSegment()
-    read.query_name = name
-    read.query_sequence = "ACGTACGTAC"
-    read.flag = 1024 if is_duplicate else 0
-    read.reference_id = reference_id
-    read.reference_start = start
-    read.mapping_quality = mapq
-    read.cigar = ((0, 10),)
-    read.next_reference_id = -1
-    read.next_reference_start = -1
-    read.template_length = 0
-    read.query_qualities = pysam.qualitystring_to_array("I" * 10)
-    return read
+) -> _Read:
+    return _Read(
+        name=name,
+        reference_id=reference_id,
+        start=start,
+        mapq=mapq,
+        is_duplicate=is_duplicate,
+    )
 
 
 def _has_alignment_index(path: Path) -> bool:
@@ -748,22 +732,142 @@ def _has_alignment_index(path: Path) -> bool:
 
 def _write_bam(
     path: Path,
-    reads: list[pysam.AlignedSegment],
+    reads: list[_Read],
     *,
     header: dict[str, object] | None = None,
-    index: bool,
+    index: bool = False,
 ) -> None:
     bam_header = header or {
         "HD": {"VN": "1.6", "SO": "coordinate"},
         "SQ": [{"SN": "chr1", "LN": 250}],
     }
-    with pysam.AlignmentFile(str(path), "wb", header=bam_header) as bam:
-        for read in sorted(
-            reads, key=lambda item: (item.reference_id, item.reference_start)
-        ):
-            bam.write(read)
-    if index:
-        pysam.index(str(path))
+    sq_list = bam_header.get("SQ", [{"SN": "chr1", "LN": 250}])
+    ref_seqs = [{"name": sq["SN"], "length": sq["LN"]} for sq in sq_list]
+    ref_id_to_name = {idx: sq["SN"] for idx, sq in enumerate(sq_list)}
+    sorted_reads = sorted(reads, key=lambda r: (r.reference_id, r.start))
+    if sorted_reads:
+        names = [r.name for r in sorted_reads]
+        chroms = [
+            ref_id_to_name.get(r.reference_id, f"chr{r.reference_id + 1}")
+            for r in sorted_reads
+        ]
+        starts = [r.start for r in sorted_reads]
+        ends = [r.start + 10 for r in sorted_reads]
+        flags = [1024 if r.is_duplicate else 0 for r in sorted_reads]
+        mapqs = [r.mapq for r in sorted_reads]
+        cigars = ["10M" for _ in sorted_reads]
+        sequences = ["ACGTACGTAC" for _ in sorted_reads]
+        qualities = ["I" * 10 for _ in sorted_reads]
+        mate_chroms = [None for _ in sorted_reads]
+        mate_starts = [None for _ in sorted_reads]
+        tlen = [0 for _ in sorted_reads]
+    else:
+        names = []
+        chroms = []
+        starts = []
+        ends = []
+        flags = []
+        mapqs = []
+        cigars = []
+        sequences = []
+        qualities = []
+        mate_chroms = []
+        mate_starts = []
+        tlen = []
+
+    df = pl.DataFrame(
+        {
+            "name": pl.Series(names, dtype=pl.String),
+            "chrom": pl.Series(chroms, dtype=pl.String),
+            "start": pl.Series(starts, dtype=pl.UInt32),
+            "end": pl.Series(ends, dtype=pl.UInt32),
+            "flags": pl.Series(flags, dtype=pl.UInt32),
+            "cigar": pl.Series(cigars, dtype=pl.String),
+            "mapping_quality": pl.Series(mapqs, dtype=pl.UInt32),
+            "mate_chrom": pl.Series(mate_chroms, dtype=pl.String),
+            "mate_start": pl.Series(mate_starts, dtype=pl.UInt32),
+            "sequence": pl.Series(sequences, dtype=pl.String),
+            "quality_scores": pl.Series(qualities, dtype=pl.String),
+            "template_length": pl.Series(tlen, dtype=pl.Int32),
+        }
+    )
+    meta_header = {
+        "file_format_version": "1.6",
+        "reference_sequences": json.dumps(ref_seqs),
+    }
+    pb.set_option(pb.POLARS_BIO_COORDINATE_SYSTEM_ZERO_BASED, True)
+    pb.set_source_metadata(df, format="bam", path=str(path), header=meta_header)
+    pb.write_bam(df, str(path), sort_on_write=True)
+
+
+def _write_cram(
+    path: Path,
+    reads: list[_Read],
+    fasta_path: Path,
+    *,
+    header: dict[str, object] | None = None,
+) -> None:
+    bam_header = header or {
+        "HD": {"VN": "1.6", "SO": "coordinate"},
+        "SQ": [{"SN": "chr1", "LN": 250}],
+    }
+    sq_list = bam_header.get("SQ", [{"SN": "chr1", "LN": 250}])
+    ref_seqs = [{"name": sq["SN"], "length": sq["LN"]} for sq in sq_list]
+    ref_id_to_name = {idx: sq["SN"] for idx, sq in enumerate(sq_list)}
+    sorted_reads = sorted(reads, key=lambda r: (r.reference_id, r.start))
+    if sorted_reads:
+        names = [r.name for r in sorted_reads]
+        chroms = [
+            ref_id_to_name.get(r.reference_id, f"chr{r.reference_id + 1}")
+            for r in sorted_reads
+        ]
+        starts = [r.start for r in sorted_reads]
+        ends = [r.start + 10 for r in sorted_reads]
+        flags = [1024 if r.is_duplicate else 0 for r in sorted_reads]
+        mapqs = [r.mapq for r in sorted_reads]
+        cigars = ["10M" for _ in sorted_reads]
+        sequences = ["ACGTACGTAC" for _ in sorted_reads]
+        qualities = ["I" * 10 for _ in sorted_reads]
+        mate_chroms = [None for _ in sorted_reads]
+        mate_starts = [None for _ in sorted_reads]
+        tlen = [0 for _ in sorted_reads]
+    else:
+        names = []
+        chroms = []
+        starts = []
+        ends = []
+        flags = []
+        mapqs = []
+        cigars = []
+        sequences = []
+        qualities = []
+        mate_chroms = []
+        mate_starts = []
+        tlen = []
+
+    df = pl.DataFrame(
+        {
+            "name": pl.Series(names, dtype=pl.String),
+            "chrom": pl.Series(chroms, dtype=pl.String),
+            "start": pl.Series(starts, dtype=pl.UInt32),
+            "end": pl.Series(ends, dtype=pl.UInt32),
+            "flags": pl.Series(flags, dtype=pl.UInt32),
+            "cigar": pl.Series(cigars, dtype=pl.String),
+            "mapping_quality": pl.Series(mapqs, dtype=pl.UInt32),
+            "mate_chrom": pl.Series(mate_chroms, dtype=pl.String),
+            "mate_start": pl.Series(mate_starts, dtype=pl.UInt32),
+            "sequence": pl.Series(sequences, dtype=pl.String),
+            "quality_scores": pl.Series(qualities, dtype=pl.String),
+            "template_length": pl.Series(tlen, dtype=pl.Int32),
+        }
+    )
+    meta_header = {
+        "file_format_version": "1.6",
+        "reference_sequences": json.dumps(ref_seqs),
+    }
+    pb.set_option(pb.POLARS_BIO_COORDINATE_SYSTEM_ZERO_BASED, True)
+    pb.set_source_metadata(df, format="cram", path=str(path), header=meta_header)
+    pb.write_cram(df, str(path), reference_path=str(fasta_path), sort_on_write=True)
 
 
 if __name__ == "__main__":

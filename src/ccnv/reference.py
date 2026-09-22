@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Final, Literal
 
 import numpy as np
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pysam
 from numpy.typing import NDArray
 from sklearn.decomposition import PCA
 
@@ -165,18 +165,19 @@ def _fasta_contigs(path: Path, *, all_contigs: bool) -> tuple[list[str], list[in
     fasta = path.expanduser()
     if not fasta.is_file():
         raise ReferenceError(f"FASTA not found: {fasta}")
-    if not Path(f"{fasta}.fai").is_file():
-        logger.debug("creating FASTA index for %s", fasta)
-        try:
-            pysam.faidx(str(fasta))
-        except Exception as error:
-            raise ReferenceError(f"failed to index FASTA {fasta}: {error}") from error
-    handle = pysam.FastaFile(str(fasta))
-    try:
-        header_names = list(handle.references)
-        header_lengths = [int(length) for length in handle.lengths]
-    finally:
-        handle.close()
+    fai_path = Path(f"{fasta}.fai")
+    if not fai_path.is_file():
+        raise ReferenceError(
+            f"FASTA index not found: {fai_path}. Please create an index before running."
+        )
+    fai_table = pl.read_csv(
+        fai_path,
+        separator="\t",
+        has_header=False,
+        new_columns=["name", "length", "offset", "line_bases", "line_width"],
+    )
+    header_names = fai_table["name"].to_list()
+    header_lengths = fai_table["length"].cast(pl.Int64).to_list()
     if any(length <= 0 for length in header_lengths):
         raise ReferenceError(f"{fasta} contains non-positive contig lengths")
     layout = select_layout(header_names, header_lengths, all_contigs=all_contigs)

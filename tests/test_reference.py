@@ -6,7 +6,6 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pysam
 from published_fixtures import (
     CHR21_LENGTH,
     PUBLISHED_BIN_SIZE,
@@ -16,6 +15,7 @@ from published_fixtures import (
     PUBLISHED_CRAM_URL,
     ensure_published_fasta,
     ensure_published_file,
+    write_fai,
 )
 from sklearn.neighbors import NearestNeighbors
 from typer.testing import CliRunner
@@ -788,12 +788,26 @@ class TestFlatFastaReference(unittest.TestCase):
         with self.assertRaisesRegex(ReferenceError, "sample Parquet paths or a FASTA"):
             run(ReferenceConfig(samples=(), prefix=Path("ref")))
 
+    def test_missing_fasta_index_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta = Path(tmpdir) / "tiny.fa"
+            fasta.write_text(">chr1\nACGT\n")
+            with self.assertRaisesRegex(ReferenceError, "FASTA index not found"):
+                run(
+                    ReferenceConfig(
+                        samples=(),
+                        prefix=Path(tmpdir) / "ref",
+                        fasta=fasta,
+                        bin_size=100,
+                    )
+                )
+
 
 def _write_tiny_fasta(path: Path, records: tuple[tuple[str, int], ...]) -> Path:
     with path.open("w", encoding="ascii") as handle:
         for name, length in records:
             handle.write(f">{name}\n{'A' * length}\n")
-    pysam.faidx(str(path))
+    write_fai(path)
     return path
 
 

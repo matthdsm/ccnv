@@ -5,10 +5,38 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import pysam
-
 from ccnv.convert import run as convert
 from ccnv.models import ConvertConfig, parquet_path
+
+
+def write_fai(fasta_path: Path) -> Path:
+    """Generate a .fai index file for a FASTA in pure Python."""
+    fai_path = Path(f"{fasta_path}.fai")
+    records: list[str] = []
+    with open(fasta_path, "rb") as handle:
+        line = handle.readline()
+        while line:
+            if line.startswith(b">"):
+                name = line[1:].split()[0].decode("ascii")
+                offset = handle.tell()
+                first_seq = handle.readline()
+                line_blen = len(first_seq.rstrip(b"\r\n"))
+                line_len = len(first_seq)
+                seq_len = line_blen
+                while True:
+                    pos = handle.tell()
+                    seq_line = handle.readline()
+                    if not seq_line or seq_line.startswith(b">"):
+                        handle.seek(pos)
+                        break
+                    seq_len += len(seq_line.rstrip(b"\r\n"))
+                records.append(
+                    f"{name}\t{seq_len}\t{offset}\t{line_blen}\t{line_len}\n"
+                )
+            line = handle.readline()
+    fai_path.write_text("".join(records), encoding="ascii")
+    return fai_path
+
 
 CONVERT_FIXTURES = Path(__file__).parent / "fixtures" / "convert"
 _DATASETS = "https://raw.githubusercontent.com/nf-cmgg/test-datasets/ccnv/"
@@ -52,11 +80,11 @@ def ensure_published_file(path: Path, url: str) -> Path:
 
 
 def ensure_published_fasta() -> Path:
-    """Return the cached chr21 FASTA, indexing it with pysam when needed."""
+    """Return the cached chr21 FASTA, indexing it when needed."""
 
     fasta = ensure_published_file(PUBLISHED_FASTA, PUBLISHED_FASTA_URL)
     if not Path(f"{fasta}.fai").is_file():
-        pysam.faidx(str(fasta))
+        write_fai(fasta)
     return fasta
 
 

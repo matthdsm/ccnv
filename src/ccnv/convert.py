@@ -1,17 +1,17 @@
 """Stream BAM/CRAM alignments into canonical sample Parquet bins."""
 
+import json
 import logging
-from collections.abc import Iterator, Mapping, Sequence
-from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from pathlib import Path
 from typing import Final
 
 import numpy as np
+import polars as pl
+import polars_bio as pb
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pysam
 
 from ccnv.models import Contig, ConvertConfig, GenomeProfile, ReadFilters, parquet_path
 from ccnv.schemas import (
@@ -44,77 +44,70 @@ class ConvertError(ValueError):
     """Raised when conversion cannot proceed with the given inputs."""
 
 
-@dataclass(frozen=True, slots=True)
-class _ContigTask:
-    """One contig's binning work, sized to be cheap to send to a worker."""
-
-    path: Path
-    fmt: str
-    fasta: Path | None
-    name: str
-    length: int
-    bin_size: int
-    filters: ReadFilters
-    decode_threads: int = 1
-
-
-_WORKER_HANDLES: dict[tuple[str, str, str | None, int], pysam.AlignmentFile] = {}
-
-
-def split_thread_budget(budget: int, n_tasks: int) -> tuple[int, int]:
-    """Split a CPU budget into process workers and per-handle htslib threads.
-
-    The product of the returned values is at most ``budget``. A single task or a
-    budget of 1 stays in-process and gives the whole budget to pysam, whose
-    ``threads`` argument is passed to ``hts_set_threads`` as ``threads - 1``.
-    Otherwise each handle gets two threads when the budget is at least 4, so
-    CRAM decode is not stuck at pysam's default of one.
-    """
-
-    if budget <= 0:
-        raise ValueError("thread budget must be a positive integer")
-    if n_tasks <= 0:
-        raise ValueError("n_tasks must be a positive integer")
-    if budget == 1 or n_tasks == 1:
-        return 1, budget
-    decode_threads = 2 if budget >= 4 else 1
-    workers = min(n_tasks, max(1, budget // decode_threads))
-    return workers, max(1, budget // workers)
-
-
-def _worker_handle(task: _ContigTask) -> pysam.AlignmentFile:
-    """Reuse one alignment handle per worker process, keyed by input file."""
-
-    key = (
-        str(task.path),
-        task.fmt,
-        str(task.fasta) if task.fasta else None,
-        task.decode_threads,
-    )
-    handle = _WORKER_HANDLES.get(key)
-    if handle is None:
-        handle = _open_alignment(
-            task.path, task.fmt, task.fasta, threads=task.decode_threads
-        )
-        _WORKER_HANDLES[key] = handle
-    return handle
-
-
-def _bin_contig(task: _ContigTask) -> tuple[np.ndarray, dict[str, int]]:
-    """Bin one contig inside a worker process."""
-
-    return bin_contig_with_handle(_worker_handle(task), task)
-
-
-def bin_contig_with_handle(
-    handle: pysam.AlignmentFile, task: _ContigTask
+def filter_and_bin_contig(
+    lf: pl.LazyFrame,
+    contig: Contig,
+    bin_size: int,
+    n_bins: int,
+    filters: ReadFilters,
 ) -> tuple[np.ndarray, dict[str, int]]:
-    """Count reads for one contig and return its bin counts plus QC counters."""
+    """Filter reads and compute bin counts and QC statistics for one contig."""
 
-    starts, _ = bin_intervals(task.length, task.bin_size)
     qc = empty_qc()
-    kept_starts = _kept_starts(handle.fetch(task.name), task.filters, qc, task.length)
-    return bin_counts(kept_starts, task.bin_size, starts.size), qc
+    contig_df = (
+        lf.filter(pl.col("chrom") == contig.name)
+        .select(["start", "flags", "mapping_quality"])
+        .collect()
+    )
+    n_reads = len(contig_df)
+    qc["reads_seen"] = n_reads
+    if n_reads == 0:
+        return np.zeros(n_bins, dtype=np.uint64), qc
+
+    conditions = []
+    if filters.exclude_unmapped:
+        conditions.append(((pl.col("flags") & 4) != 0, "filter_unmapped"))
+    conditions.append((pl.col("start").is_null(), "filter_no_start"))
+    if filters.exclude_secondary:
+        conditions.append(((pl.col("flags") & 256) != 0, "filter_secondary"))
+    if filters.exclude_supplementary:
+        conditions.append(((pl.col("flags") & 2048) != 0, "filter_supplementary"))
+    if filters.exclude_duplicates:
+        conditions.append(((pl.col("flags") & 1024) != 0, "filter_duplicate"))
+    if filters.require_proper_pair:
+        conditions.append(
+            (
+                ((pl.col("flags") & 1) != 0) & ((pl.col("flags") & 2) == 0),
+                "filter_improper_pair",
+            )
+        )
+    if filters.min_mapping_quality > 0:
+        conditions.append(
+            (
+                pl.col("mapping_quality") < filters.min_mapping_quality,
+                "filter_mapq",
+            )
+        )
+    conditions.append((pl.col("start") >= contig.length, "filter_no_start"))
+
+    expr = pl.when(conditions[0][0]).then(pl.lit(conditions[0][1]))
+    for cond, res in conditions[1:]:
+        expr = expr.when(cond).then(pl.lit(res))
+    expr = expr.otherwise(pl.lit("kept")).alias("reason")
+
+    classified = contig_df.with_columns(expr)
+    reason_counts = classified["reason"].value_counts()
+    for row in reason_counts.iter_rows():
+        r_name, r_cnt = row[0], row[1]
+        if r_name in qc:
+            qc[r_name] = r_cnt
+        elif r_name == "kept":
+            qc["reads_kept"] = r_cnt
+
+    kept_df = classified.filter(pl.col("reason") == "kept")
+    kept_starts = kept_df["start"].to_numpy()
+    counts = bin_counts(kept_starts, bin_size, n_bins)
+    return counts, qc
 
 
 def empty_qc() -> dict[str, int]:
@@ -355,20 +348,46 @@ def read_sample_parquet(path: Path) -> pa.Table:
     return table
 
 
-@contextmanager
-def _binned_contigs(
-    tasks: Sequence[_ContigTask],
-    workers: int,
-    handle: pysam.AlignmentFile,
-) -> Iterator[Iterator[tuple[np.ndarray, dict[str, int]]]]:
-    """Yield per-contig results in task order, serially or across worker processes."""
+def _scan_alignment(
+    path: Path,
+    fmt: str,
+    fasta: Path | None,
+    threads: int = 1,
+) -> tuple[pl.LazyFrame, list[str], list[int]]:
+    pb.set_option(pb.POLARS_BIO_MAX_THREADS, str(max(1, threads)))
+    if fmt == "cram":
+        if fasta is None:
+            raise ConvertError(
+                f"{path} is CRAM and requires a reference FASTA. "
+                "Pass --fasta /path/to/reference.fa."
+            )
+        fasta_path = fasta.expanduser()
+        if not fasta_path.is_file():
+            raise ConvertError(f"CRAM reference FASTA not found: {fasta_path}")
+        fai_path = Path(f"{fasta_path}.fai")
+        if not fai_path.is_file():
+            raise ConvertError(
+                f"FASTA index not found: {fai_path}. "
+                "CRAM decoding requires an indexed FASTA reference."
+            )
+        lf = pb.scan_cram(
+            str(path), reference_path=str(fasta_path), use_zero_based=True
+        )
+    else:
+        lf = pb.scan_bam(str(path), use_zero_based=True)
 
-    if workers <= 1 or len(tasks) < 2:
-        yield (bin_contig_with_handle(handle, task) for task in tasks)
-        return
-    logger.debug("binning %d contigs across %d worker processes", len(tasks), workers)
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        yield pool.map(_bin_contig, tasks)
+    meta = pb.get_metadata(lf)
+    header = meta.get("header") or {}
+    ref_seqs_raw = header.get("reference_sequences")
+    if not ref_seqs_raw:
+        raise ConvertError(f"{path} header declares no contigs")
+    if isinstance(ref_seqs_raw, str):
+        ref_seqs = json.loads(ref_seqs_raw)
+    else:
+        ref_seqs = ref_seqs_raw
+    header_names = [s["name"] for s in ref_seqs]
+    header_lengths = [int(s["length"]) for s in ref_seqs]
+    return lf, header_names, header_lengths
 
 
 def run(config: ConvertConfig) -> None:
@@ -380,84 +399,56 @@ def run(config: ConvertConfig) -> None:
 
     fmt = _alignment_format(alignment)
     logger.debug("opening alignment %s as %s", alignment, fmt)
-    bam = _open_alignment(alignment, fmt, config.fasta)
-    try:
-        bam = _ensure_index(alignment, fmt, bam, config.fasta, threads=1)
-        header_names = list(bam.references)
-        header_lengths = [int(length) for length in bam.lengths]
-        if not header_names:
-            raise ConvertError(f"{alignment} header declares no contigs")
-        if any(length <= 0 for length in header_lengths):
-            raise ConvertError(
-                f"{alignment} header contains non-positive contig lengths"
-            )
-        layout = select_layout(
-            header_names, header_lengths, all_contigs=config.all_contigs
+    lf, header_names, header_lengths = _scan_alignment(
+        alignment, fmt, config.fasta, threads=config.threads
+    )
+    if not header_names:
+        raise ConvertError(f"{alignment} header declares no contigs")
+    if any(length <= 0 for length in header_lengths):
+        raise ConvertError(f"{alignment} header contains non-positive contig lengths")
+    layout = select_layout(header_names, header_lengths, all_contigs=config.all_contigs)
+    if not layout:
+        raise ConvertError(
+            f"{alignment} header declares no canonical chromosomes; "
+            "pass --all-contigs to bin every contig"
         )
-        if not layout:
-            raise ConvertError(
-                f"{alignment} header declares no canonical chromosomes; "
-                "pass --all-contigs to bin every contig"
-            )
-        profile = GenomeProfile(layout)
+    profile = GenomeProfile(layout)
+    logger.debug(
+        "binning %d of %d header contigs; skipped %d non-canonical",
+        len(layout),
+        len(header_names),
+        len(header_names) - len(layout),
+    )
+    contig_lengths = profile.length_map()
+
+    qc = empty_qc()
+    contig_arrays: list[np.ndarray] = []
+    start_arrays: list[np.ndarray] = []
+    end_arrays: list[np.ndarray] = []
+    count_arrays: list[np.ndarray] = []
+
+    for contig in layout:
+        starts, ends = bin_intervals(contig.length, config.bin_size)
+        counts, contig_qc = filter_and_bin_contig(
+            lf=lf,
+            contig=contig,
+            bin_size=config.bin_size,
+            n_bins=starts.size,
+            filters=config.filters,
+        )
+        for counter, value in contig_qc.items():
+            qc[counter] += value
         logger.debug(
-            "binning %d of %d header contigs; skipped %d non-canonical",
-            len(layout),
-            len(header_names),
-            len(header_names) - len(layout),
+            "binned contig %s (%d bp): %d bins, %d reads kept",
+            contig.name,
+            contig.length,
+            starts.size,
+            contig_qc["reads_kept"],
         )
-        contig_lengths = profile.length_map()
-        workers, decode_threads = split_thread_budget(config.threads, len(layout))
-        logger.debug(
-            "using %d worker processes and %d htslib threads per handle",
-            workers,
-            decode_threads,
-        )
-        if workers <= 1 and decode_threads > 1:
-            bam.close()
-            bam = _open_alignment(alignment, fmt, config.fasta, threads=decode_threads)
-
-        qc = empty_qc()
-        qc["header_mapped"] = int(bam.mapped)
-        qc["header_unmapped"] = int(bam.unmapped)
-        qc["header_no_coordinate"] = int(bam.nocoordinate)
-
-        tasks = [
-            _ContigTask(
-                path=alignment,
-                fmt=fmt,
-                fasta=config.fasta,
-                name=contig.name,
-                length=contig.length,
-                bin_size=config.bin_size,
-                filters=config.filters,
-                decode_threads=decode_threads,
-            )
-            for contig in layout
-        ]
-
-        contig_arrays: list[np.ndarray] = []
-        start_arrays: list[np.ndarray] = []
-        end_arrays: list[np.ndarray] = []
-        count_arrays: list[np.ndarray] = []
-        with _binned_contigs(tasks, workers, bam) as results:
-            for task, (counts, contig_qc) in zip(tasks, results, strict=True):
-                for counter, value in contig_qc.items():
-                    qc[counter] += value
-                starts, ends = bin_intervals(task.length, config.bin_size)
-                logger.debug(
-                    "binned contig %s (%d bp): %d bins, %d reads kept",
-                    task.name,
-                    task.length,
-                    starts.size,
-                    contig_qc["reads_kept"],
-                )
-                contig_arrays.append(np.full(starts.size, task.name, dtype=object))
-                start_arrays.append(starts)
-                end_arrays.append(ends)
-                count_arrays.append(counts)
-    finally:
-        bam.close()
+        contig_arrays.append(np.full(starts.size, contig.name, dtype=object))
+        start_arrays.append(starts)
+        end_arrays.append(ends)
+        count_arrays.append(counts)
 
     table = _sample_table(
         contig_arrays,
@@ -486,80 +477,6 @@ def _alignment_format(path: Path) -> str:
     if suffix == ".cram":
         return "cram"
     raise ConvertError(f"{path} must be BAM or CRAM (found suffix {path.suffix!r})")
-
-
-def _open_alignment(
-    path: Path,
-    fmt: str,
-    fasta: Path | None,
-    threads: int = 1,
-) -> pysam.AlignmentFile:
-    decode_threads = max(1, threads)
-    if fmt == "cram":
-        if fasta is None:
-            raise ConvertError(
-                f"{path} is CRAM and requires a reference FASTA. "
-                "Pass --fasta /path/to/reference.fa (indexed with samtools faidx)."
-            )
-        if not fasta.is_file():
-            raise ConvertError(f"CRAM reference FASTA not found: {fasta}")
-        return pysam.AlignmentFile(
-            str(path),
-            "rc",
-            reference_filename=str(fasta),
-            threads=decode_threads,
-        )
-    return pysam.AlignmentFile(str(path), "rb", threads=decode_threads)
-
-
-def _ensure_index(
-    path: Path,
-    fmt: str,
-    handle: pysam.AlignmentFile,
-    fasta: Path | None,
-    threads: int = 1,
-) -> pysam.AlignmentFile:
-    if handle.has_index():
-        logger.debug("%s already has an index", path)
-        return handle
-    handle.close()
-    kind = "CRAM" if fmt == "cram" else "BAM"
-    logger.debug("creating %s index for %s", kind, path)
-    try:
-        pysam.index(str(path))
-    except Exception as error:
-        raise ConvertError(
-            f"failed to create {kind} index for {path}: {error}"
-        ) from error
-    handle = _open_alignment(path, fmt, fasta, threads=threads)
-    if handle.has_index():
-        return handle
-    handle.close()
-    raise ConvertError(f"failed to create {kind} index for {path}")
-
-
-def _kept_starts(
-    reads: Iterator[object],
-    filters: ReadFilters,
-    qc: dict[str, int],
-    contig_length: int,
-) -> np.ndarray:
-    starts: list[int] = []
-    for read in reads:
-        qc["reads_seen"] += 1
-        reason = rejection_reason(read, filters)
-        if reason is not None:
-            qc[reason] += 1
-            continue
-        start = int(read.reference_start)
-        if start >= contig_length:
-            qc["filter_no_start"] += 1
-            continue
-        starts.append(start)
-        qc["reads_kept"] += 1
-    if not starts:
-        return np.empty(0, dtype=np.int64)
-    return np.fromiter(starts, dtype=np.int64, count=len(starts))
 
 
 def _reference_identity(

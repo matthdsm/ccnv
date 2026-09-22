@@ -2,7 +2,7 @@
 
 ccnv is a Python 3.12+ rewrite of the WISECONDOR shallow whole-genome
 sequencing copy-number pipeline. `convert` streams BAM/CRAM files into
-canonical sample Parquet, creating a pysam index when one is missing.
+canonical sample Parquet using Polars-Bio.
 `reference` builds autosomal and optional sex-contig models into a versioned
 reference Parquet, or a flat uniform-depth model from a FASTA reference when no control
 samples are available. `predict` normalizes coverage, segments it with weighted
@@ -48,10 +48,9 @@ ccnv predict sample.ccnv reference.ccnv \
   --prefix results/sample --ratio-threshold 0.2
 ```
 
-CRAM conversion also requires `--fasta` and an indexed FASTA. Missing BAM/CRAM
-indexes are created automatically with pysam. CLI file
-inputs must exist: Typer rejects missing BAM/CRAM, FASTA, sample Parquet, and
-reference Parquet paths. `reference` accepts sample Parquet files and/or
+CRAM conversion also requires `--fasta` and an indexed FASTA (`.fai`).
+CLI file inputs must exist: Typer rejects missing BAM/CRAM, FASTA, sample Parquet, and
+reference Parquet paths. Missing required indices fail fast with an actionable error. `reference` accepts sample Parquet files and/or
 directories; directories are searched recursively for sample Parquet (other
 files are ignored). With a FASTA file instead of samples, `reference` writes a
 flat uniform-depth model from contig lengths so `predict` can run without a

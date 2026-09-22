@@ -11,7 +11,7 @@ Copynumber-CNV is a bioinformatics tool for Copy Number Variation (CNV) analysis
 - **Language:** Python 3.12+
 - **CLI Framework:** Typer
 - **Data Science:** NumPy, SciPy, Polars, Scikit-learn, PyArrow, Ruptures
-- **Bioinformatics:** Pysam
+- **Bioinformatics:** Polars-Bio
 - **Environment & Dependency Management:** [Pixi](https://pixi.sh). The `default`
   environment includes the `dev` feature; `prod` is the same runtime
   dependencies without test/lint tools and is what the Docker image installs.
@@ -22,14 +22,14 @@ Copynumber-CNV is a bioinformatics tool for Copy Number Variation (CNV) analysis
 
 ### Pipeline Stages
 
-1. **Convert:** Stream a BAM/CRAM once per contig, creating a pysam index when
-   missing, filter reads, calculate binned counts with NumPy, and write
-   canonical sample Parquet plus deterministic QC metadata. Only canonical
+1. **Convert:** Stream a BAM/CRAM with Polars-Bio, filter reads, calculate
+   binned counts with NumPy, and write canonical sample Parquet plus
+   deterministic QC metadata. If a required index is missing (such as `.fai`
+   for CRAM decoding), convert fails fast with an actionable error. Only canonical
    chromosomes (1-22, X, Y in UCSC or plain spelling) are
    binned unless `--all-contigs` is set; mitochondrial, ALT, decoy, random,
-   unplaced, and EBV contigs are skipped. `-t/--threads` is a CPU budget split
-   between contig worker processes and per-handle htslib decode threads; output
-   order follows the header.
+   unplaced, and EBV contigs are skipped. `-t/--threads` sets Polars-Bio
+   multithreading; output order follows the header.
 2. **Reference:** Validate sample layouts, rebin sample counts to the target
    bin size (default 5000 bp) when contig lengths match, normalize depth, fit
    deterministic PCA, construct batched off-contig nearest-bin models, and

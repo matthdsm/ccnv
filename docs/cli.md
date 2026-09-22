@@ -13,8 +13,8 @@ level to see them on stderr.
 
 ## convert
 
-Convert one BAM or CRAM into canonical sample Parquet. If the alignment has no
-index, `convert` builds one with pysam (`.bai`/`.crai`).
+Convert one BAM or CRAM into canonical sample Parquet. Required indices (such as
+`.fai` for CRAM decoding) must exist; missing required indices fail fast with an error.
 
 ```console
 ccnv convert ALIGNMENT [--prefix PREFIX] [options]
@@ -22,17 +22,17 @@ ccnv convert ALIGNMENT [--prefix PREFIX] [options]
 
 | Flag / argument | Default | Meaning |
 | --- | --- | --- |
-| `ALIGNMENT` | required | BAM or CRAM. A missing index is created automatically. CRAM also needs `--fasta`. |
+| `ALIGNMENT` | required | BAM or CRAM. CRAM also needs an indexed `--fasta`. |
 | `--prefix` | alignment stem | Output prefix. Writes `<prefix>.ccnv`. |
 | `--bin-size` | `5000` | Target bin size in bases. The last bin on each contig may be shorter. |
-| `--fasta` | unset | Reference FASTA required for CRAM. Must exist. |
+| `--fasta` | unset | Reference FASTA required for CRAM. Must exist and have a `.fai` index. |
 | `--min-mapq` | `1` | Minimum mapping quality to keep. |
 | `--keep-duplicates` | off | Keep SAM duplicate reads. |
 | `--keep-secondary` | off | Keep secondary alignments. |
 | `--keep-supplementary` | off | Keep supplementary alignments. |
 | `--allow-improper-pairs` | off | Keep paired reads that are not proper pairs. Unpaired reads are not subject to the proper-pair rule. |
 | `--all-contigs` | off | Bin every header contig instead of canonical chromosomes only. |
-| `-t`, `--threads` | CPU count | CPU budget split between contig worker processes and per-handle BAM/CRAM decode threads. `1` bins serially with a single htslib thread. A budget of 8 on many contigs uses 4 workers × 2 decode threads. |
+| `-t`, `--threads` | CPU count | Thread budget passed to Polars-Bio DataFusion engine. |
 | `--loglevel` | `WARNING` | Logging verbosity for convert steps. |
 
 Only canonical chromosomes are binned: autosomes 1-22 plus X and Y, written as UCSC (`chr1`, `chrX`) or plain NCBI/Ensembl (`1`, `X`) accessions. The `chr` prefix and the letter case are both ignored, so `CHR7` and `y` are canonical.
@@ -48,12 +48,10 @@ mitochondrial and decoy sequence. This is the escape hatch for non-human or
 custom layouts whose contigs do not use human chromosome names.
 `ConvertConfig(all_contigs=...)` defaults to `False`, matching the CLI.
 
-Contigs are binned in parallel across worker processes; output row order always
-follows the alignment header. `--threads` is a CPU budget, not a raw process
-count: convert keeps `workers × AlignmentFile(threads=)` at most that budget so
-CRAM decompression is not stuck at pysam's default of one thread per handle.
-`ConvertConfig(threads=...)` defaults to `1`, so library callers stay serial
-unless they opt in.
+Binning is executed with Polars-Bio lazy streaming; output row order always
+follows the alignment header. `--threads` sets the thread budget for Polars-Bio
+DataFusion execution. `ConvertConfig(threads=...)` defaults to `1`, so library
+callers stay serial unless they opt in.
 
 ## reference
 

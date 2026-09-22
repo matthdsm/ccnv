@@ -1,10 +1,13 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
+import polars as pl
+import polars_bio as pb
 import pyarrow.parquet as pq
-import pysam
+from published_fixtures import write_fai
 
 from ccnv.convert import run as convert
 from ccnv.models import (
@@ -166,47 +169,78 @@ def _write_fasta(path: Path) -> None:
         for name, length in CONTIGS:
             handle.write(f">{name}\n")
             handle.write("A" * length + "\n")
-    pysam.faidx(str(path))
+    write_fai(path)
 
 
 def _write_alignment(path: Path, counts: dict[str, np.ndarray]) -> None:
-    header = {
-        "HD": {"VN": "1.6", "SO": "coordinate"},
-        "SQ": [{"SN": name, "LN": length} for name, length in CONTIGS],
+    ref_seqs = [{"name": name, "length": length} for name, length in CONTIGS]
+    (
+        names,
+        chroms,
+        starts,
+        ends,
+        flags,
+        mapqs,
+        cigars,
+        sequences,
+        qualities,
+        mate_chroms,
+        mate_starts,
+        tlen,
+    ) = ([] for _ in range(12))
+    read_index = 0
+    for contig, length in CONTIGS:
+        for bin_index, count in enumerate(counts[contig]):
+            start = bin_index * BIN_SIZE
+            for offset in range(int(count)):
+                st = min(start + offset, length - 10)
+                names.append(f"r{read_index}")
+                chroms.append(contig)
+                starts.append(st)
+                ends.append(st + 10)
+                flags.append(0)
+                mapqs.append(60)
+                cigars.append("10M")
+                sequences.append("A" * 10)
+                qualities.append("I" * 10)
+                mate_chroms.append(None)
+                mate_starts.append(None)
+                tlen.append(0)
+                read_index += 1
+
+    df = pl.DataFrame(
+        {
+            "name": pl.Series(names, dtype=pl.String),
+            "chrom": pl.Series(chroms, dtype=pl.String),
+            "start": pl.Series(starts, dtype=pl.UInt32),
+            "end": pl.Series(ends, dtype=pl.UInt32),
+            "flags": pl.Series(flags, dtype=pl.UInt32),
+            "cigar": pl.Series(cigars, dtype=pl.String),
+            "mapping_quality": pl.Series(mapqs, dtype=pl.UInt32),
+            "mate_chrom": pl.Series(mate_chroms, dtype=pl.String),
+            "mate_start": pl.Series(mate_starts, dtype=pl.UInt32),
+            "sequence": pl.Series(sequences, dtype=pl.String),
+            "quality_scores": pl.Series(qualities, dtype=pl.String),
+            "template_length": pl.Series(tlen, dtype=pl.Int32),
+        }
+    )
+    meta_header = {
+        "file_format_version": "1.6",
+        "reference_sequences": json.dumps(ref_seqs),
     }
-    with pysam.AlignmentFile(str(path), "wb", header=header) as alignment:
-        read_index = 0
-        for reference_id, (contig, length) in enumerate(CONTIGS):
-            for bin_index, count in enumerate(counts[contig]):
-                start = bin_index * BIN_SIZE
-                for offset in range(int(count)):
-                    read = pysam.AlignedSegment()
-                    read.query_name = f"r{read_index}"
-                    read.query_sequence = "A" * 10
-                    read.flag = 0
-                    read.reference_id = reference_id
-                    read.reference_start = min(start + offset, length - 10)
-                    read.mapping_quality = 60
-                    read.cigar = ((0, 10),)
-                    read.query_qualities = pysam.qualitystring_to_array("I" * 10)
-                    alignment.write(read)
-                    read_index += 1
-    pysam.index(str(path))
+    pb.set_option(pb.POLARS_BIO_COORDINATE_SYSTEM_ZERO_BASED, True)
+    pb.set_source_metadata(df, format="bam", path=str(path), header=meta_header)
+    pb.write_bam(df, str(path), sort_on_write=True)
 
 
 def _bam_to_cram(bam_path: Path, cram_path: Path, fasta: Path) -> None:
-    with (
-        pysam.AlignmentFile(str(bam_path), "rb") as bam,
-        pysam.AlignmentFile(
-            str(cram_path),
-            "wc",
-            header=bam.header,
-            reference_filename=str(fasta),
-        ) as cram,
-    ):
-        for read in bam:
-            cram.write(read)
-    pysam.index(str(cram_path))
+    lf = pb.scan_bam(str(bam_path), use_zero_based=True)
+    df = lf.collect()
+    meta = pb.get_metadata(lf)
+    meta_header = meta.get("header") or {}
+    pb.set_option(pb.POLARS_BIO_COORDINATE_SYSTEM_ZERO_BASED, True)
+    pb.set_source_metadata(df, format="cram", path=str(cram_path), header=meta_header)
+    pb.write_cram(df, str(cram_path), reference_path=str(fasta), sort_on_write=True)
 
 
 if __name__ == "__main__":

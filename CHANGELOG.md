@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replaced `pysam` and `samtools` dependencies with `polars-bio` for reading BAM/CRAM and FASTA indexes.
+- Dropped automatic index generation for BAM/CRAM and FASTA; execution fails fast with an actionable error if a required index (such as `.fai` for CRAM) is absent.
+- Updated `ccnv convert` to stream alignments with Polars-Bio and forward thread budgets to DataFusion multithreading.
 - Unified default bin size to 5,000 bp across `convert`, `reference`, and models.
 - `ccnv reference` accepts FASTA inputs as a positional argument alongside sample Parquet inputs, removing the `--fasta` option.
 - `ccnv reference` rebins sample counts to `--bin-size` when cohort samples differ in native bin size, requiring matching contig lengths.
