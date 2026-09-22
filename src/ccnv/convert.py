@@ -2,8 +2,10 @@
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict
+from collections.abc import Iterator, Mapping, Sequence
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Final
 
@@ -42,6 +44,40 @@ QC_COUNTERS: Final[tuple[str, ...]] = (
 
 class ConvertError(ValueError):
     """Raised when conversion cannot proceed with the given inputs."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ContigTask:
+    """One contig's binning work, sized to be cheap to send to a worker."""
+
+    path: Path
+    fmt: str
+    fasta: Path | None
+    name: str
+    length: int
+    bin_size: int
+    filters: ReadFilters
+    decode_threads: int = 1
+
+
+_WORKER_LF: dict[tuple[str, str, str | None, int], pl.LazyFrame] = {}
+
+
+def split_thread_budget(budget: int, n_tasks: int) -> tuple[int, int]:
+    """Split a CPU budget into process workers and decode threads.
+
+    The product of the returned values is at most ``budget``.
+    """
+
+    if budget <= 0:
+        raise ValueError("thread budget must be a positive integer")
+    if n_tasks <= 0:
+        raise ValueError("n_tasks must be a positive integer")
+    if budget == 1 or n_tasks == 1:
+        return 1, budget
+    decode_threads = 2 if budget >= 4 else 1
+    workers = min(n_tasks, max(1, budget // decode_threads))
+    return workers, max(1, budget // workers)
 
 
 def filter_and_bin_contig(
@@ -108,6 +144,51 @@ def filter_and_bin_contig(
     kept_starts = kept_df["start"].to_numpy()
     counts = bin_counts(kept_starts, bin_size, n_bins)
     return counts, qc
+
+
+def _worker_scan(task: _ContigTask) -> pl.LazyFrame:
+    """Reuse one alignment LazyFrame per worker process, keyed by input file."""
+
+    key = (
+        str(task.path),
+        task.fmt,
+        str(task.fasta) if task.fasta else None,
+        task.decode_threads,
+    )
+    lf = _WORKER_LF.get(key)
+    if lf is None:
+        pb.set_option(pb.POLARS_BIO_MAX_THREADS, str(max(1, task.decode_threads)))
+        if task.fmt == "cram":
+            lf = pb.scan_cram(
+                str(task.path),
+                reference_path=str(task.fasta) if task.fasta else None,
+                use_zero_based=True,
+            )
+        else:
+            lf = pb.scan_bam(str(task.path), use_zero_based=True)
+        _WORKER_LF[key] = lf
+    return lf
+
+
+def bin_contig_with_lf(
+    lf: pl.LazyFrame, task: _ContigTask
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Count reads for one contig and return its bin counts plus QC counters."""
+
+    starts, _ = bin_intervals(task.length, task.bin_size)
+    return filter_and_bin_contig(
+        lf=lf,
+        contig=Contig(task.name, task.length),
+        bin_size=task.bin_size,
+        n_bins=starts.size,
+        filters=task.filters,
+    )
+
+
+def _bin_contig(task: _ContigTask) -> tuple[np.ndarray, dict[str, int]]:
+    """Bin one contig inside a worker process."""
+
+    return bin_contig_with_lf(_worker_scan(task), task)
 
 
 def empty_qc() -> dict[str, int]:
@@ -390,6 +471,22 @@ def _scan_alignment(
     return lf, header_names, header_lengths
 
 
+@contextmanager
+def _binned_contigs(
+    tasks: Sequence[_ContigTask],
+    workers: int,
+    lf: pl.LazyFrame,
+) -> Iterator[Iterator[tuple[np.ndarray, dict[str, int]]]]:
+    """Yield per-contig results in task order, serially or across worker processes."""
+
+    if workers <= 1 or len(tasks) < 2:
+        yield (bin_contig_with_lf(lf, task) for task in tasks)
+        return
+    logger.debug("binning %d contigs across %d worker processes", len(tasks), workers)
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        yield pool.map(_bin_contig, tasks)
+
+
 def run(config: ConvertConfig) -> None:
     """Convert one BAM/CRAM into canonical sample Parquet."""
 
@@ -420,6 +517,26 @@ def run(config: ConvertConfig) -> None:
         len(header_names) - len(layout),
     )
     contig_lengths = profile.length_map()
+    workers, decode_threads = split_thread_budget(config.threads, len(layout))
+    logger.debug(
+        "using %d worker processes and %d decode threads per handle",
+        workers,
+        decode_threads,
+    )
+
+    tasks = [
+        _ContigTask(
+            path=alignment,
+            fmt=fmt,
+            fasta=config.fasta,
+            name=contig.name,
+            length=contig.length,
+            bin_size=config.bin_size,
+            filters=config.filters,
+            decode_threads=decode_threads,
+        )
+        for contig in layout
+    ]
 
     qc = empty_qc()
     contig_arrays: list[np.ndarray] = []
@@ -427,28 +544,22 @@ def run(config: ConvertConfig) -> None:
     end_arrays: list[np.ndarray] = []
     count_arrays: list[np.ndarray] = []
 
-    for contig in layout:
-        starts, ends = bin_intervals(contig.length, config.bin_size)
-        counts, contig_qc = filter_and_bin_contig(
-            lf=lf,
-            contig=contig,
-            bin_size=config.bin_size,
-            n_bins=starts.size,
-            filters=config.filters,
-        )
-        for counter, value in contig_qc.items():
-            qc[counter] += value
-        logger.debug(
-            "binned contig %s (%d bp): %d bins, %d reads kept",
-            contig.name,
-            contig.length,
-            starts.size,
-            contig_qc["reads_kept"],
-        )
-        contig_arrays.append(np.full(starts.size, contig.name, dtype=object))
-        start_arrays.append(starts)
-        end_arrays.append(ends)
-        count_arrays.append(counts)
+    with _binned_contigs(tasks, workers, lf) as results:
+        for task, (counts, contig_qc) in zip(tasks, results, strict=True):
+            for counter, value in contig_qc.items():
+                qc[counter] += value
+            starts, ends = bin_intervals(task.length, config.bin_size)
+            logger.debug(
+                "binned contig %s (%d bp): %d bins, %d reads kept",
+                task.name,
+                task.length,
+                starts.size,
+                contig_qc["reads_kept"],
+            )
+            contig_arrays.append(np.full(starts.size, task.name, dtype=object))
+            start_arrays.append(starts)
+            end_arrays.append(ends)
+            count_arrays.append(counts)
 
     table = _sample_table(
         contig_arrays,

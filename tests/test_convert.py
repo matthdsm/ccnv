@@ -33,6 +33,7 @@ from ccnv.convert import (
     rejection_reason,
     run,
     select_layout,
+    split_thread_budget,
 )
 from ccnv.models import Contig, ConvertConfig, GenomeProfile, ReadFilters, parquet_path
 from ccnv.schemas import (
@@ -517,6 +518,23 @@ class TestParallelBinning(unittest.TestCase):
     def test_threads_must_be_positive(self) -> None:
         with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
             ConvertConfig(Path("a.bam"), Path("out"), bin_size=100, threads=0)
+
+    def test_thread_budget_splits_workers_and_decode_threads(self) -> None:
+        cases = (
+            (1, 24, 1, 1),
+            (8, 1, 1, 8),
+            (8, 24, 4, 2),
+            (16, 24, 8, 2),
+            (4, 24, 2, 2),
+            (3, 24, 3, 1),
+            (8, 3, 3, 2),
+        )
+        for budget, n_tasks, workers, decode in cases:
+            with self.subTest(budget=budget, n_tasks=n_tasks):
+                self.assertEqual(
+                    split_thread_budget(budget, n_tasks), (workers, decode)
+                )
+                self.assertLessEqual(workers * decode, budget)
 
     def test_scan_alignment_forwards_threads(self) -> None:
         with (
