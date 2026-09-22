@@ -83,7 +83,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             empty = Path(tmpdir) / "empty"
             empty.mkdir()
-            with self.assertRaisesRegex(SampleInputError, "no sample Parquet"):
+            with self.assertRaisesRegex(SampleInputError, "no sample CCNV files"):
                 expand_sample_inputs([empty])
 
     def test_cli_reference_expands_directory(self) -> None:
@@ -134,7 +134,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
         result = CliRunner().invoke(app, ["predict", "--help"])
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("[default: autosomal]", _cli_text(result.output))
-        self.assertIn("<autosomal|female|male", _cli_text(result.output))
+        self.assertRegex(_cli_text(result.output), r"<autosomal\|female.*\|male>")
 
     def test_loglevel_flag_is_on_every_command(self) -> None:
         for command in ("convert", "reference", "predict"):

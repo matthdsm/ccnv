@@ -30,13 +30,16 @@ Copynumber-CNV is a bioinformatics tool for Copy Number Variation (CNV) analysis
    unplaced, and EBV contigs are skipped. `-t/--threads` is a CPU budget split
    between contig worker processes and per-handle htslib decode threads; output
    order follows the header.
-2. **Reference:** Validate identical sample layouts, normalize depth, fit
+2. **Reference:** Validate sample layouts, rebin sample counts to the target
+   bin size (default 5000 bp) when contig lengths match, normalize depth, fit
    deterministic PCA, construct batched off-contig nearest-bin models, and
-   write autosomal/optional sex branches to reference Parquet. With `--fasta`
+   write autosomal/optional sex branches to reference Parquet. With a FASTA file
    and no samples, build a flat uniform-depth model from contig lengths so
    predict can run without a control cohort (canonical chromosomes including
    X/Y are autosomal; `--all-contigs` includes every FASTA contig).
-3. **Predict:** Project and normalize a sample, build within-sample references,
+3. **Predict:** Project and normalize a sample (rebinning sample counts in memory
+   to reference bin coordinates if bin sizes differ and contig lengths match,
+   leaving reference Parquet untouched), build within-sample references,
    segment with weighted Ruptures Binseg, call gains/losses, and write bin and
    segment BED (0-based half-open, extra columns with a header), calls BED,
    optional SVG, and matching Parquet tables. CLI `--prefix` receives the

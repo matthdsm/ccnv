@@ -1,7 +1,6 @@
 """Stream BAM/CRAM alignments into canonical sample Parquet bins."""
 
 import logging
-import re
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
@@ -18,6 +17,7 @@ from ccnv.models import Contig, ConvertConfig, GenomeProfile, ReadFilters, parqu
 from ccnv.schemas import (
     SAMPLE_SCHEMA,
     ArtifactKind,
+    decode_metadata,
     metadata_for,
     validate_table,
 )
@@ -145,14 +145,15 @@ def select_layout(
 
 
 def is_canonical_contig(name: str) -> bool:
-    """
-    Report whether a contig is a canonical autosome or sex chromosome.
+    """Report whether a contig is a canonical autosome or sex chromosome.
+
     Accepts UCSC (``chr1``, ``chrX``) and plain NCBI/Ensembl (``1``, ``X``) spellings.
-    Mitochondrial contigs, ALT and decoy scaffolds, unplaced scaffolds, and EBV are not canonical.
+    Mitochondrial contigs, ALT/decoy scaffolds, unplaced scaffolds, and EBV
+    are not canonical.
     """
 
     bare = name[3:] if name[:3].lower() == "chr" else name
-    return bare.isdigit() or bare.upper() in {"X", "Y"}
+    return (bare.isdigit() and 1 <= int(bare) <= 22) or bare.upper() in {"X", "Y"}
 
 
 def bin_intervals(length: int, bin_size: int) -> tuple[np.ndarray, np.ndarray]:
@@ -178,6 +179,138 @@ def bin_counts(starts: np.ndarray, bin_size: int, n_bins: int) -> np.ndarray:
     indices = starts // bin_size
     valid = (indices >= 0) & (indices < n_bins)
     return np.bincount(indices[valid], minlength=n_bins).astype(np.uint64)
+
+
+def rebin_counts(
+    source_starts: np.ndarray,
+    source_ends: np.ndarray,
+    source_counts: np.ndarray,
+    target_starts: np.ndarray,
+    target_ends: np.ndarray,
+) -> np.ndarray:
+    """Redistribute 1D binned counts from source intervals to target intervals.
+
+    Both intervals must partition the same contig length [0, L].
+    Coarsening sums nested bins; refining splits counts uniformly by overlap length.
+    """
+    if target_starts.size == 0:
+        return np.empty(0, dtype=np.float64)
+    if source_starts.size == 0:
+        return np.zeros(target_starts.size, dtype=np.float64)
+    if source_ends[-1] != target_ends[-1]:
+        raise ValueError(
+            f"contig length mismatch: source ends at {source_ends[-1]}, "
+            f"target ends at {target_ends[-1]}"
+        )
+    if (
+        source_starts.size == target_starts.size
+        and np.array_equal(source_starts, target_starts)
+        and np.array_equal(source_ends, target_ends)
+    ):
+        return np.asarray(source_counts, dtype=np.float64).copy()
+
+    source_knots = np.concatenate(([source_starts[0]], source_ends))
+    source_cum = np.concatenate(([0.0], np.cumsum(source_counts, dtype=np.float64)))
+    target_knots = np.concatenate(([target_starts[0]], target_ends))
+    target_cum = np.interp(target_knots, source_knots, source_cum)
+    target_counts = np.diff(target_cum)
+    return np.maximum(target_counts, 0.0)
+
+
+def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
+    """Rescale sample Parquet counts to target_bin_size without changing length."""
+    if target_bin_size <= 0:
+        raise ValueError("target_bin_size must be a positive integer")
+    metadata = decode_metadata(table.schema.metadata)
+    current_bin_size = metadata.get("bin_size")
+    if current_bin_size == target_bin_size:
+        return table
+
+    contig_lengths = metadata.get("contig_lengths")
+    if not isinstance(contig_lengths, dict) or not contig_lengths:
+        raise ValueError("table metadata lacks contig_lengths")
+
+    contig_col = table.column("contig").to_pylist()
+    start_col = np.asarray(table.column("start").to_pylist(), dtype=np.int64)
+    end_col = np.asarray(table.column("end").to_pylist(), dtype=np.int64)
+    count_col = np.asarray(table.column("count").to_pylist(), dtype=np.float64)
+
+    new_contigs: list[np.ndarray] = []
+    new_starts: list[np.ndarray] = []
+    new_ends: list[np.ndarray] = []
+    new_counts: list[np.ndarray] = []
+
+    contig_indices: dict[str, list[int]] = {}
+    for idx, c in enumerate(contig_col):
+        contig_indices.setdefault(c, []).append(idx)
+
+    for contig_name, length in contig_lengths.items():
+        target_starts, target_ends = bin_intervals(int(length), target_bin_size)
+        idxs = contig_indices.get(contig_name)
+        if idxs is None or len(idxs) == 0:
+            target_counts = np.zeros(target_starts.size, dtype=np.float64)
+        else:
+            s_starts = start_col[idxs]
+            s_ends = end_col[idxs]
+            s_counts = count_col[idxs]
+            target_counts = rebin_counts(
+                s_starts, s_ends, s_counts, target_starts, target_ends
+            )
+        new_contigs.append(np.full(target_starts.size, contig_name, dtype=object))
+        new_starts.append(target_starts)
+        new_ends.append(target_ends)
+        new_counts.append(target_counts)
+
+    meta_values = {
+        key: val
+        for key, val in metadata.items()
+        if key
+        not in (
+            "artifact_kind",
+            "schema_version",
+            "coordinate_system",
+            "contig_lengths",
+        )
+    }
+    meta_values["bin_size"] = target_bin_size
+    new_metadata = metadata_for(
+        ArtifactKind.SAMPLE,
+        contig_lengths={str(k): int(v) for k, v in contig_lengths.items()},
+        values=meta_values,
+    )
+    new_schema = pa.schema(
+        [
+            pa.field("contig", pa.string(), nullable=False),
+            pa.field("start", pa.int64(), nullable=False),
+            pa.field("end", pa.int64(), nullable=False),
+            pa.field("count", pa.float64(), nullable=False),
+        ]
+    ).with_metadata(new_metadata)
+
+    empty_str = np.array([], dtype=object)
+    empty_i64 = np.empty(0, dtype=np.int64)
+    empty_f64 = np.empty(0, dtype=np.float64)
+    return pa.table(
+        {
+            "contig": pa.array(
+                np.concatenate(new_contigs) if new_contigs else empty_str,
+                type=pa.string(),
+            ),
+            "start": pa.array(
+                np.concatenate(new_starts) if new_starts else empty_i64,
+                type=pa.int64(),
+            ),
+            "end": pa.array(
+                np.concatenate(new_ends) if new_ends else empty_i64,
+                type=pa.int64(),
+            ),
+            "count": pa.array(
+                np.concatenate(new_counts) if new_counts else empty_f64,
+                type=pa.float64(),
+            ),
+        },
+        schema=new_schema,
+    )
 
 
 def rejection_reason(read: object, filters: ReadFilters) -> str | None:

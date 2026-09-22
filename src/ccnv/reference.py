@@ -15,7 +15,7 @@ import pysam
 from numpy.typing import NDArray
 from sklearn.decomposition import PCA
 
-from ccnv.convert import bin_intervals, select_layout
+from ccnv.convert import bin_intervals, rebin_sample_table, select_layout
 from ccnv.models import ReferenceConfig, parquet_path
 from ccnv.schemas import (
     REFERENCE_SCHEMA,
@@ -75,7 +75,6 @@ def run(config: ReferenceConfig) -> None:
 
     _validate_config(config)
     if config.fasta is not None:
-        # TODO: make flat reference sex aware if config is available
         assert config.bin_size is not None
         logger.debug("building flat reference from FASTA %s", config.fasta)
         n_samples = max(config.min_cohort_size, 2)
@@ -89,13 +88,14 @@ def run(config: ReferenceConfig) -> None:
             config = replace(config, sex_contigs=())
     else:
         logger.debug("loading %d sample parquet files", len(config.samples))
-        cohort = load_cohort(config.samples)
+        cohort = load_cohort(config.samples, target_bin_size=config.bin_size)
     logger.debug(
         "loaded cohort: %d bins, %d samples, bin_size=%d",
         cohort.counts.shape[0],
         cohort.counts.shape[1],
         cohort.bin_size,
     )
+
     table = build_reference_table(cohort, config)
     validate_table(table, ArtifactKind.REFERENCE)
     path = parquet_path(config.prefix)
@@ -104,13 +104,16 @@ def run(config: ReferenceConfig) -> None:
     pq.write_table(table, path)
 
 
-def load_cohort(paths: tuple[Path, ...]) -> Cohort:
+def load_cohort(
+    paths: tuple[Path, ...],
+    target_bin_size: int | None = None,
+) -> Cohort:
     """Load sample Parquet files and reject incompatible cohorts."""
 
     if not paths:
         raise ReferenceError("at least one sample Parquet path is required")
     tables = tuple(_read_sample(path) for path in paths)
-    return validate_cohort(tables, paths)
+    return validate_cohort(tables, paths, target_bin_size=target_bin_size)
 
 
 def cohort_from_fasta(
@@ -188,8 +191,9 @@ def _fasta_contigs(path: Path, *, all_contigs: bool) -> tuple[list[str], list[in
 def validate_cohort(
     tables: tuple[pa.Table, ...],
     paths: tuple[Path, ...] | None = None,
+    target_bin_size: int | None = None,
 ) -> Cohort:
-    """Require matching bins, bin size, and contig lengths across samples."""
+    """Require matching contig lengths across samples, rebinning counts if set."""
 
     if len(tables) < 1:
         raise ReferenceError("cohort must contain at least one sample")
@@ -199,50 +203,69 @@ def validate_cohort(
     if len(resolved_paths) != len(tables):
         raise ReferenceError("paths must align with sample tables")
 
-    identities: list[object] = []
-    counts: list[NDArray[np.float64]] = []
-    expected_bins: tuple[tuple[str, int, int], ...] | None = None
-    expected_lengths: dict[str, int] | None = None
-    expected_bin_size: int | None = None
-
     for path, table in zip(resolved_paths, tables, strict=True):
         try:
             validate_table(table, ArtifactKind.SAMPLE)
         except SchemaError as error:
             raise ReferenceError(f"{path}: {error}") from error
+
+    expected_lengths: dict[str, int] | None = None
+    expected_bin_size: int | None = None
+
+    for path, table in zip(resolved_paths, tables, strict=True):
         metadata = decode_metadata(table.schema.metadata)
         contig_lengths = metadata["contig_lengths"]
         bin_size = metadata["bin_size"]
         if not isinstance(contig_lengths, dict) or not isinstance(bin_size, int):
             raise ReferenceError(f"{path}: sample metadata is incomplete")
-        bins = bin_coordinates(table)
-        if expected_bins is None:
-            expected_bins = bins
-            expected_lengths = {
-                str(name): int(length) for name, length in contig_lengths.items()
-            }
+        current_lengths = {
+            str(name): int(length) for name, length in contig_lengths.items()
+        }
+        if expected_lengths is None:
+            expected_lengths = current_lengths
             expected_bin_size = bin_size
-        elif bin_size != expected_bin_size:
+        elif current_lengths != expected_lengths:
+            raise ReferenceError(f"{path}: contig_lengths do not match the cohort")
+        elif target_bin_size is None and bin_size != expected_bin_size:
             raise ReferenceError(
                 f"{path}: bin_size {bin_size} does not match cohort {expected_bin_size}"
             )
-        elif contig_lengths != expected_lengths:
-            raise ReferenceError(f"{path}: contig_lengths do not match the cohort")
+
+    assert expected_lengths is not None
+    effective_bin_size = (
+        target_bin_size if target_bin_size is not None else expected_bin_size
+    )
+    assert effective_bin_size is not None
+
+    processed_tables: list[pa.Table] = []
+    for table in tables:
+        metadata = decode_metadata(table.schema.metadata)
+        if metadata.get("bin_size") != effective_bin_size:
+            table = rebin_sample_table(table, effective_bin_size)
+        processed_tables.append(table)
+
+    identities: list[object] = []
+    counts: list[NDArray[np.float64]] = []
+    expected_bins: tuple[tuple[str, int, int], ...] | None = None
+
+    for path, table in zip(resolved_paths, processed_tables, strict=True):
+        metadata = decode_metadata(table.schema.metadata)
+        bins = bin_coordinates(table)
+        if expected_bins is None:
+            expected_bins = bins
         elif bins != expected_bins:
             raise ReferenceError(f"{path}: bin coordinates do not match the cohort")
         identities.append(metadata.get("source_identity", {"path": str(path)}))
         counts.append(np.asarray(table.column("count").to_pylist(), dtype=np.float64))
 
     assert expected_bins is not None
-    assert expected_lengths is not None
-    assert expected_bin_size is not None
     return Cohort(
         counts=np.column_stack(counts),
         contigs=tuple(contig for contig, _, _ in expected_bins),
         starts=np.array([start for _, start, _ in expected_bins], dtype=np.int64),
         ends=np.array([end for _, _, end in expected_bins], dtype=np.int64),
         contig_lengths=expected_lengths,
-        bin_size=expected_bin_size,
+        bin_size=effective_bin_size,
         identities=tuple(identities),
         paths=resolved_paths,
     )
@@ -525,12 +548,12 @@ def _validate_config(config: ReferenceConfig) -> None:
     has_fasta = config.fasta is not None
     if not has_samples and not has_fasta:
         raise ReferenceError(
-            "provide sample Parquet paths or --fasta to build a flat reference"
+            "provide sample Parquet paths or a FASTA to build a flat reference"
         )
     if has_samples and has_fasta:
         raise ReferenceError("provide either sample Parquet paths or a FASTA, not both")
     if has_fasta and (config.bin_size is None or config.bin_size <= 0):
-        raise ReferenceError("bin_size must be a positive integer when using --fasta")
+        raise ReferenceError("bin_size must be a positive integer when using a FASTA")
     if config.pca_components < 1:
         raise ReferenceError("pca_components must be a positive integer")
     if config.nearest_bins < 1:

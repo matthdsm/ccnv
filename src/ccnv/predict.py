@@ -12,7 +12,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from numpy.typing import ArrayLike, NDArray
 
-from ccnv.convert import read_sample_parquet
+from ccnv.convert import read_sample_parquet, rebin_sample_table
 from ccnv.models import PredictConfig
 from ccnv.reference import (
     BRANCH_AUTOSOMAL,
@@ -190,13 +190,30 @@ def load_inputs(
         )
         if branch in branches
     }
+    for contig in {item[0] for item in required}:
+        if sample_lengths.get(contig) != reference_lengths.get(contig):
+            raise PredictError(f"contig length mismatch for {contig!r}")
+
+    ref_model = reference_meta.get("model")
+    ref_bin_size = ref_model.get("bin_size") if isinstance(ref_model, dict) else None
+    sample_bin_size = sample_meta.get("bin_size")
+    if (
+        isinstance(ref_bin_size, int)
+        and isinstance(sample_bin_size, int)
+        and sample_bin_size != ref_bin_size
+    ):
+        logger.debug(
+            "rebinning sample from %d bp to reference bin size %d bp",
+            sample_bin_size,
+            ref_bin_size,
+        )
+        sample = rebin_sample_table(sample, ref_bin_size)
+
+    sample_bins = set(bin_coordinates(sample))
     missing = sorted(required - sample_bins)
     if missing:
         contigs = ", ".join(dict.fromkeys(item[0] for item in missing))
         raise PredictError(f"sample is missing reference bins on contig(s): {contigs}")
-    for contig in {item[0] for item in required}:
-        if sample_lengths.get(contig) != reference_lengths.get(contig):
-            raise PredictError(f"contig length mismatch for {contig!r}")
 
     return PredictionInput(
         sample=sample,

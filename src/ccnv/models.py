@@ -2,7 +2,9 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
+
+DEFAULT_BIN_SIZE: Final[int] = 5000
 
 
 def parquet_path(prefix: Path) -> Path:
@@ -71,7 +73,7 @@ class ReadFilters:
 class ConvertConfig:
     alignment: Path
     prefix: Path
-    bin_size: int
+    bin_size: int = DEFAULT_BIN_SIZE
     fasta: Path | None = None
     filters: ReadFilters = ReadFilters()
     threads: int = 1

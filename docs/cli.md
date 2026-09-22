@@ -62,14 +62,14 @@ uniform-depth model from a FASTA when no control samples are available.
 
 ```console
 ccnv reference SAMPLES... --prefix PREFIX [options]
-ccnv reference --fasta GENOME.fa --prefix PREFIX [--bin-size N]
+ccnv reference GENOME.fa --prefix PREFIX [--bin-size N]
 ```
 
 | Flag / argument | Default | Meaning |
 | --- | --- | --- |
 | `SAMPLES...` | optional | Sample Parquet files and/or directories. Directories are searched recursively for sample Parquet; other files are ignored. Provide exactly one FASTA file when building a flat reference. |
 | `--prefix` | required | Output prefix. Writes `<prefix>.ccnv`. |
-| `--bin-size` | `100000` | Target bin size in bases for `--fasta`. Ignored when building from samples. |
+| `--bin-size` | `5000` | Target bin size in bases. When building from samples, samples are rebinned to this target size (default 5000). When building from a FASTA, sets the uniform bin size. |
 | `--all-contigs` | off | Include every FASTA contig in a flat reference instead of canonical chromosomes only. |
 | `--autosomal-contig` | all non-sex contigs | Autosomal contig name. Repeat the flag for each contig. |
 | `--sex-contig` | `X,Y,chrX,chrY` | Sex contig name. Repeat as needed. The default set is intersected with contigs present in the samples; any other explicit name must exist. |
@@ -87,9 +87,10 @@ There is no `--sample-sex` flag. For human data, sex contigs default to
 inferred from that signal, or from `--sex-cutoff` when you supply one. If
 inference fails, only the autosomal branch is written.
 
-Samples must be able to be scaled to identical bin sizes and contig lengths must be consistent across all samples.
+Input samples are rebinned to the target bin size (default 5000) if their bin sizes
+differ, provided their contig lengths match.
 
-Providing a fasta file as sample writes a **flat** reference: bins follow the FASTA layout at
+Providing a FASTA file writes a **flat** reference: bins follow the FASTA layout at
 `--bin-size`, expected depth is proportional to bin width, and identical replica
 profiles fill the usual PCA and nearest-bin model. Canonical chromosomes
 including X and Y are treated as autosomal (no sex branches). This lets
@@ -130,3 +131,7 @@ Prediction writes:
 
 BED coordinates are 0-based, half-open, with contig names from the sample
 genome. Called segments also appear in `_calls.bed`.
+
+If the sample has a different bin size than the reference model, it is
+automatically rebinned to the reference bin coordinates in memory, provided their
+contig lengths match. The reference Parquet file is never modified.

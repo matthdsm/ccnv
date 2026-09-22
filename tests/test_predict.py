@@ -32,6 +32,7 @@ from ccnv.schemas import (
     REFERENCE_SCHEMA,
     SAMPLE_SCHEMA,
     ArtifactKind,
+    decode_metadata,
     metadata_for,
 )
 
@@ -65,7 +66,7 @@ def _reference_table() -> pa.Table:
         ArtifactKind.REFERENCE,
         contig_lengths={"chr1": 100, "chr2": 80},
         values={
-            "model": {"branches": [BRANCH_AUTOSOMAL]},
+            "model": {"branches": [BRANCH_AUTOSOMAL], "bin_size": 100},
             "sample_identities": [],
         },
     )
@@ -224,6 +225,83 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
             pq.write_table(_reference_table(), reference_path)
 
             with self.assertRaisesRegex(PredictError, "missing.*chr2"):
+                load_inputs(sample_path, reference_path)
+
+    def test_load_inputs_rebins_sample_without_modifying_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            sample_path = directory / "sample.ccnv"
+            reference_path = directory / "reference.ccnv"
+
+            sample_metadata = metadata_for(
+                ArtifactKind.SAMPLE,
+                contig_lengths={"chr1": 100, "chr2": 80},
+                values={
+                    "bin_size": 50,
+                    "source_identity": {"id": "test"},
+                    "reference_identity": {"id": "genome"},
+                    "qc": {},
+                    "filters": asdict(ReadFilters()),
+                },
+            )
+            sample_50 = pa.table(
+                {
+                    "contig": ["chr1", "chr1", "chr2", "chr2"],
+                    "start": pa.array([0, 50, 0, 50], type=pa.int64()),
+                    "end": pa.array([50, 100, 50, 80], type=pa.int64()),
+                    "count": pa.array([5, 5, 6, 4], type=pa.uint64()),
+                },
+                schema=SAMPLE_SCHEMA.with_metadata(sample_metadata),
+            )
+            pq.write_table(sample_50, sample_path)
+            ref_table = _reference_table()
+            pq.write_table(ref_table, reference_path)
+
+            ref_bytes_before = reference_path.read_bytes()
+            ref_mtime_before = reference_path.stat().st_mtime_ns
+
+            inputs = load_inputs(sample_path, reference_path)
+
+            self.assertEqual(inputs.sample.num_rows, 2)
+            self.assertEqual(
+                decode_metadata(inputs.sample.schema.metadata)["bin_size"], 100
+            )
+            np.testing.assert_allclose(
+                inputs.sample.column("count").to_pylist(), [10.0, 10.0]
+            )
+            self.assertEqual(reference_path.read_bytes(), ref_bytes_before)
+            self.assertEqual(reference_path.stat().st_mtime_ns, ref_mtime_before)
+
+    def test_load_inputs_rejects_contig_length_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            sample_path = directory / "sample.ccnv"
+            reference_path = directory / "reference.ccnv"
+
+            sample_metadata = metadata_for(
+                ArtifactKind.SAMPLE,
+                contig_lengths={"chr1": 150, "chr2": 80},
+                values={
+                    "bin_size": 100,
+                    "source_identity": {"id": "test"},
+                    "reference_identity": {"id": "genome"},
+                    "qc": {},
+                    "filters": asdict(ReadFilters()),
+                },
+            )
+            sample_mismatch = pa.table(
+                {
+                    "contig": ["chr1", "chr1", "chr2"],
+                    "start": pa.array([0, 100, 0], type=pa.int64()),
+                    "end": pa.array([100, 150, 80], type=pa.int64()),
+                    "count": pa.array([10, 5, 10], type=pa.uint64()),
+                },
+                schema=SAMPLE_SCHEMA.with_metadata(sample_metadata),
+            )
+            pq.write_table(sample_mismatch, sample_path)
+            pq.write_table(_reference_table(), reference_path)
+
+            with self.assertRaisesRegex(PredictError, "contig length mismatch"):
                 load_inputs(sample_path, reference_path)
 
 

@@ -150,7 +150,7 @@ class TestReferenceSchemaRejection(unittest.TestCase):
 class TestCohortCompatibility(unittest.TestCase):
     def test_rejects_bin_size_mismatch(self) -> None:
         left = _sample_table([10, 10], bin_size=100)
-        right = _sample_table([10, 10], bin_size=50)
+        right = _sample_table([5, 5, 5, 5], bin_size=50)
         with self.assertRaisesRegex(ReferenceError, "bin_size"):
             validate_cohort((left, right))
 
@@ -164,6 +164,21 @@ class TestCohortCompatibility(unittest.TestCase):
         )
         with self.assertRaisesRegex(ReferenceError, "bin coordinates"):
             validate_cohort((left, right))
+
+    def test_mixed_native_bin_sizes_succeed_when_target_bin_size_set(self) -> None:
+        left = _sample_table([10, 10], bin_size=100)
+        right = _sample_table([5, 5, 5, 5], bin_size=50)
+        cohort = validate_cohort((left, right), target_bin_size=100)
+        self.assertEqual(cohort.bin_size, 100)
+        self.assertEqual(cohort.counts.shape, (2, 2))
+        np.testing.assert_allclose(cohort.counts[:, 0], [10.0, 10.0])
+        np.testing.assert_allclose(cohort.counts[:, 1], [10.0, 10.0])
+
+    def test_mismatched_contig_lengths_fail_even_with_target_bin_size(self) -> None:
+        left = _sample_table([10, 10], contig_lengths={"chr1": 200}, bin_size=100)
+        right = _sample_table([10], contig_lengths={"chr1": 100}, bin_size=100)
+        with self.assertRaisesRegex(ReferenceError, "contig_lengths do not match"):
+            validate_cohort((left, right), target_bin_size=100)
 
     def test_accepts_matching_nonhuman_layout(self) -> None:
         contigs = ["scaffold-A", "scaffold-A", "lgX"]
@@ -736,7 +751,6 @@ class TestFlatFastaReference(unittest.TestCase):
                 app,
                 [
                     "reference",
-                    "--fasta",
                     str(fasta),
                     "--prefix",
                     str(prefix),
@@ -771,7 +785,7 @@ class TestFlatFastaReference(unittest.TestCase):
                 )
 
     def test_neither_samples_nor_fasta_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ReferenceError, "sample Parquet paths or --fasta"):
+        with self.assertRaisesRegex(ReferenceError, "sample Parquet paths or a FASTA"):
             run(ReferenceConfig(samples=(), prefix=Path("ref")))
 
 

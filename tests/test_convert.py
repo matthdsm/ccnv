@@ -1,9 +1,11 @@
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pyarrow as pa
 import pysam
 from published_fixtures import (
     CHR21_LENGTH,
@@ -23,6 +25,8 @@ from ccnv.convert import (
     bin_intervals,
     is_canonical_contig,
     read_sample_parquet,
+    rebin_counts,
+    rebin_sample_table,
     rejection_reason,
     run,
     select_layout,
@@ -31,8 +35,11 @@ from ccnv.convert import (
 from ccnv.models import Contig, ConvertConfig, GenomeProfile, ReadFilters, parquet_path
 from ccnv.schemas import (
     COORDINATE_SYSTEM,
+    SAMPLE_SCHEMA,
     SCHEMA_VERSION,
+    ArtifactKind,
     decode_metadata,
+    metadata_for,
 )
 
 
@@ -82,6 +89,89 @@ class TestBinEdges(unittest.TestCase):
             n_bins=3,
         )
         np.testing.assert_array_equal(counts, [2, 2, 2])
+
+
+class TestRebin(unittest.TestCase):
+    def test_rebin_coarsens_by_summing_nested_bins(self) -> None:
+        source_starts = np.array([0, 50, 100, 150], dtype=np.int64)
+        source_ends = np.array([50, 100, 150, 200], dtype=np.int64)
+        source_counts = np.array([10, 20, 30, 40], dtype=np.float64)
+
+        target_starts = np.array([0, 100], dtype=np.int64)
+        target_ends = np.array([100, 200], dtype=np.int64)
+
+        rebinned = rebin_counts(
+            source_starts, source_ends, source_counts, target_starts, target_ends
+        )
+        np.testing.assert_allclose(rebinned, [30.0, 70.0])
+
+    def test_rebin_refines_by_splitting_uniformly(self) -> None:
+        source_starts = np.array([0, 100], dtype=np.int64)
+        source_ends = np.array([100, 200], dtype=np.int64)
+        source_counts = np.array([30, 70], dtype=np.float64)
+
+        target_starts = np.array([0, 50, 100, 150], dtype=np.int64)
+        target_ends = np.array([50, 100, 150, 200], dtype=np.int64)
+
+        rebinned = rebin_counts(
+            source_starts, source_ends, source_counts, target_starts, target_ends
+        )
+        np.testing.assert_allclose(rebinned, [15.0, 15.0, 35.0, 35.0])
+
+    def test_rebin_handles_partial_last_bin(self) -> None:
+        source_starts = np.array([0, 100, 200], dtype=np.int64)
+        source_ends = np.array([100, 200, 250], dtype=np.int64)
+        source_counts = np.array([100, 100, 50], dtype=np.float64)
+
+        target_starts, target_ends = bin_intervals(250, 50)
+        rebinned = rebin_counts(
+            source_starts, source_ends, source_counts, target_starts, target_ends
+        )
+        np.testing.assert_allclose(rebinned, [50.0, 50.0, 50.0, 50.0, 50.0])
+
+    def test_rebin_rejects_contig_length_mismatch(self) -> None:
+        source_starts = np.array([0, 100], dtype=np.int64)
+        source_ends = np.array([100, 200], dtype=np.int64)
+        source_counts = np.array([10, 20], dtype=np.float64)
+
+        target_starts = np.array([0, 100], dtype=np.int64)
+        target_ends = np.array([100, 250], dtype=np.int64)
+
+        with self.assertRaisesRegex(ValueError, "contig length mismatch"):
+            rebin_counts(
+                source_starts, source_ends, source_counts, target_starts, target_ends
+            )
+
+    def test_rebin_sample_table_updates_metadata_and_counts(self) -> None:
+        metadata = metadata_for(
+            ArtifactKind.SAMPLE,
+            contig_lengths={"chr1": 200},
+            values={
+                "bin_size": 100,
+                "source_identity": {"id": "s1"},
+                "reference_identity": {"name": "test"},
+                "qc": {},
+                "filters": asdict(ReadFilters()),
+            },
+        )
+        table = pa.table(
+            {
+                "contig": ["chr1", "chr1"],
+                "start": pa.array([0, 100], type=pa.int64()),
+                "end": pa.array([100, 200], type=pa.int64()),
+                "count": pa.array([10, 20], type=pa.uint64()),
+            },
+            schema=SAMPLE_SCHEMA.with_metadata(metadata),
+        )
+
+        rebinned = rebin_sample_table(table, target_bin_size=50)
+        rebinned_meta = decode_metadata(rebinned.schema.metadata)
+        self.assertEqual(rebinned_meta["bin_size"], 50)
+        self.assertEqual(rebinned_meta["contig_lengths"], {"chr1": 200})
+        self.assertEqual(rebinned.num_rows, 4)
+        np.testing.assert_allclose(
+            rebinned.column("count").to_pylist(), [5.0, 5.0, 10.0, 10.0]
+        )
 
 
 class TestReadFilters(unittest.TestCase):
@@ -487,18 +577,7 @@ class TestCanonicalContigs(unittest.TestCase):
         self.assertEqual(tuple(contig.name for contig in layout), ("chr1", "chrM"))
 
     def test_canonical_spellings_are_kept(self) -> None:
-        for name in (
-            "chr1",
-            "chr22",
-            "chrX",
-            "chrY",
-            "1",
-            "22",
-            "X",
-            "Y",
-            "CHR7",
-            "y"
-        ):
+        for name in ("chr1", "chr22", "chrX", "chrY", "1", "22", "X", "Y", "CHR7", "y"):
             with self.subTest(name=name):
                 self.assertTrue(is_canonical_contig(name))
 
@@ -515,7 +594,7 @@ class TestCanonicalContigs(unittest.TestCase):
             "MT",
             "chr23",
             "0",
-            "scaffold-A"
+            "scaffold-A",
         ):
             with self.subTest(name=name):
                 self.assertFalse(is_canonical_contig(name))

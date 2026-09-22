@@ -15,6 +15,7 @@ import typer
 from ccnv.convert import ConvertError
 from ccnv.convert import run as run_convert
 from ccnv.models import (
+    DEFAULT_BIN_SIZE,
     ConvertConfig,
     PredictConfig,
     ReadFilters,
@@ -145,7 +146,7 @@ def convert(
     ] = None,
     bin_size: Annotated[
         int, typer.Option(min=1, help="Target bin size in bases")
-    ] = 5000,
+    ] = DEFAULT_BIN_SIZE,
     fasta: Annotated[
         Path | None,
         typer.Option(
@@ -244,7 +245,7 @@ def reference(
     ] = None,
     bin_size: Annotated[
         int, typer.Option(min=1, help="Target bin size in bases")
-    ] = 5000,
+    ] = DEFAULT_BIN_SIZE,
     all_contigs: Annotated[
         bool,
         typer.Option(
@@ -306,6 +307,7 @@ def reference(
 
     configure_logging(loglevel)
     sample_paths: tuple[Path, ...] = ()
+    fasta: Path | None = None
     if samples:
         if len(samples) == 1 and samples[0].suffix.lower() in (".fasta", ".fa", ".fna"):
             fasta = samples[0]
