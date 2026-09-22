@@ -111,7 +111,7 @@ ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
 | `SAMPLE` | required | Sample Parquet from `convert`. |
 | `REFERENCE` | required | Reference Parquet from `reference`. |
 | `--prefix` | sample stem | Output prefix for the files below. |
-| `--sex` | `auto` | Sex branch: `auto`, `female`, or `male`. `auto` uses the same signal contig stored on the reference when possible. |
+| `--sex` | `autosomal` | Sex branch: `autosomal`, `female`, or `male`. `autosomal` uses the same signal contig stored on the reference when possible. |
 | `--penalty` | `1.0` | Weighted-SSE Binseg penalty. This is not DNAcopy `alpha`. |
 | `--z-threshold` | `3.0` | Absolute segment z-score call cutoff. |
 | `--ratio-threshold` | unset | Absolute log2-ratio call cutoff. When set, it overrides z-score calling. |

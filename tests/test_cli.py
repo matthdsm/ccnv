@@ -133,8 +133,8 @@ class TestReferenceSampleExpansion(unittest.TestCase):
     def test_predict_help_shows_sex_choices_and_defaults(self) -> None:
         result = CliRunner().invoke(app, ["predict", "--help"])
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("[default: auto]", _cli_text(result.output))
-        self.assertIn("<auto|female|male", _cli_text(result.output))
+        self.assertIn("[default: autosomal]", _cli_text(result.output))
+        self.assertIn("<autosomal|female|male", _cli_text(result.output))
 
     def test_loglevel_flag_is_on_every_command(self) -> None:
         for command in ("convert", "reference", "predict"):

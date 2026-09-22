@@ -107,7 +107,7 @@ class PredictConfig:
     sample: Path
     reference: Path
     prefix: Path
-    sex: Literal["auto", "female", "male"] = "auto"
+    sex: Literal["autosomal", "female", "male"] = "autosomal"
     penalty: float = 1.0
     z_threshold: float = 3.0
     ratio_threshold: float | None = None

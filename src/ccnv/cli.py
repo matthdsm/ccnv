@@ -54,7 +54,7 @@ class LogLevel(StrEnum):
 class SexBranch(StrEnum):
     """Allowed predict sex-branch values."""
 
-    auto = "auto"
+    autosomal = "autosomal"
     female = "female"
     male = "male"
 
@@ -107,7 +107,7 @@ def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
                 if _is_sample_parquet(candidate)
             ]
             if not matches:
-                raise SampleInputError(f"{path} contains no sample Parquet files")
+                raise SampleInputError(f"{path} contains no sample CCNV files")
             for match in matches:
                 if match not in seen:
                     seen.add(match)
@@ -380,7 +380,7 @@ def predict(
     sex: Annotated[
         SexBranch,
         typer.Option(help="Sex branch used for gonosome models"),
-    ] = SexBranch.auto,
+    ] = SexBranch.autosomal,
     penalty: Annotated[
         float,
         typer.Option(min=0.0, help="Weighted-SSE segmentation penalty"),

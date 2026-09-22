@@ -143,7 +143,7 @@ def load_inputs(
     sample_path: Path,
     reference_path: Path,
     *,
-    sex: Literal["auto", "female", "male"] = "auto",
+    sex: Literal["autosomal", "female", "male"] = "autosomal",
 ) -> PredictionInput:
     """Read artifacts through their contracts and select model branches."""
 
@@ -174,7 +174,7 @@ def load_inputs(
     if chosen_sex is not None:
         sex_branch = BRANCH_FEMALE_SEX if chosen_sex == "female" else BRANCH_MALE_SEX
         if sex_branch not in branch_values:
-            if sex != "auto":
+            if sex != "autosomal":
                 raise PredictError(f"reference has no {sex_branch!r} branch")
         else:
             branches.append(sex_branch)
@@ -550,12 +550,12 @@ def write_outputs(
 
 
 def _resolve_sample_sex(
-    requested: Literal["auto", "female", "male"],
+    requested: Literal["autosomal", "female", "male"],
     sample: pa.Table,
     metadata: dict[str, object],
     branches: set[object],
 ) -> Sex | None:
-    if requested != "auto":
+    if requested != "autosomal":
         return requested
     sex_branches = {BRANCH_FEMALE_SEX, BRANCH_MALE_SEX} & branches
     if not sex_branches:
