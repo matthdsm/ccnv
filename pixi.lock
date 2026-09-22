@@ -113,6 +113,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.3-h35e630c_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/orc-2.3.1-h443056b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/polars-runtime-32-1.43.2-py310h9585f58_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/polars-runtime-compat-1.43.2-py310h761ce75_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/prek-0.4.14-hb17b654_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/prometheus-cpp-1.3.0-ha5d0236_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-25.0.0-py312h7900ff3_0.conda
@@ -251,6 +252,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/openssl-3.6.4-he6ad1d5_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/orc-2.3.1-h1fb4f23_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/polars-runtime-32-1.44.0-py310h3417b80_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/polars-runtime-compat-1.44.0-py310hbc9a487_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/prek-0.4.14-h069e38c_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/prometheus-cpp-1.3.0-h7938499_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pyarrow-25.0.0-py312h8025657_0.conda
@@ -320,7 +322,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/packaging-26.3-pyhc364b38_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pip-26.2.1-pyh8b19718_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pluggy-1.6.0-pyhf9edf01_1.conda
-      - conda: https://conda.anaconda.org/conda-forge/noarch/polars-1.43.2-pyh8da0edf_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/polars-1.44.2-pyh3138b34_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pygments-2.21.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pyproject_hooks-1.2.0-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pytest-9.1.1-pyhc364b38_2.conda
@@ -413,7 +415,8 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/numpy-2.5.2-py312ha003a3f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/openssl-3.6.3-hd24854e_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/orc-2.3.1-hef2a647_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/polars-runtime-32-1.43.2-py310hcbcba24_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/polars-runtime-32-1.44.2-py311h1c79744_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/polars-runtime-compat-1.44.2-py311ha9e3d13_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/prek-0.4.14-h6fdd925_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/prometheus-cpp-1.3.0-h0967b3e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyarrow-25.0.0-py312h1f38498_0.conda
@@ -527,6 +530,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/openssl-3.6.3-h35e630c_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/orc-2.3.1-h443056b_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/polars-runtime-32-1.43.2-py310h9585f58_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/polars-runtime-compat-1.43.2-py310h761ce75_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/prometheus-cpp-1.3.0-ha5d0236_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-25.0.0-py312h7900ff3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/pyarrow-core-25.0.0-py312h2054cf2_0_cpu.conda
@@ -651,6 +655,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/openssl-3.6.4-he6ad1d5_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/orc-2.3.1-h1fb4f23_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/polars-runtime-32-1.44.0-py310h3417b80_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/polars-runtime-compat-1.44.0-py310hbc9a487_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/prometheus-cpp-1.3.0-h7938499_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pyarrow-25.0.0-py312h8025657_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/pyarrow-core-25.0.0-py312h2cce741_0_cpu.conda
@@ -700,7 +705,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/markdown-it-py-4.2.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mdurl-0.1.2-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/narwhals-2.25.0-pyhcf101f3_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/noarch/polars-1.43.2-pyh8da0edf_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/polars-1.44.2-pyh3138b34_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pygments-2.21.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/python-gil-3.12.14-hd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/python_abi-3.12-8_cp312.conda
@@ -787,7 +792,8 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/numpy-2.5.2-py312ha003a3f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/openssl-3.6.3-hd24854e_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/orc-2.3.1-hef2a647_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/polars-runtime-32-1.43.2-py310hcbcba24_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/polars-runtime-32-1.44.2-py311h1c79744_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/polars-runtime-compat-1.44.2-py311ha9e3d13_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/prometheus-cpp-1.3.0-h0967b3e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyarrow-25.0.0-py312h1f38498_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/pyarrow-core-25.0.0-py312h7d9569a_0_cpu.conda
@@ -2360,6 +2366,26 @@ packages:
   run_exports: {}
   size: 41707372
   timestamp: 1785582019869
+- conda: https://conda.anaconda.org/conda-forge/linux-64/polars-runtime-compat-1.43.2-py310h761ce75_0.conda
+  noarch: python
+  sha256: e313be9012ed45ab2b71283a286b737637b7e2f32a668631a5375fcae6d1631a
+  md5: 718d92537dbc8e8b3e8a2ec8a1cf866e
+  depends:
+  - python
+  - libstdcxx >=14
+  - libgcc >=14
+  - __glibc >=2.17,<3.0.a0
+  - _python_abi3_support 1.*
+  - cpython >=3.10
+  constrains:
+  - __glibc >=2.17
+  license: MIT
+  license_family: MIT
+  purls:
+  - pkg:pypi/polars-runtime-compat?source=hash-mapping
+  run_exports: {}
+  size: 41379159
+  timestamp: 1785582047955
 - conda: https://conda.anaconda.org/conda-forge/linux-64/prek-0.4.14-hb17b654_0.conda
   sha256: baae79c166f1220ae9da0b9396ae2930d00c8d977d8e7440d8290f899df55b9c
   md5: c447879c2ce58f3d477c25333cf04d7f
@@ -3990,10 +4016,29 @@ packages:
   - __glibc >=2.17
   license: MIT
   purls:
-  - pkg:pypi/polars-runtime-32?source=compressed-mapping
+  - pkg:pypi/polars-runtime-32?source=hash-mapping
   run_exports: {}
   size: 38861084
   timestamp: 1787638294779
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/polars-runtime-compat-1.44.0-py310hbc9a487_0.conda
+  noarch: python
+  sha256: e31f298183c3ae6fc35b1146e20b0d93f37e9cad47ec4726a84125d6ffa0fa26
+  md5: 6d69a0cf442a3e353e027d1a9bf3a578
+  depends:
+  - python
+  - libstdcxx >=15
+  - libgcc >=15
+  - _python_abi3_support 1.*
+  - cpython >=3.10
+  constrains:
+  - __glibc >=2.17
+  license: MIT
+  license_family: MIT
+  purls:
+  - pkg:pypi/polars-runtime-compat?source=hash-mapping
+  run_exports: {}
+  size: 38694955
+  timestamp: 1787638210155
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/prek-0.4.14-h069e38c_0.conda
   sha256: 9f6977bd726ef01bd67505acbbeeeb7eaca8c8ec8c56069256c6d3ac16d5d87a
   md5: 3917d7790cf5f8b5f97b9f44df780ad6
@@ -4133,7 +4178,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/ruff?source=compressed-mapping
+  - pkg:pypi/ruff?source=hash-mapping
   run_exports: {}
   size: 8647773
   timestamp: 1787257898184
@@ -4510,10 +4555,38 @@ packages:
   - polars-runtime-compat ==1.44.0
   license: MIT
   purls:
-  - pkg:pypi/polars?source=compressed-mapping
+  - pkg:pypi/polars?source=hash-mapping
   run_exports: {}
   size: 558817
   timestamp: 1787638220352
+- conda: https://conda.anaconda.org/conda-forge/noarch/polars-1.44.2-pyh3138b34_0.conda
+  sha256: df9834da83b1eab9296aae08b4b00516be213ba0610fd3592426df2d2e025123
+  md5: 716482997743170f404e0c2a29ab406d
+  depends:
+  - polars-runtime-32 ==1.44.2
+  - python >=3.11
+  - python
+  constrains:
+  - numpy >=1.16.0
+  - pyarrow >=7.0.0
+  - fastexcel >=0.9
+  - openpyxl >=3.0.0
+  - xlsx2csv >=0.8.0
+  - connectorx >=0.3.2
+  - deltalake >=1.0.0
+  - pyiceberg >=0.7.1
+  - altair >=5.4.0
+  - great_tables >=0.8.0
+  - polars-runtime-32 ==1.44.2
+  - polars-runtime-64 ==1.44.2
+  - polars-runtime-compat ==1.44.2
+  license: MIT
+  license_family: MIT
+  purls:
+  - pkg:pypi/polars?source=compressed-mapping
+  run_exports: {}
+  size: 559898
+  timestamp: 1788957763651
 - conda: https://conda.anaconda.org/conda-forge/noarch/pygments-2.21.0-pyhcf101f3_0.conda
   sha256: f5f015ff1bc3e1b7fc08eee096b1865234189ae0b82bebdb86a5369116e42fa0
   md5: 2882dee445dfa45b0c5afce3ffb7730a
@@ -5991,25 +6064,44 @@ packages:
     - orc >=2.3.1,<2.3.2.0a0
   size: 513679
   timestamp: 1784301269750
-- conda: https://conda.anaconda.org/conda-forge/osx-arm64/polars-runtime-32-1.43.2-py310hcbcba24_0.conda
+- conda: https://conda.anaconda.org/conda-forge/osx-arm64/polars-runtime-32-1.44.2-py311h1c79744_0.conda
   noarch: python
-  sha256: 2c7e90b2614257da2cb220b19c4dd420444c7ae8d2692caaedcd43c1184fa01a
-  md5: f9c536a3a5d4117e1d5c6b61d8f791ea
+  sha256: a3617edc6a8942e58d663434a06fd9f2d156bd05ccee687ba6f1c899ace8084d
+  md5: 831373c96d07bfe7c5dc29e2346e11af
   depends:
   - python
-  - libcxx >=19
+  - libcxx >=21
   - __osx >=11.0
   - _python_abi3_support 1.*
-  - cpython >=3.10
+  - cpython >=3.11
   constrains:
   - __osx >=11.0
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/polars-runtime-32?source=hash-mapping
+  - pkg:pypi/polars-runtime-32?source=compressed-mapping
   run_exports: {}
-  size: 36474118
-  timestamp: 1785581928504
+  size: 34546003
+  timestamp: 1788957662024
+- conda: https://conda.anaconda.org/conda-forge/osx-arm64/polars-runtime-compat-1.44.2-py311ha9e3d13_0.conda
+  noarch: python
+  sha256: 023fd1aa114bb8b8d8c3b38181f32496c7af9f7a12191badc76407c80fbe387f
+  md5: ee18a88a74aa3f54ac5ae3cb31e04b60
+  depends:
+  - python
+  - libcxx >=21
+  - __osx >=11.0
+  - _python_abi3_support 1.*
+  - cpython >=3.11
+  constrains:
+  - __osx >=11.0
+  license: MIT
+  license_family: MIT
+  purls:
+  - pkg:pypi/polars-runtime-compat?source=compressed-mapping
+  run_exports: {}
+  size: 34441824
+  timestamp: 1788957653695
 - conda: https://conda.anaconda.org/conda-forge/osx-arm64/prek-0.4.14-h6fdd925_0.conda
   sha256: 64196ecf6c16fa6ef383ed1e9abe12a374cba2d88aacf06a4a23b8e02cfa4c75
   md5: a513b8516f2bcb668f12104e4f147061
@@ -6145,7 +6237,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/ruff?source=compressed-mapping
+  - pkg:pypi/ruff?source=hash-mapping
   run_exports: {}
   size: 8202144
   timestamp: 1787258082982
@@ -6286,6 +6378,7 @@ packages:
   requires_dist:
   - numpy
   - polars
+  - polars-runtime-compat
   - pyarrow
   - pysam
   - ruptures

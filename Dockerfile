@@ -1,4 +1,4 @@
-FROM ghcr.io/prefix-dev/pixi:0.77.0 AS build
+FROM ghcr.io/prefix-dev/pixi:0.81.0 AS build
 
 WORKDIR /app
 COPY pyproject.toml pixi.lock README.md LICENSE.md ./
@@ -18,4 +18,5 @@ COPY --from=build --chmod=0755 /app/entrypoint.sh /app/entrypoint.sh
 COPY --from=build /app/src /app/src
 COPY --from=build /app/pyproject.toml /app/pyproject.toml
 
-ENTRYPOINT ["/app/entrypoint.sh", "ccnv"]
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["ccnv"]
