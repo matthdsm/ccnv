@@ -236,24 +236,14 @@ def reference(
             dir_okay=True,
             readable=True,
             help=(
-                "Sample Parquet files and/or directories; directories are searched "
-                "recursively for sample Parquet. Omit when using --fasta."
+                "Sample Parquet files and/or directories; directories are searched"
+                " recursively for sample Parquet."
+                "To build a flat reference, provide exactly one fasta file."
             ),
         ),
     ] = None,
-    fasta: Annotated[
-        Path | None,
-        typer.Option(
-            "--fasta",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            help="Build a flat uniform-depth reference from this FASTA (no samples)",
-        ),
-    ] = None,
     bin_size: Annotated[
-        int, typer.Option(min=1, help="Target bin size in bases for --fasta")
+        int, typer.Option(min=1, help="Target bin size in bases")
     ] = 5000,
     all_contigs: Annotated[
         bool,
@@ -317,29 +307,32 @@ def reference(
     configure_logging(loglevel)
     sample_paths: tuple[Path, ...] = ()
     if samples:
-        try:
-            sample_paths = expand_sample_inputs(samples)
-        except SampleInputError as error:
-            _fail(error, 2)
+        if len(samples) == 1 and samples[0].suffix.lower() in (".fasta", ".fa", ".fna"):
+            fasta = samples[0]
+        else:
+            try:
+                sample_paths = expand_sample_inputs(samples)
+            except SampleInputError as error:
+                _fail(error, 2)
     try:
         run_reference(
             ReferenceConfig(
-                samples=sample_paths,
-                prefix=prefix,
+                all_contigs=all_contigs,
                 autosomal_contigs=(
                     tuple(autosomal_contig) if autosomal_contig else None
                 ),
-                sex_contigs=tuple(sex_contig),
-                sex_signal_contig=sex_signal_contig,
-                sex_cutoff=sex_cutoff,
-                pca_components=pca_components,
-                nearest_bins=nearest_bins,
+                bin_size=bin_size,
+                fasta=fasta,
                 max_batch_memory_mb=max_batch_memory_mb,
                 min_cohort_size=min_cohort_size,
                 min_sex_group_size=min_sex_group_size,
-                fasta=fasta,
-                bin_size=bin_size,
-                all_contigs=all_contigs,
+                nearest_bins=nearest_bins,
+                pca_components=pca_components,
+                prefix=prefix,
+                samples=sample_paths,
+                sex_contigs=tuple(sex_contig),
+                sex_cutoff=sex_cutoff,
+                sex_signal_contig=sex_signal_contig,
             )
         )
     except ReferenceError as error:

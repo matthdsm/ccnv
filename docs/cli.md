@@ -67,9 +67,8 @@ ccnv reference --fasta GENOME.fa --prefix PREFIX [--bin-size N]
 
 | Flag / argument | Default | Meaning |
 | --- | --- | --- |
-| `SAMPLES...` | optional | Sample Parquet files and/or directories. Directories are searched recursively for sample Parquet; other files are ignored. Omit when using `--fasta`. |
+| `SAMPLES...` | optional | Sample Parquet files and/or directories. Directories are searched recursively for sample Parquet; other files are ignored. Provide exactly one FASTA file when building a flat reference. |
 | `--prefix` | required | Output prefix. Writes `<prefix>.ccnv`. |
-| `--fasta` | unset | FASTA whose contig lengths define a flat reference. No control samples are read. A missing `.fai` is created automatically. Mutually exclusive with `SAMPLES`. |
 | `--bin-size` | `100000` | Target bin size in bases for `--fasta`. Ignored when building from samples. |
 | `--all-contigs` | off | Include every FASTA contig in a flat reference instead of canonical chromosomes only. |
 | `--autosomal-contig` | all non-sex contigs | Autosomal contig name. Repeat the flag for each contig. |
@@ -88,9 +87,9 @@ There is no `--sample-sex` flag. For human data, sex contigs default to
 inferred from that signal, or from `--sex-cutoff` when you supply one. If
 inference fails, only the autosomal branch is written.
 
-Samples must share identical bins and contig lengths.
+Samples must be able to be scaled to identical bin sizes and contig lengths must be consistent across all samples.
 
-`--fasta` writes a **flat** reference: bins follow the FASTA layout at
+Providing a fasta file as sample writes a **flat** reference: bins follow the FASTA layout at
 `--bin-size`, expected depth is proportional to bin width, and identical replica
 profiles fill the usual PCA and nearest-bin model. Canonical chromosomes
 including X and Y are treated as autosomal (no sex branches). This lets
@@ -131,5 +130,3 @@ Prediction writes:
 
 BED coordinates are 0-based, half-open, with contig names from the sample
 genome. Called segments also appear in `_calls.bed`.
-        int, typer.Option(min=1, help="Target bin size in bases for --fasta")
-    ] = 5000,

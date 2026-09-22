@@ -75,6 +75,7 @@ def run(config: ReferenceConfig) -> None:
 
     _validate_config(config)
     if config.fasta is not None:
+        # TODO: make flat reference sex aware if config is available
         assert config.bin_size is not None
         logger.debug("building flat reference from FASTA %s", config.fasta)
         n_samples = max(config.min_cohort_size, 2)
