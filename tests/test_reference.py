@@ -116,7 +116,7 @@ class TestReferenceSchemaRejection(unittest.TestCase):
             }
         )
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = _write_sample(Path(tmpdir), "bad.parquet", table)
+            path = _write_sample(Path(tmpdir), "bad.ccnv", table)
             with self.assertRaisesRegex(ReferenceError, "fields do not match"):
                 load_cohort((path,))
 
@@ -307,7 +307,7 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             cohort,
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.parquet") for index in range(6)),
+                samples=tuple(Path(f"{index}.ccnv") for index in range(6)),
                 prefix=Path("unused"),
                 pca_components=2,
                 nearest_bins=1,
@@ -345,7 +345,7 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.parquet") for index in range(6)),
+                samples=tuple(Path(f"{index}.ccnv") for index in range(6)),
                 prefix=Path("unused"),
                 pca_components=2,
                 nearest_bins=1,
@@ -374,7 +374,7 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.parquet") for index in range(4)),
+                samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
                 prefix=Path("unused"),
                 sex_contigs=DEFAULT_SEX_CONTIGS,
                 sex_signal_contig="chrY",
@@ -405,7 +405,7 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.parquet") for index in range(4)),
+                samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
                 prefix=Path("unused"),
                 sex_contigs=DEFAULT_SEX_CONTIGS,
                 sex_signal_contig="chrY",
@@ -435,7 +435,7 @@ class TestSexInference(unittest.TestCase):
         ]
         cohort = validate_cohort(tuple(tables))
         config = ReferenceConfig(
-            samples=tuple(Path(f"{index}.parquet") for index in range(4)),
+            samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
             prefix=Path("unused"),
             sex_contigs=("chrZ",),
             pca_components=2,
@@ -458,7 +458,7 @@ class TestSexInference(unittest.TestCase):
             for index in range(4)
         ]
         config = ReferenceConfig(
-            samples=tuple(Path(f"{index}.parquet") for index in range(4)),
+            samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
             prefix=Path("unused"),
             sex_signal_contig="chrZ",
             pca_components=2,
@@ -491,7 +491,7 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.parquet") for index in range(6)),
+                samples=tuple(Path(f"{index}.ccnv") for index in range(6)),
                 prefix=Path("unused"),
                 sex_cutoff=0.1,
                 pca_components=2,
@@ -524,7 +524,7 @@ class TestSexInference(unittest.TestCase):
             paths = [
                 _write_sample(
                     root,
-                    f"{index}.parquet",
+                    f"{index}.ccnv",
                     _sample_table(
                         counts,
                         contigs=contigs,
@@ -548,8 +548,8 @@ class TestSexInference(unittest.TestCase):
             )
             run(config)
             run(replace(config, prefix=root / "ref2"))
-            first = pq.read_table(root / "ref.parquet")
-            second = pq.read_table(root / "ref2.parquet")
+            first = pq.read_table(root / "ref.ccnv")
+            second = pq.read_table(root / "ref2.ccnv")
             validate_table(first, ArtifactKind.REFERENCE)
             self.assertEqual(
                 decode_metadata(first.schema.metadata)["model"],
@@ -710,7 +710,7 @@ class TestFlatFastaReference(unittest.TestCase):
                 contig_lengths={"chr1": 250, "chr2": 150},
                 bin_size=100,
             )
-            sample_path = _write_sample(root, "sample.parquet", sample)
+            sample_path = _write_sample(root, "sample.ccnv", sample)
             outputs = predict(
                 PredictConfig(
                     sample=sample_path,
@@ -763,7 +763,7 @@ class TestFlatFastaReference(unittest.TestCase):
             with self.assertRaisesRegex(ReferenceError, "not both"):
                 run(
                     ReferenceConfig(
-                        samples=(Path("sample.parquet"),),
+                        samples=(Path("sample.ccnv"),),
                         prefix=Path(tmpdir) / "ref",
                         fasta=fasta,
                         bin_size=100,

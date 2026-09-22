@@ -44,7 +44,7 @@ ccnv reference controls/ --prefix reference \
 
 ccnv reference --fasta genome.fa --prefix reference --bin-size 100000
 
-ccnv predict sample.parquet reference.parquet \
+ccnv predict sample.ccnv reference.ccnv \
   --prefix results/sample --ratio-threshold 0.2
 ```
 
@@ -61,7 +61,7 @@ fraction, or omit it to infer a cutoff when groups separate cleanly. Samples
 must have identical bins and contig lengths. See [CLI reference](docs/cli.md)
 for every flag. Production cohorts normally need at least ten controls.
 
-`convert` writes `<prefix>.parquet`. `reference` writes `<prefix>.parquet`.
+`convert` writes `<prefix>.ccnv`. `reference` writes `<prefix>.ccnv`.
 Prediction writes:
 
 - `<prefix>_bins.bed`: per-bin ratio, z-score, weight, reference size, mask
@@ -71,7 +71,7 @@ Prediction writes:
   bin count, and call.
 - `<prefix>_calls.bed`: called gains/losses only.
 - `<prefix>_plot.svg`: genome-aware plot unless `--no-plot` is passed.
-- `<prefix>_bins.parquet` and `<prefix>_segments.parquet`: the same evidence
+- `<prefix>_bins.ccnv` and `<prefix>_segments.ccnv`: the same evidence
   as typed tables.
 
 Omit `--prefix` on `convert` or `predict` to use the input stem.

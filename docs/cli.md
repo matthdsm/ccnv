@@ -23,7 +23,7 @@ ccnv convert ALIGNMENT [--prefix PREFIX] [options]
 | Flag / argument | Default | Meaning |
 | --- | --- | --- |
 | `ALIGNMENT` | required | BAM or CRAM. A missing index is created automatically. CRAM also needs `--fasta`. |
-| `--prefix` | alignment stem | Output prefix. Writes `<prefix>.parquet`. |
+| `--prefix` | alignment stem | Output prefix. Writes `<prefix>.ccnv`. |
 | `--bin-size` | `5000` | Target bin size in bases. The last bin on each contig may be shorter. |
 | `--fasta` | unset | Reference FASTA required for CRAM. Must exist. |
 | `--min-mapq` | `1` | Minimum mapping quality to keep. |
@@ -68,7 +68,7 @@ ccnv reference --fasta GENOME.fa --prefix PREFIX [--bin-size N]
 | Flag / argument | Default | Meaning |
 | --- | --- | --- |
 | `SAMPLES...` | optional | Sample Parquet files and/or directories. Directories are searched recursively for sample Parquet; other files are ignored. Omit when using `--fasta`. |
-| `--prefix` | required | Output prefix. Writes `<prefix>.parquet`. |
+| `--prefix` | required | Output prefix. Writes `<prefix>.ccnv`. |
 | `--fasta` | unset | FASTA whose contig lengths define a flat reference. No control samples are read. A missing `.fai` is created automatically. Mutually exclusive with `SAMPLES`. |
 | `--bin-size` | `100000` | Target bin size in bases for `--fasta`. Ignored when building from samples. |
 | `--all-contigs` | off | Include every FASTA contig in a flat reference instead of canonical chromosomes only. |
@@ -127,7 +127,7 @@ Prediction writes:
 - `<prefix>_segments.bed`
 - `<prefix>_calls.bed`
 - `<prefix>_plot.svg` unless `--no-plot`
-- `<prefix>_bins.parquet` and `<prefix>_segments.parquet`
+- `<prefix>_bins.ccnv` and `<prefix>_segments.ccnv`
 
 BED coordinates are 0-based, half-open, with contig names from the sample
 genome. Called segments also appear in `_calls.bed`.

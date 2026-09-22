@@ -50,13 +50,13 @@ class TestCliPathChecks(unittest.TestCase):
 
     def test_predict_rejects_missing_sample(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            reference = Path(tmpdir) / "reference.parquet"
+            reference = Path(tmpdir) / "reference.ccnv"
             reference.write_bytes(b"PARQUET")
             result = CliRunner().invoke(
                 app,
                 [
                     "predict",
-                    str(Path(tmpdir) / "missing.parquet"),
+                    str(Path(tmpdir) / "missing.ccnv"),
                     str(reference),
                 ],
             )
@@ -70,11 +70,11 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             root = Path(tmpdir)
             nested = root / "batch" / "lane"
             nested.mkdir(parents=True)
-            first = _write_sample(nested / "a.parquet")
-            second = _write_sample(root / "batch" / "c.parquet")
+            first = _write_sample(nested / "a.ccnv")
+            second = _write_sample(root / "batch" / "c.ccnv")
             (nested / "notes.txt").write_text("ignore")
-            pq.write_table(pa.table({"x": [1]}), nested / "other.parquet")
-            extra = _write_sample(root / "explicit.parquet")
+            pq.write_table(pa.table({"x": [1]}), nested / "other.ccnv")
+            extra = _write_sample(root / "explicit.ccnv")
 
             expanded = expand_sample_inputs([root / "batch", extra])
             self.assertEqual(expanded, (second, first, extra.resolve()))
@@ -91,8 +91,8 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             root = Path(tmpdir)
             nested = root / "controls" / "set-a"
             nested.mkdir(parents=True)
-            first = _write_sample(nested / "s1.parquet")
-            second = _write_sample(root / "controls" / "s2.parquet")
+            first = _write_sample(nested / "s1.ccnv")
+            second = _write_sample(root / "controls" / "s2.ccnv")
             with patch("ccnv.cli.run_reference") as run:
                 result = CliRunner().invoke(
                     app,
@@ -152,7 +152,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
     def test_cli_reference_forwards_sex_cutoff(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            sample = _write_sample(root / "s1.parquet")
+            sample = _write_sample(root / "s1.ccnv")
             with patch("ccnv.cli.run_reference") as run:
                 result = CliRunner().invoke(
                     app,
@@ -180,7 +180,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
     def test_reference_rejects_sample_sex_option(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            sample = _write_sample(root / "s1.parquet")
+            sample = _write_sample(root / "s1.ccnv")
             result = CliRunner().invoke(
                 app,
                 [

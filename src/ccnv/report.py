@@ -47,8 +47,8 @@ def write_outputs(
     bins_bed = Path(f"{prefix}_bins.bed")
     segments_bed = Path(f"{prefix}_segments.bed")
     calls_bed = Path(f"{prefix}_calls.bed")
-    bins_parquet = Path(f"{prefix}_bins.parquet")
-    segments_parquet = Path(f"{prefix}_segments.parquet")
+    bins_parquet = Path(f"{prefix}_bins.ccnv")
+    segments_parquet = Path(f"{prefix}_segments.ccnv")
     plot_path = Path(f"{prefix}_plot.svg") if plot else None
     _write_bed(bins_bed, BINS_BED_HEADER, _bin_bed_rows(bins))
     _write_bed(segments_bed, SEGMENTS_BED_HEADER, _segment_bed_rows(segments))

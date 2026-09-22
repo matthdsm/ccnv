@@ -218,8 +218,8 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
     def test_missing_reference_contig_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             directory = Path(tmpdir)
-            sample_path = directory / "sample.parquet"
-            reference_path = directory / "reference.parquet"
+            sample_path = directory / "sample.ccnv"
+            reference_path = directory / "reference.ccnv"
             pq.write_table(_sample_table(include_chr2=False), sample_path)
             pq.write_table(_reference_table(), reference_path)
 
@@ -260,8 +260,8 @@ class TestPredictPublishedCrams(unittest.TestCase):
             segments_bed = Path(f"{predict_prefix}_segments.bed")
             calls_bed = Path(f"{predict_prefix}_calls.bed")
             plot_svg = Path(f"{predict_prefix}_plot.svg")
-            bins_parquet = Path(f"{predict_prefix}_bins.parquet")
-            segments_parquet = Path(f"{predict_prefix}_segments.parquet")
+            bins_parquet = Path(f"{predict_prefix}_bins.ccnv")
+            segments_parquet = Path(f"{predict_prefix}_segments.ccnv")
             for path in (
                 bins_bed,
                 segments_bed,

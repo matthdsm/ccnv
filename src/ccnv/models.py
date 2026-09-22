@@ -8,7 +8,7 @@ from typing import Literal
 def parquet_path(prefix: Path) -> Path:
     """Canonical sample or reference Parquet path for a CLI prefix."""
 
-    return Path(f"{prefix}.parquet")
+    return Path(f"{prefix}.ccnv")
 
 
 @dataclass(frozen=True, slots=True)

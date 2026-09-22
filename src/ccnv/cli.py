@@ -103,7 +103,7 @@ def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
         if resolved.is_dir():
             matches = [
                 candidate.resolve()
-                for candidate in sorted(resolved.rglob("*.parquet"))
+                for candidate in sorted(resolved.rglob("*.ccnv"))
                 if _is_sample_parquet(candidate)
             ]
             if not matches:
@@ -141,7 +141,7 @@ def convert(
     ],
     prefix: Annotated[
         Path | None,
-        typer.Option(help="Output path prefix; writes PREFIX.parquet"),
+        typer.Option(help="Output path prefix; writes PREFIX.ccnv"),
     ] = None,
     bin_size: Annotated[
         int, typer.Option(min=1, help="Target bin size in bases")
@@ -226,7 +226,7 @@ def convert(
 def reference(
     prefix: Annotated[
         Path,
-        typer.Option(help="Output path prefix; writes PREFIX.parquet"),
+        typer.Option(help="Output path prefix; writes PREFIX.ccnv"),
     ],
     samples: Annotated[
         list[Path] | None,
