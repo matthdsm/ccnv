@@ -1,7 +1,6 @@
 # Convert / reference functional fixtures
 
-`test_convert.py`, `test_reference.py`, and `test_predict.py` download these
-published chr21 files on first run and cache them here. They are gitignored.
+`test_convert.py`, `test_reference.py`, and `test_predict.py` download these published chr21 files on first run and cache them here. They are gitignored.
 
 - CRAM: https://raw.githubusercontent.com/nf-cmgg/test-datasets/wisecondorx/data/genomics/homo_sapiens/illumina/cram/test.cram
 - CRAM: https://raw.githubusercontent.com/nf-cmgg/test-datasets/wisecondorx/data/genomics/homo_sapiens/illumina/cram/test2.cram

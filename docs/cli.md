@@ -1,22 +1,16 @@
 # CLI reference
 
-The `ccnv` entry point is a Typer app with three subcommands: `convert`,
-`reference`, and `predict`. Commands take `--prefix` and append canonical
-suffixes themselves; do not pass output file extensions.
+The `ccnv` entry point is a Typer app with three subcommands: `convert`, `reference`, and `predict`. Commands take `--prefix` and append canonical suffixes themselves; do not pass output file extensions.
 
-Every command accepts `-h` or `--help`. File arguments and options marked as
-existing paths are rejected by Typer before the stage runs.
+Every command accepts `-h` or `--help`. File arguments and options marked as existing paths are rejected by Typer before the stage runs.
 
-`--loglevel` is accepted on every command (`DEBUG`, `INFO`, `WARNING`, `ERROR`,
-`CRITICAL`; default `WARNING`). Pipeline steps emit `DEBUG` messages; raise the
-level to see them on stderr.
+`--loglevel` is accepted on every command (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`; default `WARNING`). Pipeline steps emit `DEBUG` messages; raise the level to see them on stderr.
 
 For full algorithmic details, data transformations, and decision paths, see the [Pipeline Architecture & Subcommands](pipeline.md) guide.
 
 ## convert
 
-Convert one BAM or CRAM into canonical sample Parquet. If the alignment has no
-index, `convert` builds one with pysam (`.bai`/`.crai`).
+Convert one BAM or CRAM into canonical sample Parquet. If the alignment has no index, `convert` builds one with pysam (`.bai`/`.crai`).
 
 ```console
 ccnv convert ALIGNMENT [--prefix PREFIX] [options]
@@ -39,23 +33,11 @@ ccnv convert ALIGNMENT [--prefix PREFIX] [options]
 
 Only canonical chromosomes are binned: autosomes 1-22 plus X and Y, written as UCSC (`chr1`, `chrX`) or plain NCBI/Ensembl (`1`, `X`) accessions. The `chr` prefix and the letter case are both ignored, so `CHR7` and `y` are canonical.
 
-Everything else is skipped: mitochondrial contigs (`chrM`, `MT`),
-`_alt`, `_decoy`, and `_random` scaffolds, unplaced `chrUn_*` scaffolds, and
-`chrEBV`. Skipped contigs are absent from the bins, from `contig_lengths`, and
-from `reference_identity.contig_order`, and their reads are never read. Convert
-fails when a header has no canonical chromosome.
+Everything else is skipped: mitochondrial contigs (`chrM`, `MT`), `_alt`, `_decoy`, and `_random` scaffolds, unplaced `chrUn_*` scaffolds, and `chrEBV`. Skipped contigs are absent from the bins, from `contig_lengths`, and from `reference_identity.contig_order`, and their reads are never read. Convert fails when a header has no canonical chromosome.
 
-Pass `--all-contigs` to bin every contig in the header instead, including
-mitochondrial and decoy sequence. This is the escape hatch for non-human or
-custom layouts whose contigs do not use human chromosome names.
-`ConvertConfig(all_contigs=...)` defaults to `False`, matching the CLI.
+Pass `--all-contigs` to bin every contig in the header instead, including mitochondrial and decoy sequence. This is the escape hatch for non-human or custom layouts whose contigs do not use human chromosome names. `ConvertConfig(all_contigs=...)` defaults to `False`, matching the CLI.
 
-Contigs are binned in parallel across worker processes; output row order always
-follows the alignment header. `--threads` is a CPU budget, not a raw process
-count: convert keeps `workers × AlignmentFile(threads=)` at most that budget so
-CRAM decompression is not stuck at pysam's default of one thread per handle.
-`ConvertConfig(threads=...)` defaults to `1`, so library callers stay serial
-unless they opt in.
+Contigs are binned in parallel across worker processes; output row order always follows the alignment header. `--threads` is a CPU budget, not a raw process count: convert keeps `workers × AlignmentFile(threads=)` at most that budget so CRAM decompression is not stuck at pysam's default of one thread per handle. `ConvertConfig(threads=...)` defaults to `1`, so library callers stay serial unless they opt in.
 
 ```mermaid
 flowchart LR
@@ -71,8 +53,7 @@ See [Pipeline Architecture: convert](pipeline.md#1-convert) for detailed process
 
 ## reference
 
-Build a reference model from control sample Parquet files, or a flat
-uniform-depth model from a FASTA when no control samples are available.
+Build a reference model from control sample Parquet files, or a flat uniform-depth model from a FASTA when no control samples are available.
 
 ```console
 ccnv reference SAMPLES... --prefix PREFIX [options]
@@ -96,20 +77,11 @@ ccnv reference GENOME.fa --prefix PREFIX [--bin-size N]
 | `--min-sex-group-size` | `5` | Minimum inferred samples per sex before a sex-contig branch is written. |
 | `--loglevel` | `WARNING` | Logging verbosity for reference steps. |
 
-There is no `--sample-sex` flag. For human data, sex contigs default to
-`X`/`Y`/`chrX`/`chrY` and the signal contig defaults to `chrY` or `Y`. Sex is
-inferred from that signal, or from `--sex-cutoff` when you supply one. If
-inference fails, only the autosomal branch is written.
+There is no `--sample-sex` flag. For human data, sex contigs default to `X`/`Y`/`chrX`/`chrY` and the signal contig defaults to `chrY` or `Y`. Sex is inferred from that signal, or from `--sex-cutoff` when you supply one. If inference fails, only the autosomal branch is written.
 
-Input samples are rebinned to the target bin size (default 5000) if their bin sizes
-differ, provided their contig lengths match.
+Input samples are rebinned to the target bin size (default 5000) if their bin sizes differ, provided their contig lengths match.
 
-Providing a FASTA file writes a **flat** reference: bins follow the FASTA layout at
-`--bin-size`, expected depth is proportional to bin width, and identical replica
-profiles fill the usual PCA and nearest-bin model. Canonical chromosomes
-including X and Y are treated as autosomal (no sex branches). This lets
-`predict` run without a control cohort; it is not a substitute for matched
-controls.
+Providing a FASTA file writes a **flat** reference: bins follow the FASTA layout at `--bin-size`, expected depth is proportional to bin width, and identical replica profiles fill the usual PCA and nearest-bin model. Canonical chromosomes including X and Y are treated as autosomal (no sex branches). This lets `predict` run without a control cohort; it is not a substitute for matched controls.
 
 ```mermaid
 flowchart LR
@@ -125,8 +97,7 @@ See [Pipeline Architecture: reference](pipeline.md#2-reference) for cohort vs fl
 
 ## predict
 
-Normalize one sample against a reference, segment, and write BED (and optional
-plot).
+Normalize one sample against a reference, segment, and write BED (and optional plot).
 
 ```console
 ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
@@ -155,12 +126,9 @@ Prediction writes:
 - `<prefix>_plot.svg` unless `--no-plot`
 - `<prefix>_bins.ccnv` and `<prefix>_segments.ccnv`
 
-BED coordinates are 0-based, half-open, with contig names from the sample
-genome. Called segments also appear in `_calls.bed`.
+BED coordinates are 0-based, half-open, with contig names from the sample genome. Called segments also appear in `_calls.bed`.
 
-If the sample has a different bin size than the reference model, it is
-automatically rebinned to the reference bin coordinates in memory, provided their
-contig lengths match. The reference Parquet file is never modified.
+If the sample has a different bin size than the reference model, it is automatically rebinned to the reference bin coordinates in memory, provided their contig lengths match. The reference Parquet file is never modified.
 
 ```mermaid
 flowchart LR
