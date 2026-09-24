@@ -19,15 +19,7 @@ from ccnv.reference import (
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
 )
-from ccnv.report import (
-    BINS_BED_HEADER,
-    CALLS_BED_HEADER,
-    SEGMENTS_BED_HEADER,
-    write_genome_plot,
-)
-from ccnv.report import (
-    write_outputs as write_prediction_files,
-)
+from ccnv.report import write_outputs
 from ccnv.results import BinResult, CallType, PredictionOutputs, SegmentResult
 from ccnv.schemas import (
     ArtifactKind,
@@ -39,25 +31,16 @@ from ccnv.schemas import (
 from ccnv.segment import segment_genome
 
 __all__ = (
-    "BINS_BED_HEADER",
-    "CALLS_BED_HEADER",
-    "SEGMENTS_BED_HEADER",
-    "BinResult",
     "BranchModel",
-    "CallType",
     "PredictError",
     "PredictionInput",
-    "PredictionOutputs",
     "ProjectedCoverage",
-    "SegmentResult",
     "call_segment",
     "distance_cutoff",
     "load_inputs",
     "normalize_branch",
     "run",
     "segment_and_call",
-    "write_genome_plot",
-    "write_outputs",
 )
 
 logger = logging.getLogger(__name__)
@@ -131,12 +114,13 @@ def run(config: PredictConfig) -> PredictionOutputs:
         ratio_threshold=config.ratio_threshold,
         max_blacklist_gap=config.max_blacklist_gap,
     )
-    logger.debug(
-        "produced %d segments (%d called)",
-        len(segments),
-        sum(1 for item in segments if item.call is not None),
+    return write_outputs(
+        config.prefix,
+        bin_results,
+        segments,
+        inputs.contig_lengths,
+        config.plot,
     )
-    return write_outputs(config.prefix, bin_results, segments, inputs, config.plot)
 
 
 def load_inputs(
@@ -551,19 +535,6 @@ def segment_and_call(
             )
         )
     return tuple(output)
-
-
-def write_outputs(
-    prefix: Path,
-    bins: tuple[BinResult, ...],
-    segments: tuple[SegmentResult, ...],
-    inputs: PredictionInput,
-    plot: bool,
-) -> PredictionOutputs:
-    """Write 0-based half-open BED evidence, matching Parquet, and an SVG plot."""
-
-    logger.debug("writing prediction outputs with prefix %s", prefix)
-    return write_prediction_files(prefix, bins, segments, inputs.contig_lengths, plot)
 
 
 def _resolve_sample_sex(

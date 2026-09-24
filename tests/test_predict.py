@@ -12,22 +12,23 @@ from typer.testing import CliRunner
 from ccnv.cli import app
 from ccnv.models import PredictConfig, ReadFilters, ReferenceConfig, parquet_path
 from ccnv.predict import (
-    BINS_BED_HEADER,
-    CALLS_BED_HEADER,
-    SEGMENTS_BED_HEADER,
-    BinResult,
     BranchModel,
     PredictError,
     PredictionInput,
-    SegmentResult,
     call_segment,
     load_inputs,
     normalize_branch,
     segment_and_call,
-    write_outputs,
 )
 from ccnv.reference import BRANCH_AUTOSOMAL
 from ccnv.reference import run as build_reference
+from ccnv.report import (
+    BINS_BED_HEADER,
+    CALLS_BED_HEADER,
+    SEGMENTS_BED_HEADER,
+    write_outputs,
+)
+from ccnv.results import BinResult, SegmentResult
 from ccnv.schemas import (
     REFERENCE_SCHEMA,
     SAMPLE_SCHEMA,
@@ -168,7 +169,11 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             outputs = write_outputs(
-                Path(tmpdir) / "result", bins, segments, inputs, plot=False
+                Path(tmpdir) / "result",
+                bins,
+                segments,
+                inputs.contig_lengths,
+                plot=False,
             )
             bins_rows = outputs.bins_bed.read_text().splitlines()
             segment_rows = outputs.segments_bed.read_text().splitlines()

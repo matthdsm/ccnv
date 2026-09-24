@@ -85,7 +85,7 @@ def run(config: ReferenceConfig) -> None:
             n_samples=n_samples,
             all_contigs=config.all_contigs,
         )
-        if _uses_default_sex_contigs(config.sex_contigs):
+        if config.sex_contigs is None or config.sex_contigs == DEFAULT_SEX_CONTIGS:
             config = replace(config, sex_contigs=())
     else:
         logger.debug("loading %d sample parquet files", len(config.samples))
@@ -592,7 +592,7 @@ def _resolve_contig_roles(
     requested_sex = (
         None if config.sex_contigs is None else tuple(dict.fromkeys(config.sex_contigs))
     )
-    if _uses_default_sex_contigs(requested_sex):
+    if requested_sex is None or requested_sex == DEFAULT_SEX_CONTIGS:
         sex_contigs = tuple(name for name in DEFAULT_SEX_CONTIGS if name in available)
     else:
         sex_contigs = requested_sex
@@ -641,7 +641,7 @@ def _resolve_sexes(
 def _resolve_sex_signal(cohort: Cohort, config: ReferenceConfig) -> str | None:
     available = set(cohort.contigs)
     requested = config.sex_signal_contig
-    if _uses_default_sex_signal(requested):
+    if requested is None or requested == DEFAULT_SEX_SIGNAL_CONTIGS[0]:
         for name in DEFAULT_SEX_SIGNAL_CONTIGS:
             if name in available:
                 return name
@@ -649,14 +649,6 @@ def _resolve_sex_signal(cohort: Cohort, config: ReferenceConfig) -> str | None:
     if requested not in available:
         raise ReferenceError(f"unknown sex-signal contig {requested!r}")
     return requested
-
-
-def _uses_default_sex_contigs(requested: tuple[str, ...] | None) -> bool:
-    return requested is None or requested == DEFAULT_SEX_CONTIGS
-
-
-def _uses_default_sex_signal(requested: str | None) -> bool:
-    return requested is None or requested == DEFAULT_SEX_SIGNAL_CONTIGS[0]
 
 
 def _validate_sex_cutoff(cutoff: float | None) -> None:
