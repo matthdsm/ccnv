@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Comprehensive pipeline architecture documentation (`docs/pipeline.md`) with detailed Mermaid flowcharts for all three subcommands (`convert`, `reference`, `predict`), and embedded stage flowcharts in the CLI reference (`docs/cli.md`).
 - `rebin_counts` and `rebin_sample_table` for 1D mass-conserving count interpolation across bin grids.
 - `ccnv convert`: stream BAM/CRAM into versioned sample Parquet, auto-index
   missing `.bai`/`.crai`, bin canonical chromosomes (or `--all-contigs`), and

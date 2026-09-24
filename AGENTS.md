@@ -139,5 +139,5 @@ published fixtures establish regression evidence, not clinical sensitivity,
 specificity, or assay thresholds. Sex inference requires sufficient separated
 cohort groups unless `--sex-cutoff` is set; per-sample sex labels are not
 accepted on the CLI. See
-`docs/validation.md` for accepted migration differences, `docs/benchmarks.md`
-for measured evidence, and `docs/cli.md` for command flags.
+`docs/validation.md` for accepted migration differences, `docs/pipeline.md`
+for detailed subcommand flowcharts and pipeline mechanics, and `docs/cli.md` for command flags.

@@ -10,3 +10,4 @@ dist/
 *.crai
 *.npz
 *.parquet
+*.ccnv

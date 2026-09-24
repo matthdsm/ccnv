@@ -60,7 +60,7 @@ control cohort. Sex-contig models default to `X`/`Y`/`chrX`/`chrY` and a
 fraction, or omit it to infer a cutoff when groups separate cleanly. Input
 samples are rebinned to the target bin size (default 5000) if their bin sizes
 differ, provided contig lengths match. See [CLI reference](docs/cli.md)
-for every flag. Production cohorts normally need at least ten controls.
+for every flag and [Pipeline Architecture](docs/pipeline.md) for detailed subcommands and flowcharts. Production cohorts normally need at least ten controls.
 
 `convert` writes `<prefix>.ccnv`. `reference` writes `<prefix>.ccnv`.
 Prediction writes:

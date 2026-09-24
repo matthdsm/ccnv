@@ -1,0 +1,280 @@
+# Pipeline Architecture & Subcommands
+
+Copynumber-CNV (`ccnv`) is a copy number variation analysis tool designed for whole-genome sequencing data. It re-engineers and modernizes the algorithms from WISECONDOR and WisecondorX with versioned Apache Arrow/Parquet storage (`1.0.0`), organism-agnostic coordinate contracts, and deterministic multi-core execution.
+
+The pipeline comprises three core subcommands:
+1. [`convert`](#1-convert): Transforms raw BAM/CRAM alignments into binned coverage count profiles.
+2. [`reference`](#2-reference): Builds statistical background models from cohort controls or generates a flat reference from a reference FASTA.
+3. [`predict`](#3-predict): Normalizes a target sample against a reference, performs change-point segmentation, and calls copy-number gains and losses.
+
+```mermaid
+flowchart LR
+    A["BAM / CRAM Alignment"] -->|ccnv convert| B["Sample Parquet<br/>(<sample>.ccnv)"]
+    C["Control BAMs / CRAMs"] -->|ccnv convert| D["Control Parquets<br/>(<ctrl>.ccnv)"]
+    D -->|ccnv reference| E["Reference Parquet<br/>(<reference>.ccnv)"]
+    F["Reference FASTA"] -.->|ccnv reference (flat)| E
+    B -->|ccnv predict| G["Prediction Artifacts<br/>(BED, Parquet, SVG)"]
+    E -->|ccnv predict| G
+```
+
+---
+
+## Coordinate & Storage Contracts
+
+- **0-Based Half-Open Coordinates:** All bin intervals, segment boundaries, and BED outputs strictly adhere to `[start, end)` half-open conventions.
+- **Header-Authoritative Layouts:** Contig identifiers, ordering, and lengths are derived directly from alignment headers or FASTA headers. No fixed 24-chromosome human layout is assumed.
+- **Canonical vs All-Contigs:** By default, standard autosomes (1-22) and allosomes (X, Y) are binned, while unplaced scaffolds, decoys, and mitochondrial sequences are skipped. Pass `--all-contigs` to retain every contig.
+- **Versioned Parquet Format:** Files are persisted as Apache Arrow tables compressed with Zstandard (`zstd`), with embedded schema version (`1.0.0`), genome metadata, and execution QC counters.
+
+---
+
+## 1. convert
+
+The `convert` subcommand streams alignment records from a BAM or CRAM file, applies quality and alignment flag filters, aggregates kept reads into fixed-width genomic bins, tracks deterministic quality control counters, and outputs a canonical sample Parquet file (`<prefix>.ccnv`).
+
+### Detailed Processing Flow
+
+```mermaid
+flowchart TD
+    InAlign["BAM or CRAM alignment"] --> CheckIdx{"Index (.bai/.crai) present?"}
+    CheckIdx -- No --> BuildIdx["Generate index using pysam"]
+    CheckIdx -- Yes --> OpenAlign["Open alignment file"]
+    BuildIdx --> OpenAlign
+    
+    InFasta["FASTA reference"] --> CheckCRAM{"Is input CRAM?"}
+    CheckCRAM -- Yes --> CheckFai{"FASTA index (.fai) present?"}
+    CheckFai -- No --> ErrFai["Error: CRAM requires indexed FASTA"]
+    CheckFai -- Yes --> OpenAlign
+    CheckCRAM -- No --> OpenAlign
+
+    OpenAlign --> ParseHeader["Read alignment header: contigs & lengths"]
+    ParseHeader --> LayoutFilter{"--all-contigs enabled?"}
+    LayoutFilter -- No --> KeepCanonical["Retain canonical chromosomes (1-22, X, Y)"]
+    LayoutFilter -- Yes --> KeepAll["Retain all header contigs"]
+    KeepCanonical --> Layout["Construct GenomeProfile layout"]
+    KeepAll --> Layout
+
+    Layout --> Budget["split_thread_budget(threads, n_contigs)"]
+    Budget --> ExecMode{"workers > 1 and n_tasks >= 2?"}
+    ExecMode -- Yes --> Pool["ProcessPoolExecutor with worker processes"]
+    ExecMode -- No --> Serial["In-process serial execution"]
+
+    Pool --> WorkerStream["Parallel contig streaming (pysam per worker)"]
+    Serial --> MainStream["Serial contig streaming"]
+
+    WorkerStream --> ReadFilter["Evaluate alignment flags & quality"]
+    MainStream --> ReadFilter
+
+    subgraph FilterPipeline ["Read Classification & QC Counting"]
+        ReadFilter --> Q1{"Unmapped? (flag & 4)"}
+        Q1 -- Yes --> D1["filter_unmapped"]
+        Q1 -- No --> Q2{"Invalid start? (< 0 or >= contig_length)"}
+        Q2 -- Yes --> D2["filter_no_start"]
+        Q2 -- No --> Q3{"Secondary? (flag & 256)"}
+        Q3 -- Yes --> D3["filter_secondary"]
+        Q3 -- No --> Q4{"Supplementary? (flag & 2048)"}
+        Q4 -- Yes --> D4["filter_supplementary"]
+        Q4 -- No --> Q5{"Duplicate? (flag & 1024)"}
+        Q5 -- Yes --> D5["filter_duplicate"]
+        Q5 -- No --> Q6{"Improper pair? (paired & not proper)"}
+        Q6 -- Yes --> D6["filter_improper_pair"]
+        Q6 -- No --> Q7{"mapq < min_mapq?"}
+        Q7 -- Yes --> D7["filter_mapq"]
+        Q7 -- No --> Kept["Record kept read (reads_kept)"]
+    end
+
+    Kept --> Binning["Compute bin index: start // bin_size"]
+    Binning --> CountBins["Aggregate binned counts: bin_counts()"]
+    CountBins --> OrderContigs["Preserve strict alignment header contig order"]
+    OrderContigs --> ArrowTable["Construct PyArrow Table (SAMPLE_SCHEMA 1.0.0)"]
+    ArrowTable --> WriteParquet["Write <prefix>.ccnv (Parquet with zstd)"]
+```
+
+### Algorithmic Details
+
+1. **Preflight & Indexing:** If a BAM or CRAM file lacks an index (`.bai` or `.crai`), `convert` automatically generates one using `pysam`. CRAM conversions require an indexed reference FASTA via `--fasta`.
+2. **Contig Layout Selection:** The header's reference sequences are inspected. Unless `--all-contigs` is passed, non-canonical contigs (mitochondrial, decoy, unplaced, ALT contigs) are excluded from processing.
+3. **Thread Budget Allocation:** The `--threads` parameter defines a total CPU budget. `split_thread_budget` splits this into concurrent contig worker processes (`workers`) and per-handle HTSlib decode threads (`decode_threads`), ensuring `workers * decode_threads <= threads`. When budget is 1 or only 1 contig is present, processing stays in-process.
+4. **Read Filtering Precedence:** Reads are evaluated in strict priority order. The first failing criterion increments its corresponding QC counter and discards the read:
+   - `filter_unmapped`: Read is unmapped (SAM flag `0x4`).
+   - `filter_no_start`: Alignment start is undefined, negative, or beyond the declared contig length.
+   - `filter_secondary`: Secondary alignment (SAM flag `0x100`).
+   - `filter_supplementary`: Supplementary alignment (SAM flag `0x800`).
+   - `filter_duplicate`: Optical/PCR duplicate (SAM flag `0x400`).
+   - `filter_improper_pair`: Paired read not marked as a proper pair (SAM flag `0x1` set, `0x2` unset).
+   - `filter_mapq`: Mapping quality strictly below `--min-mapq` (default: 1).
+5. **Interval Binning:** Contig coordinates are partitioned into contiguous intervals of width `--bin-size` (default: 5,000 bp). Final bins on a contig may be shorter than `--bin-size`. Kept read start positions are binned using vector operations (`np.bincount`).
+6. **Artifact Output:** Writes `<prefix>.ccnv` containing four columns: `contig: string`, `start: int64`, `end: int64`, and `count: uint64`. Embedded Arrow metadata stores contig lengths, bin size, source file path, and all aggregated QC counters.
+
+---
+
+## 2. reference
+
+The `reference` subcommand constructs a background reference model. It operates in one of two modes:
+1. **Cohort Mode:** Learns systematic coverage variation, PCA components, and nearest off-contig reference bins across a collection of control sample Parquets.
+2. **Flat Reference Mode:** Builds an idealized, uniform-depth reference model directly from a FASTA file when no control cohort is available.
+
+### Detailed Processing Flow
+
+```mermaid
+flowchart TD
+    InputArg["Input: SAMPLES... or GENOME.fa"] --> ModeDecision{"Is input a single FASTA file?"}
+    
+    ModeDecision -- Yes --> FlatMode["Flat Reference Mode"]
+    ModeDecision -- No --> CohortMode["Cohort Reference Mode"]
+
+    subgraph CohortPipeline ["Cohort Reference Processing"]
+        CohortMode --> Discover["Discover and read all sample Parquet files (.ccnv)"]
+        Discover --> CheckCohortSize{"Cohort size >= --min-cohort-size (10)?"}
+        CheckCohortSize -- No --> ErrCohort["Error: Insufficient cohort size"]
+        CheckCohortSize -- Yes --> ValidateLayout["Verify identical contig names and lengths across samples"]
+        
+        ValidateLayout --> RebinDecision{"Sample bin sizes match target --bin-size?"}
+        RebinDecision -- No --> RebinSamples["rebin_sample_table(): in-memory mass-conserving rebinning"]
+        RebinDecision -- Yes --> DepthNorm["Calculate median autosomal depth per sample & normalize"]
+        RebinSamples --> DepthNorm
+
+        DepthNorm --> ContigPartition["Partition contigs into Autosomal and Sex sets"]
+        ContigPartition --> SexInference["Calculate sex-signal contig coverage (chrY/Y fraction)"]
+        
+        SexInference --> CutoffDecision{"--sex-cutoff provided?"}
+        CutoffDecision -- Yes --> FixedCutoff["Assign male/female using explicit cutoff threshold"]
+        CutoffDecision -- No --> InferCutoff{"Bimodal gap separation detected?"}
+        InferCutoff -- Yes --> InferredCutoff["Assign male/female based on inferred gap threshold"]
+        InferCutoff -- No --> FallbackAuto["Inference failed: Skip sex branches, build autosomal only"]
+        FixedCutoff --> ValidateSexGroups{"Each sex group >= --min-sex-group-size (5)?"}
+        InferredCutoff --> ValidateSexGroups
+        ValidateSexGroups -- Yes --> ActiveSexBranches["Enable Female and Male branches"]
+        ValidateSexGroups -- No --> FallbackAuto
+
+        ActiveSexBranches --> FitBranches["Fit branch models (Autosomal, Female, Male)"]
+        FallbackAuto --> FitBranches
+        
+        subgraph BranchFitting ["Model Fitting per Branch"]
+            FitBranches --> FitPCA["Fit PCA: Mean profile and top K components (--pca-components)"]
+            FitPCA --> CalcResiduals["Compute PCA-subtracted residual profiles"]
+            CalcResiduals --> DistBatch["Batched pairwise Euclidean distance (--max-batch-memory-mb)"]
+            DistBatch --> NearestSelection["Select top --nearest-bins (300) off-contig bins per target"]
+            NearestSelection --> FitNull["Compute null ratio mean and variance across cohort"]
+        end
+    end
+
+    subgraph FlatPipeline ["Flat Reference Processing"]
+        FlatMode --> ReadFastaHeader["Extract contig names and lengths from FASTA"]
+        ReadFastaHeader --> LayoutFilterFasta{"--all-contigs enabled?"}
+        LayoutFilterFasta -- No --> CanonicalFasta["Retain canonical chromosomes (1-22, X, Y)"]
+        LayoutFilterFasta -- Yes --> AllFasta["Retain all FASTA contigs"]
+        CanonicalFasta --> GenFlatBins["Generate uniform bins of size --bin-size"]
+        AllFasta --> GenFlatBins
+        GenFlatBins --> FlatDepth["Assign expected depth proportional to bin length"]
+        FlatDepth --> FlatReplica["Generate synthetic replica profiles for PCA & nearest-bins"]
+        FlatReplica --> FlatAutosomalOnly["Build Autosomal branch only (all contigs marked autosomal)"]
+    end
+
+    FitNull --> ArrowRef["Assemble PyArrow Table (REFERENCE_SCHEMA 1.0.0)"]
+    FlatAutosomalOnly --> ArrowRef
+    ArrowRef --> WriteRef["Write <prefix>.ccnv (Parquet with zstd)"]
+```
+
+### Algorithmic Details
+
+1. **Cohort Discovery & Validation:** Input paths are traversed recursively for sample Parquets (`.ccnv`). All samples must share the exact same contig ordering and contig lengths.
+2. **On-the-Fly Rebinning:** If sample Parquets were converted at a bin size different from the reference's `--bin-size`, `rebin_sample_table` coarsens or refines count arrays in memory using exact geometric overlap, conserving total count mass.
+3. **Depth Normalization:** Total count across all autosomal bins is calculated per sample. Sample counts are scaled to median autosomal depth to correct for variable library sequencing depth.
+4. **Sex Contig Inference:** Coverage on `--sex-signal-contig` (default: `chrY` or `Y`) relative to total depth is evaluated across the cohort. If samples separate into two distinct clusters separated by a coverage gap, a boundary cutoff is automatically placed; alternatively, an explicit `--sex-cutoff` can be supplied. Samples with signal above the cutoff are assigned male; those below are assigned female.
+5. **PCA Decomposition:** For each branch (autosomal and sex-specific), coverage profiles are centered and decomposed using Truncated SVD / PCA into `--pca-components` (default: 5) to capture cohort-wide systemic variability (e.g., GC content curves, batch effects).
+6. **Nearest Off-Contig Reference Bins:** For each target bin, pairwise Euclidean distances are computed against all candidate bins located on *different* contigs. Distances are calculated in chunked batches bounded by `--max-batch-memory-mb` (default: 256 MiB). The `--nearest-bins` (default: 300) with smallest Euclidean distance are recorded as that bin's reference set.
+7. **Flat Reference Construction:** When passed a FASTA file and no samples, `reference` creates a uniform model directly from FASTA contig lengths. Expected bin depths are set strictly proportional to bin width. Synthetic replica profiles populate PCA loadings and nearest-bin models, allowing `predict` to execute without a control cohort.
+
+---
+
+## 3. predict
+
+The `predict` subcommand normalizes a test sample against the reference model, subtracts systematic biases via eigenspace projection and within-sample reference bin matching, performs change-point segmentation using weighted Binary Segmentation (Binseg), and calls copy-number gains and losses.
+
+### Detailed Processing Flow
+
+```mermaid
+flowchart TD
+    InSample["Sample Parquet (<sample>.ccnv)"] --> LoadCompat["Validate schema 1.0.0 & contig length compatibility"]
+    InRef["Reference Parquet (<reference>.ccnv)"] --> LoadCompat
+    
+    LoadCompat --> RebinCheck{"Sample bin size == Reference bin size?"}
+    RebinCheck -- No --> InMemRebin["rebin_counts() in memory to reference bin grid"]
+    RebinCheck -- Yes --> BranchSelect["Select active reference branch"]
+    InMemRebin --> BranchSelect
+
+    BranchSelect --> BranchOption{"--sex option"}
+    BranchOption -- "female / male" --> ExplicitSex["Load explicit sex branch"]
+    BranchOption -- "autosomal (default)" --> AutoBranchCheck{"Reference has sex branches?"}
+    AutoBranchCheck -- Yes --> InferSampleSex["Compute sample Y-signal coverage and select branch"]
+    AutoBranchCheck -- No --> AutosomalBranch["Use autosomal branch"]
+    InferSampleSex --> ExplicitSex
+
+    ExplicitSex --> DepthScale["Scale sample coverage to match reference median depth"]
+    AutosomalBranch --> DepthScale
+
+    DepthScale --> ProjectPCA["Project sample onto reference PCA components"]
+    ProjectPCA --> SubtractPCA["Subtract reconstructed PCA bias from sample coverage"]
+    
+    SubtractPCA --> MatchNearest["Within-sample reference matching"]
+    subgraph WithinSampleNorm ["Within-Sample Expected Coverage"]
+        MatchNearest --> LoadNearest["Lookup precomputed nearest off-contig bins"]
+        LoadNearest --> MaskOutliers["Drop masked and non-informative reference bins"]
+        MaskOutliers --> ExpectedRatio["Compute observed / expected ratio and residual z-score"]
+    end
+
+    ExpectedRatio --> IterativeMask["Iterative outlier masking (--mask-repeats iterations)"]
+    IterativeMask --> BinWeights["Assign bin weights: weight = 1.0 / (variance + epsilon)"]
+
+    BinWeights --> SegInput["Prepare weighted ratios and coordinates for segmentation"]
+    subgraph SegEngine ["Weighted Ruptures Binseg Segmentation"]
+        SegInput --> GapPartition["Split contigs across masked gaps exceeding --max-blacklist-gap"]
+        GapPartition --> BinsegRun["Run Binary Segmentation with Weighted L2 Cost"]
+        BinsegRun --> PenaltyStop["Evaluate change points with penalty parameter --penalty"]
+    end
+
+    PenaltyStop --> SegmentMetrics["Compute segment statistics: mean ratio, aggregate z-score, total weight"]
+    SegmentMetrics --> CallingCriteria{"Call decision metric"}
+    
+    CallingCriteria -- "--ratio-threshold set" --> RatioCheck{"Absolute log2-ratio > threshold?"}
+    CallingCriteria -- "Default: --z-threshold" --> ZCheck{"Absolute z-score > --z-threshold?"}
+    
+    RatioCheck -- Yes --> MakeCall["Assign GAIN or LOSS"]
+    RatioCheck -- No --> NeutralCall["Assign NORMAL"]
+    ZCheck -- Yes --> MakeCall
+    ZCheck -- No --> NeutralCall
+
+    MakeCall --> ReportGen["Format and generate output files"]
+    NeutralCall --> ReportGen
+
+    subgraph ArtifactOutputs ["Prediction Artifacts Generated"]
+        ReportGen --> BedBins["<prefix>_bins.bed (Per-bin metrics & reference states)"]
+        ReportGen --> BedSegs["<prefix>_segments.bed (All segmented genomic regions)"]
+        ReportGen --> BedCalls["<prefix>_calls.bed (Called GAIN and LOSS events only)"]
+        ReportGen --> CcnvBins["<prefix>_bins.ccnv (Typed Arrow Parquet)"]
+        ReportGen --> CcnvSegs["<prefix>_segments.ccnv (Typed Arrow Parquet)"]
+        ReportGen --> PlotCheck{"--no-plot enabled?"}
+        PlotCheck -- No --> GenPlot["<prefix>_plot.svg (Genome-wide CNV ratio plot)"]
+        PlotCheck -- Yes --> EndPredict["Complete"]
+        GenPlot --> EndPredict
+    end
+```
+
+### Algorithmic Details
+
+1. **Rebinning to Reference Coordinates:** If the input sample was binned at a resolution differing from the reference model, sample counts are rebinned in memory using 1D mass-conserving interpolation (`rebin_counts`). The reference Parquet file is never modified.
+2. **Sex Branch Selection:** If `--sex autosomal` is passed (the default), `predict` checks whether the reference model includes sex-specific branches. If present, the sample's coverage fraction on the reference signal contig is measured to select the appropriate branch (`female` or `male`).
+3. **PCA Projection & Bias Removal:** Sample bin coverage is centered against reference mean coverage and projected onto the reference principal component loadings. The projected component signal is subtracted, eliminating shared systematic biases (such as GC-content dependency and batch-level sequencing fluctuations).
+4. **Within-Sample Reference Normalization:** For each target bin, expected coverage is calculated from the sample's own coverage across the pre-selected `--nearest-bins` on other contigs. The ratio of observed to expected coverage and the corresponding z-score are calculated against the reference null distribution.
+5. **Iterative Outlier Masking:** Extreme ratio outliers can distort neighboring bins during change-point detection. The pipeline runs `--mask-repeats` (default: 3) iterations of masking bins exceeding extreme deviation thresholds before segmenting.
+6. **Weighted Ruptures Binseg:** Segmentation is performed per contig using Binary Segmentation (`ruptures.Binseg`) with a customized weighted L2 cost model (`WeightedL2Cost`). Each bin's squared error contribution is weighted inversely by its reference variance. Uninformative masked gaps exceeding `--max-blacklist-gap` (default: 2,000,000 bp) prevent segmentation from bridging across centromeres or unmappable heterochromatin.
+7. **Event Calling:** Each segment receives a weighted mean ratio, total weight, and an aggregate z-score:
+   - Default: Segments with absolute z-score exceeding `--z-threshold` (default: 3.0) are classified as `GAIN` or `LOSS`.
+   - Ratio Override: If `--ratio-threshold` is set, calls are made strictly on absolute log2 ratio, bypassing z-score calling.
+8. **Output Deliverables:**
+   - `<prefix>_bins.bed`: 0-based half-open BED containing per-bin ratios, z-scores, weights, and masking status.
+   - `<prefix>_segments.bed`: Full segmentation results across all contigs.
+   - `<prefix>_calls.bed`: Significant copy number alterations (`GAIN` and `LOSS` only).
+   - `<prefix>_bins.ccnv` & `<prefix>_segments.ccnv`: Typed Arrow Parquet tables.
+   - `<prefix>_plot.svg`: Genome-wide multi-chromosome visualization plotting observed bin ratios, fitted segments, and call thresholds (unless `--no-plot` is passed).

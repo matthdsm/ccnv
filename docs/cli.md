@@ -11,6 +11,8 @@ existing paths are rejected by Typer before the stage runs.
 `CRITICAL`; default `WARNING`). Pipeline steps emit `DEBUG` messages; raise the
 level to see them on stderr.
 
+For full algorithmic details, data transformations, and decision paths, see the [Pipeline Architecture & Subcommands](pipeline.md) guide.
+
 ## convert
 
 Convert one BAM or CRAM into canonical sample Parquet. If the alignment has no
@@ -55,6 +57,18 @@ CRAM decompression is not stuck at pysam's default of one thread per handle.
 `ConvertConfig(threads=...)` defaults to `1`, so library callers stay serial
 unless they opt in.
 
+```mermaid
+flowchart LR
+    A["BAM / CRAM Alignment"] --> B["pysam Indexing & Header Parsing"]
+    B --> C["Canonical Contig Filtering"]
+    C --> D["Multi-Process Contig Streaming"]
+    D --> E["Flag & MAPQ Filtering"]
+    E --> F["Vectorized Bin Counting"]
+    F --> G["<prefix>.ccnv (Sample Parquet)"]
+```
+
+See [Pipeline Architecture: convert](pipeline.md#1-convert) for detailed processing logic and QC counters.
+
 ## reference
 
 Build a reference model from control sample Parquet files, or a flat
@@ -97,6 +111,18 @@ including X and Y are treated as autosomal (no sex branches). This lets
 `predict` run without a control cohort; it is not a substitute for matched
 controls.
 
+```mermaid
+flowchart LR
+    A["Control Parquets or FASTA"] --> B["Layout Validation & Rebinning"]
+    B --> C["Depth Normalization"]
+    C --> D["Sex Inference & Branch Partitioning"]
+    D --> E["PCA Decomposition"]
+    E --> F["Batched Nearest-Bin Search"]
+    F --> G["<prefix>.ccnv (Reference Parquet)"]
+```
+
+See [Pipeline Architecture: reference](pipeline.md#2-reference) for cohort vs flat FASTA reference details.
+
 ## predict
 
 Normalize one sample against a reference, segment, and write BED (and optional
@@ -135,3 +161,17 @@ genome. Called segments also appear in `_calls.bed`.
 If the sample has a different bin size than the reference model, it is
 automatically rebinned to the reference bin coordinates in memory, provided their
 contig lengths match. The reference Parquet file is never modified.
+
+```mermaid
+flowchart LR
+    A["Sample & Reference Parquets"] --> B["In-Memory Rebinning (if needed)"]
+    B --> C["Sex Branch Selection & Depth Scaling"]
+    C --> D["PCA Projection & Bias Subtraction"]
+    D --> E["Within-Sample Nearest-Bin Normalization"]
+    E --> F["Iterative Outlier Masking"]
+    F --> G["Weighted Ruptures Binseg"]
+    G --> H["Z-score / Ratio Threshold Calling"]
+    H --> I["BED, Parquet & SVG Outputs"]
+```
+
+See [Pipeline Architecture: predict](pipeline.md#3-predict) for detailed segmentation mechanics, calling criteria, and artifact specifications.
