@@ -100,8 +100,8 @@ def write_genome_plot(
     for contig in ordered:
         offsets[contig] = total
         total += contig_lengths[contig]
-    width, height = 1200, 360
-    left, right, top, bottom = 55, 20, 20, 45
+    width, height = 1200, 380
+    left, right, top, bottom = 55, 40, 20, 75
     plot_width, plot_height = width - left - right, height - top - bottom
 
     def x(contig: str, position: float) -> float:
@@ -112,11 +112,56 @@ def write_genome_plot(
         return top + plot_height * (2.0 - clipped) / 4.0
 
     lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        "font-family=\"system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, "
+        'Arial, sans-serif">',
         '<rect width="100%" height="100%" fill="white"/>',
-        f'<line x1="{left}" y1="{y(0):.2f}" x2="{width - right}" '
-        f'y2="{y(0):.2f}" stroke="#999"/>',
     ]
+
+    for i, contig in enumerate(ordered):
+        x_start = x(contig, 0)
+        x_end = x(contig, contig_lengths[contig])
+        w = x_end - x_start
+        if i % 2 == 1:
+            lines.append(
+                f'<rect x="{x_start:g}" y="{top}" width="{w:g}" '
+                f'height="{plot_height}" fill="#f5f5f5"/>'
+            )
+        if i > 0:
+            lines.append(
+                f'<line x1="{x_start:g}" y1="{top}" x2="{x_start:g}" '
+                f'y2="{top + plot_height}" stroke="#e0e0e0" stroke-width="1"/>'
+            )
+
+    for tick in (-2, -1, 0, 1, 2):
+        y_pos = y(float(tick))
+        if tick == 0:
+            lines.append(
+                f'<line x1="{left}" y1="{y_pos:g}" x2="{width - right}" '
+                f'y2="{y_pos:g}" stroke="#888" stroke-width="1"/>'
+            )
+        elif tick in (-1, 1):
+            lines.append(
+                f'<line x1="{left}" y1="{y_pos:g}" x2="{width - right}" '
+                f'y2="{y_pos:g}" stroke="#e5e5e5" stroke-width="1" '
+                'stroke-dasharray="4,4"/>'
+            )
+        else:
+            lines.append(
+                f'<line x1="{left}" y1="{y_pos:g}" x2="{width - right}" '
+                f'y2="{y_pos:g}" stroke="#ccc" stroke-width="1"/>'
+            )
+        lines.append(
+            f'<line x1="{left - 4}" y1="{y_pos:g}" x2="{left}" '
+            f'y2="{y_pos:g}" stroke="#333" stroke-width="1"/>'
+        )
+        lines.append(
+            f'<text x="{left - 7}" y="{y_pos:g}" text-anchor="end" '
+            f'dominant-baseline="central" font-size="10" fill="#555">{tick}</text>'
+        )
+
+    seen_points: set[tuple[float, float]] = set()
+    bin_path_cmds: list[str] = []
     for result in bins:
         for contig, start, end, ratio, masked in zip(
             result.contigs,
@@ -128,27 +173,72 @@ def write_genome_plot(
         ):
             if masked or not np.isfinite(ratio):
                 continue
-            lines.append(
-                f'<circle cx="{x(contig, (start + end) / 2):.2f}" '
-                f'cy="{y(float(ratio)):.2f}" r="1.2" fill="#4776b4"/>'
-            )
+            cx = round(x(contig, (start + end) / 2) * 2) / 2
+            cy = round(y(float(ratio)) * 2) / 2
+            point = (cx, cy)
+            if point in seen_points:
+                continue
+            seen_points.add(point)
+            bin_path_cmds.append(f"M{cx:g},{cy:g}h.1")
+
+    if bin_path_cmds:
+        lines.append(
+            f'<path d="{"".join(bin_path_cmds)}" fill="none" stroke="#4776b4" '
+            'stroke-width="2.4" stroke-linecap="round"/>'
+        )
+
+    segment_colors = {"gain": "#c43c39", "loss": "#3c8c5a"}
+    segment_paths: dict[str, list[str]] = {"gain": [], "loss": [], "neutral": []}
     for item in segments:
-        color = (
-            "#c43c39"
-            if item.call == "gain"
-            else ("#3c8c5a" if item.call == "loss" else "#222")
-        )
-        lines.append(
-            f'<line x1="{x(item.contig, item.start):.2f}" '
-            f'y1="{y(item.ratio):.2f}" x2="{x(item.contig, item.end):.2f}" '
-            f'y2="{y(item.ratio):.2f}" stroke="{color}" stroke-width="2"/>'
-        )
+        cat = item.call if item.call in segment_colors else "neutral"
+        x1 = x(item.contig, item.start)
+        x2 = x(item.contig, item.end)
+        y_val = y(item.ratio)
+        segment_paths[cat].append(f"M{x1:g},{y_val:g}H{x2:g}")
+
+    for cat, cmds in segment_paths.items():
+        if cmds:
+            color = segment_colors.get(cat, "#222")
+            lines.append(
+                f'<path d="{"".join(cmds)}" stroke="{color}" stroke-width="2" '
+                'fill="none"/>'
+            )
+
+    lines.append(
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" '
+        'stroke="#333" stroke-width="1"/>'
+    )
+    lines.append(
+        f'<line x1="{left}" y1="{top + plot_height}" x2="{width - right}" '
+        f'y2="{top + plot_height}" stroke="#333" stroke-width="1"/>'
+    )
+
+    y_mid = top + plot_height / 2
+    lines.append(
+        f'<text transform="rotate(-90)" x="{-y_mid:g}" y="16" '
+        'text-anchor="middle" font-size="11" font-weight="600" fill="#333">'
+        "Log2 Ratio</text>"
+    )
+
+    label_y = top + plot_height + 8
     for contig in ordered:
-        midpoint = contig_lengths[contig] / 2
+        x_start = x(contig, 0)
+        x_end = x(contig, contig_lengths[contig])
+        if x_end - x_start < 10:
+            continue
+        cx = (x_start + x_end) / 2
         lines.append(
-            f'<text x="{x(contig, midpoint):.2f}" y="{height - 15}" '
-            f'text-anchor="middle" font-size="10">{_xml_escape(contig)}</text>'
+            f'<text transform="translate({cx:g},{label_y:g}) rotate(45)" '
+            f'text-anchor="start" font-size="9" fill="#555">'
+            f"{_xml_escape(contig)}</text>"
         )
+
+    x_mid = left + plot_width / 2
+    lines.append(
+        f'<text x="{x_mid:g}" y="{height - 10}" text-anchor="middle" '
+        'font-size="11" font-weight="600" fill="#333">Chromosome</text>'
+    )
+
     lines.append("</svg>")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
