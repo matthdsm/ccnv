@@ -17,6 +17,7 @@ from sklearn.decomposition import PCA
 
 from ccnv.convert import bin_intervals, rebin_sample_table, select_layout
 from ccnv.models import ReferenceConfig, parquet_path
+from ccnv.reference_qc import run_reference_qc_on_table
 from ccnv.schemas import (
     REFERENCE_SCHEMA,
     ArtifactKind,
@@ -102,6 +103,14 @@ def run(config: ReferenceConfig) -> None:
     logger.debug("writing reference parquet %s (%d rows)", path, table.num_rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, path)
+    if config.qc_report:
+        run_reference_qc_on_table(
+            table,
+            prefix=config.prefix,
+            reference_path=path,
+            write_json=True,
+            emit_stderr=True,
+        )
 
 
 def load_cohort(

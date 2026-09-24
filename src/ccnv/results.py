@@ -51,3 +51,13 @@ class PredictionOutputs:
     segments_parquet: Path
     bins: tuple[BinResult, ...]
     segments: tuple[SegmentResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceQCOutputs:
+    """Artifacts and verdict produced by reference QC."""
+
+    json_path: Path
+    overall_verdict: str
+    worst_severity: int
+    data: dict[str, object]

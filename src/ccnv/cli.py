@@ -20,6 +20,7 @@ from ccnv.models import (
     PredictConfig,
     ReadFilters,
     ReferenceConfig,
+    ReferenceQCConfig,
 )
 from ccnv.predict import PredictError
 from ccnv.predict import run as run_predict
@@ -30,6 +31,10 @@ from ccnv.reference import (
 )
 from ccnv.reference import (
     run as run_reference,
+)
+from ccnv.reference_qc import (
+    ReferenceQCError,
+    run_reference_qc,
 )
 from ccnv.schemas import ArtifactKind, SchemaError, decode_metadata
 
@@ -301,6 +306,13 @@ def reference(
     min_sex_group_size: Annotated[
         int, typer.Option(min=1, help="Minimum samples per sex for a sex-contig branch")
     ] = 5,
+    qc_report: Annotated[
+        bool,
+        typer.Option(
+            "--qc-report/--no-qc-report",
+            help="Generate reference quality control report",
+        ),
+    ] = True,
     loglevel: LogLevelOption = LogLevel.warning,
 ) -> None:
     """Build a reference model from control samples or a flat FASTA layout."""
@@ -331,6 +343,7 @@ def reference(
                 nearest_bins=nearest_bins,
                 pca_components=pca_components,
                 prefix=prefix,
+                qc_report=qc_report,
                 samples=sample_paths,
                 sex_contigs=tuple(sex_contig),
                 sex_cutoff=sex_cutoff,
@@ -338,6 +351,39 @@ def reference(
             )
         )
     except ReferenceError as error:
+        _fail(error, 1)
+
+
+@app.command(name="ref-qc")
+def ref_qc(
+    reference: Annotated[
+        Path,
+        typer.Argument(
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            resolve_path=True,
+            help="Reference Parquet file (.ccnv)",
+        ),
+    ],
+    prefix: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Prefix for report output; writes PREFIX_qc.json (defaults to "
+                "reference path without suffix)"
+            ),
+        ),
+    ] = None,
+    loglevel: LogLevelOption = LogLevel.warning,
+) -> None:
+    """Analyze an existing reference model and evaluate quality control metrics."""
+
+    configure_logging(loglevel)
+    try:
+        run_reference_qc(ReferenceQCConfig(reference=reference, prefix=prefix))
+    except ReferenceQCError as error:
         _fail(error, 1)
 
 

@@ -63,7 +63,7 @@ ccnv reference GENOME.fa --prefix PREFIX [--bin-size N]
 | Flag / argument | Default | Meaning |
 | --- | --- | --- |
 | `SAMPLES...` | optional | Sample Parquet files and/or directories. Directories are searched recursively for sample Parquet; other files are ignored. Provide exactly one FASTA file when building a flat reference. |
-| `--prefix` | required | Output prefix. Writes `<prefix>.ccnv`. |
+| `--prefix` | required | Output prefix. Writes `<prefix>.ccnv` and `<prefix>_qc.json` (unless `--no-qc-report` is passed). |
 | `--bin-size` | `5000` | Target bin size in bases. When building from samples, samples are rebinned to this target size (default 5000). When building from a FASTA, sets the uniform bin size. |
 | `--all-contigs` | off | Include every FASTA contig in a flat reference instead of canonical chromosomes only. |
 | `--autosomal-contig` | all non-sex contigs | Autosomal contig name. Repeat the flag for each contig. |
@@ -75,6 +75,7 @@ ccnv reference GENOME.fa --prefix PREFIX [--bin-size N]
 | `--max-batch-memory-mb` | `256` | Memory cap in MiB for batched distance computation. |
 | `--min-cohort-size` | `10` | Minimum samples required for the autosomal branch. |
 | `--min-sex-group-size` | `5` | Minimum inferred samples per sex before a sex-contig branch is written. |
+| `--qc-report / --no-qc-report` | `on` | Generate reference quality control report (`<prefix>_qc.json`) and summary verdict on stderr. |
 | `--loglevel` | `WARNING` | Logging verbosity for reference steps. |
 
 There is no `--sample-sex` flag. For human data, sex contigs default to `X`/`Y`/`chrX`/`chrY` and the signal contig defaults to `chrY` or `Y`. Sex is inferred from that signal, or from `--sex-cutoff` when you supply one. If inference fails, only the autosomal branch is written.
@@ -90,10 +91,26 @@ flowchart LR
     C --> D["Sex Inference & Branch Partitioning"]
     D --> E["PCA Decomposition"]
     E --> F["Batched Nearest-Bin Search"]
-    F --> G["<prefix>.ccnv (Reference Parquet)"]
+    F --> G["<prefix>.ccnv & <prefix>_qc.json"]
 ```
 
 See [Pipeline Architecture: reference](pipeline.md#2-reference) for cohort vs flat FASTA reference details.
+
+## ref-qc
+
+Analyze an existing reference model and evaluate quality control metrics post-creation.
+
+```console
+ccnv ref-qc REFERENCE [--prefix PREFIX] [options]
+```
+
+| Flag / argument | Default | Meaning |
+| --- | --- | --- |
+| `REFERENCE` | required | Existing reference Parquet file (`.ccnv`). |
+| `--prefix` | reference stem | Output prefix for report. Writes `<prefix>_qc.json`. |
+| `--loglevel` | `WARNING` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`). |
+
+The `ref-qc` subcommand inspects model metadata, computes nearest-neighbor distance distributions across each branch, and evaluates WisecondorX-derived heuristics to produce an overall usability verdict (`PASS`, `WARN`, `FAIL`). A concise 1-2 line summary is emitted to `stderr`, and structured metrics are saved to `<prefix>_qc.json`.
 
 ## predict
 

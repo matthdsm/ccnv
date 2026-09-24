@@ -102,6 +102,13 @@ class ReferenceConfig:
     fasta: Path | None = None
     bin_size: int | None = None
     all_contigs: bool = False
+    qc_report: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceQCConfig:
+    reference: Path
+    prefix: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)

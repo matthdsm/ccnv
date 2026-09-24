@@ -2,14 +2,16 @@
 
 Copynumber-CNV (`ccnv`) is a copy number variation analysis tool designed for whole-genome sequencing data. It re-engineers and modernizes the algorithms from WISECONDOR and WisecondorX with versioned Apache Arrow/Parquet storage (`1.0.0`), organism-agnostic coordinate contracts, and deterministic multi-core execution.
 
-The pipeline comprises three core subcommands: [`convert`](#1-convert) (transforms raw BAM/CRAM alignments into binned count profiles), [`reference`](#2-reference) (builds background models from cohort controls or reference FASTA), and [`predict`](#3-predict) (normalizes sample against reference, segments with weighted Binseg, and calls CNVs).
+The pipeline comprises four subcommands: [`convert`](#1-convert) (transforms raw BAM/CRAM alignments into binned count profiles), [`reference`](#2-reference) (builds background models from cohort controls or reference FASTA), [`ref-qc`](#3-ref-qc) (evaluates reference usability and quality metrics), and [`predict`](#4-predict) (normalizes sample against reference, segments with weighted Binseg, and calls CNVs).
 
 ```mermaid
 flowchart LR
     A["BAM / CRAM Alignment"] -->|ccnv convert| B["Sample Parquet (<sample>.ccnv)"]
     C["Control BAMs / CRAMs"] -->|ccnv convert| D["Control Parquets (<ctrl>.ccnv)"]
     D -->|ccnv reference| E["Reference Parquet (<reference>.ccnv)"]
+    D -->|ccnv reference| H["Reference QC (<reference>_qc.json)"]
     F["Reference FASTA"] -.->|ccnv reference (flat)| E
+    E -->|ccnv ref-qc| H
     B -->|ccnv predict| G["Prediction Artifacts (BED, Parquet, SVG)"]
     E -->|ccnv predict| G
 ```
@@ -69,6 +71,7 @@ flowchart TD
     FitPCA --> FitNearest["Find top --nearest-bins off-contig bins via batched Euclidean distance"]
     FitNearest --> FitNull["Compute cohort null ratio mean and variance"]
     FitNull --> WriteRef["Write <prefix>.ccnv (REFERENCE_SCHEMA 1.0.0)"]
+    WriteRef --> WriteQC["Evaluate reference QC & write <prefix>_qc.json (unless --no-qc-report)"]
     FlatMode --> WriteRef
 ```
 
@@ -79,8 +82,31 @@ flowchart TD
 5. **PCA Decomposition:** For each branch (autosomal and sex-specific), coverage profiles are centered and decomposed using Truncated SVD / PCA into `--pca-components` (default: 5) to capture cohort-wide systemic variability (e.g., GC content curves, batch effects).
 6. **Nearest Off-Contig Reference Bins:** For each target bin, pairwise Euclidean distances are computed against all candidate bins located on *different* contigs. Distances are calculated in chunked batches bounded by `--max-batch-memory-mb` (default: 256 MiB). The `--nearest-bins` (default: 300) with smallest Euclidean distance are recorded as that bin's reference set.
 7. **Flat Reference Construction:** When passed a FASTA file and no samples, `reference` creates a uniform model directly from FASTA contig lengths. Expected bin depths are set strictly proportional to bin width. Synthetic replica profiles populate PCA loadings and nearest-bin models, allowing `predict` to execute without a control cohort.
+8. **Reference Quality Control:** Evaluates nearest-neighbor distance distributions across each branch, checks masked bin rates, sex inference separation, and flags distance distribution outliers. Produces a machine-readable report `<prefix>_qc.json` with an overall usability verdict (`PASS`, `WARN`, `FAIL`) and prints a concise summary to stderr.
 
-## 3. predict
+## 3. ref-qc
+
+The `ref-qc` subcommand evaluates quality control metrics on an existing reference file post-creation.
+
+```mermaid
+flowchart TD
+    InRef["Reference Parquet (<reference>.ccnv)"] --> ValidateRef["Validate Schema 1.0.0 & Model Metadata"]
+    ValidateRef --> BranchStats["Compute Per-Bin Distance Distributions per Branch"]
+    BranchStats --> EvalVerdict["Evaluate Branch and Cohort Heuristics"]
+    EvalVerdict --> OutJSON["Write <prefix>_qc.json"]
+    EvalVerdict --> StderrSummary["Print Verdict Summary to stderr"]
+```
+
+1. **Model Validation:** Verifies that the table conforms to `REFERENCE_SCHEMA` version `1.0.0` and decodes stored metadata (parameters, cohort size, sex inference results).
+2. **Nearest-Bin Distance Statistics:** For each unmasked bin across each branch, computes mean and maximum nearest-neighbor distance and count of references.
+3. **Outlier Detection:** Computes branch mean-of-means and standard deviation of bin distance means. Bins with mean distance exceeding `mean + 3.0 * std` are flagged as outlier bins.
+4. **Branch Usability Verdicts:**
+   - **Autosomal / Female branches:** Flags `FAIL` if unmasked bins are absent or `std_of_means > 10.0`. Flags `WARN` if `std_of_means > 2.0`, `outlier_pct > 1.0%`, or bins have fewer than `min_ref_bins` neighbors.
+   - **Male branch:** In addition to general distance checks, evaluates the sex-signal contig (e.g., `chrY`). Flags `FAIL` if usable signal-contig bins drop below 20% or mean distance exceeds 100.0. Flags `WARN` if usable bins drop below 50% or mean distance exceeds 5.0.
+   - **Flat FASTA reference:** Flags `WARN` with an explanatory message indicating that the flat reference lacks empirical cohort noise models and sex branches, but is synthetically valid.
+5. **Output Delivery:** Writes `<prefix>_qc.json` containing complete metrics and emits a one-line summary to `stderr`. Exit code remains 0 when reference QC completes successfully.
+
+## 4. predict
 
 The `predict` subcommand normalizes a test sample against the reference model, subtracts systematic biases via eigenspace projection and within-sample reference bin matching, performs change-point segmentation using weighted Binary Segmentation (Binseg), and calls copy-number gains and losses.
 

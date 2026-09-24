@@ -127,6 +127,7 @@ class TestInstalledPipelineContract(unittest.TestCase):
             ]
             self.assertIn(("chr10", "gain"), calls, evidence)
             self.assertIn(("linkage-X", "loss"), calls, evidence)
+            self.assertTrue((root / "reference_qc.json").is_file())
             self.assertTrue(outputs.bins_bed.is_file())
             self.assertTrue(outputs.segments_bed.is_file())
             self.assertTrue(outputs.calls_bed.is_file())

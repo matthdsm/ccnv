@@ -697,6 +697,7 @@ class TestFlatFastaReference(unittest.TestCase):
                 set(table.column("contig").to_pylist()), {"chr1", "chr2", "chrX"}
             )
             self.assertFalse(any(table.column("masked").to_pylist()))
+            self.assertTrue((Path(tmpdir) / "ref_qc.json").is_file())
 
     def test_flat_reference_lets_predict_run_without_control_samples(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -715,8 +716,10 @@ class TestFlatFastaReference(unittest.TestCase):
                     pca_components=1,
                     nearest_bins=2,
                     min_cohort_size=2,
+                    qc_report=False,
                 )
             )
+            self.assertFalse((root / "ref_qc.json").is_file())
             sample = _sample_table(
                 [200, 200, 50, 100, 50],
                 contigs=["chr1", "chr1", "chr1", "chr2", "chr2"],
