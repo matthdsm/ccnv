@@ -79,7 +79,8 @@ pixi run python benchmarks/run_benchmarks.py --scale 2 --repeats 3
 - **Typing:** Use maximal type annotations
 
 ### Code Changes
-- All changes should be make through a pull request. Each pull request needs to be recorded in `CHANGELOG.md`, following best practices found [here](https://keepachangelog.com/en/1.1.0/#how)
+
+- All changes should be made through a pull request. Each pull request needs to be recorded in `CHANGELOG.md`, following best practices found [here](https://keepachangelog.com/en/1.1.0/#how)
 
 ### Testing Guidelines
 
