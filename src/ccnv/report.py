@@ -1,4 +1,5 @@
 import logging
+import re
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -101,6 +102,16 @@ def write_outputs(
     )
 
 
+def natural_sort_key(name: str) -> tuple[tuple[int, int | str], ...]:
+    """Return key for natural sort order treating embedded numbers as integers."""
+
+    return tuple(
+        (0, int(chunk)) if chunk.isdigit() else (1, chunk.casefold())
+        for chunk in re.split(r"(\d+)", name)
+        if chunk
+    )
+
+
 def write_genome_plot(
     path: Path,
     bins: tuple[BinResult, ...],
@@ -110,8 +121,15 @@ def write_genome_plot(
     """Write a dependency-free SVG with true contig-length genome offsets."""
 
     total_raw_bins = sum(b.starts.size for b in bins)
+    raw_contigs = dict.fromkeys(
+        [contig for result in bins for contig in result.contigs]
+        + [item.contig for item in segments]
+    )
     ordered = tuple(
-        dict.fromkeys(contig for result in bins for contig in result.contigs)
+        sorted(
+            (c for c in raw_contigs if c in contig_lengths and contig_lengths[c] > 0),
+            key=natural_sort_key,
+        )
     )
     logger.debug(
         "generating genome SVG plot %s (%d contigs, %d raw bins)",

@@ -9,6 +9,7 @@ from ccnv.report import (
     BINS_BED_HEADER,
     CALLS_BED_HEADER,
     SEGMENTS_BED_HEADER,
+    natural_sort_key,
     write_genome_plot,
     write_outputs,
 )
@@ -151,6 +152,68 @@ class TestReport(unittest.TestCase):
             self.assertEqual(tuple(seg_lines[0].split("\t")), SEGMENTS_BED_HEADER)
             call_lines = outputs.calls_bed.read_text().splitlines()
             self.assertEqual(tuple(call_lines[0].split("\t")), CALLS_BED_HEADER)
+
+    def test_natural_sort_key(self) -> None:
+        raw = [
+            "chr1",
+            "chr10",
+            "chr11",
+            "chr2",
+            "chr20",
+            "chr22",
+            "chr3",
+            "chrX",
+            "chrY",
+        ]
+        sorted_contigs = sorted(raw, key=natural_sort_key)
+        self.assertEqual(
+            sorted_contigs,
+            [
+                "chr1",
+                "chr2",
+                "chr3",
+                "chr10",
+                "chr11",
+                "chr20",
+                "chr22",
+                "chrX",
+                "chrY",
+            ],
+        )
+
+    def test_write_genome_plot_natural_chrom_sort_order(self) -> None:
+        contig_lengths = {
+            "chr10": 50_000,
+            "chr2": 50_000,
+            "chr1": 50_000,
+            "chrY": 50_000,
+            "chrX": 50_000,
+        }
+        bins = (
+            BinResult(
+                branch="autosomal",
+                contigs=("chr10", "chr2", "chr1", "chrY", "chrX"),
+                starts=np.array([0, 0, 0, 0, 0], dtype=np.int64),
+                ends=np.array([50_000, 50_000, 50_000, 50_000, 50_000], dtype=np.int64),
+                ratios=np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+                zscores=np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+                weights=np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64),
+                reference_sizes=np.array([10, 10, 10, 10, 10], dtype=np.int64),
+                masked=np.array([False, False, False, False, False], dtype=bool),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svg_path = Path(tmpdir) / "natural_plot.svg"
+            write_genome_plot(svg_path, bins, (), contig_lengths)
+            content = svg_path.read_text(encoding="utf-8")
+
+        root = ET.fromstring(content)
+        texts = [
+            t.text
+            for t in root.findall("{http://www.w3.org/2000/svg}text")
+            if "rotate(45)" in t.attrib.get("transform", "")
+        ]
+        self.assertEqual(texts, ["chr1", "chr2", "chr10", "chrX", "chrY"])
 
 
 if __name__ == "__main__":
