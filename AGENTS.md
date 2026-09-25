@@ -42,7 +42,7 @@ A fixed human chromosome layout is intentionally absent, the tool is meant to be
 
 - Schema version `1.0.0`; all coordinates are 0-based half-open.
 - Sample rows are `contig`, `start`, `end`, and `count`.
-- Reference rows add branch, mask, PCA, nearest-reference, and null-ratio model fields.
+- Reference rows add branch, mask, PCA, nearest-reference indices, mean distance, and null-model fields.
 - Alignment-header contig names, order, lengths, and partial final bins are authoritative. Readers reject incompatible versions, layouts, and bounds.
 
 ## Development Workflow

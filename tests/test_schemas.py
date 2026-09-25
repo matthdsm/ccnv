@@ -7,6 +7,7 @@ import pyarrow as pa
 from ccnv.models import ReadFilters
 from ccnv.schemas import (
     COORDINATE_SYSTEM,
+    REFERENCE_SCHEMA,
     SAMPLE_SCHEMA,
     SCHEMA_VERSION,
     ArtifactKind,
@@ -147,6 +148,66 @@ class TestSchemaContracts(unittest.TestCase):
             bin_coordinates(table),
             (("chr1", 0, 100), ("chr2", 0, 80)),
         )
+
+    def test_reference_schema_accepted_and_old_rejected(self) -> None:
+        ref_meta = metadata_for(
+            ArtifactKind.REFERENCE,
+            contig_lengths={"chr1": 200},
+            values={
+                "sample_identities": [],
+                "model": {"branches": ["autosomal"]},
+            },
+        )
+        ref_table = pa.table(
+            {
+                "branch": ["autosomal", "autosomal"],
+                "contig": ["chr1", "chr1"],
+                "start": pa.array([0, 100], type=pa.int64()),
+                "end": pa.array([100, 200], type=pa.int64()),
+                "masked": [False, False],
+                "pca_mean": [0.0, 0.0],
+                "pca_loadings": [[0.1], [0.1]],
+                "nearest_ref_indices": [[1], [0]],
+                "mean_distance": pa.array([0.5, 0.5], type=pa.float32()),
+                "null_mean": [0.0, 0.0],
+                "null_std": [0.1, 0.1],
+            },
+            schema=REFERENCE_SCHEMA.with_metadata(ref_meta),
+        )
+        validate_schema(ref_table.schema, ArtifactKind.REFERENCE)
+        validate_table(ref_table, ArtifactKind.REFERENCE)
+
+        # Old schema with nearest_ref_distances and null_ratios is rejected
+        old_schema = pa.schema(
+            [
+                pa.field("branch", pa.string(), nullable=False),
+                pa.field("contig", pa.string(), nullable=False),
+                pa.field("start", pa.int64(), nullable=False),
+                pa.field("end", pa.int64(), nullable=False),
+                pa.field("masked", pa.bool_(), nullable=False),
+                pa.field("pca_mean", pa.float64(), nullable=False),
+                pa.field("pca_loadings", pa.list_(pa.float64()), nullable=False),
+                pa.field("nearest_ref_indices", pa.list_(pa.int32()), nullable=False),
+                pa.field(
+                    "nearest_ref_distances", pa.list_(pa.float64()), nullable=False
+                ),
+                pa.field("null_ratios", pa.list_(pa.float64()), nullable=False),
+            ]
+        )
+        with self.assertRaisesRegex(SchemaError, "fields do not match"):
+            validate_schema(old_schema.with_metadata(ref_meta), ArtifactKind.REFERENCE)
+
+    def test_unsupported_schema_version_rejected(self) -> None:
+        with self.assertRaisesRegex(SchemaError, "unsupported schema version"):
+            metadata_for(
+                ArtifactKind.REFERENCE,
+                contig_lengths={"chr1": 200},
+                values={
+                    "schema_version": "9.9.9",
+                    "sample_identities": [],
+                    "model": {"branches": ["autosomal"]},
+                },
+            )
 
 
 if __name__ == "__main__":

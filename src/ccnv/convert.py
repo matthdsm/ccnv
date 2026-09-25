@@ -231,9 +231,15 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
         raise ValueError("table metadata lacks contig_lengths")
 
     contig_col = table.column("contig").to_pylist()
-    start_col = np.asarray(table.column("start").to_pylist(), dtype=np.int64)
-    end_col = np.asarray(table.column("end").to_pylist(), dtype=np.int64)
-    count_col = np.asarray(table.column("count").to_pylist(), dtype=np.float64)
+    start_col = np.asarray(
+        table.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
+    )
+    end_col = np.asarray(
+        table.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
+    )
+    count_col = np.asarray(
+        table.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
+    )
 
     new_contigs: list[np.ndarray] = []
     new_starts: list[np.ndarray] = []

@@ -301,8 +301,9 @@ def _write_reference(path: Path) -> Path:
             "pca_mean": pa.array([1.0], type=pa.float64()),
             "pca_loadings": pa.array([[0.1]], type=pa.list_(pa.float64())),
             "nearest_ref_indices": pa.array([[0]], type=pa.list_(pa.int32())),
-            "nearest_ref_distances": pa.array([[0.5]], type=pa.list_(pa.float64())),
-            "null_ratios": pa.array([[1.0]], type=pa.list_(pa.float64())),
+            "mean_distance": pa.array([0.5], type=pa.float32()),
+            "null_mean": pa.array([0.0], type=pa.float64()),
+            "null_std": pa.array([0.1], type=pa.float64()),
         },
         schema=REFERENCE_SCHEMA.with_metadata(metadata),
     )

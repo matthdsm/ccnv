@@ -252,10 +252,15 @@ def compute_branch_qc(
             "message": "all bins masked",
         }
 
-    distances = unmasked_table.column("nearest_ref_distances").to_pylist()
+    mean_d = (
+        unmasked_table.column("mean_distance")
+        .to_numpy(zero_copy_only=False)
+        .astype(np.float64)
+    )
+    indices_col = unmasked_table.column("nearest_ref_indices").combine_chunks()
+    offsets = indices_col.offsets.to_numpy()
+    n_refs = (offsets[1:] - offsets[:-1]).astype(np.int64)
     contigs = np.asarray(unmasked_table.column("contig"))
-
-    mean_d, n_refs = compute_per_bin_stats(distances)
     valid = np.isfinite(mean_d)
     n_valid = int(np.sum(valid))
     if n_valid == 0:

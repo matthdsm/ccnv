@@ -136,10 +136,9 @@ class TestReferenceSchemaRejection(unittest.TestCase):
                 "pca_mean": pa.array([0.0, 0.0], type=pa.float64()),
                 "pca_loadings": pa.array([[0.1], [0.1]], type=pa.list_(pa.float64())),
                 "nearest_ref_indices": pa.array([[], []], type=pa.list_(pa.int32())),
-                "nearest_ref_distances": pa.array(
-                    [[], []], type=pa.list_(pa.float64())
-                ),
-                "null_ratios": pa.array([[], []], type=pa.list_(pa.float64())),
+                "mean_distance": pa.array([0.0, 0.0], type=pa.float32()),
+                "null_mean": pa.array([0.0, 0.0], type=pa.float64()),
+                "null_std": pa.array([0.0, 0.0], type=pa.float64()),
             },
             schema=REFERENCE_SCHEMA.with_metadata(metadata),
         )
@@ -578,6 +577,48 @@ class TestSexInference(unittest.TestCase):
                 model["sample_sexes"],
                 ["female", "female", "female", "male", "male", "male"],
             )
+
+    def test_reference_table_schema_and_varying_cohort_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            contigs = ["chr1", "chr1", "chr2", "chr2"]
+            starts = [0, 100, 0, 100]
+            ends = [100, 200, 100, 200]
+            lengths = {"chr1": 200, "chr2": 200}
+
+            for cohort_size in (4, 7):
+                paths = []
+                for i in range(cohort_size):
+                    counts = [10 + i, 12 - i % 3, 15 + i % 2, 9 + i]
+                    table = _sample_table(
+                        counts,
+                        contigs=contigs,
+                        starts=starts,
+                        ends=ends,
+                        contig_lengths=lengths,
+                    )
+                    p = _write_sample(root, f"sample_{cohort_size}_{i}.ccnv", table)
+                    paths.append(p)
+
+                ref_prefix = root / f"ref_{cohort_size}"
+                config = ReferenceConfig(
+                    samples=tuple(paths),
+                    prefix=ref_prefix,
+                    pca_components=2,
+                    nearest_bins=1,
+                    min_cohort_size=4,
+                )
+                run(config)
+                ref_path = root / f"ref_{cohort_size}.ccnv"
+                table = pq.read_table(ref_path)
+                validate_table(table, ArtifactKind.REFERENCE)
+                self.assertIn("mean_distance", table.column_names)
+                self.assertIn("null_mean", table.column_names)
+                self.assertIn("null_std", table.column_names)
+                self.assertNotIn("nearest_ref_distances", table.column_names)
+                self.assertNotIn("null_ratios", table.column_names)
+                self.assertEqual(len(table.column("null_mean")), 4)
+                self.assertEqual(len(table.column("null_std")), 4)
 
 
 class TestReferencePublishedCrams(unittest.TestCase):

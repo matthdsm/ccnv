@@ -145,7 +145,7 @@ class TestLoggingVerbosity(unittest.TestCase):
             self.assertIn("PCA fitted 2 components: explained variance", res.output)
             self.assertIn("mask kept", res.output)
             self.assertIn("selecting 5 nearest off-contig bins", res.output)
-            self.assertIn("null ratios computed for", res.output)
+            self.assertIn("null models computed for", res.output)
             self.assertIn("wrote reference parquet", res.output)
             self.assertIn("evaluating reference QC", res.output)
             self.assertIn("branch autosomal QC:", res.output)

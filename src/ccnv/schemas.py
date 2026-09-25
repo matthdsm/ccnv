@@ -8,6 +8,7 @@ from typing import Final
 import pyarrow as pa
 
 SCHEMA_VERSION: Final[str] = "1.0.0"
+SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset({"1.0.0"})
 COORDINATE_SYSTEM: Final[str] = "0-based-half-open"
 METADATA_PREFIX: Final[str] = "ccnv."
 
@@ -40,8 +41,9 @@ REFERENCE_SCHEMA: Final[pa.Schema] = pa.schema(
         pa.field("pca_mean", pa.float64(), nullable=False),
         pa.field("pca_loadings", pa.list_(pa.float64()), nullable=False),
         pa.field("nearest_ref_indices", pa.list_(pa.int32()), nullable=False),
-        pa.field("nearest_ref_distances", pa.list_(pa.float64()), nullable=False),
-        pa.field("null_ratios", pa.list_(pa.float64()), nullable=False),
+        pa.field("mean_distance", pa.float32(), nullable=False),
+        pa.field("null_mean", pa.float64(), nullable=False),
+        pa.field("null_std", pa.float64(), nullable=False),
     ]
 )
 
@@ -129,10 +131,10 @@ def validate_metadata(metadata: Mapping[str, object], kind: ArtifactKind) -> Non
         raise SchemaError(f"missing {kind.value} metadata: {', '.join(missing)}")
     if metadata["artifact_kind"] != kind.value:
         raise SchemaError(f"expected artifact kind {kind.value!r}")
-    if metadata["schema_version"] != SCHEMA_VERSION:
+    version = metadata.get("schema_version")
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
         raise SchemaError(
-            f"unsupported schema version {metadata['schema_version']!r}; "
-            f"expected {SCHEMA_VERSION!r}"
+            f"unsupported schema version {version!r}; expected {SCHEMA_VERSION!r}"
         )
     if metadata["coordinate_system"] != COORDINATE_SYSTEM:
         raise SchemaError(f"coordinates must be {COORDINATE_SYSTEM}")
@@ -176,7 +178,9 @@ def validate_schema(schema: pa.Schema, kind: ArtifactKind) -> None:
     expected = SAMPLE_SCHEMA if kind is ArtifactKind.SAMPLE else REFERENCE_SCHEMA
     if not schema.equals(expected, check_metadata=False):
         raise SchemaError(f"{kind.value} fields do not match schema {SCHEMA_VERSION}")
-    validate_metadata(decode_metadata(schema.metadata), kind)
+
+    metadata = decode_metadata(schema.metadata)
+    validate_metadata(metadata, kind)
 
 
 def bin_coordinates(table: pa.Table) -> tuple[tuple[str, int, int], ...]:
@@ -200,15 +204,41 @@ def validate_table(table: pa.Table, kind: ArtifactKind) -> None:
     contig_lengths = metadata["contig_lengths"]
     assert isinstance(contig_lengths, dict)
 
+    # Fast path for large tables: check bounds and duplicates via PyArrow/NumPy
+    if table.num_rows > 1000:
+        import numpy as np
+
+        starts = table.column("start").to_numpy(zero_copy_only=False)
+        ends = table.column("end").to_numpy(zero_copy_only=False)
+        contig_arr = np.asarray(table.column("contig").to_numpy(zero_copy_only=False))
+        unique_contigs = set(table.column("contig").unique().to_pylist())
+
+        all_contigs_declared = unique_contigs.issubset(contig_lengths.keys())
+        basic_bounds_ok = bool(np.all(starts >= 0) and np.all(ends > starts))
+        lengths_ok = all_contigs_declared and all(
+            bool(np.all(ends[contig_arr == c] <= contig_lengths[c]))
+            for c in unique_contigs
+        )
+
+        cols = (
+            ["branch", "contig", "start", "end"]
+            if kind is ArtifactKind.REFERENCE
+            else ["contig", "start", "end"]
+        )
+        no_duplicates = table.group_by(cols).aggregate([]).num_rows == table.num_rows
+
+        if all_contigs_declared and basic_bounds_ok and lengths_ok and no_duplicates:
+            return
+
     contigs: list[str] = table.column("contig").to_pylist()
-    starts: list[int] = table.column("start").to_pylist()
-    ends: list[int] = table.column("end").to_pylist()
+    starts_list: list[int] = table.column("start").to_pylist()
+    ends_list: list[int] = table.column("end").to_pylist()
     branches: list[str] | None = (
         table.column("branch").to_pylist() if kind is ArtifactKind.REFERENCE else None
     )
     seen: set[tuple[object, ...]] = set()
     for index, (contig, start, end) in enumerate(
-        zip(contigs, starts, ends, strict=True)
+        zip(contigs, starts_list, ends_list, strict=True)
     ):
         length = contig_lengths.get(contig)
         if not isinstance(length, int):

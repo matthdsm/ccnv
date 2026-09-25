@@ -195,8 +195,9 @@ class TestReferenceQC(unittest.TestCase):
                     "pca_mean": [1.0] * n_bins,
                     "pca_loadings": [[0.1, 0.2]] * n_bins,
                     "nearest_ref_indices": [[1, 2]] * n_bins,
-                    "nearest_ref_distances": [[0.5, 0.6]] * n_bins,
-                    "null_ratios": [[1.0, 1.0]] * n_bins,
+                    "mean_distance": [0.55] * n_bins,
+                    "null_mean": [0.0] * n_bins,
+                    "null_std": [0.1] * n_bins,
                 },
                 schema=REFERENCE_SCHEMA.with_metadata(metadata),
             )
@@ -253,8 +254,9 @@ class TestReferenceQC(unittest.TestCase):
                     "pca_mean": [1.0] * n_bins,
                     "pca_loadings": [[0.0, 0.0]] * n_bins,
                     "nearest_ref_indices": [[1, 2]] * n_bins,
-                    "nearest_ref_distances": [[0.1, 0.2]] * n_bins,
-                    "null_ratios": [[1.0, 1.0]] * n_bins,
+                    "mean_distance": [0.15] * n_bins,
+                    "null_mean": [0.0] * n_bins,
+                    "null_std": [0.1] * n_bins,
                 },
                 schema=REFERENCE_SCHEMA.with_metadata(metadata),
             )

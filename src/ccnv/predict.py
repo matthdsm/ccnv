@@ -36,7 +36,6 @@ __all__ = (
     "PredictionInput",
     "ProjectedCoverage",
     "call_segment",
-    "distance_cutoff",
     "load_inputs",
     "normalize_branch",
     "run",
@@ -77,8 +76,9 @@ class BranchModel:
     pca_mean: NDArray[np.float64]
     pca_loadings: NDArray[np.float64]
     nearest_indices: tuple[NDArray[np.int64], ...]
-    nearest_distances: tuple[NDArray[np.float64], ...]
-    null_ratios: tuple[NDArray[np.float64], ...]
+    mean_distance: NDArray[np.float32]
+    null_mean: NDArray[np.float64]
+    null_std: NDArray[np.float64]
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,8 +149,7 @@ def load_inputs(
     reference_meta = decode_metadata(reference.schema.metadata)
     sample_lengths = _contig_lengths(sample_meta)
     reference_lengths = _contig_lengths(reference_meta)
-    sample_bins = set(bin_coordinates(sample))
-    branch_values = set(reference.column("branch").to_pylist())
+    branch_values = set(reference.column("branch").unique().to_pylist())
     chosen_sex = _resolve_sample_sex(sex, sample, reference_meta, branch_values)
     branches = [BRANCH_AUTOSOMAL]
     if BRANCH_AUTOSOMAL not in branch_values:
@@ -162,21 +161,6 @@ def load_inputs(
                 raise PredictError(f"reference has no {sex_branch!r} branch")
         else:
             branches.append(sex_branch)
-
-    required = {
-        (contig, start, end)
-        for branch, contig, start, end in zip(
-            reference.column("branch").to_pylist(),
-            reference.column("contig").to_pylist(),
-            reference.column("start").to_pylist(),
-            reference.column("end").to_pylist(),
-            strict=True,
-        )
-        if branch in branches
-    }
-    for contig in {item[0] for item in required}:
-        if sample_lengths.get(contig) != reference_lengths.get(contig):
-            raise PredictError(f"contig length mismatch for {contig!r}")
 
     ref_model = reference_meta.get("model")
     ref_bin_size = ref_model.get("bin_size") if isinstance(ref_model, dict) else None
@@ -193,11 +177,31 @@ def load_inputs(
         )
         sample = rebin_sample_table(sample, ref_bin_size)
 
-    sample_bins = set(bin_coordinates(sample))
-    missing = sorted(required - sample_bins)
-    if missing:
-        contigs = ", ".join(dict.fromkeys(item[0] for item in missing))
-        raise PredictError(f"sample is missing reference bins on contig(s): {contigs}")
+    ref_branch_arr = np.asarray(
+        reference.column("branch").to_numpy(zero_copy_only=False)
+    )
+    branch_mask = np.isin(ref_branch_arr, branches)
+    active_ref = reference.filter(pa.array(branch_mask))
+
+    ref_active_contigs = set(active_ref.column("contig").unique().to_pylist())
+    for contig in ref_active_contigs:
+        if sample_lengths.get(contig) != reference_lengths.get(contig):
+            raise PredictError(f"contig length mismatch for {contig!r}")
+
+    sample_contig_arr = np.asarray(
+        sample.column("contig").to_numpy(zero_copy_only=False)
+    )
+    sample_active_mask = np.isin(sample_contig_arr, list(ref_active_contigs))
+    sample_active = sample.filter(pa.array(sample_active_mask))
+    if sample_active.num_rows != active_ref.num_rows:
+        sample_bins = set(bin_coordinates(sample))
+        required = set(bin_coordinates(active_ref))
+        missing = sorted(required - sample_bins)
+        if missing:
+            contigs = ", ".join(dict.fromkeys(item[0] for item in missing))
+            raise PredictError(
+                f"sample is missing reference bins on contig(s): {contigs}"
+            )
 
     return PredictionInput(
         sample=sample,
@@ -211,77 +215,115 @@ def load_inputs(
 def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
     """Align sample counts to a branch and materialize its nested model arrays."""
 
-    reference_branches = np.asarray(
-        inputs.reference.column("branch").to_pylist(), dtype=object
-    )
-    row_indexes = np.flatnonzero(reference_branches == branch)
+    branch_col = inputs.reference.column("branch")
+    branch_arr = np.asarray(branch_col.to_numpy(zero_copy_only=False))
+    row_indexes = np.flatnonzero(branch_arr == branch)
     if row_indexes.size == 0:
         raise PredictError(f"reference branch {branch!r} is empty")
-    branch_table = inputs.reference.take(pa.array(row_indexes))
-    sample_counts = {
-        coordinate: float(count)
-        for coordinate, count in zip(
-            bin_coordinates(inputs.sample),
-            inputs.sample.column("count").to_pylist(),
-            strict=True,
-        )
-    }
-    coordinates = bin_coordinates(branch_table)
-    counts = np.asarray([sample_counts[item] for item in coordinates], dtype=np.float64)
-    masked = np.asarray(branch_table.column("masked").to_pylist(), dtype=np.bool_)
-    unmasked_count = int(np.count_nonzero(~masked))
-    loading_rows = branch_table.column("pca_loadings").to_pylist()
-    component_counts = {len(loading_rows[index]) for index in np.flatnonzero(~masked)}
-    if len(component_counts) != 1:
-        raise PredictError(f"branch {branch!r} has inconsistent PCA loading shapes")
-    n_components = component_counts.pop()
-    loadings = np.asarray(
-        [loading_rows[index] for index in np.flatnonzero(~masked)],
-        dtype=np.float64,
-    ).T
-    if loadings.shape != (n_components, unmasked_count):
-        raise PredictError(f"branch {branch!r} has invalid PCA loading shape")
 
-    unmasked_rows = np.flatnonzero(~masked)
-    nearest_values = branch_table.column("nearest_ref_indices").to_pylist()
-    distance_values = branch_table.column("nearest_ref_distances").to_pylist()
-    null_values = branch_table.column("null_ratios").to_pylist()
-    nearest = tuple(
-        np.asarray(nearest_values[index], dtype=np.int64) for index in unmasked_rows
+    start_row = int(row_indexes[0])
+    num_rows = int(row_indexes.size)
+    if int(row_indexes[-1]) == start_row + num_rows - 1:
+        branch_table = inputs.reference.slice(start_row, num_rows)
+    else:
+        branch_table = inputs.reference.take(pa.array(row_indexes))
+
+    branch_contigs = tuple(branch_table.column("contig").to_pylist())
+    branch_starts = branch_table.column("start").to_numpy(zero_copy_only=False)
+    branch_ends = branch_table.column("end").to_numpy(zero_copy_only=False)
+
+    sample_contig_arr = np.asarray(
+        inputs.sample.column("contig").to_numpy(zero_copy_only=False)
     )
-    distances = tuple(
-        np.asarray(distance_values[index], dtype=np.float64) for index in unmasked_rows
-    )
-    null_ratios = tuple(
-        np.asarray(null_values[index], dtype=np.float64) for index in unmasked_rows
-    )
-    if not (len(nearest) == len(distances) == len(null_ratios) == unmasked_count):
-        raise PredictError(
-            f"branch {branch!r} nested arrays do not align with its mask"
+    branch_contig_set = set(branch_contigs)
+    sample_branch_mask = np.isin(sample_contig_arr, list(branch_contig_set))
+    sample_branch_table = inputs.sample.filter(pa.array(sample_branch_mask))
+    if (
+        sample_branch_table.num_rows == branch_table.num_rows
+        and sample_branch_table.column("start").equals(branch_table.column("start"))
+        and sample_branch_table.column("end").equals(branch_table.column("end"))
+        and sample_branch_table.column("contig").equals(branch_table.column("contig"))
+    ):
+        counts = (
+            sample_branch_table.column("count")
+            .to_numpy(zero_copy_only=False)
+            .astype(np.float64)
         )
-    for indexes, values in zip(nearest, distances, strict=True):
-        if (
-            indexes.size != values.size
-            or np.any(indexes < 0)
-            or np.any(indexes >= unmasked_count)
-        ):
+    else:
+        sample_counts = {
+            coordinate: float(count)
+            for coordinate, count in zip(
+                bin_coordinates(inputs.sample),
+                inputs.sample.column("count").to_pylist(),
+                strict=True,
+            )
+        }
+        coordinates = bin_coordinates(branch_table)
+        counts = np.asarray(
+            [sample_counts[item] for item in coordinates], dtype=np.float64
+        )
+
+    masked = (
+        branch_table.column("masked").to_numpy(zero_copy_only=False).astype(np.bool_)
+    )
+    unmasked_rows = np.flatnonzero(~masked)
+    unmasked_count = int(unmasked_rows.size)
+
+    pca_mean_col = branch_table.column("pca_mean").to_numpy(zero_copy_only=False)
+    pca_mean = np.nan_to_num(pca_mean_col[unmasked_rows], nan=0.0).astype(np.float64)
+
+    loading_chunk = branch_table.column("pca_loadings").combine_chunks()
+    loading_offsets = loading_chunk.offsets.to_numpy()
+    comp_sizes = loading_offsets[unmasked_rows + 1] - loading_offsets[unmasked_rows]
+    unique_comp_sizes = np.unique(comp_sizes)
+    if len(unique_comp_sizes) != 1:
+        raise PredictError(f"branch {branch!r} has inconsistent PCA loading shapes")
+    n_components = int(unique_comp_sizes[0])
+    loadings_flat = loading_chunk.values.to_numpy()
+    if unmasked_count == branch_table.num_rows:
+        loadings = loadings_flat.reshape(unmasked_count, n_components).T.astype(
+            np.float64
+        )
+    else:
+        loadings = np.empty((n_components, unmasked_count), dtype=np.float64)
+        for i, row in enumerate(unmasked_rows):
+            start = loading_offsets[row]
+            loadings[:, i] = loadings_flat[start : start + n_components]
+
+    nearest_chunk = branch_table.column("nearest_ref_indices").combine_chunks()
+    nearest_offsets = nearest_chunk.offsets.to_numpy()
+    nearest_flat = nearest_chunk.values.to_numpy()
+    nearest = tuple(
+        nearest_flat[nearest_offsets[row] : nearest_offsets[row + 1]].astype(np.int64)
+        for row in unmasked_rows
+    )
+
+    mean_distance = branch_table.column("mean_distance").to_numpy(zero_copy_only=False)[
+        unmasked_rows
+    ]
+    null_mean = branch_table.column("null_mean").to_numpy(zero_copy_only=False)[
+        unmasked_rows
+    ]
+    null_std = branch_table.column("null_std").to_numpy(zero_copy_only=False)[
+        unmasked_rows
+    ]
+    for indexes in nearest:
+        if np.any(indexes < 0) or np.any(indexes >= unmasked_count):
             raise PredictError(f"branch {branch!r} has invalid nearest references")
 
     return BranchModel(
         branch=branch,
-        contigs=tuple(branch_table.column("contig").to_pylist()),
-        starts=np.asarray(branch_table.column("start").to_pylist(), dtype=np.int64),
-        ends=np.asarray(branch_table.column("end").to_pylist(), dtype=np.int64),
+        contigs=branch_contigs,
+        starts=branch_starts,
+        ends=branch_ends,
         counts=counts,
         masked=masked,
-        pca_mean=np.asarray(
-            branch_table.filter(pa.array(~masked)).column("pca_mean").to_pylist(),
-            dtype=np.float64,
-        ),
+        pca_mean=pca_mean,
         pca_loadings=loadings,
         nearest_indices=nearest,
-        nearest_distances=distances,
-        null_ratios=null_ratios,
+        mean_distance=mean_distance,
+        null_mean=null_mean,
+        null_std=null_std,
     )
 
 
@@ -320,39 +362,43 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
     projected = project_coverage(model)
     unmasked_positions = np.flatnonzero(~model.masked)
     corrected = projected.corrected[unmasked_positions]
+    n_unmasked = unmasked_positions.size
+
     ratios = np.full(model.counts.shape, np.nan, dtype=np.float64)
     zscores = np.full(model.counts.shape, np.nan, dtype=np.float64)
     weights = np.zeros(model.counts.shape, dtype=np.float64)
     reference_sizes = np.zeros(model.counts.shape, dtype=np.int64)
-    cutoff = distance_cutoff(model.nearest_distances, config.mask_repeats)
+
     eligible = np.isfinite(corrected) & (corrected > 0)
     local_ratios = np.full(corrected.shape, np.nan, dtype=np.float64)
     local_zscores = np.full(corrected.shape, np.nan, dtype=np.float64)
 
+    filtered_neighbors = model.nearest_indices
+    null_mean = model.null_mean
+    null_std = model.null_std
+
+    min_ref_bins = config.min_reference_bins
+
     for iteration in range(config.mask_repeats):
-        for index, (neighbors, distances, null) in enumerate(
-            zip(
-                model.nearest_indices,
-                model.nearest_distances,
-                model.null_ratios,
-                strict=True,
-            )
-        ):
-            size, ratio, zscore = _within_sample_ratio(
-                corrected[index],
-                neighbors,
-                distances,
-                null,
-                corrected=corrected,
-                eligible=eligible,
-                cutoff=cutoff,
-                index=index,
-                min_reference_bins=config.min_reference_bins,
-            )
-            reference_sizes[unmasked_positions[index]] = size
-            if ratio is not None:
-                local_ratios[index] = ratio
-                local_zscores[index] = zscore
+        for index in range(n_unmasked):
+            val = corrected[index]
+            neighbors = filtered_neighbors[index]
+            mask = eligible[neighbors] & (neighbors != index)
+            selected = neighbors[mask]
+            n_sel = int(selected.size)
+            reference_sizes[unmasked_positions[index]] = n_sel
+            if not np.isfinite(val) or val <= 0 or n_sel < min_ref_bins:
+                local_ratios[index] = np.nan
+                local_zscores[index] = np.nan
+                continue
+            baseline = float(np.median(corrected[selected]))
+            if not np.isfinite(baseline) or baseline <= 0:
+                continue
+            ratio = float(np.log2(val / baseline))
+            local_ratios[index] = ratio
+            s = null_std[index]
+            local_zscores[index] = (ratio - null_mean[index]) / s if s > 0 else 0.0
+
         eligible = (
             np.isfinite(corrected)
             & np.isfinite(local_zscores)
@@ -381,13 +427,12 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
     )
     ratios[unmasked_positions] = local_ratios
     zscores[unmasked_positions] = local_zscores
-    for local, distances in enumerate(model.nearest_distances):
-        finite = distances[np.isfinite(distances) & (distances <= cutoff)]
-        if finite.size:
-            mean_distance = float(np.mean(np.sqrt(np.maximum(finite, 0.0))))
-            weights[unmasked_positions[local]] = (
-                1.0 / mean_distance if mean_distance > 0 else 1.0
-            )
+
+    valid_dist = (model.mean_distance > 0) & np.isfinite(model.mean_distance)
+    unmasked_weights = np.zeros(n_unmasked, dtype=np.float64)
+    unmasked_weights[valid_dist] = 1.0 / model.mean_distance[valid_dist]
+    unmasked_weights[~valid_dist] = 1.0
+    weights[unmasked_positions] = unmasked_weights
     valid = (
         projected.usable
         & np.isfinite(ratios)
@@ -409,54 +454,6 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
         reference_sizes=reference_sizes,
         masked=~valid,
     )
-
-
-def _within_sample_ratio(
-    value: float,
-    neighbors: NDArray[np.int64],
-    distances: NDArray[np.float64],
-    null: NDArray[np.float64],
-    *,
-    corrected: NDArray[np.float64],
-    eligible: NDArray[np.bool_],
-    cutoff: float,
-    index: int,
-    min_reference_bins: int,
-) -> tuple[int, float | None, float | None]:
-    selected = neighbors[
-        (distances <= cutoff) & eligible[neighbors] & (neighbors != index)
-    ]
-    if (
-        not np.isfinite(value)
-        or value <= 0
-        or selected.size < min_reference_bins
-        or null.size < 2
-    ):
-        return selected.size, np.nan, np.nan
-    baseline = float(np.median(corrected[selected]))
-    if not np.isfinite(baseline) or baseline <= 0:
-        return selected.size, None, None
-    ratio = float(np.log2(value / baseline))
-    null_finite = null[np.isfinite(null)]
-    null_std = float(np.std(null_finite, ddof=1))
-    zscore = (ratio - float(np.mean(null_finite))) / null_std if null_std > 0 else 0.0
-    return selected.size, ratio, zscore
-
-
-def distance_cutoff(distances: tuple[NDArray[np.float64], ...], repeats: int) -> float:
-    """Return an iterative three-sigma cutoff for nearest-bin distances."""
-
-    values = np.concatenate(distances) if distances else np.empty(0)
-    values = values[np.isfinite(values) & (values >= 0)]
-    if values.size == 0:
-        return np.inf
-    cutoff = np.inf
-    for _ in range(repeats):
-        selected = values[values < cutoff]
-        if selected.size == 0:
-            break
-        cutoff = float(np.mean(selected) + 3.0 * np.std(selected))
-    return cutoff
 
 
 def call_segment(

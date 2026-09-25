@@ -81,12 +81,9 @@ def _reference_table() -> pa.Table:
             "pca_mean": pa.array([0.5, 0.5], type=pa.float64()),
             "pca_loadings": pa.array([[0.0], [0.0]], type=pa.list_(pa.float64())),
             "nearest_ref_indices": pa.array([[1], [0]], type=pa.list_(pa.int32())),
-            "nearest_ref_distances": pa.array(
-                [[1.0], [1.0]], type=pa.list_(pa.float64())
-            ),
-            "null_ratios": pa.array(
-                [[-0.1, 0.1], [-0.1, 0.1]], type=pa.list_(pa.float64())
-            ),
+            "mean_distance": pa.array([1.0, 1.0], type=pa.float32()),
+            "null_mean": pa.array([0.0, 0.0], type=pa.float64()),
+            "null_std": pa.array([0.141421356, 0.141421356], type=pa.float64()),
         },
         schema=REFERENCE_SCHEMA.with_metadata(metadata),
     )
@@ -109,8 +106,9 @@ class TestNormalization(unittest.TestCase):
                 np.array([0, 1]),
                 np.array([0, 1]),
             ),
-            nearest_distances=tuple(np.array([1.0, 1.2]) for _ in range(4)),
-            null_ratios=tuple(np.array([-0.1, 0.0, 0.1]) for _ in range(4)),
+            mean_distance=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            null_mean=np.zeros(4, dtype=np.float64),
+            null_std=np.full(4, 0.1, dtype=np.float64),
         )
         config = PredictConfig(
             Path("sample"),

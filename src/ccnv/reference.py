@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final, Literal
@@ -102,7 +103,18 @@ def run(config: ReferenceConfig) -> None:
     path = parquet_path(config.prefix)
     logger.debug("writing reference parquet %s (%d rows)", path, table.num_rows)
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, path)
+    pq.write_table(
+        table,
+        path,
+        compression="zstd",
+        compression_level=3,
+        use_dictionary=["branch", "contig"],
+        column_encoding={
+            "start": "DELTA_BINARY_PACKED",
+            "end": "DELTA_BINARY_PACKED",
+            "nearest_ref_indices.list.element": "DELTA_BINARY_PACKED",
+        },
+    )
     logger.debug(
         "wrote reference parquet %s (%.1f KB)",
         path,
@@ -584,10 +596,9 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
             "nearest_ref_indices": pa.array(
                 rows["nearest_ref_indices"], type=pa.list_(pa.int32())
             ),
-            "nearest_ref_distances": pa.array(
-                rows["nearest_ref_distances"], type=pa.list_(pa.float64())
-            ),
-            "null_ratios": pa.array(rows["null_ratios"], type=pa.list_(pa.float64())),
+            "mean_distance": pa.array(rows["mean_distance"], type=pa.float32()),
+            "null_mean": pa.array(rows["null_mean"], type=pa.float64()),
+            "null_std": pa.array(rows["null_std"], type=pa.float64()),
         },
         schema=REFERENCE_SCHEMA.with_metadata(metadata),
     )
@@ -723,6 +734,39 @@ def _contig_fractions(cohort: Cohort, contig: str) -> NDArray[np.float64]:
     return cohort.counts[mask].sum(axis=0) / totals
 
 
+def distance_cutoff(
+    distances: (
+        tuple[NDArray[np.float64], ...]
+        | NDArray[np.floating]
+        | Sequence[Sequence[float]]
+    ),
+    repeats: int = 3,
+) -> float:
+    """Return an iterative three-sigma cutoff for nearest-bin distances."""
+
+    if isinstance(distances, np.ndarray):
+        values = distances.ravel()
+    elif (
+        isinstance(distances, tuple)
+        and distances
+        and isinstance(distances[0], np.ndarray)
+    ):
+        values = np.concatenate(distances)
+    else:
+        values = np.asarray([d for sub in distances for d in sub], dtype=np.float64)
+
+    values = values[np.isfinite(values) & (values >= 0)]
+    if values.size == 0:
+        return float("inf")
+    cutoff = float("inf")
+    for _ in range(repeats):
+        selected = values[values < cutoff]
+        if selected.size == 0:
+            break
+        cutoff = float(np.mean(selected) + 3.0 * np.std(selected))
+    return cutoff
+
+
 def _empty_branch_columns() -> dict[str, list[object]]:
     return {
         "branch": [],
@@ -733,8 +777,9 @@ def _empty_branch_columns() -> dict[str, list[object]]:
         "pca_mean": [],
         "pca_loadings": [],
         "nearest_ref_indices": [],
-        "nearest_ref_distances": [],
-        "null_ratios": [],
+        "mean_distance": [],
+        "null_mean": [],
+        "null_std": [],
     }
 
 
@@ -793,15 +838,35 @@ def _append_branch(
         k=config.nearest_bins,
         max_batch_memory_mb=config.max_batch_memory_mb,
     )
-    null_ratios = _null_ratios(corrected, nearest_indices)
-    valid_nulls = [r for sub in null_ratios for r in sub if np.isfinite(r)]
+    null_mean, null_std = _null_models(corrected, nearest_indices)
+    valid_nulls = null_mean[np.isfinite(null_mean)]
     logger.debug(
-        "%s null ratios computed for %d bins (mean=%.4f, std=%.4f)",
+        "%s null models computed for %d bins (mean=%.4f, std=%.4f)",
         branch,
-        len(null_ratios),
-        float(np.mean(valid_nulls)) if valid_nulls else 0.0,
-        float(np.std(valid_nulls)) if valid_nulls else 0.0,
+        len(null_mean),
+        float(np.mean(valid_nulls)) if valid_nulls.size > 0 else 0.0,
+        float(np.std(valid_nulls)) if valid_nulls.size > 0 else 0.0,
     )
+
+    flat_distances = [d for sub in nearest_distances for d in sub if math.isfinite(d)]
+    dist_arr = np.asarray(flat_distances, dtype=np.float64)
+    cutoff = distance_cutoff(dist_arr, repeats=3)
+    logger.debug("%s distance cutoff computed: %.4f", branch, cutoff)
+
+    filtered_nearest: list[list[int]] = []
+    mean_distances: list[float] = []
+    for d_list, idx_list in zip(nearest_distances, nearest_indices, strict=True):
+        d_arr = np.asarray(d_list, dtype=np.float64)
+        idx_arr = np.asarray(idx_list, dtype=np.int32)
+        valid = (d_arr <= cutoff) & np.isfinite(d_arr)
+        if np.any(valid):
+            mean_dist = float(np.mean(np.sqrt(np.maximum(d_arr[valid], 0.0))))
+            mean_distances.append(mean_dist)
+            filtered_idx = np.sort(idx_arr[valid])
+            filtered_nearest.append(filtered_idx.tolist())
+        else:
+            mean_distances.append(0.0)
+            filtered_nearest.append([])
 
     unmasked_iter = 0
     starts = cohort.starts[selected]
@@ -816,33 +881,39 @@ def _append_branch(
             rows["pca_mean"].append(0.0)
             rows["pca_loadings"].append([])
             rows["nearest_ref_indices"].append([])
-            rows["nearest_ref_distances"].append([])
-            rows["null_ratios"].append([])
+            rows["mean_distance"].append(0.0)
+            rows["null_mean"].append(0.0)
+            rows["null_std"].append(0.0)
             continue
         rows["masked"].append(False)
         rows["pca_mean"].append(float(pca_mean[unmasked_iter]))
         rows["pca_loadings"].append(pca_loadings[:, unmasked_iter].tolist())
-        rows["nearest_ref_indices"].append(nearest_indices[unmasked_iter])
-        rows["nearest_ref_distances"].append(nearest_distances[unmasked_iter])
-        rows["null_ratios"].append(null_ratios[unmasked_iter])
+        rows["nearest_ref_indices"].append(filtered_nearest[unmasked_iter])
+        rows["mean_distance"].append(mean_distances[unmasked_iter])
+        rows["null_mean"].append(float(null_mean[unmasked_iter]))
+        rows["null_std"].append(float(null_std[unmasked_iter]))
         unmasked_iter += 1
 
 
-def _null_ratios(
+def _null_models(
     corrected: NDArray[np.float64],
     nearest_indices: list[list[int]],
-) -> list[list[float]]:
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     n_null = min(_MAX_NULL_SAMPLES, corrected.shape[1])
-    ratios: list[list[float]] = []
+    n_bins = len(nearest_indices)
+    null_mean = np.zeros(n_bins, dtype=np.float64)
+    null_std = np.zeros(n_bins, dtype=np.float64)
     for bin_index, neighbors in enumerate(nearest_indices):
         if not neighbors:
-            ratios.append([0.0] * n_null)
             continue
         reference = np.median(corrected[neighbors, :n_null], axis=0)
         with np.errstate(divide="ignore", invalid="ignore"):
             values = np.log2(corrected[bin_index, :n_null] / reference)
-        ratios.append(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).tolist())
-    return ratios
+        values_clean = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+        null_mean[bin_index] = float(np.mean(values_clean))
+        s = float(np.std(values_clean, ddof=1)) if values_clean.size > 1 else 0.0
+        null_std[bin_index] = s if np.isfinite(s) and s > 0 else 0.0
+    return null_mean, null_std
 
 
 def _median_abs_deviation(values: NDArray[np.floating]) -> float:

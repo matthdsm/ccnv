@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Optimized reference schema (`SCHEMA_VERSION = "1.0.0"`), replacing variable-length `null_ratios` and `nearest_ref_distances` with pre-filtered sorted `nearest_ref_indices`, scalar `mean_distance`, `null_mean`, and `null_std`.
+- Reference Parquet writing now uses Zstandard (level 3) compression, dictionary encoding on categorical strings (`branch`, `contig`), and Delta Binary Packing on coordinates (`start`, `end`) and neighbor indices (`nearest_ref_indices.list.element`), shrinking reference files by ~6.5x (e.g., from 2.16 GB down to 333 MB).
+- Vectorized `predict.py`, `convert.py`, `reference_qc.py`, and `schemas.py` using PyArrow chunk buffer slicing and NumPy vectorized ops, slashing reference reading, bounds checking, and normalization time by over 5x.
 - Unified default bin size to 5,000 bp across `convert`, `reference`, and models.
 - `ccnv reference` accepts FASTA inputs as a positional argument alongside sample Parquet inputs, removing the `--fasta` option.
 - `ccnv reference` rebins sample counts to `--bin-size` when cohort samples differ in native bin size, requiring matching contig lengths.
