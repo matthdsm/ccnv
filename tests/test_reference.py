@@ -41,6 +41,7 @@ from ccnv.reference import (
     select_nearest_bins,
     validate_cohort,
 )
+from ccnv.reference_compute import compute_null_models
 from ccnv.schemas import (
     REFERENCE_SCHEMA,
     SAMPLE_SCHEMA,
@@ -831,6 +832,69 @@ class TestFlatFastaReference(unittest.TestCase):
     def test_neither_samples_nor_fasta_is_rejected(self) -> None:
         with self.assertRaisesRegex(ReferenceError, "sample Parquet paths or a FASTA"):
             run(ReferenceConfig(samples=(), prefix=Path("ref")))
+
+
+class TestParallelReference(unittest.TestCase):
+    def test_reference_config_threads_validation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
+            ReferenceConfig(samples=(Path("a.ccnv"),), prefix=Path("ref"), threads=0)
+        with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
+            ReferenceConfig(samples=(Path("a.ccnv"),), prefix=Path("ref"), threads=-1)
+
+    def test_select_nearest_bins_parallel_equivalence(self) -> None:
+        rng = np.random.default_rng(42)
+        n_bins = 2500
+        profiles = rng.normal(size=(n_bins, 5)).astype(np.float64)
+        contig_ids = np.repeat(np.arange(5), n_bins // 5)
+
+        idx_seq, dst_seq = select_nearest_bins(
+            profiles, contig_ids, k=10, max_batch_memory_mb=16, threads=1
+        )
+        idx_par, dst_par = select_nearest_bins(
+            profiles, contig_ids, k=10, max_batch_memory_mb=16, threads=2
+        )
+
+        self.assertEqual(idx_seq, idx_par)
+        np.testing.assert_allclose(dst_seq, dst_par, rtol=1e-12, atol=1e-12)
+
+    def test_compute_null_models_parallel_equivalence(self) -> None:
+        rng = np.random.default_rng(123)
+        n_bins = 6000
+        corrected = rng.uniform(0.5, 2.0, size=(n_bins, 10)).astype(np.float64)
+        indices = [
+            rng.choice(n_bins, size=20, replace=False).tolist() for _ in range(n_bins)
+        ]
+
+        mean_seq, std_seq = compute_null_models(corrected, indices, threads=1)
+        mean_par, std_par = compute_null_models(corrected, indices, threads=2)
+
+        np.testing.assert_allclose(mean_seq, mean_par, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(std_seq, std_par, rtol=1e-12, atol=1e-12)
+
+    def test_load_cohort_parallel_equivalence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for i in range(4):
+                p = Path(tmpdir) / f"sample_{i}.ccnv"
+                t = _sample_table(
+                    [10, 20, 30],
+                    contigs=["chr1", "chr1", "chr2"],
+                    starts=[0, 1000, 0],
+                    ends=[1000, 2000, 1000],
+                    bin_size=1000,
+                )
+                pq.write_table(t, p)
+                paths.append(p)
+
+            cohort_seq = load_cohort(tuple(paths), threads=1)
+            cohort_par = load_cohort(tuple(paths), threads=2)
+
+            np.testing.assert_array_equal(cohort_seq.counts, cohort_par.counts)
+            self.assertEqual(cohort_seq.contigs, cohort_par.contigs)
+            np.testing.assert_array_equal(cohort_seq.starts, cohort_par.starts)
+            np.testing.assert_array_equal(cohort_seq.ends, cohort_par.ends)
+            self.assertEqual(cohort_seq.contig_lengths, cohort_par.contig_lengths)
+            self.assertEqual(cohort_seq.bin_size, cohort_par.bin_size)
 
 
 def _write_tiny_fasta(path: Path, records: tuple[tuple[str, int], ...]) -> Path:

@@ -103,6 +103,11 @@ class ReferenceConfig:
     bin_size: int | None = None
     all_contigs: bool = False
     qc_report: bool = True
+    threads: int = 1
+
+    def __post_init__(self) -> None:
+        if self.threads <= 0:
+            raise ValueError("threads must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)

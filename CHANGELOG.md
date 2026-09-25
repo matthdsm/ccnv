@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Parallelized `ccnv reference` execution controlled by a `-t/--threads` flag (defaulting to system CPU count), multi-processing cohort sample loading and rebinning via `src/ccnv/cohort.py`, parallelizing batched off-contig nearest-bin selection via `src/ccnv/reference_compute.py`, and multi-processing null model derivation.
+- Extracted cohort ingestion and validation into `src/ccnv/cohort.py` and compute kernels into `src/ccnv/reference_compute.py`, keeping modules modular and strictly below 1,000 lines.
+- Replaced boolean array masking with precomputed contiguous contig slice bounds in `select_nearest_bins`, accelerating per-query candidate masking by over 400x.
+- Vectorized `rebin_sample_table` contig boundaries using NumPy run-length transitions instead of converting Arrow contig columns to Python string lists.
 - Optimized reference schema (`SCHEMA_VERSION = "1.0.0"`), replacing variable-length `null_ratios` and `nearest_ref_distances` with pre-filtered sorted `nearest_ref_indices`, scalar `mean_distance`, `null_mean`, and `null_std`.
 - Reference Parquet writing now uses Zstandard (level 3) compression, dictionary encoding on categorical strings (`branch`, `contig`), and Delta Binary Packing on coordinates (`start`, `end`) and neighbor indices (`nearest_ref_indices.list.element`), shrinking reference files by ~6.5x (e.g., from 2.16 GB down to 333 MB).
 - Vectorized `predict.py`, `convert.py`, `reference_qc.py`, and `schemas.py` using PyArrow chunk buffer slicing and NumPy vectorized ops, slashing reference reading, bounds checking, and normalization time by over 5x.

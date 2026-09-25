@@ -323,12 +323,26 @@ def reference(
             help="Generate reference quality control report",
         ),
     ] = True,
+    threads: Annotated[
+        int,
+        typer.Option(
+            "-t",
+            "--threads",
+            min=1,
+            help="CPU budget for parallel loading and reference modeling",
+        ),
+    ] = DEFAULT_THREADS,
     loglevel: LogLevelOption = LogLevel.warning,
 ) -> None:
     """Build a reference model from control samples or a flat FASTA layout."""
 
     configure_logging(loglevel)
-    cli_logger.debug("starting reference: prefix=%s, bin_size=%d", prefix, bin_size)
+    cli_logger.debug(
+        "starting reference: prefix=%s, bin_size=%d, threads=%d",
+        prefix,
+        bin_size,
+        threads,
+    )
     started = perf_counter()
     sample_paths: tuple[Path, ...] = ()
     fasta: Path | None = None
@@ -360,6 +374,7 @@ def reference(
                 sex_contigs=tuple(sex_contig),
                 sex_cutoff=sex_cutoff,
                 sex_signal_contig=sex_signal_contig,
+                threads=threads,
             )
         )
         cli_logger.debug("reference completed in %.3f s", perf_counter() - started)

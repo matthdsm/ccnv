@@ -230,7 +230,7 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
     if not isinstance(contig_lengths, dict) or not contig_lengths:
         raise ValueError("table metadata lacks contig_lengths")
 
-    contig_col = table.column("contig").to_pylist()
+    contig_arr = np.asarray(table.column("contig"))
     start_col = np.asarray(
         table.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
     )
@@ -246,19 +246,27 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
     new_ends: list[np.ndarray] = []
     new_counts: list[np.ndarray] = []
 
-    contig_indices: dict[str, list[int]] = {}
-    for idx, c in enumerate(contig_col):
-        contig_indices.setdefault(c, []).append(idx)
+    if len(contig_arr) == 0:
+        contig_slices: dict[str, tuple[int, int]] = {}
+    else:
+        changes = np.flatnonzero(contig_arr[1:] != contig_arr[:-1]) + 1
+        starts = np.concatenate(([0], changes))
+        ends = np.concatenate((changes, [len(contig_arr)]))
+        contig_slices = {
+            str(contig_arr[s]): (int(s), int(e))
+            for s, e in zip(starts, ends, strict=True)
+        }
 
     for contig_name, length in contig_lengths.items():
         target_starts, target_ends = bin_intervals(int(length), target_bin_size)
-        idxs = contig_indices.get(contig_name)
-        if idxs is None or len(idxs) == 0:
+        span = contig_slices.get(contig_name)
+        if span is None:
             target_counts = np.zeros(target_starts.size, dtype=np.float64)
         else:
-            s_starts = start_col[idxs]
-            s_ends = end_col[idxs]
-            s_counts = count_col[idxs]
+            s, e = span
+            s_starts = start_col[s:e]
+            s_ends = end_col[s:e]
+            s_counts = count_col[s:e]
             target_counts = rebin_counts(
                 s_starts, s_ends, s_counts, target_starts, target_ends
             )

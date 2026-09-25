@@ -6,25 +6,40 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from pathlib import Path
 from typing import Final, Literal
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pysam
 from numpy.typing import NDArray
 from sklearn.decomposition import PCA
 
-from ccnv.convert import bin_intervals, rebin_sample_table, select_layout
+from ccnv.cohort import (
+    Cohort as Cohort,
+)
+from ccnv.cohort import (
+    ReferenceError as ReferenceError,
+)
+from ccnv.cohort import (
+    cohort_from_fasta as cohort_from_fasta,
+)
+from ccnv.cohort import (
+    load_cohort as load_cohort,
+)
+from ccnv.cohort import (
+    validate_cohort as validate_cohort,
+)
 from ccnv.models import ReferenceConfig, parquet_path
+from ccnv.reference_compute import (
+    compute_null_models,
+)
+from ccnv.reference_compute import (
+    select_nearest_bins as select_nearest_bins,
+)
 from ccnv.reference_qc import run_reference_qc_on_table
 from ccnv.schemas import (
     REFERENCE_SCHEMA,
     ArtifactKind,
-    SchemaError,
-    bin_coordinates,
-    decode_metadata,
     metadata_for,
     validate_table,
 )
@@ -41,24 +56,6 @@ _MAX_NULL_SAMPLES: Final[int] = 100
 _SEPARATION_MAD_MULTIPLIER: Final[float] = 4.0
 
 logger = logging.getLogger(__name__)
-
-
-class ReferenceError(ValueError):
-    """Raised when a cohort cannot be turned into a reference."""
-
-
-@dataclass(frozen=True, slots=True)
-class Cohort:
-    """Aligned binned counts from compatible sample Parquet files."""
-
-    counts: NDArray[np.float64]
-    contigs: tuple[str, ...]
-    starts: NDArray[np.int64]
-    ends: NDArray[np.int64]
-    contig_lengths: dict[str, int]
-    bin_size: int
-    identities: tuple[object, ...]
-    paths: tuple[Path, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +87,11 @@ def run(config: ReferenceConfig) -> None:
             config = replace(config, sex_contigs=())
     else:
         logger.debug("loading %d sample parquet files", len(config.samples))
-        cohort = load_cohort(config.samples, target_bin_size=config.bin_size)
+        cohort = load_cohort(
+            config.samples,
+            target_bin_size=config.bin_size,
+            threads=config.threads,
+        )
     logger.debug(
         "loaded cohort: %d bins, %d samples, bin_size=%d",
         cohort.counts.shape[0],
@@ -128,187 +129,6 @@ def run(config: ReferenceConfig) -> None:
             write_json=True,
             emit_stderr=True,
         )
-
-
-def load_cohort(
-    paths: tuple[Path, ...],
-    target_bin_size: int | None = None,
-) -> Cohort:
-    """Load sample Parquet files and reject incompatible cohorts."""
-
-    if not paths:
-        raise ReferenceError("at least one sample Parquet path is required")
-    tables = tuple(_read_sample(path) for path in paths)
-    return validate_cohort(tables, paths, target_bin_size=target_bin_size)
-
-
-def cohort_from_fasta(
-    fasta: Path,
-    bin_size: int,
-    *,
-    n_samples: int,
-    all_contigs: bool = False,
-) -> Cohort:
-    """Build identical uniform-depth samples from FASTA contig lengths."""
-
-    if n_samples < 1:
-        raise ReferenceError("n_samples must be a positive integer")
-    names, lengths = _fasta_contigs(fasta, all_contigs=all_contigs)
-    contigs: list[str] = []
-    starts: list[int] = []
-    ends: list[int] = []
-    for name, length in zip(names, lengths, strict=True):
-        contig_starts, contig_ends = bin_intervals(length, bin_size)
-        contigs.extend([name] * contig_starts.size)
-        starts.extend(int(value) for value in contig_starts)
-        ends.extend(int(value) for value in contig_ends)
-    start_array = np.asarray(starts, dtype=np.int64)
-    end_array = np.asarray(ends, dtype=np.int64)
-    expected = np.maximum(end_array - start_array, 1).astype(np.float64)
-    counts = np.broadcast_to(expected[:, np.newaxis], (expected.size, n_samples)).copy()
-    resolved = fasta.expanduser().resolve()
-    identities = tuple(
-        {
-            "path": str(resolved),
-            "format": "flat-fasta",
-            "replica": index,
-        }
-        for index in range(n_samples)
-    )
-    return Cohort(
-        counts=counts,
-        contigs=tuple(contigs),
-        starts=start_array,
-        ends=end_array,
-        contig_lengths=dict(zip(names, lengths, strict=True)),
-        bin_size=bin_size,
-        identities=identities,
-        paths=tuple(Path(f"{resolved}#flat-{index}") for index in range(n_samples)),
-    )
-
-
-def _fasta_contigs(path: Path, *, all_contigs: bool) -> tuple[list[str], list[int]]:
-    fasta = path.expanduser()
-    if not fasta.is_file():
-        raise ReferenceError(f"FASTA not found: {fasta}")
-    if not Path(f"{fasta}.fai").is_file():
-        logger.debug("creating FASTA index for %s", fasta)
-        try:
-            pysam.faidx(str(fasta))
-        except Exception as error:
-            raise ReferenceError(f"failed to index FASTA {fasta}: {error}") from error
-    handle = pysam.FastaFile(str(fasta))
-    try:
-        header_names = list(handle.references)
-        header_lengths = [int(length) for length in handle.lengths]
-    finally:
-        handle.close()
-    if any(length <= 0 for length in header_lengths):
-        raise ReferenceError(f"{fasta} contains non-positive contig lengths")
-    layout = select_layout(header_names, header_lengths, all_contigs=all_contigs)
-    if not layout:
-        raise ReferenceError(
-            f"{fasta} declares no canonical chromosomes; "
-            "pass --all-contigs to include every contig"
-        )
-    return [contig.name for contig in layout], [contig.length for contig in layout]
-
-
-def validate_cohort(
-    tables: tuple[pa.Table, ...],
-    paths: tuple[Path, ...] | None = None,
-    target_bin_size: int | None = None,
-) -> Cohort:
-    """Require matching contig lengths across samples, rebinning counts if set."""
-
-    if len(tables) < 1:
-        raise ReferenceError("cohort must contain at least one sample")
-    resolved_paths = paths or tuple(
-        Path(f"sample_{index}") for index in range(len(tables))
-    )
-    if len(resolved_paths) != len(tables):
-        raise ReferenceError("paths must align with sample tables")
-
-    for path, table in zip(resolved_paths, tables, strict=True):
-        try:
-            validate_table(table, ArtifactKind.SAMPLE)
-        except SchemaError as error:
-            raise ReferenceError(f"{path}: {error}") from error
-
-    expected_lengths: dict[str, int] | None = None
-    expected_bin_size: int | None = None
-
-    for path, table in zip(resolved_paths, tables, strict=True):
-        metadata = decode_metadata(table.schema.metadata)
-        contig_lengths = metadata["contig_lengths"]
-        bin_size = metadata["bin_size"]
-        if not isinstance(contig_lengths, dict) or not isinstance(bin_size, int):
-            raise ReferenceError(f"{path}: sample metadata is incomplete")
-        current_lengths = {
-            str(name): int(length) for name, length in contig_lengths.items()
-        }
-        if expected_lengths is None:
-            expected_lengths = current_lengths
-            expected_bin_size = bin_size
-        elif current_lengths != expected_lengths:
-            raise ReferenceError(f"{path}: contig_lengths do not match the cohort")
-        elif target_bin_size is None and bin_size != expected_bin_size:
-            raise ReferenceError(
-                f"{path}: bin_size {bin_size} does not match cohort {expected_bin_size}"
-            )
-
-    assert expected_lengths is not None
-    effective_bin_size = (
-        target_bin_size if target_bin_size is not None else expected_bin_size
-    )
-    assert effective_bin_size is not None
-
-    processed_tables: list[pa.Table] = []
-    for path, table in zip(resolved_paths, tables, strict=True):
-        metadata = decode_metadata(table.schema.metadata)
-        orig_bin_size = metadata.get("bin_size")
-        if orig_bin_size != effective_bin_size:
-            logger.debug(
-                "rebinning cohort sample %s from %s bp to %s bp",
-                path.name,
-                orig_bin_size,
-                effective_bin_size,
-            )
-            table = rebin_sample_table(table, effective_bin_size)
-        processed_tables.append(table)
-
-    identities: list[object] = []
-    counts: list[NDArray[np.float64]] = []
-    expected_bins: tuple[tuple[str, int, int], ...] | None = None
-
-    for path, table in zip(resolved_paths, processed_tables, strict=True):
-        metadata = decode_metadata(table.schema.metadata)
-        bins = bin_coordinates(table)
-        if expected_bins is None:
-            expected_bins = bins
-        elif bins != expected_bins:
-            raise ReferenceError(f"{path}: bin coordinates do not match the cohort")
-        identities.append(metadata.get("source_identity", {"path": str(path)}))
-        col_counts = np.asarray(table.column("count").to_pylist(), dtype=np.float64)
-        logger.debug(
-            "loaded cohort sample %s: %d bins, %d total depth",
-            path.name,
-            table.num_rows,
-            int(np.sum(col_counts)),
-        )
-        counts.append(col_counts)
-
-    assert expected_bins is not None
-    return Cohort(
-        counts=np.column_stack(counts),
-        contigs=tuple(contig for contig, _, _ in expected_bins),
-        starts=np.array([start for _, start, _ in expected_bins], dtype=np.int64),
-        ends=np.array([end for _, _, end in expected_bins], dtype=np.int64),
-        contig_lengths=expected_lengths,
-        bin_size=effective_bin_size,
-        identities=tuple(identities),
-        paths=resolved_paths,
-    )
 
 
 def normalize_depth(counts: NDArray[np.floating]) -> NDArray[np.float64]:
@@ -367,50 +187,6 @@ def fit_pca(
         pca.mean_.astype(np.float64, copy=False),
         pca.components_.astype(np.float64, copy=False),
     )
-
-
-def select_nearest_bins(
-    profiles: NDArray[np.floating],
-    contig_ids: NDArray[np.integer],
-    k: int,
-    max_batch_memory_mb: int,
-) -> tuple[list[list[int]], list[list[float]]]:
-    """Pick k nearest off-contig bins with batched distances and argpartition."""
-
-    data = np.asarray(profiles, dtype=np.float64)
-    contig_ids = np.asarray(contig_ids)
-    n_bins = data.shape[0]
-    if k < 1:
-        raise ReferenceError("nearest_bins must be a positive integer")
-    if n_bins == 0:
-        return [], []
-
-    max_bytes = max(int(max_batch_memory_mb * 1024 * 1024), 1)
-    bytes_per_query = max(n_bins, 1) * data.dtype.itemsize
-    batch_size = max(1, max_bytes // bytes_per_query)
-    candidate_norm = np.sum(data * data, axis=1)
-
-    indices: list[list[int]] = [[] for _ in range(n_bins)]
-    distances: list[list[float]] = [[] for _ in range(n_bins)]
-    for start in range(0, n_bins, batch_size):
-        stop = min(start + batch_size, n_bins)
-        batch = data[start:stop]
-        query_norm = np.sum(batch * batch, axis=1, keepdims=True)
-        dist = query_norm + candidate_norm - 2.0 * (batch @ data.T)
-        np.maximum(dist, 0.0, out=dist)
-        for offset, query in enumerate(range(start, stop)):
-            row = dist[offset]
-            row[contig_ids == contig_ids[query]] = np.inf
-            available = int(np.count_nonzero(np.isfinite(row)))
-            if available == 0:
-                continue
-            take = min(k, available)
-            partitioned = np.argpartition(row, take - 1)[:take]
-            ordered = partitioned[np.argsort(row[partitioned], kind="mergesort")]
-            indices[query] = [int(index) for index in ordered]
-            distances[query] = [float(row[index]) for index in ordered]
-        del dist, batch, query_norm
-    return indices, distances
 
 
 def infer_sample_sexes(
@@ -628,13 +404,6 @@ def _validate_config(config: ReferenceConfig) -> None:
     _validate_sex_cutoff(config.sex_cutoff)
 
 
-def _read_sample(path: Path) -> pa.Table:
-    try:
-        return pq.read_table(path)
-    except (FileNotFoundError, OSError, pa.ArrowInvalid) as error:
-        raise ReferenceError(f"{path}: cannot read sample Parquet ({error})") from error
-
-
 def _resolve_contig_roles(
     cohort: Cohort,
     config: ReferenceConfig,
@@ -837,8 +606,13 @@ def _append_branch(
         contig_ids,
         k=config.nearest_bins,
         max_batch_memory_mb=config.max_batch_memory_mb,
+        threads=config.threads,
     )
-    null_mean, null_std = _null_models(corrected, nearest_indices)
+    null_mean, null_std = compute_null_models(
+        corrected,
+        nearest_indices,
+        threads=config.threads,
+    )
     valid_nulls = null_mean[np.isfinite(null_mean)]
     logger.debug(
         "%s null models computed for %d bins (mean=%.4f, std=%.4f)",
@@ -893,27 +667,6 @@ def _append_branch(
         rows["null_mean"].append(float(null_mean[unmasked_iter]))
         rows["null_std"].append(float(null_std[unmasked_iter]))
         unmasked_iter += 1
-
-
-def _null_models(
-    corrected: NDArray[np.float64],
-    nearest_indices: list[list[int]],
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    n_null = min(_MAX_NULL_SAMPLES, corrected.shape[1])
-    n_bins = len(nearest_indices)
-    null_mean = np.zeros(n_bins, dtype=np.float64)
-    null_std = np.zeros(n_bins, dtype=np.float64)
-    for bin_index, neighbors in enumerate(nearest_indices):
-        if not neighbors:
-            continue
-        reference = np.median(corrected[neighbors, :n_null], axis=0)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            values = np.log2(corrected[bin_index, :n_null] / reference)
-        values_clean = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
-        null_mean[bin_index] = float(np.mean(values_clean))
-        s = float(np.std(values_clean, ddof=1)) if values_clean.size > 1 else 0.0
-        null_std[bin_index] = s if np.isfinite(s) and s > 0 else 0.0
-    return null_mean, null_std
 
 
 def _median_abs_deviation(values: NDArray[np.floating]) -> float:

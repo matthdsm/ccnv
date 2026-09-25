@@ -183,6 +183,26 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             self.assertEqual(config.sex_signal_contig, "chrY")
             self.assertEqual(config.sex_cutoff, 0.004)
 
+    def test_cli_reference_forwards_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample = _write_sample(root / "s1.ccnv")
+            with patch("ccnv.cli.run_reference") as run:
+                result = CliRunner().invoke(
+                    app,
+                    [
+                        "reference",
+                        str(sample),
+                        "--prefix",
+                        str(root / "ref"),
+                        "-t",
+                        "4",
+                    ],
+                )
+            self.assertEqual(result.exit_code, 0, result.output)
+            config = run.call_args.args[0]
+            self.assertEqual(config.threads, 4)
+
     def test_reference_rejects_sample_sex_option(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
