@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Genome SVG plot x-axis now naturally sorts chromosomes (treating embedded numbers as integers) so contigs appear in natural order (e.g. `chr1`, `chr2`, ..., `chr10`, ..., `chrX`, `chrY`) instead of lexicographical order.
+- Prediction outputs (`_bins.bed`, `_segments.bed`, `_calls.bed`, `_bins.ccnv`, `_segments.ccnv`, and `_plot.svg`) now sort chromosomes and intervals in natural sort order (e.g. `chr1`, `chr2`, ..., `chr10`, ..., `chrX`, `chrY`) instead of lexicographical order.
 - Parallelized `ccnv reference` execution controlled by a `-t/--threads` flag (defaulting to system CPU count), multi-processing cohort sample loading and rebinning via `src/ccnv/cohort.py`, parallelizing batched off-contig nearest-bin selection via `src/ccnv/reference_compute.py`, and multi-processing null model derivation.
 - Extracted cohort ingestion and validation into `src/ccnv/cohort.py` and compute kernels into `src/ccnv/reference_compute.py`, keeping modules modular and strictly below 1,000 lines.
 - Replaced boolean array masking with precomputed contiguous contig slice bounds in `select_nearest_bins`, accelerating per-query candidate masking by over 400x.

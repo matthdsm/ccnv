@@ -4,6 +4,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
+import pyarrow.parquet as pq
 
 from ccnv.report import (
     BINS_BED_HEADER,
@@ -214,6 +215,78 @@ class TestReport(unittest.TestCase):
             if "rotate(45)" in t.attrib.get("transform", "")
         ]
         self.assertEqual(texts, ["chr1", "chr2", "chr10", "chrX", "chrY"])
+
+    def test_write_outputs_naturally_sorts_all_artifacts(self) -> None:
+        contig_lengths = {
+            "chr10": 50_000,
+            "chr2": 50_000,
+            "chr1": 50_000,
+            "chrY": 50_000,
+            "chrX": 50_000,
+        }
+        bins = (
+            BinResult(
+                branch="autosomal",
+                contigs=("chr10", "chr2", "chr1", "chrY", "chrX"),
+                starts=np.array([0, 0, 0, 0, 0], dtype=np.int64),
+                ends=np.array([50_000, 50_000, 50_000, 50_000, 50_000], dtype=np.int64),
+                ratios=np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+                zscores=np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
+                weights=np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64),
+                reference_sizes=np.array([10, 10, 10, 10, 10], dtype=np.int64),
+                masked=np.array([False, False, False, False, False], dtype=bool),
+            ),
+        )
+        segments = (
+            SegmentResult("chr10", 0, 50_000, 0.4, 3.2, 1.0, 1, "gain"),
+            SegmentResult("chr2", 0, 50_000, -0.5, -3.1, 1.0, 1, "loss"),
+            SegmentResult("chr1", 0, 50_000, 0.0, 0.0, 1.0, 1, None),
+            SegmentResult("chrY", 0, 50_000, 0.0, 0.0, 1.0, 1, None),
+            SegmentResult("chrX", 0, 50_000, 0.0, 0.0, 1.0, 1, None),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prefix = Path(tmpdir) / "test_out"
+            outputs = write_outputs(prefix, bins, segments, contig_lengths, plot=True)
+
+            # Check bins BED order
+            bins_lines = outputs.bins_bed.read_text().splitlines()[1:]
+            bins_contigs = [line.split("\t")[0] for line in bins_lines]
+            self.assertEqual(bins_contigs, ["chr1", "chr2", "chr10", "chrX", "chrY"])
+
+            # Check segments BED order
+            seg_lines = outputs.segments_bed.read_text().splitlines()[1:]
+            seg_contigs = [line.split("\t")[0] for line in seg_lines]
+            self.assertEqual(seg_contigs, ["chr1", "chr2", "chr10", "chrX", "chrY"])
+
+            # Check calls BED order
+            call_lines = outputs.calls_bed.read_text().splitlines()[1:]
+            call_contigs = [line.split("\t")[0] for line in call_lines]
+            self.assertEqual(call_contigs, ["chr2", "chr10"])
+
+            # Check bins Parquet order
+            bins_tbl = pq.read_table(outputs.bins_parquet)
+            self.assertEqual(
+                bins_tbl.column("contig").to_pylist(),
+                ["chr1", "chr2", "chr10", "chrX", "chrY"],
+            )
+
+            # Check segments Parquet order
+            seg_tbl = pq.read_table(outputs.segments_parquet)
+            self.assertEqual(
+                seg_tbl.column("contig").to_pylist(),
+                ["chr1", "chr2", "chr10", "chrX", "chrY"],
+            )
+
+            # Check returned outputs
+            self.assertEqual(
+                outputs.bins[0].contigs,
+                ("chr1", "chr2", "chr10", "chrX", "chrY"),
+            )
+            self.assertEqual(
+                [s.contig for s in outputs.segments],
+                ["chr1", "chr2", "chr10", "chrX", "chrY"],
+            )
 
 
 if __name__ == "__main__":

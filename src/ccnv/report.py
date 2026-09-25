@@ -36,6 +36,74 @@ SEGMENTS_BED_HEADER = (
 CALLS_BED_HEADER = ("contig", "start", "end", "ratio", "zscore", "type")
 
 
+def natural_sort_key(name: str) -> tuple[tuple[int, int | str], ...]:
+    """Return key for natural sort order treating embedded numbers as integers."""
+
+    return tuple(
+        (0, int(chunk)) if chunk.isdigit() else (1, chunk.casefold())
+        for chunk in re.split(r"(\d+)", name)
+        if chunk
+    )
+
+
+def sort_bin_result(result: BinResult) -> BinResult:
+    """Sort BinResult bins in natural chromosome order, preserving coords."""
+    if len(result.contigs) <= 1:
+        return result
+    unique_contigs = list(dict.fromkeys(result.contigs))
+    sorted_contigs = sorted(unique_contigs, key=natural_sort_key)
+    if unique_contigs == sorted_contigs:
+        return result
+
+    contig_indices: dict[str, list[int]] = {}
+    for i, c in enumerate(result.contigs):
+        contig_indices.setdefault(c, []).append(i)
+
+    idx_list: list[int] = []
+    new_contigs: list[str] = []
+    for c in sorted_contigs:
+        indices = contig_indices[c]
+        idx_list.extend(indices)
+        new_contigs.extend([c] * len(indices))
+
+    idx = np.array(idx_list, dtype=np.intp)
+    return BinResult(
+        branch=result.branch,
+        contigs=tuple(new_contigs),
+        starts=result.starts[idx],
+        ends=result.ends[idx],
+        ratios=result.ratios[idx],
+        zscores=result.zscores[idx],
+        weights=result.weights[idx],
+        reference_sizes=result.reference_sizes[idx],
+        masked=result.masked[idx],
+    )
+
+
+def sort_bin_results(results: tuple[BinResult, ...]) -> tuple[BinResult, ...]:
+    """Sort a collection of BinResult objects by natural chromosome order."""
+    sorted_branches = tuple(sort_bin_result(res) for res in results)
+    return tuple(
+        sorted(
+            sorted_branches,
+            key=lambda res: (
+                natural_sort_key(res.contigs[0]) if res.contigs else (),
+                res.branch,
+            ),
+        )
+    )
+
+
+def sort_segments(segments: Iterable[SegmentResult]) -> tuple[SegmentResult, ...]:
+    """Sort SegmentResult records naturally by chromosome and start position."""
+    return tuple(
+        sorted(
+            segments,
+            key=lambda s: (natural_sort_key(s.contig), s.start, s.end),
+        )
+    )
+
+
 def write_outputs(
     prefix: Path,
     bins: tuple[BinResult, ...],
@@ -46,6 +114,8 @@ def write_outputs(
     """Write 0-based half-open BED evidence, matching Parquet, and an SVG plot."""
 
     prefix.parent.mkdir(parents=True, exist_ok=True)
+    bins = sort_bin_results(bins)
+    segments = sort_segments(segments)
     bins_bed = Path(f"{prefix}_bins.bed")
     segments_bed = Path(f"{prefix}_segments.bed")
     calls_bed = Path(f"{prefix}_calls.bed")
@@ -99,16 +169,6 @@ def write_outputs(
         segments_parquet,
         bins,
         segments,
-    )
-
-
-def natural_sort_key(name: str) -> tuple[tuple[int, int | str], ...]:
-    """Return key for natural sort order treating embedded numbers as integers."""
-
-    return tuple(
-        (0, int(chunk)) if chunk.isdigit() else (1, chunk.casefold())
-        for chunk in re.split(r"(\d+)", name)
-        if chunk
     )
 
 
