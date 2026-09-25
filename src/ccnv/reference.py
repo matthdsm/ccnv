@@ -103,6 +103,11 @@ def run(config: ReferenceConfig) -> None:
     logger.debug("writing reference parquet %s (%d rows)", path, table.num_rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(table, path)
+    logger.debug(
+        "wrote reference parquet %s (%.1f KB)",
+        path,
+        path.stat().st_size / 1024,
+    )
     if config.qc_report:
         run_reference_qc_on_table(
             table,
@@ -247,9 +252,16 @@ def validate_cohort(
     assert effective_bin_size is not None
 
     processed_tables: list[pa.Table] = []
-    for table in tables:
+    for path, table in zip(resolved_paths, tables, strict=True):
         metadata = decode_metadata(table.schema.metadata)
-        if metadata.get("bin_size") != effective_bin_size:
+        orig_bin_size = metadata.get("bin_size")
+        if orig_bin_size != effective_bin_size:
+            logger.debug(
+                "rebinning cohort sample %s from %s bp to %s bp",
+                path.name,
+                orig_bin_size,
+                effective_bin_size,
+            )
             table = rebin_sample_table(table, effective_bin_size)
         processed_tables.append(table)
 
@@ -265,7 +277,14 @@ def validate_cohort(
         elif bins != expected_bins:
             raise ReferenceError(f"{path}: bin coordinates do not match the cohort")
         identities.append(metadata.get("source_identity", {"path": str(path)}))
-        counts.append(np.asarray(table.column("count").to_pylist(), dtype=np.float64))
+        col_counts = np.asarray(table.column("count").to_pylist(), dtype=np.float64)
+        logger.debug(
+            "loaded cohort sample %s: %d bins, %d total depth",
+            path.name,
+            table.num_rows,
+            int(np.sum(col_counts)),
+        )
+        counts.append(col_counts)
 
     assert expected_bins is not None
     return Cohort(
@@ -316,6 +335,17 @@ def fit_pca(
         raise ReferenceError("PCA requires at least one sample and one unmasked bin")
     pca = PCA(n_components=n_components, svd_solver="full")
     pca.fit(samples)
+    if (
+        hasattr(pca, "explained_variance_ratio_")
+        and pca.explained_variance_ratio_ is not None
+    ):
+        finite_vars = np.nan_to_num(pca.explained_variance_ratio_ * 100.0)
+        logger.debug(
+            "PCA fitted %d components: explained variance [%s] (total=%.2f%%)",
+            n_components,
+            ", ".join(f"{v:.2f}%" for v in finite_vars),
+            float(np.sum(finite_vars)),
+        )
     reconstructed = pca.inverse_transform(pca.transform(samples))
     with np.errstate(divide="ignore", invalid="ignore"):
         corrected = samples / reconstructed
@@ -457,6 +487,17 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
         sex_contigs,
     )
     sexes, sex_source, inference, signal = _resolve_sexes(cohort, config, sex_contigs)
+    if inference is not None:
+        cutoff_str = (
+            f"{inference.cutoff:.4f}" if inference.cutoff is not None else "None"
+        )
+        logger.debug(
+            "sex inference on signal %s: cutoff=%s (passed=%s, reason=%s)",
+            signal,
+            cutoff_str,
+            inference.passed,
+            inference.reason,
+        )
     logger.debug(
         "resolved sample sexes via %s (signal=%s): %s",
         sex_source,
@@ -723,11 +764,14 @@ def _append_branch(
     usable = mask_low_coverage(normalized)
     if not np.any(usable):
         raise ReferenceError(f"branch {branch!r} has no unmasked bins")
+    n_unmasked = int(np.count_nonzero(usable))
     logger.debug(
-        "%s mask kept %d/%d bins",
+        "%s mask kept %d/%d bins (%.1f%% unmasked, %d masked)",
         branch,
-        int(np.count_nonzero(usable)),
+        n_unmasked,
         usable.size,
+        100.0 * n_unmasked / usable.size,
+        usable.size - n_unmasked,
     )
 
     logger.debug("fitting PCA for %s (%d components)", branch, config.pca_components)
@@ -738,9 +782,10 @@ def _append_branch(
     unmasked_contigs = np.asarray(contig_subset[usable], dtype=str)
     _, contig_ids = np.unique(unmasked_contigs, return_inverse=True)
     logger.debug(
-        "selecting %d nearest off-contig bins for %s",
+        "selecting %d nearest off-contig bins for %s (%d unmasked bins)",
         config.nearest_bins,
         branch,
+        n_unmasked,
     )
     nearest_indices, nearest_distances = select_nearest_bins(
         corrected,
@@ -749,6 +794,14 @@ def _append_branch(
         max_batch_memory_mb=config.max_batch_memory_mb,
     )
     null_ratios = _null_ratios(corrected, nearest_indices)
+    valid_nulls = [r for sub in null_ratios for r in sub if np.isfinite(r)]
+    logger.debug(
+        "%s null ratios computed for %d bins (mean=%.4f, std=%.4f)",
+        branch,
+        len(null_ratios),
+        float(np.mean(valid_nulls)) if valid_nulls else 0.0,
+        float(np.std(valid_nulls)) if valid_nulls else 0.0,
+    )
 
     unmasked_iter = 0
     starts = cohort.starts[selected]

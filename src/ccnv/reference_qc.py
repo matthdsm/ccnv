@@ -337,6 +337,12 @@ def run_reference_qc_on_table(
     messages: list[str] = []
 
     branch_names = tuple(dict.fromkeys(table.column("branch").to_pylist()))
+    logger.debug(
+        "evaluating reference QC (branches=%s, flat=%s, %d rows)",
+        branch_names,
+        is_flat,
+        table.num_rows,
+    )
     for branch_name in branch_names:
         b_qc = compute_branch_qc(
             table,
@@ -347,6 +353,14 @@ def run_reference_qc_on_table(
         if b_qc is not None:
             branches_qc[branch_name] = b_qc
             v = str(b_qc.get("verdict", "PASS"))
+            logger.debug(
+                "branch %s QC: %s (masked=%.1f%%, outlier=%.1f%%, low_refs=%d)",
+                branch_name,
+                v,
+                float(b_qc.get("mask_pct", 0.0)),
+                float(b_qc.get("outlier_pct", 0.0)),
+                int(b_qc.get("n_low_refs", 0)),
+            )
             severities.append(VERDICT_SEVERITY.get(v, 0))
             if b_qc.get("message"):
                 messages.append(f"[{branch_name}] {b_qc['message']}")
@@ -359,6 +373,12 @@ def run_reference_qc_on_table(
 
     worst = max(severities) if severities else 0
     overall_verdict = SEVERITY_TO_VERDICT[worst]
+    logger.debug(
+        "reference QC overall: %s (worst_severity=%d, messages=%s)",
+        overall_verdict,
+        worst,
+        messages,
+    )
 
     sample_identities = metadata.get("sample_identities", [])
     sample_count = len(sample_identities) if isinstance(sample_identities, list) else 0

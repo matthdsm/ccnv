@@ -406,6 +406,20 @@ def run(config: ConvertConfig) -> None:
             len(header_names),
             len(header_names) - len(layout),
         )
+        logger.debug(
+            "selected contigs (%d bp total): %s",
+            sum(c.length for c in layout),
+            ", ".join(c.name for c in layout[:8]) + ("..." if len(layout) > 8 else ""),
+        )
+        logger.debug(
+            "read filters: min_mapping_quality=%d, exclude_duplicates=%s, "
+            "exclude_secondary=%s, exclude_supplementary=%s, require_proper_pair=%s",
+            config.filters.min_mapping_quality,
+            config.filters.exclude_duplicates,
+            config.filters.exclude_secondary,
+            config.filters.exclude_supplementary,
+            config.filters.require_proper_pair,
+        )
         contig_lengths = profile.length_map()
         workers, decode_threads = split_thread_budget(config.threads, len(layout))
         logger.debug(
@@ -452,12 +466,33 @@ def run(config: ConvertConfig) -> None:
                     starts.size,
                     contig_qc["reads_kept"],
                 )
+                logger.debug(
+                    "contig %s filter drops: %d unmapped, %d low_mapq, "
+                    "%d duplicates, %d secondary, %d supplementary",
+                    task.name,
+                    contig_qc["filter_unmapped"],
+                    contig_qc["filter_mapq"],
+                    contig_qc["filter_duplicate"],
+                    contig_qc["filter_secondary"],
+                    contig_qc["filter_supplementary"],
+                )
                 contig_arrays.append(np.full(starts.size, task.name, dtype=object))
                 start_arrays.append(starts)
                 end_arrays.append(ends)
                 count_arrays.append(counts)
     finally:
         bam.close()
+
+    logger.debug(
+        "convert QC summary: %d reads examined, %d kept (%.1f%%), %d duplicate, "
+        "%d low_mapq, %d unmapped",
+        qc["reads_seen"],
+        qc["reads_kept"],
+        (qc["reads_kept"] / qc["reads_seen"] * 100) if qc["reads_seen"] else 0.0,
+        qc["filter_duplicate"],
+        qc["filter_mapq"],
+        qc["filter_unmapped"],
+    )
 
     table = _sample_table(
         contig_arrays,
@@ -477,6 +512,11 @@ def run(config: ConvertConfig) -> None:
     output = parquet_path(config.prefix)
     logger.debug("writing sample parquet %s (%d bins)", output, table.num_rows)
     write_sample_parquet(output, table)
+    logger.debug(
+        "wrote sample parquet %s (%.1f KB)",
+        output,
+        output.stat().st_size / 1024,
+    )
 
 
 def _alignment_format(path: Path) -> str:

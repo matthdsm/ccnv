@@ -1,5 +1,4 @@
-"""BED, Parquet, and SVG writers for prediction artifacts."""
-
+import logging
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -8,6 +7,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ccnv.results import BinResult, PredictionOutputs, SegmentResult
+
+logger = logging.getLogger(__name__)
 
 BINS_BED_HEADER = (
     "contig",
@@ -50,6 +51,15 @@ def write_outputs(
     bins_parquet = Path(f"{prefix}_bins.ccnv")
     segments_parquet = Path(f"{prefix}_segments.ccnv")
     plot_path = Path(f"{prefix}_plot.svg") if plot else None
+    calls = [item for item in segments if item.call is not None]
+    total_bins = sum(b.starts.size for b in bins)
+    logger.debug(
+        "writing prediction outputs to prefix %s (%d bins, %d segments, %d calls)",
+        prefix,
+        total_bins,
+        len(segments),
+        len(calls),
+    )
     _write_bed(bins_bed, BINS_BED_HEADER, _bin_bed_rows(bins))
     _write_bed(segments_bed, SEGMENTS_BED_HEADER, _segment_bed_rows(segments))
     _write_bed(
@@ -64,12 +74,19 @@ def write_outputs(
                 _format_bed_float(item.zscore),
                 item.call,
             )
-            for item in segments
-            if item.call is not None
+            for item in calls
         ),
     )
     pq.write_table(_bins_table(bins), bins_parquet, compression="zstd")
     pq.write_table(_segments_table(segments), segments_parquet, compression="zstd")
+    logger.debug(
+        "wrote %s, %s, %s, %s, %s",
+        bins_bed.name,
+        segments_bed.name,
+        calls_bed.name,
+        bins_parquet.name,
+        segments_parquet.name,
+    )
     if plot_path is not None:
         write_genome_plot(plot_path, bins, segments, contig_lengths)
     return PredictionOutputs(
@@ -92,8 +109,15 @@ def write_genome_plot(
 ) -> None:
     """Write a dependency-free SVG with true contig-length genome offsets."""
 
+    total_raw_bins = sum(b.starts.size for b in bins)
     ordered = tuple(
         dict.fromkeys(contig for result in bins for contig in result.contigs)
+    )
+    logger.debug(
+        "generating genome SVG plot %s (%d contigs, %d raw bins)",
+        path,
+        len(ordered),
+        total_raw_bins,
     )
     offsets: dict[str, int] = {}
     total = 0
@@ -241,6 +265,16 @@ def write_genome_plot(
 
     lines.append("</svg>")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    reduction = (
+        100.0 * (1.0 - len(seen_points) / total_raw_bins) if total_raw_bins > 0 else 0.0
+    )
+    logger.debug(
+        "wrote genome SVG plot %s (%.1f KB, %d points, %.1f%% sub-pixel reduction)",
+        path,
+        path.stat().st_size / 1024,
+        len(seen_points),
+        reduction,
+    )
 
 
 def _write_bed(

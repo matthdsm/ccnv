@@ -329,7 +329,7 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
     local_ratios = np.full(corrected.shape, np.nan, dtype=np.float64)
     local_zscores = np.full(corrected.shape, np.nan, dtype=np.float64)
 
-    for _ in range(config.mask_repeats):
+    for iteration in range(config.mask_repeats):
         for index, (neighbors, distances, null) in enumerate(
             zip(
                 model.nearest_indices,
@@ -358,10 +358,27 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
             & np.isfinite(local_zscores)
             & (np.abs(local_zscores) < _MASK_Z_THRESHOLD)
         )
+        logger.debug(
+            "branch %s within-sample iteration %d/%d: %d eligible bins",
+            model.branch,
+            iteration + 1,
+            config.mask_repeats,
+            int(np.count_nonzero(eligible)),
+        )
 
     finite_ratios = np.isfinite(local_ratios)
+    median_shift = 0.0
     if np.any(finite_ratios):
-        local_ratios[finite_ratios] -= float(np.median(local_ratios[finite_ratios]))
+        median_shift = float(np.median(local_ratios[finite_ratios]))
+        local_ratios[finite_ratios] -= median_shift
+    logger.debug(
+        "branch %s: %d finite ratios, median shift=%.4f (mean=%.4f, std=%.4f)",
+        model.branch,
+        int(np.count_nonzero(finite_ratios)),
+        median_shift,
+        float(np.mean(local_ratios[finite_ratios])) if np.any(finite_ratios) else 0.0,
+        float(np.std(local_ratios[finite_ratios])) if np.any(finite_ratios) else 0.0,
+    )
     ratios[unmasked_positions] = local_ratios
     zscores[unmasked_positions] = local_zscores
     for local, distances in enumerate(model.nearest_distances):
@@ -534,6 +551,28 @@ def segment_and_call(
                 ),
             )
         )
+    gains = sum(1 for s in output if s.call == "gain")
+    losses = sum(1 for s in output if s.call == "loss")
+    neutral = sum(1 for s in output if s.call is None)
+    logger.debug(
+        "called %d segments: %d gains, %d losses, %d neutral",
+        len(output),
+        gains,
+        losses,
+        neutral,
+    )
+    for s in output:
+        if s.call is not None:
+            logger.debug(
+                "call %s: %s:%d-%d (%d bins, ratio=%.3f, z=%.2f)",
+                s.call.upper(),
+                s.contig,
+                s.start,
+                s.end,
+                s.bin_count,
+                s.ratio,
+                s.zscore,
+            )
     return tuple(output)
 
 
@@ -564,7 +603,15 @@ def _resolve_sample_sex(
     if total <= 0:
         raise PredictError("sample has zero total coverage")
     fraction = float(np.sum(counts[contigs == signal]) / total)
-    return "male" if fraction > float(cutoff) else "female"
+    sex = "male" if fraction > float(cutoff) else "female"
+    logger.debug(
+        "inferred sample sex as %s (signal %s fraction=%.4f vs cutoff=%.4f)",
+        sex,
+        signal,
+        fraction,
+        float(cutoff),
+    )
+    return sex
 
 
 def _contig_lengths(metadata: dict[str, object]) -> dict[str, int]:

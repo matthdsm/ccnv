@@ -7,6 +7,7 @@ the penalty. This is not DNAcopy's hypothesis-test ``alpha`` and must be tuned
 independently.
 """
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from time import perf_counter
@@ -16,6 +17,8 @@ import numpy as np
 import ruptures as rpt
 from numpy.typing import ArrayLike, NDArray
 from ruptures.base import BaseCost
+
+logger = logging.getLogger(__name__)
 
 Algorithm = Literal["pelt", "binseg"]
 DEFAULT_MAX_BLACKLIST_GAP = 2_000_000
@@ -190,10 +193,17 @@ def segment_genome(
 ) -> tuple[Segment, ...]:
     """Segment ordered contig inputs without assumptions about contig names."""
 
-    return tuple(
-        segment
-        for contig, (starts, ends, ratios, weights, contig_length) in contigs.items()
-        for segment in segment_contig(
+    started = perf_counter()
+    logger.debug(
+        "segmenting %d contigs with %s (penalty=%.2f, max_blacklist_gap=%d bp)",
+        len(contigs),
+        algorithm,
+        penalty,
+        max_blacklist_gap,
+    )
+    all_segments: list[Segment] = []
+    for contig, (starts, ends, ratios, weights, contig_length) in contigs.items():
+        segments = segment_contig(
             contig=contig,
             starts=starts,
             ends=ends,
@@ -206,7 +216,23 @@ def segment_genome(
             jump=jump,
             max_blacklist_gap=max_blacklist_gap,
         )
+        if segments:
+            logger.debug(
+                "contig %s: %d segments found across %d bp",
+                contig,
+                len(segments),
+                contig_length,
+            )
+        all_segments.extend(segments)
+
+    elapsed = perf_counter() - started
+    logger.debug(
+        "segmentation finished: %d segments across %d contigs in %.3f s",
+        len(all_segments),
+        len(contigs),
+        elapsed,
     )
+    return tuple(all_segments)
 
 
 def benchmark_algorithms(

@@ -6,6 +6,7 @@ import sys
 from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
+from time import perf_counter
 from typing import Annotated, NoReturn
 
 import pyarrow as pa
@@ -45,6 +46,7 @@ app = typer.Typer(
 )
 
 DEFAULT_THREADS = os.cpu_count() or 1
+cli_logger = logging.getLogger("ccnv.cli")
 
 
 class LogLevel(StrEnum):
@@ -207,6 +209,13 @@ def convert(
     """Convert one alignment into canonical binned counts."""
 
     configure_logging(loglevel)
+    cli_logger.debug(
+        "starting convert: alignment=%s, bin_size=%d, threads=%d",
+        alignment,
+        bin_size,
+        threads,
+    )
+    started = perf_counter()
     config = ConvertConfig(
         alignment,
         prefix if prefix is not None else alignment.with_suffix(""),
@@ -224,6 +233,7 @@ def convert(
     )
     try:
         run_convert(config)
+        cli_logger.debug("convert completed in %.3f s", perf_counter() - started)
     except ConvertError as error:
         _fail(error, 1)
 
@@ -318,6 +328,8 @@ def reference(
     """Build a reference model from control samples or a flat FASTA layout."""
 
     configure_logging(loglevel)
+    cli_logger.debug("starting reference: prefix=%s, bin_size=%d", prefix, bin_size)
+    started = perf_counter()
     sample_paths: tuple[Path, ...] = ()
     fasta: Path | None = None
     if samples:
@@ -350,6 +362,7 @@ def reference(
                 sex_signal_contig=sex_signal_contig,
             )
         )
+        cli_logger.debug("reference completed in %.3f s", perf_counter() - started)
     except ReferenceError as error:
         _fail(error, 1)
 
@@ -381,8 +394,11 @@ def ref_qc(
     """Analyze an existing reference model and evaluate quality control metrics."""
 
     configure_logging(loglevel)
+    cli_logger.debug("starting ref-qc: reference=%s", reference)
+    started = perf_counter()
     try:
         run_reference_qc(ReferenceQCConfig(reference=reference, prefix=prefix))
+        cli_logger.debug("ref-qc completed in %.3f s", perf_counter() - started)
     except ReferenceQCError as error:
         _fail(error, 1)
 
@@ -471,6 +487,13 @@ def predict(
     """Predict copy-number events for one sample."""
 
     configure_logging(loglevel)
+    cli_logger.debug(
+        "starting predict: sample=%s, reference=%s, sex=%s",
+        sample,
+        reference,
+        sex.value,
+    )
+    started = perf_counter()
     try:
         run_predict(
             PredictConfig(
@@ -487,6 +510,7 @@ def predict(
                 plot=plot,
             )
         )
+        cli_logger.debug("predict completed in %.3f s", perf_counter() - started)
     except PredictError as error:
         _fail(error, 1)
 
