@@ -1,3 +1,4 @@
+import gzip
 import tempfile
 import unittest
 from pathlib import Path
@@ -129,20 +130,35 @@ class TestInstalledPipelineContract(unittest.TestCase):
             self.assertTrue(outputs.bins_bed.is_file())
             self.assertTrue(outputs.segments_bed.is_file())
             self.assertTrue(outputs.calls_bed.is_file())
+            self.assertTrue(Path(str(outputs.bins_bed) + ".tbi").is_file())
+            self.assertTrue(Path(str(outputs.segments_bed) + ".tbi").is_file())
+            self.assertTrue(Path(str(outputs.calls_bed) + ".tbi").is_file())
+            self.assertIsNotNone(outputs.bins_vcf)
+            self.assertTrue(outputs.bins_vcf.is_file())
+            self.assertTrue(Path(str(outputs.bins_vcf) + ".tbi").is_file())
+            self.assertIsNotNone(outputs.segments_vcf)
+            self.assertTrue(outputs.segments_vcf.is_file())
+            self.assertTrue(Path(str(outputs.segments_vcf) + ".tbi").is_file())
+            self.assertIsNotNone(outputs.calls_vcf)
+            self.assertTrue(outputs.calls_vcf.is_file())
+            self.assertTrue(Path(str(outputs.calls_vcf) + ".tbi").is_file())
             self.assertTrue(outputs.bins_parquet.is_file())
             self.assertTrue(outputs.segments_parquet.is_file())
             self.assertTrue(outputs.plot_svg and outputs.plot_svg.is_file())
-            bins_header = outputs.bins_bed.read_text().splitlines()[0].split("\t")
-            segments_header = (
-                outputs.segments_bed.read_text().splitlines()[0].split("\t")
-            )
-            calls_header = outputs.calls_bed.read_text().splitlines()[0].split("\t")
+            with gzip.open(outputs.bins_bed, "rt") as h:
+                bins_lines = h.read().splitlines()
+            bins_header = bins_lines[0].split("\t")
+            with gzip.open(outputs.segments_bed, "rt") as h:
+                segments_header = h.read().splitlines()[0].split("\t")
+            with gzip.open(outputs.calls_bed, "rt") as h:
+                calls_header = h.read().splitlines()[0].split("\t")
             self.assertEqual(tuple(bins_header), BINS_BED_HEADER)
             self.assertEqual(tuple(segments_header), SEGMENTS_BED_HEADER)
             self.assertEqual(tuple(calls_header), CALLS_BED_HEADER)
-            for line in outputs.bins_bed.read_text().splitlines()[1:]:
+            for line in bins_lines[1:]:
                 contig = line.split("\t")[0]
                 self.assertFalse(contig.isdigit(), contig)
+
             for segment in outputs.segments:
                 self.assertLessEqual(segment.end, dict(CONTIGS)[segment.contig])
 

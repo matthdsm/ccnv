@@ -1,3 +1,4 @@
+import gzip
 import tempfile
 import unittest
 from dataclasses import asdict
@@ -6,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pysam
 from published_fixtures import CHR21_LENGTH, convert_published_samples
 from typer.testing import CliRunner
 
@@ -173,11 +175,15 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
                 inputs.contig_lengths,
                 plot=False,
             )
-            bins_rows = outputs.bins_bed.read_text().splitlines()
-            segment_rows = outputs.segments_bed.read_text().splitlines()
-            call_rows = outputs.calls_bed.read_text().splitlines()
+            with gzip.open(outputs.bins_bed, "rt") as h:
+                bins_rows = h.read().splitlines()
+            with gzip.open(outputs.segments_bed, "rt") as h:
+                segment_rows = h.read().splitlines()
+            with gzip.open(outputs.calls_bed, "rt") as h:
+                call_rows = h.read().splitlines()
 
         self.assertEqual(tuple(bins_rows[0].split("\t")), BINS_BED_HEADER)
+
         self.assertEqual(tuple(segment_rows[0].split("\t")), SEGMENTS_BED_HEADER)
         self.assertEqual(tuple(call_rows[0].split("\t")), CALLS_BED_HEADER)
         self.assertEqual(bins_rows[1].split("\t")[:3], ["chr1", "0", "95"])
@@ -337,9 +343,12 @@ class TestPredictPublishedCrams(unittest.TestCase):
             )
             self.assertEqual(result.exit_code, 0, result.output)
 
-            bins_bed = Path(f"{predict_prefix}_bins.bed")
-            segments_bed = Path(f"{predict_prefix}_segments.bed")
-            calls_bed = Path(f"{predict_prefix}_calls.bed")
+            bins_bed = Path(f"{predict_prefix}_bins.bed.gz")
+            segments_bed = Path(f"{predict_prefix}_segments.bed.gz")
+            calls_bed = Path(f"{predict_prefix}_calls.bed.gz")
+            bins_vcf = Path(f"{predict_prefix}_bins.vcf.gz")
+            segments_vcf = Path(f"{predict_prefix}_segments.vcf.gz")
+            calls_vcf = Path(f"{predict_prefix}_calls.vcf.gz")
             plot_svg = Path(f"{predict_prefix}_plot.svg")
             bins_parquet = Path(f"{predict_prefix}_bins.ccnv")
             segments_parquet = Path(f"{predict_prefix}_segments.ccnv")
@@ -347,26 +356,47 @@ class TestPredictPublishedCrams(unittest.TestCase):
                 bins_bed,
                 segments_bed,
                 calls_bed,
+                Path(str(bins_bed) + ".tbi"),
+                Path(str(segments_bed) + ".tbi"),
+                Path(str(calls_bed) + ".tbi"),
+                bins_vcf,
+                segments_vcf,
+                calls_vcf,
+                Path(str(bins_vcf) + ".tbi"),
+                Path(str(segments_vcf) + ".tbi"),
+                Path(str(calls_vcf) + ".tbi"),
                 plot_svg,
                 bins_parquet,
                 segments_parquet,
             ):
                 self.assertTrue(path.is_file(), path)
 
-            bin_lines = bins_bed.read_text().splitlines()
+            with gzip.open(bins_bed, "rt") as h:
+                bin_lines = h.read().splitlines()
             self.assertEqual(tuple(bin_lines[0].split("\t")), BINS_BED_HEADER)
             self.assertEqual(len(bin_lines) - 1, 468)
             self.assertEqual(bin_lines[1].split("\t")[0], "chr21")
             self.assertEqual(int(bin_lines[1].split("\t")[1]), 0)
             self.assertEqual(int(bin_lines[-1].split("\t")[2]), CHR21_LENGTH)
+
+            with gzip.open(segments_bed, "rt") as h:
+                seg_lines = h.read().splitlines()
             self.assertEqual(
-                tuple(segments_bed.read_text().splitlines()[0].split("\t")),
+                tuple(seg_lines[0].split("\t")),
                 SEGMENTS_BED_HEADER,
             )
+
+            with gzip.open(calls_bed, "rt") as h:
+                call_lines = h.read().splitlines()
             self.assertEqual(
-                tuple(calls_bed.read_text().splitlines()[0].split("\t")),
+                tuple(call_lines[0].split("\t")),
                 CALLS_BED_HEADER,
             )
+
+            with pysam.TabixFile(str(bins_vcf)) as tb:
+                records = list(tb.fetch("chr21", 0, CHR21_LENGTH))
+                self.assertEqual(len(records), 468)
+
             bins_table = pq.read_table(bins_parquet)
             self.assertEqual(bins_table.num_rows, 468)
             self.assertEqual(set(bins_table.column("contig").to_pylist()), {"chr21"})

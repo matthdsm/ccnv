@@ -49,6 +49,9 @@ class PredictionOutputs:
     plot_svg: Path | None
     bins_parquet: Path
     segments_parquet: Path
+    bins_vcf: Path | None
+    segments_vcf: Path | None
+    calls_vcf: Path | None
     bins: tuple[BinResult, ...]
     segments: tuple[SegmentResult, ...]
 

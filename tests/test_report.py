@@ -1,3 +1,4 @@
+import gzip
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -5,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+import pysam
 
 from ccnv.report import (
     BINS_BED_HEADER,
@@ -142,17 +144,119 @@ class TestReport(unittest.TestCase):
             self.assertTrue(outputs.bins_bed.is_file())
             self.assertTrue(outputs.segments_bed.is_file())
             self.assertTrue(outputs.calls_bed.is_file())
+            self.assertTrue(Path(str(outputs.bins_bed) + ".tbi").is_file())
+            self.assertTrue(Path(str(outputs.segments_bed) + ".tbi").is_file())
+            self.assertTrue(Path(str(outputs.calls_bed) + ".tbi").is_file())
+            self.assertIsNotNone(outputs.bins_vcf)
+            self.assertTrue(outputs.bins_vcf.is_file())
+            self.assertTrue(Path(str(outputs.bins_vcf) + ".tbi").is_file())
+            self.assertIsNotNone(outputs.segments_vcf)
+            self.assertTrue(outputs.segments_vcf.is_file())
+            self.assertTrue(Path(str(outputs.segments_vcf) + ".tbi").is_file())
+            self.assertIsNotNone(outputs.calls_vcf)
+            self.assertTrue(outputs.calls_vcf.is_file())
+            self.assertTrue(Path(str(outputs.calls_vcf) + ".tbi").is_file())
             self.assertTrue(outputs.bins_parquet.is_file())
             self.assertTrue(outputs.segments_parquet.is_file())
             self.assertIsNotNone(outputs.plot_svg)
             self.assertTrue(outputs.plot_svg.is_file())
 
-            bins_lines = outputs.bins_bed.read_text().splitlines()
+            with gzip.open(outputs.bins_bed, "rt") as h:
+                bins_lines = h.read().splitlines()
             self.assertEqual(tuple(bins_lines[0].split("\t")), BINS_BED_HEADER)
-            seg_lines = outputs.segments_bed.read_text().splitlines()
+            with gzip.open(outputs.segments_bed, "rt") as h:
+                seg_lines = h.read().splitlines()
             self.assertEqual(tuple(seg_lines[0].split("\t")), SEGMENTS_BED_HEADER)
-            call_lines = outputs.calls_bed.read_text().splitlines()
+            with gzip.open(outputs.calls_bed, "rt") as h:
+                call_lines = h.read().splitlines()
             self.assertEqual(tuple(call_lines[0].split("\t")), CALLS_BED_HEADER)
+
+            with gzip.open(outputs.bins_vcf, "rt") as h:
+                bins_vcf_lines = h.read().splitlines()
+            self.assertTrue(bins_vcf_lines[0].startswith("##fileformat=VCFv4.2"))
+            chrom_lines = [line for line in bins_vcf_lines if line.startswith("#CHROM")]
+            self.assertEqual(len(chrom_lines), 1)
+            self.assertTrue(
+                chrom_lines[0].startswith(
+                    "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tsample_out"
+                )
+            )
+
+            with pysam.TabixFile(str(outputs.bins_bed)) as tb:
+                self.assertEqual(list(tb.header), ["\t".join(BINS_BED_HEADER)])
+                records = list(tb.fetch("chr1", 0, 100_000))
+                self.assertEqual(len(records), 1)
+
+            with pysam.TabixFile(str(outputs.bins_vcf)) as tb:
+                records = list(tb.fetch("chr1", 0, 100_000))
+                self.assertEqual(len(records), 1)
+                fields = records[0].split("\t")
+                self.assertEqual(fields[0], "chr1")
+                self.assertEqual(fields[1], "1")
+                self.assertEqual(fields[4], "<CNV>")
+                self.assertEqual(fields[6], "PASS")
+                self.assertIn("SVTYPE=CNV", fields[7])
+                self.assertEqual(fields[8], "LOG2R:ZSCORE:WEIGHT:REF_SIZE")
+
+            with pysam.VariantFile(str(outputs.bins_vcf)) as vf:
+                self.assertEqual(list(vf.header.samples), ["sample_out"])
+                self.assertIn("chr1", vf.header.contigs)
+                self.assertEqual(vf.header.contigs["chr1"].length, 100_000)
+                recs = list(vf.fetch("chr1", 0, 100_000))
+                self.assertEqual(len(recs), 1)
+                self.assertEqual(recs[0].chrom, "chr1")
+                self.assertEqual(recs[0].pos, 1)
+                self.assertEqual(recs[0].stop, 100_000)
+                self.assertEqual(recs[0].id, "chr1:0-100000")
+                self.assertEqual(recs[0].alts, ("<CNV>",))
+                self.assertEqual(list(recs[0].filter), ["PASS"])
+                self.assertEqual(recs[0].info["SVTYPE"], "CNV")
+                self.assertEqual(recs[0].info["BRANCH"], "autosomal")
+                self.assertAlmostEqual(recs[0].samples["sample_out"]["LOG2R"], 0.0)
+                self.assertEqual(recs[0].samples["sample_out"]["REF_SIZE"], 10)
+
+            with pysam.VariantFile(str(outputs.segments_vcf)) as vf:
+                self.assertEqual(list(vf.header.samples), ["sample_out"])
+                recs = list(vf.fetch("chr1", 0, 100_000))
+                self.assertEqual(len(recs), 1)
+                self.assertEqual(recs[0].stop, 100_000)
+                self.assertEqual(recs[0].info["SVTYPE"], "CNV")
+                self.assertTrue(recs[0].info["IMPRECISE"])
+                self.assertEqual(recs[0].samples["sample_out"]["BINS"], 1)
+
+            with pysam.VariantFile(str(outputs.calls_vcf)) as vf:
+                self.assertEqual(list(vf.header.samples), ["sample_out"])
+                recs = list(vf.fetch("chr1", 0, 100_000))
+                self.assertEqual(len(recs), 0)
+
+    def test_write_outputs_vcf_disabled(self) -> None:
+        contig_lengths = {"chr1": 100_000}
+        bins = (
+            BinResult(
+                branch="autosomal",
+                contigs=("chr1",),
+                starts=np.array([0], dtype=np.int64),
+                ends=np.array([100_000], dtype=np.int64),
+                ratios=np.array([0.0], dtype=np.float64),
+                zscores=np.array([0.0], dtype=np.float64),
+                weights=np.array([1.0], dtype=np.float64),
+                reference_sizes=np.array([10], dtype=np.int64),
+                masked=np.array([False], dtype=bool),
+            ),
+        )
+        segments = (SegmentResult("chr1", 0, 100_000, 0.0, 0.0, 1.0, 1, None),)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prefix = Path(tmpdir) / "no_vcf"
+            outputs = write_outputs(
+                prefix, bins, segments, contig_lengths, plot=False, vcf=False
+            )
+            self.assertIsNone(outputs.bins_vcf)
+            self.assertIsNone(outputs.segments_vcf)
+            self.assertIsNone(outputs.calls_vcf)
+            self.assertFalse(Path(f"{prefix}_bins.vcf.gz").exists())
+            self.assertFalse(Path(f"{prefix}_bins.vcf.gz.tbi").exists())
+            self.assertTrue(outputs.bins_bed.is_file())
+            self.assertTrue(Path(f"{prefix}_bins.bed.gz.tbi").is_file())
 
     def test_natural_sort_key(self) -> None:
         raw = [
@@ -250,19 +354,58 @@ class TestReport(unittest.TestCase):
             outputs = write_outputs(prefix, bins, segments, contig_lengths, plot=True)
 
             # Check bins BED order
-            bins_lines = outputs.bins_bed.read_text().splitlines()[1:]
+            with gzip.open(outputs.bins_bed, "rt") as h:
+                bins_lines = h.read().splitlines()[1:]
             bins_contigs = [line.split("\t")[0] for line in bins_lines]
             self.assertEqual(bins_contigs, ["chr1", "chr2", "chr10", "chrX", "chrY"])
 
             # Check segments BED order
-            seg_lines = outputs.segments_bed.read_text().splitlines()[1:]
+            with gzip.open(outputs.segments_bed, "rt") as h:
+                seg_lines = h.read().splitlines()[1:]
             seg_contigs = [line.split("\t")[0] for line in seg_lines]
             self.assertEqual(seg_contigs, ["chr1", "chr2", "chr10", "chrX", "chrY"])
 
             # Check calls BED order
-            call_lines = outputs.calls_bed.read_text().splitlines()[1:]
+            with gzip.open(outputs.calls_bed, "rt") as h:
+                call_lines = h.read().splitlines()[1:]
             call_contigs = [line.split("\t")[0] for line in call_lines]
             self.assertEqual(call_contigs, ["chr2", "chr10"])
+
+            # Check VCF records and sorting
+            self.assertIsNotNone(outputs.bins_vcf)
+            with gzip.open(outputs.bins_vcf, "rt") as h:
+                vcf_bin_records = [
+                    line for line in h.read().splitlines() if not line.startswith("#")
+                ]
+            self.assertEqual(
+                [line.split("\t")[0] for line in vcf_bin_records],
+                ["chr1", "chr2", "chr10", "chrX", "chrY"],
+            )
+
+            self.assertIsNotNone(outputs.segments_vcf)
+            with gzip.open(outputs.segments_vcf, "rt") as h:
+                vcf_seg_records = [
+                    line for line in h.read().splitlines() if not line.startswith("#")
+                ]
+            self.assertEqual(
+                [line.split("\t")[0] for line in vcf_seg_records],
+                ["chr1", "chr2", "chr10", "chrX", "chrY"],
+            )
+            # chr1: neutral -> <CNV>, chr2: loss -> <DEL>, chr10: gain -> <DUP>
+            self.assertEqual(vcf_seg_records[0].split("\t")[4], "<CNV>")
+            self.assertEqual(vcf_seg_records[1].split("\t")[4], "<DEL>")
+            self.assertEqual(vcf_seg_records[2].split("\t")[4], "<DUP>")
+
+            self.assertIsNotNone(outputs.calls_vcf)
+            with gzip.open(outputs.calls_vcf, "rt") as h:
+                vcf_call_records = [
+                    line for line in h.read().splitlines() if not line.startswith("#")
+                ]
+            self.assertEqual(
+                [line.split("\t")[0] for line in vcf_call_records], ["chr2", "chr10"]
+            )
+            self.assertEqual(vcf_call_records[0].split("\t")[4], "<DEL>")
+            self.assertEqual(vcf_call_records[1].split("\t")[4], "<DUP>")
 
             # Check bins Parquet order
             bins_tbl = pq.read_table(outputs.bins_parquet)

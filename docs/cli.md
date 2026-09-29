@@ -133,17 +133,21 @@ ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
 | `--mask-repeats` | `3` | Iterations of within-sample masking of extreme bins. |
 | `--max-blacklist-gap` | `2000000` | Maximum masked gap (bases) that segmentation may bridge. |
 | `--plot` / `--no-plot` | `--plot` | Write `<prefix>_plot.svg`. |
+| `--vcf` / `--no-vcf` | `--vcf` | Write bgzip-compressed and tabix-indexed VCFv4.2 outputs (`_bins.vcf.gz`, `_segments.vcf.gz`, `_calls.vcf.gz`). |
 | `--loglevel` | `WARNING` | Logging verbosity for predict steps. |
 
 Prediction writes:
 
-- `<prefix>_bins.bed`
-- `<prefix>_segments.bed`
-- `<prefix>_calls.bed`
+- `<prefix>_bins.bed.gz` (and `.tbi`)
+- `<prefix>_segments.bed.gz` (and `.tbi`)
+- `<prefix>_calls.bed.gz` (and `.tbi`)
+- `<prefix>_bins.vcf.gz` (and `.tbi`, unless `--no-vcf`)
+- `<prefix>_segments.vcf.gz` (and `.tbi`, unless `--no-vcf`)
+- `<prefix>_calls.vcf.gz` (and `.tbi`, unless `--no-vcf`)
 - `<prefix>_plot.svg` unless `--no-plot`
 - `<prefix>_bins.ccnv` and `<prefix>_segments.ccnv`
 
-BED coordinates are 0-based, half-open, with contig names from the sample genome. Called segments also appear in `_calls.bed`.
+BED coordinates are 0-based, half-open, with contig names from the sample genome and a `#contig` header for standard tabix compatibility. VCF outputs follow VCFv4.2 with 1-based start coordinates, symbolic SV types (`<DUP>`, `<DEL>`, `<CNV>`), and sample genotype format metrics (`LOG2R`, `ZSCORE`, `WEIGHT`, `BINS` / `REF_SIZE`). Called segments also appear in `_calls.bed.gz` and `_calls.vcf.gz`.
 
 If the sample has a different bin size than the reference model, it is automatically rebinned to the reference bin coordinates in memory, provided their contig lengths match. The reference Parquet file is never modified.
 

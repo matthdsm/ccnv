@@ -120,6 +120,7 @@ def run(config: PredictConfig) -> PredictionOutputs:
         segments,
         inputs.contig_lengths,
         config.plot,
+        config.vcf,
     )
 
 

@@ -129,3 +129,4 @@ class PredictConfig:
     mask_repeats: int = 3
     max_blacklist_gap: int = 2_000_000
     plot: bool = True
+    vcf: bool = True

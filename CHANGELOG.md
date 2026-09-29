@@ -8,7 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Prediction outputs (`_bins.bed`, `_segments.bed`, `_calls.bed`, `_bins.ccnv`, `_segments.ccnv`, and `_plot.svg`) now sort chromosomes and intervals in natural sort order (e.g. `chr1`, `chr2`, ..., `chr10`, ..., `chrX`, `chrY`) instead of lexicographical order.
+- Prediction BED outputs (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`) are now always bgzip-compressed and tabix-indexed (`.tbi`), with `#contig` headers for standard tabix/IGV compatibility.
+- Prediction outputs (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`, `_bins.vcf.gz`, `_segments.vcf.gz`, `_calls.vcf.gz`, `_bins.ccnv`, `_segments.ccnv`, and `_plot.svg`) now sort chromosomes and intervals in natural sort order (e.g. `chr1`, `chr2`, ..., `chr10`, ..., `chrX`, `chrY`) instead of lexicographical order.
 - Parallelized `ccnv reference` execution controlled by a `-t/--threads` flag (defaulting to system CPU count), multi-processing cohort sample loading and rebinning via `src/ccnv/cohort.py`, parallelizing batched off-contig nearest-bin selection via `src/ccnv/reference_compute.py`, and multi-processing null model derivation.
 - Extracted cohort ingestion and validation into `src/ccnv/cohort.py` and compute kernels into `src/ccnv/reference_compute.py`, keeping modules modular and strictly below 1,000 lines.
 - Replaced boolean array masking with precomputed contiguous contig slice bounds in `select_nearest_bins`, accelerating per-query candidate masking by over 400x.
@@ -29,7 +30,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- VCFv4.2 prediction outputs: `ccnv predict` now generates bgzip-compressed and tabix-indexed VCF files for bins (`_bins.vcf.gz`), segments (`_segments.vcf.gz`), and called events (`_calls.vcf.gz`) using native `pysam.VariantFile` and `pysam.BGZFile` single-pass streaming, containing standard symbolic SV tags (`<DUP>`, `<DEL>`, `<CNV>`), 1-based intervals, and copy ratio / z-score format metrics, enabled by default with `--vcf / --no-vcf` control.
 - `ccnv ref-qc`: evaluate reference model usability and WisecondorX-derived quality heuristics (`PASS`, `WARN`, `FAIL`) on existing reference files, emitting `<prefix>_qc.json` and a stderr summary.
+
 - Reference creation quality control: `ccnv reference` automatically evaluates reference metrics and writes `<prefix>_qc.json` during build (toggleable via `--qc-report / --no-qc-report`).
 - Comprehensive pipeline architecture documentation (`docs/pipeline.md`) with detailed Mermaid flowcharts for all pipeline subcommands (`convert`, `reference`, `ref-qc`, `predict`), and embedded stage flowcharts in the CLI reference (`docs/cli.md`).
 - `rebin_counts` and `rebin_sample_table` for 1D mass-conserving count interpolation across bin grids.
