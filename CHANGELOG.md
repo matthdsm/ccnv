@@ -40,5 +40,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Sex-contig branches inferred from a Y-signal contig (`--sex-cutoff` optional); no per-sample sex labels on the CLI.
 - CI that publishes multi-arch (`linux/amd64`, `linux/arm64`) GHCR images from `pixi.lock` (`latest` on `master`; SHA, version, and `stable` on release) and attaches a Python wheel to GitHub Releases. Local images: `pixi run docker-build`.
 - Real-world NIPT conversion validation and storage comparison against WisecondorX documented in `docs/validation.md`.
+- Reference creation comparison against WisecondorX across 8 pipeline stages, numerical concordance, and 9.2x storage footprint reduction documented in `docs/validation.md`.
+- Predict stage comparison against WisecondorX across 8 pipeline stages, bin concordance (r=0.9869), weighted Ruptures segmentation, and 4.2x Parquet compression advantage documented in `docs/validation.md`.
 - CI rejects pull requests that do not update `CHANGELOG.md`.
+
+
 
