@@ -1,6 +1,6 @@
 # Validation
 
-## Conversion concordance and storage comparison
+## Conversion concordance and storage comparison against WisecondorX (v1.3.2)
 
 Validation of the `convert` stage was conducted on a real-world NIPT sample binned at 5 kb across 24 chromosomes (1–22, X, Y), comprising 617,665 total bins and 66,629,087 raw reads.
 
