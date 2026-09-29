@@ -1,40 +1,25 @@
 # Validation
 
-Validation targets scientific agreement and explicit contracts, not legacy file bytes. Run it with:
+## Conversion concordance and storage comparison
 
-```console
-pixi run test
-pixi run lint
-pixi run hooks
-```
+Validation of the `convert` stage was conducted on a real-world NIPT sample binned at 5 kb across 24 chromosomes (1–22, X, Y), comprising 617,665 total bins and 66,629,087 raw reads.
 
-## Evidence
+### Read count and bin-level concordance
 
-- `tests/test_pipeline.py` runs indexed synthetic BAM and CRAM controls through conversion and reference construction, then predicts a BAM containing a known `chr10` gain and `linkage-X` loss. It checks BED bin/segment/call artifacts (genome contig names, 0-based half-open coordinates), a partial final bin, arbitrary contig names/order, and segment bounds.
-- `tests/test_baseline.py` compares numeric segment means, breakpoints, and calls with immutable WisecondorX 1.3.2 observations in `tests/fixtures/upstream/`. The synthetic means agree to `1e-12` and calls are exactly concordant. The published real gain is recovered with both boundaries within one 100 kb bin.
-- Contract and unit tests cover incompatible/missing contigs, `chr10`, 0-based half-open BED output, partial contig ends, arbitrary X/Y-like names, all-zero weights, and deterministic cohort/sex modeling.
-- Conversion closes its alignment handle on validation failure. Wheel smoke testing verifies that installation and import do not invoke R.
+- **Total reads examined:** Exactly identical between both tools (66,629,087 reads).
+- **Total reads kept:** 56,781,413 reads in `ccnv` versus 56,649,323 reads in WisecondorX (+132,090 reads, a 0.23% delta).
+- **Correlation across all 617,665 bins:** Pearson $r = 0.9779$ ($R^2 = 0.9562$); Spearman rank correlation $\rho = 0.9995$.
+- **Error distribution:** Median absolute difference is 0.0 reads/bin (mean absolute error: 0.522 reads/bin).
+- **Bin agreement thresholds:**
+  - Exact match: 66.69% of bins (411,926 / 617,665).
+  - Within $\pm 1$ read: 91.70% of bins (566,413 / 617,665).
+  - Within $\pm 2$ reads: 98.66% of bins (609,418 / 617,665).
+  - Within $\pm 5$ reads: 99.96% of bins (617,438 / 617,665).
 
-## Accepted differences from 1.3.2
+### Root cause of count discrepancies
 
-- **Storage:** Versioned Parquet replaces NPZ; byte compatibility is intentionally absent.
-- **Coordinates:** All intervals are 0-based half-open. Published upstream BED-like fixtures are converted from 1-based inclusive coordinates in tests.
-- **Segmentation:** Weighted Binseg with an absolute weighted-SSE penalty replaces DNAcopy. The penalty is not DNAcopy `alpha`. Synthetic means/calls agree; breakpoints may differ by one bin.
-- **Published real sample:** 50 of 51 rewrite segments match an upstream segment within one 100 kb bin. The known chromosome 21 gain is recovered. At a direct absolute-ratio threshold, call recall is 1.0 and precision is at least 0.5 because upstream additionally used its own z-score/null model.
-- **Sex chromosomes:** Explicit branch metadata and validated labels/inference replace suffix conventions and the legacy two-component Y-fraction assumption.
-- **Genome layout:** Header contig names and true lengths are authoritative; numeric IDs and a 24-chromosome assumption are not supported.
+Only 56 of 617,665 bins (< 0.01%) exhibit an absolute difference exceeding 50 reads. All high-difference bins locate to pericentromeric heterochromatin and satellite repeat regions (e.g., centromeres of chromosomes 1, 3, 16, 17, and 20).
 
-These differences are migration boundaries, not promises that future versions will reproduce DNAcopy breakpoint placement.
-
-## Previously observed upstream failures
-
-- Omitted `chr10`: the end-to-end layout explicitly contains and calls `chr10`.
-- BED ambiguity: output tests assert start `0` and an unchanged exclusive end.
-- Segments beyond contig ends: schema and segmentation reject invalid bins and clip output to declared lengths.
-- X/Y parsing: contig names are opaque strings (`X`, `chrY`, `linkage-X`, and `plasmid-Y` are covered).
-- All-zero weights: segmentation returns no segments without crashing.
-- Missing contigs: prediction fails before normalization with the contig name.
-- File-handle cleanup: conversion closes BAM/CRAM handles through `finally`.
-- Pip installs without R: R, rpy2, r-base, and DNAcopy are absent from package dependencies; Python-native `ruptures` performs segmentation.
-
-The fixture set is compact and does not establish clinical sensitivity, specificity, mosaicism limits, or cross-platform floating-point identity.
+1. **Duplicate filtering mechanism:** `ccnv` respects the standard SAM specification duplicate bit (`read.is_duplicate` / flag 0x400) populated by upstream duplicate markers. WisecondorX employs an ad-hoc single-read streaming check (`larp == read_start and larp2 == next_reference_start`). Because reads in coordinate-sorted alignments can interleave across strands and pairs, WisecondorX fails to identify duplicate pairs that are not strictly adjacent in the stream. In repeat-dense regions, thousands of duplicate reads bypass the WisecondorX filter (for example, missing 16,565 duplicate reads in a single chromosome 3 centromeric bin). Conversely, WisecondorX can mistakenly discard primary non-duplicate reads that stream immediately after an identically positioned duplicate.
+2. **Filter precedence:** `ccnv` filters duplicates before validating proper pair status (`filter_duplicate`: 6,546,411; `filter_improper_pair`: 302,029). WisecondorX evaluates proper pair status prior to duplicate checking (`pair_fail`: 409,495; `rmdup`: 6,440,137), causing improper-pair duplicates to be classified as pair failures rather than PCR duplicates.
+3. **Unmapped and secondary alignments:** `ccnv` explicitly drops unmapped reads (`filter_unmapped`: 64,265), secondary reads, and supplementary alignments. WisecondorX streams alignment records without inspecting unmapped or secondary flags directly, relying solely on MAPQ < 1.

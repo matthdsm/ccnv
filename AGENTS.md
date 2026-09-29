@@ -66,12 +66,6 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 - `pixi run hooks`: Run pre-commit hooks (managed by `prek`).
 - `pixi run docker-build`: Build the Docker image for `linux/amd64` and `linux/arm64` (Buildx cache; not loaded into the local daemon).
 
-Run the threshold-free performance suite with:
-
-```console
-pixi run python benchmarks/run_benchmarks.py --scale 2 --repeats 3
-```
-
 ### Code Style
 
 - Adhere to the Ruff configuration in `pyproject.toml`.
@@ -87,8 +81,6 @@ pixi run python benchmarks/run_benchmarks.py --scale 2 --repeats 3
 - **Contract Tests:** When adding features that change how data is stored or processed, update the contract tests in `tests/`.
 - **Functional Tests:** Aim for high coverage of the computational logic.
 - **Pipeline Tests:** Keep BAM and CRAM end-to-end coverage in `tests/test_pipeline.py`.
-- **Scientific Baselines:** Compare numeric agreement and call concordance against immutable `tests/fixtures/upstream/`; never require legacy byte compatibility.
-- **Performance:** Record machine/input metadata in `docs/benchmarks.md`; do not add timing or RSS thresholds to CI.
 
 ## Agent Specific Instructions
 
@@ -96,7 +88,3 @@ pixi run python benchmarks/run_benchmarks.py --scale 2 --repeats 3
 - **Surgical Updates:** When fixing bugs, prioritize small, targeted changes and adding a corresponding test case.
 - **Documentation:** Update this document and README if you make changes that affect the overall architecture or development workflow.
 - **Markdown Formatting:** Do not hard-wrap lines in Markdown files; rely on editor soft-wrapping for line length. Keep paragraphs and list items on a single logical line. Avoid unnecessary newlines, redundant blank lines, and empty lines inside Mermaid diagram blocks.
-
-## Scientific limitations
-
-Weighted-SSE Binseg penalties are not DNAcopy `alpha`. The compact synthetic and published fixtures establish regression evidence, not clinical sensitivity, specificity, or assay thresholds. Sex inference requires sufficient separated cohort groups unless `--sex-cutoff` is set; per-sample sex labels are not accepted on the CLI. See `docs/validation.md` for accepted migration differences, `docs/pipeline.md` for detailed subcommand flowcharts and pipeline mechanics, and `docs/cli.md` for command flags.

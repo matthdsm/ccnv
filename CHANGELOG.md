@@ -39,4 +39,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Versioned Parquet contracts (`1.0.0`), header-authoritative contig layouts, and organism-agnostic naming (no fixed 24-chromosome genome).
 - Sex-contig branches inferred from a Y-signal contig (`--sex-cutoff` optional); no per-sample sex labels on the CLI.
 - CI that publishes multi-arch (`linux/amd64`, `linux/arm64`) GHCR images from `pixi.lock` (`latest` on `master`; SHA, version, and `stable` on release) and attaches a Python wheel to GitHub Releases. Local images: `pixi run docker-build`.
+- Real-world NIPT conversion validation and storage comparison against WisecondorX documented in `docs/validation.md`.
 - CI rejects pull requests that do not update `CHANGELOG.md`.
+
