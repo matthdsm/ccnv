@@ -5,8 +5,6 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pysam
 
 from ccnv.results import BinResult, PredictionOutputs, SegmentResult
@@ -114,7 +112,7 @@ def write_outputs(
     plot: bool,
     vcf: bool = True,
 ) -> PredictionOutputs:
-    """Write compressed BED evidence, matching Parquet, VCFs, and an SVG plot."""
+    """Write compressed BED evidence, VCFs, and an SVG plot."""
 
     prefix.parent.mkdir(parents=True, exist_ok=True)
     bins = sort_bin_results(bins)
@@ -122,8 +120,6 @@ def write_outputs(
     bins_bed = Path(f"{prefix}_bins.bed.gz")
     segments_bed = Path(f"{prefix}_segments.bed.gz")
     calls_bed = Path(f"{prefix}_calls.bed.gz")
-    bins_parquet = Path(f"{prefix}_bins.ccnv")
-    segments_parquet = Path(f"{prefix}_segments.ccnv")
     plot_path = Path(f"{prefix}_plot.svg") if plot else None
     sample_name = prefix.name if prefix.name else "SAMPLE"
     calls = [item for item in segments if item.call is not None]
@@ -195,30 +191,24 @@ def write_outputs(
             sample_name,
             calls_only=True,
         )
-    pq.write_table(_bins_table(bins), bins_parquet, compression="zstd")
-    pq.write_table(_segments_table(segments), segments_parquet, compression="zstd")
     logger.debug(
-        "wrote %s, %s, %s, %s, %s",
+        "wrote %s, %s, %s",
         bins_bed.name,
         segments_bed.name,
         calls_bed.name,
-        bins_parquet.name,
-        segments_parquet.name,
     )
     if plot_path is not None:
         write_genome_plot(plot_path, bins, segments, contig_lengths)
     return PredictionOutputs(
-        bins_bed,
-        segments_bed,
-        calls_bed,
-        plot_path,
-        bins_parquet,
-        segments_parquet,
-        bins_vcf,
-        segments_vcf,
-        calls_vcf,
-        bins,
-        segments,
+        bins_bed=bins_bed,
+        segments_bed=segments_bed,
+        calls_bed=calls_bed,
+        plot_svg=plot_path,
+        bins_vcf=bins_vcf,
+        segments_vcf=segments_vcf,
+        calls_vcf=calls_vcf,
+        bins=bins,
+        segments=segments,
     )
 
 
@@ -633,64 +623,6 @@ def _segment_bed_rows(
             item.call or "",
         )
         for item in results
-    )
-
-
-def _bins_table(results: tuple[BinResult, ...]) -> pa.Table:
-    rows = [
-        (result, index) for result in results for index in range(len(result.contigs))
-    ]
-    return pa.table(
-        {
-            "branch": [result.branch for result, _ in rows],
-            "contig": [result.contigs[index] for result, index in rows],
-            "start": pa.array(
-                [int(result.starts[index]) for result, index in rows], type=pa.int64()
-            ),
-            "end": pa.array(
-                [int(result.ends[index]) for result, index in rows], type=pa.int64()
-            ),
-            "ratio": pa.array(
-                [float(result.ratios[index]) for result, index in rows],
-                type=pa.float64(),
-                from_pandas=True,
-            ),
-            "zscore": pa.array(
-                [float(result.zscores[index]) for result, index in rows],
-                type=pa.float64(),
-                from_pandas=True,
-            ),
-            "weight": pa.array(
-                [float(result.weights[index]) for result, index in rows],
-                type=pa.float64(),
-            ),
-            "reference_size": pa.array(
-                [int(result.reference_sizes[index]) for result, index in rows],
-                type=pa.int64(),
-            ),
-            "masked": [bool(result.masked[index]) for result, index in rows],
-        }
-    )
-
-
-def _segments_table(results: tuple[SegmentResult, ...]) -> pa.Table:
-    return pa.table(
-        {
-            "contig": [item.contig for item in results],
-            "start": pa.array([item.start for item in results], type=pa.int64()),
-            "end": pa.array([item.end for item in results], type=pa.int64()),
-            "ratio": pa.array([item.ratio for item in results], type=pa.float64()),
-            "zscore": pa.array(
-                [item.zscore for item in results],
-                type=pa.float64(),
-                from_pandas=True,
-            ),
-            "weight": pa.array([item.weight for item in results], type=pa.float64()),
-            "bin_count": pa.array(
-                [item.bin_count for item in results], type=pa.int64()
-            ),
-            "call": pa.array([item.call for item in results], type=pa.string()),
-        }
     )
 
 

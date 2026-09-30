@@ -443,10 +443,7 @@ def predict(
     prefix: Annotated[
         Path | None,
         typer.Option(
-            help=(
-                "Output path prefix for PREFIX_bins.bed, PREFIX_segments.bed, "
-                "PREFIX_calls.bed, and PREFIX_plot.svg"
-            ),
+            help="Output path prefix for BED, VCF, and SVG deliverables",
         ),
     ] = None,
     sex: Annotated[

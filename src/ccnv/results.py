@@ -47,8 +47,6 @@ class PredictionOutputs:
     segments_bed: Path
     calls_bed: Path
     plot_svg: Path | None
-    bins_parquet: Path
-    segments_parquet: Path
     bins_vcf: Path | None
     segments_vcf: Path | None
     calls_vcf: Path | None

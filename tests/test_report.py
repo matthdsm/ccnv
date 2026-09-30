@@ -5,7 +5,6 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
-import pyarrow.parquet as pq
 import pysam
 
 from ccnv.report import (
@@ -156,8 +155,8 @@ class TestReport(unittest.TestCase):
             self.assertIsNotNone(outputs.calls_vcf)
             self.assertTrue(outputs.calls_vcf.is_file())
             self.assertTrue(Path(str(outputs.calls_vcf) + ".tbi").is_file())
-            self.assertTrue(outputs.bins_parquet.is_file())
-            self.assertTrue(outputs.segments_parquet.is_file())
+            self.assertFalse(Path(f"{prefix}_bins.ccnv").exists())
+            self.assertFalse(Path(f"{prefix}_segments.ccnv").exists())
             self.assertIsNotNone(outputs.plot_svg)
             self.assertTrue(outputs.plot_svg.is_file())
 
@@ -406,20 +405,6 @@ class TestReport(unittest.TestCase):
             )
             self.assertEqual(vcf_call_records[0].split("\t")[4], "<DEL>")
             self.assertEqual(vcf_call_records[1].split("\t")[4], "<DUP>")
-
-            # Check bins Parquet order
-            bins_tbl = pq.read_table(outputs.bins_parquet)
-            self.assertEqual(
-                bins_tbl.column("contig").to_pylist(),
-                ["chr1", "chr2", "chr10", "chrX", "chrY"],
-            )
-
-            # Check segments Parquet order
-            seg_tbl = pq.read_table(outputs.segments_parquet)
-            self.assertEqual(
-                seg_tbl.column("contig").to_pylist(),
-                ["chr1", "chr2", "chr10", "chrX", "chrY"],
-            )
 
             # Check returned outputs
             self.assertEqual(

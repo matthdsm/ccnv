@@ -123,7 +123,7 @@ flowchart TD
     IterativeMask --> BinWeights["Assign bin weights: weight = 1 / (variance + eps)"]
     BinWeights --> SegEngine["Weighted Ruptures Binseg (split on gaps > --max-blacklist-gap)"]
     SegEngine --> CallingCriteria["Call GAIN / LOSS by --z-threshold (or --ratio-threshold)"]
-    CallingCriteria --> OutputArtifacts["Write artifacts: compressed BED (bins, segments, calls), VCFv4.2, Parquet (.ccnv), and SVG plot"]
+    CallingCriteria --> OutputArtifacts["Write artifacts: compressed BED (bins, segments, calls), VCFv4.2, and SVG plot"]
 ```
 
 1. **Rebinning to Reference Coordinates:** If the input sample was binned at a resolution differing from the reference model, sample counts are rebinned in memory using 1D mass-conserving interpolation (`rebin_counts`). The reference Parquet file is never modified.
@@ -133,4 +133,4 @@ flowchart TD
 5. **Iterative Outlier Masking:** Extreme ratio outliers can distort neighboring bins during change-point detection. The pipeline runs `--mask-repeats` (default: 3) iterations of masking bins exceeding extreme deviation thresholds before segmenting.
 6. **Weighted Ruptures Binseg:** Segmentation is performed per contig using Binary Segmentation (`ruptures.Binseg`) with a customized weighted L2 cost model (`WeightedL2Cost`). Each bin's squared error contribution is weighted inversely by its reference variance. Uninformative masked gaps exceeding `--max-blacklist-gap` (default: 2,000,000 bp) prevent segmentation from bridging across centromeres or unmappable heterochromatin.
 7. **Event Calling:** Segments are classified as `GAIN` or `LOSS` if the absolute z-score exceeds `--z-threshold` (default: 3.0), or if `--ratio-threshold` is set, when the absolute log2 ratio exceeds that threshold.
-8. **Output Deliverables:** Writes bgzip-compressed and tabix-indexed BED tables (`<prefix>_bins.bed.gz`, `<prefix>_segments.bed.gz`, `<prefix>_calls.bed.gz`), VCFv4.2 tables (`<prefix>_bins.vcf.gz`, `<prefix>_segments.vcf.gz`, `<prefix>_calls.vcf.gz`, toggleable via `--vcf / --no-vcf`), Parquet tables (`<prefix>_bins.ccnv`, `<prefix>_segments.ccnv`), and `<prefix>_plot.svg` (unless `--no-plot` is set). BED coordinates are 0-based half-open, with contig names from the sample genome.
+8. **Output Deliverables:** Writes bgzip-compressed and tabix-indexed BED tables (`<prefix>_bins.bed.gz`, `<prefix>_segments.bed.gz`, `<prefix>_calls.bed.gz`), VCFv4.2 tables (`<prefix>_bins.vcf.gz`, `<prefix>_segments.vcf.gz`, `<prefix>_calls.vcf.gz`, toggleable via `--vcf / --no-vcf`), and `<prefix>_plot.svg` (unless `--no-plot` is set). BED coordinates are 0-based half-open, with contig names from the sample genome.

@@ -145,7 +145,6 @@ Prediction writes:
 - `<prefix>_segments.vcf.gz` (and `.tbi`, unless `--no-vcf`)
 - `<prefix>_calls.vcf.gz` (and `.tbi`, unless `--no-vcf`)
 - `<prefix>_plot.svg` unless `--no-plot`
-- `<prefix>_bins.ccnv` and `<prefix>_segments.ccnv`
 
 BED coordinates are 0-based, half-open, with contig names from the sample genome and a `#contig` header for standard tabix compatibility. VCF outputs follow VCFv4.2 with 1-based start coordinates, symbolic SV types (`<DUP>`, `<DEL>`, `<CNV>`), and sample genotype format metrics (`LOG2R`, `ZSCORE`, `WEIGHT`, `BINS` / `REF_SIZE`). Called segments also appear in `_calls.bed.gz` and `_calls.vcf.gz`.
 
@@ -160,7 +159,7 @@ flowchart LR
     E --> F["Iterative Outlier Masking"]
     F --> G["Weighted Ruptures Binseg"]
     G --> H["Z-score / Ratio Threshold Calling"]
-    H --> I["BED, Parquet & SVG Outputs"]
+    H --> I["BED, VCF & SVG Outputs"]
 ```
 
 See [Pipeline Architecture: predict](pipeline.md#3-predict) for detailed segmentation mechanics, calling criteria, and artifact specifications.

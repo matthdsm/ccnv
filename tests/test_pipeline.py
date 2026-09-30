@@ -142,8 +142,8 @@ class TestInstalledPipelineContract(unittest.TestCase):
             self.assertIsNotNone(outputs.calls_vcf)
             self.assertTrue(outputs.calls_vcf.is_file())
             self.assertTrue(Path(str(outputs.calls_vcf) + ".tbi").is_file())
-            self.assertTrue(outputs.bins_parquet.is_file())
-            self.assertTrue(outputs.segments_parquet.is_file())
+            self.assertFalse((root / "prediction_bins.ccnv").exists())
+            self.assertFalse((root / "prediction_segments.ccnv").exists())
             self.assertTrue(outputs.plot_svg and outputs.plot_svg.is_file())
             with gzip.open(outputs.bins_bed, "rt") as h:
                 bins_lines = h.read().splitlines()

@@ -350,8 +350,6 @@ class TestPredictPublishedCrams(unittest.TestCase):
             segments_vcf = Path(f"{predict_prefix}_segments.vcf.gz")
             calls_vcf = Path(f"{predict_prefix}_calls.vcf.gz")
             plot_svg = Path(f"{predict_prefix}_plot.svg")
-            bins_parquet = Path(f"{predict_prefix}_bins.ccnv")
-            segments_parquet = Path(f"{predict_prefix}_segments.ccnv")
             for path in (
                 bins_bed,
                 segments_bed,
@@ -366,10 +364,10 @@ class TestPredictPublishedCrams(unittest.TestCase):
                 Path(str(segments_vcf) + ".tbi"),
                 Path(str(calls_vcf) + ".tbi"),
                 plot_svg,
-                bins_parquet,
-                segments_parquet,
             ):
                 self.assertTrue(path.is_file(), path)
+            self.assertFalse(Path(f"{predict_prefix}_bins.ccnv").exists())
+            self.assertFalse(Path(f"{predict_prefix}_segments.ccnv").exists())
 
             with gzip.open(bins_bed, "rt") as h:
                 bin_lines = h.read().splitlines()
@@ -397,9 +395,6 @@ class TestPredictPublishedCrams(unittest.TestCase):
                 records = list(tb.fetch("chr21", 0, CHR21_LENGTH))
                 self.assertEqual(len(records), 468)
 
-            bins_table = pq.read_table(bins_parquet)
-            self.assertEqual(bins_table.num_rows, 468)
-            self.assertEqual(set(bins_table.column("contig").to_pylist()), {"chr21"})
             self.assertGreater(plot_svg.stat().st_size, 0)
 
 
