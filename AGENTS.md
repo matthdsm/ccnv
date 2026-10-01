@@ -22,7 +22,7 @@ Copynumber-CNV is a bioinformatics tool for Copy Number Variation (CNV) analysis
 
 1. **Convert:** Stream a BAM/CRAM once per contig, creating a pysam index when missing, filter reads, calculate binned counts with NumPy, and write canonical sample Parquet plus deterministic QC metadata. Only canonical chromosomes (1-22, X, Y in UCSC or plain spelling) are binned unless `--all-contigs` is set; mitochondrial, ALT, decoy, random, unplaced, and EBV contigs are skipped. `-t/--threads` is a CPU budget split between contig worker processes and per-handle htslib decode threads; output order follows the header.
 2. **Reference:** Validate sample layouts, rebin sample counts to the target bin size (default 5000 bp) when contig lengths match, normalize depth, fit deterministic PCA, construct batched off-contig nearest-bin models, and write autosomal/optional sex branches to reference Parquet. With a FASTA file and no samples, build a flat uniform-depth model from contig lengths so predict can run without a control cohort (canonical chromosomes including X/Y are autosomal; `--all-contigs` includes every FASTA contig).
-3. **Predict:** Project and normalize a sample (rebinning sample counts in memory to reference bin coordinates if bin sizes differ and contig lengths match, leaving reference Parquet untouched), build within-sample references, segment with weighted Ruptures Binseg, call gains/losses, and write bin and segment BED (0-based half-open, extra columns with a header), calls BED, optional SVG, and matching Parquet tables. CLI `--prefix` receives the path prefix; canonical suffixes are appended by the tool.
+3. **Predict:** Project and normalize a sample (rebinning sample counts in memory to reference bin coordinates if bin sizes differ and contig lengths match, leaving reference Parquet untouched), build within-sample references, segment with weighted Ruptures Binseg, call gains/losses, and write bgzipped/indexed bin and segment BED (0-based half-open, extra columns with a `#contig` header), calls BED, optional VCFv4.2 outputs, and optional SVG. CLI `--prefix` receives the path prefix; canonical suffixes are appended by the tool.
 
 A fixed human chromosome layout is intentionally absent, the tool is meant to be organism agnostic.
 
@@ -30,7 +30,7 @@ A fixed human chromosome layout is intentionally absent, the tool is meant to be
 
 - `src/ccnv/cli.py`: The `ccnv` Typer entry point and subcommands.
 - `src/ccnv/predict.py`: Functional logic for the predict stage.
-- `src/ccnv/report.py`: BED, Parquet, and SVG writers for prediction artifacts.
+- `src/ccnv/report.py`: BED, VCF, and SVG writers for prediction artifacts.
 - `src/ccnv/results.py`: Typed bin/segment/output objects shared by predict and report.
 - `src/ccnv/convert.py`: Functional logic for the convert stage.
 - `src/ccnv/reference.py`: Functional logic for creating reference files.

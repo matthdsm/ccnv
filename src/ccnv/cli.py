@@ -443,10 +443,7 @@ def predict(
     prefix: Annotated[
         Path | None,
         typer.Option(
-            help=(
-                "Output path prefix for PREFIX_bins.bed, PREFIX_segments.bed, "
-                "PREFIX_calls.bed, and PREFIX_plot.svg"
-            ),
+            help="Output path prefix for BED, VCF, and SVG deliverables",
         ),
     ] = None,
     sex: Annotated[
@@ -497,6 +494,12 @@ def predict(
         bool,
         typer.Option("--plot/--no-plot", help="Write a genome-aware SVG plot"),
     ] = True,
+    vcf: Annotated[
+        bool,
+        typer.Option(
+            "--vcf/--no-vcf", help="Write VCFv4.2 outputs for bins and segments"
+        ),
+    ] = True,
     loglevel: LogLevelOption = LogLevel.warning,
 ) -> None:
     """Predict copy-number events for one sample."""
@@ -523,8 +526,10 @@ def predict(
                 mask_repeats=mask_repeats,
                 max_blacklist_gap=max_blacklist_gap,
                 plot=plot,
+                vcf=vcf,
             )
         )
+
         cli_logger.debug("predict completed in %.3f s", perf_counter() - started)
     except PredictError as error:
         _fail(error, 1)

@@ -38,11 +38,10 @@ CRAM conversion also requires `--fasta` and an indexed FASTA. Missing BAM/CRAM i
 
 `convert` writes `<prefix>.ccnv`. `reference` writes `<prefix>.ccnv`. Prediction writes:
 
-- `<prefix>_bins.bed`: per-bin ratio, z-score, weight, reference size, mask state, and branch, with a header. Coordinates are 0-based half-open genome contig names (`id` is `contig:start-end`).
-- `<prefix>_segments.bed`: weighted segments with ratio, z-score, weight, bin count, and call.
-- `<prefix>_calls.bed`: called gains/losses only.
+- `<prefix>_bins.bed.gz` and `<prefix>_bins.vcf.gz`: per-bin ratio, z-score, weight, reference size, mask state, and branch, bgzipped and tabix-indexed.
+- `<prefix>_segments.bed.gz` and `<prefix>_segments.vcf.gz`: weighted segments with ratio, z-score, weight, bin count, and call, bgzipped and tabix-indexed.
+- `<prefix>_calls.bed.gz` and `<prefix>_calls.vcf.gz`: called gains/losses only, bgzipped and tabix-indexed.
 - `<prefix>_plot.svg`: genome-aware plot unless `--no-plot` is passed.
-- `<prefix>_bins.ccnv` and `<prefix>_segments.ccnv`: the same evidence as typed tables.
 
 Omit `--prefix` on `convert` or `predict` to use the input stem.
 

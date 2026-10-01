@@ -262,6 +262,39 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             expected_json = root / "custom_report_qc.json"
             self.assertTrue(expected_json.is_file())
 
+    def test_cli_predict_vcf_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample = _write_sample(root / "s1.ccnv")
+            reference = _write_reference(root / "ref.ccnv")
+
+            # Default: vcf=True
+            with patch("ccnv.cli.run_predict") as run:
+                result = CliRunner().invoke(
+                    app, ["predict", str(sample), str(reference)]
+                )
+                self.assertEqual(result.exit_code, 0, result.output)
+                config = run.call_args.args[0]
+                self.assertTrue(config.vcf)
+
+            # Explicit --no-vcf
+            with patch("ccnv.cli.run_predict") as run:
+                result = CliRunner().invoke(
+                    app, ["predict", str(sample), str(reference), "--no-vcf"]
+                )
+                self.assertEqual(result.exit_code, 0, result.output)
+                config = run.call_args.args[0]
+                self.assertFalse(config.vcf)
+
+            # Explicit --vcf
+            with patch("ccnv.cli.run_predict") as run:
+                result = CliRunner().invoke(
+                    app, ["predict", str(sample), str(reference), "--vcf"]
+                )
+                self.assertEqual(result.exit_code, 0, result.output)
+                config = run.call_args.args[0]
+                self.assertTrue(config.vcf)
+
 
 def _write_sample(path: Path) -> Path:
     metadata = metadata_for(

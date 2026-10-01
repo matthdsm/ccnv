@@ -118,7 +118,7 @@ Validation of the `predict` stage was conducted by running `ccnv predict` and `w
 5. **Z-score and precision weight calculation:** `wisecondorx` computes bin z-scores from the 100 empirical null ratios stored in the reference archive, without computing bin weights for segmentation. `ccnv` evaluates z-scores parametrically from `null_mean` and `null_std`, and derives precision weights $w = 1 / (\sigma_{\text{null}}^2 + \epsilon)$ to prioritize high-confidence bins during segmentation.
 6. **Segmentation engine:** `wisecondorx` delegates segmentation to the R package `DNAcopy` (Circular Binary Segmentation / CBS) via `rpy2`, running permutation tests with equal weights across all bins. `ccnv` uses Python-native `ruptures` Weighted Binary Segmentation (`Binseg`), penalizing weighted sum-of-squared errors without R dependencies or external subprocesses.
 7. **Aberration and CNV calling:** `wisecondorx` filters segments with absolute z-scores exceeding 5.0 into an aberrations BED file. `ccnv` classifies segments exceeding the call threshold (`--call-zscore 5.0`) into gains and losses. **Both tools produced exactly 0 calls (100% negative concordance)** on this sample.
-8. **Artifact reporting:** `wisecondorx` outputs 1-based plain text BED tables and PNG plots. `ccnv` generates standard 0-based half-open BED tables, typed columnar Parquet tables (`_bins.ccnv`, `_segments.ccnv`), and resolution-independent vectorized SVG plots (`_plot.svg`).
+8. **Artifact reporting:** `wisecondorx` outputs 1-based plain text BED tables and PNG plots. `ccnv` generates standard 0-based half-open bgzipped/indexed BED tables, standard VCFv4.2 structural variant tables, and resolution-independent vectorized SVG plots (`_plot.svg`).
 
 ### Bin-level numeric concordance across 27,129 mutually unmasked bins
 
@@ -134,6 +134,5 @@ Validation of the `predict` stage was conducted by running `ccnv predict` and `w
 
 ### Storage footprint and format advantages
 
-1. **Columnar Parquet compression (4.2x smaller):** The `ccnv` bin table (`_bins.ccnv`) is compressed with Zstandard to 732 KB, representing a 4.2x reduction in size compared to the corresponding BED file (3.06 MB) while preserving native data types (floats, booleans, strings) and dictionary-encoded contig metadata.
+1. **Standardized coordinate contracts and compressed streaming:** All BED and VCF exports from `ccnv` use standard coordinate systems (0-based half-open for BED, 1-based for VCF) with UCSC-style contig naming (`chr1`–`chr22`, `chrX`, `chrY`), native bgzip compression, and tabix indexing, ensuring direct compatibility with IGV, UCSC Genome Browser, and downstream genomic pipelines.
 2. **Deterministic, zero-dependency execution:** Replacing R/rpy2 CBS with Python-native weighted `ruptures` removes all R runtime dependencies, ensuring portable execution across Linux, macOS, and containerized Docker environments without numerical divergence from R package version drift.
-3. **Standardized coordinate contracts:** All BED exports from `ccnv` use 0-based half-open coordinates with UCSC-style contig naming (`chr1`–`chr22`, `chrX`, `chrY`), ensuring direct compatibility with IGV, UCSC Genome Browser, and downstream genomic pipelines without manual coordinate shifting.

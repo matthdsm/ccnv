@@ -2,17 +2,17 @@ import logging
 import re
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
+import pysam
 
 from ccnv.results import BinResult, PredictionOutputs, SegmentResult
 
 logger = logging.getLogger(__name__)
 
 BINS_BED_HEADER = (
-    "contig",
+    "#contig",
     "start",
     "end",
     "id",
@@ -24,7 +24,7 @@ BINS_BED_HEADER = (
     "branch",
 )
 SEGMENTS_BED_HEADER = (
-    "contig",
+    "#contig",
     "start",
     "end",
     "ratio",
@@ -33,7 +33,7 @@ SEGMENTS_BED_HEADER = (
     "bin_count",
     "call",
 )
-CALLS_BED_HEADER = ("contig", "start", "end", "ratio", "zscore", "type")
+CALLS_BED_HEADER = ("#contig", "start", "end", "ratio", "zscore", "type")
 
 
 def natural_sort_key(name: str) -> tuple[tuple[int, int | str], ...]:
@@ -110,18 +110,18 @@ def write_outputs(
     segments: tuple[SegmentResult, ...],
     contig_lengths: dict[str, int],
     plot: bool,
+    vcf: bool = True,
 ) -> PredictionOutputs:
-    """Write 0-based half-open BED evidence, matching Parquet, and an SVG plot."""
+    """Write compressed BED evidence, VCFs, and an SVG plot."""
 
     prefix.parent.mkdir(parents=True, exist_ok=True)
     bins = sort_bin_results(bins)
     segments = sort_segments(segments)
-    bins_bed = Path(f"{prefix}_bins.bed")
-    segments_bed = Path(f"{prefix}_segments.bed")
-    calls_bed = Path(f"{prefix}_calls.bed")
-    bins_parquet = Path(f"{prefix}_bins.ccnv")
-    segments_parquet = Path(f"{prefix}_segments.ccnv")
+    bins_bed = Path(f"{prefix}_bins.bed.gz")
+    segments_bed = Path(f"{prefix}_segments.bed.gz")
+    calls_bed = Path(f"{prefix}_calls.bed.gz")
     plot_path = Path(f"{prefix}_plot.svg") if plot else None
+    sample_name = prefix.name if prefix.name else "SAMPLE"
     calls = [item for item in segments if item.call is not None]
     total_bins = sum(b.starts.size for b in bins)
     logger.debug(
@@ -131,9 +131,11 @@ def write_outputs(
         len(segments),
         len(calls),
     )
-    _write_bed(bins_bed, BINS_BED_HEADER, _bin_bed_rows(bins))
-    _write_bed(segments_bed, SEGMENTS_BED_HEADER, _segment_bed_rows(segments))
-    _write_bed(
+    _write_compressed_bed(bins_bed, BINS_BED_HEADER, _bin_bed_rows(bins))
+    _write_compressed_bed(
+        segments_bed, SEGMENTS_BED_HEADER, _segment_bed_rows(segments)
+    )
+    _write_compressed_bed(
         calls_bed,
         CALLS_BED_HEADER,
         (
@@ -148,27 +150,65 @@ def write_outputs(
             for item in calls
         ),
     )
-    pq.write_table(_bins_table(bins), bins_parquet, compression="zstd")
-    pq.write_table(_segments_table(segments), segments_parquet, compression="zstd")
+    bins_vcf: Path | None = None
+    segments_vcf: Path | None = None
+    calls_vcf: Path | None = None
+    if vcf:
+        bins_vcf = Path(f"{prefix}_bins.vcf.gz")
+        segments_vcf = Path(f"{prefix}_segments.vcf.gz")
+        calls_vcf = Path(f"{prefix}_calls.vcf.gz")
+        _write_bins_vcf(
+            bins_vcf,
+            _build_vcf_header(
+                contig_lengths,
+                sample_name,
+                "bins",
+                extra_contigs=(c for r in bins for c in r.contigs),
+            ),
+            bins,
+            sample_name,
+        )
+        _write_segments_vcf(
+            segments_vcf,
+            _build_vcf_header(
+                contig_lengths,
+                sample_name,
+                "segments",
+                extra_contigs=(s.contig for s in segments),
+            ),
+            segments,
+            sample_name,
+        )
+        _write_segments_vcf(
+            calls_vcf,
+            _build_vcf_header(
+                contig_lengths,
+                sample_name,
+                "segments",
+                extra_contigs=(s.contig for s in segments),
+            ),
+            segments,
+            sample_name,
+            calls_only=True,
+        )
     logger.debug(
-        "wrote %s, %s, %s, %s, %s",
+        "wrote %s, %s, %s",
         bins_bed.name,
         segments_bed.name,
         calls_bed.name,
-        bins_parquet.name,
-        segments_parquet.name,
     )
     if plot_path is not None:
         write_genome_plot(plot_path, bins, segments, contig_lengths)
     return PredictionOutputs(
-        bins_bed,
-        segments_bed,
-        calls_bed,
-        plot_path,
-        bins_parquet,
-        segments_parquet,
-        bins,
-        segments,
+        bins_bed=bins_bed,
+        segments_bed=segments_bed,
+        calls_bed=calls_bed,
+        plot_svg=plot_path,
+        bins_vcf=bins_vcf,
+        segments_vcf=segments_vcf,
+        calls_vcf=calls_vcf,
+        bins=bins,
+        segments=segments,
     )
 
 
@@ -355,19 +395,193 @@ def write_genome_plot(
     )
 
 
-def _write_bed(
-    path: Path, header: tuple[str, ...], rows: Iterable[tuple[object, ...]]
-) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        handle.write("\t".join(header) + "\n")
-        for row in rows:
-            handle.write("\t".join(str(value) for value in row) + "\n")
-
-
 def _format_bed_float(value: float) -> str:
     if not np.isfinite(value):
         return "NaN"
     return f"{value:.8g}"
+
+
+def _vcf_float(value: float) -> float | None:
+    return float(value) if np.isfinite(value) else None
+
+
+def _write_compressed_bed(
+    gz_path: Path, header: tuple[str, ...], rows: Iterable[tuple[object, ...]]
+) -> Path:
+    with pysam.BGZFile(str(gz_path), "wb") as bgz:
+        bgz.write(("\t".join(header) + "\n").encode("utf-8"))
+        for row in rows:
+            bgz.write(("\t".join(str(value) for value in row) + "\n").encode("utf-8"))
+    pysam.tabix_index(str(gz_path), preset="bed", force=True)
+    return gz_path
+
+
+def _build_vcf_header(
+    contig_lengths: dict[str, int],
+    sample_name: str,
+    record_type: Literal["bins", "segments"],
+    extra_contigs: Iterable[str] = (),
+) -> pysam.VariantHeader:
+    header = pysam.VariantHeader()
+    header.add_line("##source=ccnv_predict")
+    all_contigs = set(contig_lengths.keys()) | set(extra_contigs)
+    for contig in sorted(all_contigs, key=natural_sort_key):
+        length = contig_lengths.get(contig)
+        if length is not None:
+            header.contigs.add(contig, length=length)
+        else:
+            header.contigs.add(contig)
+
+    if record_type == "bins":
+        header.add_line('##ALT=<ID=CNV,Description="Copy number variation">')
+        header.add_line(
+            "##INFO=<ID=END,Number=1,Type=Integer,"
+            'Description="End coordinate of structural variant">'
+        )
+        header.add_line(
+            "##INFO=<ID=SVTYPE,Number=1,Type=String,"
+            'Description="Type of structural variant">'
+        )
+        header.add_line(
+            '##INFO=<ID=BRANCH,Number=1,Type=String,Description="Model branch">'
+        )
+        header.add_line(
+            "##FILTER=<ID=MASKED,"
+            'Description="Bin masked due to low coverage or quality filters">'
+        )
+        header.add_line(
+            "##FORMAT=<ID=LOG2R,Number=1,Type=Float,"
+            'Description="Log2 copy ratio against within-sample reference">'
+        )
+        header.add_line(
+            "##FORMAT=<ID=ZSCORE,Number=1,Type=Float,"
+            'Description="Z-score relative to reference cohort null model">'
+        )
+        header.add_line(
+            "##FORMAT=<ID=WEIGHT,Number=1,Type=Float,"
+            'Description="Precision weight for segmentation">'
+        )
+        header.add_line(
+            "##FORMAT=<ID=REF_SIZE,Number=1,Type=Integer,"
+            'Description="Number of within-sample reference bins used">'
+        )
+    else:
+        header.add_line('##ALT=<ID=DUP,Description="Duplication / copy number gain">')
+        header.add_line('##ALT=<ID=DEL,Description="Deletion / copy number loss">')
+        header.add_line('##ALT=<ID=CNV,Description="Copy number variation">')
+        header.add_line(
+            "##INFO=<ID=END,Number=1,Type=Integer,"
+            'Description="End coordinate of structural variant">'
+        )
+        header.add_line(
+            "##INFO=<ID=SVTYPE,Number=1,Type=String,"
+            'Description="Type of structural variant">'
+        )
+        header.add_line(
+            "##INFO=<ID=IMPRECISE,Number=0,Type=Flag,"
+            'Description="Imprecise structural variation">'
+        )
+        header.add_line(
+            "##FORMAT=<ID=LOG2R,Number=1,Type=Float,"
+            'Description="Log2 copy ratio against within-sample reference">'
+        )
+        header.add_line(
+            "##FORMAT=<ID=ZSCORE,Number=1,Type=Float,"
+            'Description="Z-score relative to reference cohort null model">'
+        )
+        header.add_line(
+            "##FORMAT=<ID=WEIGHT,Number=1,Type=Float,"
+            'Description="Precision weight for segmentation">'
+        )
+        header.add_line(
+            "##FORMAT=<ID=BINS,Number=1,Type=Integer,"
+            'Description="Number of bins in segment">'
+        )
+
+    header.add_sample(sample_name)
+    return header
+
+
+def _write_bins_vcf(
+    gz_path: Path,
+    header: pysam.VariantHeader,
+    results: tuple[BinResult, ...],
+    sample_name: str,
+) -> Path:
+    with pysam.VariantFile(str(gz_path), "wz", header=header) as vf:
+        for result in results:
+            branch = result.branch
+            for index in range(len(result.contigs)):
+                contig = result.contigs[index]
+                start = int(result.starts[index])
+                end = int(result.ends[index])
+                is_masked = bool(result.masked[index])
+                filt = "MASKED" if is_masked else "PASS"
+                rec = vf.new_record(
+                    contig=contig,
+                    start=start,
+                    stop=end,
+                    alleles=("N", "<CNV>"),
+                    id=f"{contig}:{start}-{end}",
+                    filter=filt,
+                )
+                rec.info["SVTYPE"] = "CNV"
+                rec.info["BRANCH"] = branch
+                sample = rec.samples[sample_name]
+                sample["LOG2R"] = _vcf_float(float(result.ratios[index]))
+                sample["ZSCORE"] = _vcf_float(float(result.zscores[index]))
+                sample["WEIGHT"] = _vcf_float(float(result.weights[index]))
+                sample["REF_SIZE"] = int(result.reference_sizes[index])
+                vf.write(rec)
+    pysam.tabix_index(str(gz_path), preset="vcf", force=True)
+    return gz_path
+
+
+def _write_segments_vcf(
+    gz_path: Path,
+    header: pysam.VariantHeader,
+    results: tuple[SegmentResult, ...],
+    sample_name: str,
+    *,
+    calls_only: bool = False,
+) -> Path:
+    with pysam.VariantFile(str(gz_path), "wz", header=header) as vf:
+        for item in results:
+            if calls_only and item.call is None:
+                continue
+            contig = item.contig
+            start = item.start
+            end = item.end
+            if item.call == "gain":
+                alt = "<DUP>"
+                svtype = "DUP"
+                filt = "PASS"
+            elif item.call == "loss":
+                alt = "<DEL>"
+                svtype = "DEL"
+                filt = "PASS"
+            else:
+                alt = "<CNV>"
+                svtype = "CNV"
+                filt = None
+            rec = vf.new_record(
+                contig=contig,
+                start=start,
+                stop=end,
+                alleles=("N", alt),
+                id=".",
+                filter=filt,
+            )
+            rec.info["SVTYPE"] = svtype
+            rec.info["IMPRECISE"] = True
+            sample = rec.samples[sample_name]
+            sample["LOG2R"] = _vcf_float(item.ratio)
+            sample["ZSCORE"] = _vcf_float(item.zscore)
+            sample["WEIGHT"] = _vcf_float(item.weight)
+            sample["BINS"] = int(item.bin_count)
+            vf.write(rec)
+    pysam.tabix_index(str(gz_path), preset="vcf", force=True)
+    return gz_path
 
 
 def _bin_bed_rows(results: tuple[BinResult, ...]) -> tuple[tuple[object, ...], ...]:
@@ -409,64 +623,6 @@ def _segment_bed_rows(
             item.call or "",
         )
         for item in results
-    )
-
-
-def _bins_table(results: tuple[BinResult, ...]) -> pa.Table:
-    rows = [
-        (result, index) for result in results for index in range(len(result.contigs))
-    ]
-    return pa.table(
-        {
-            "branch": [result.branch for result, _ in rows],
-            "contig": [result.contigs[index] for result, index in rows],
-            "start": pa.array(
-                [int(result.starts[index]) for result, index in rows], type=pa.int64()
-            ),
-            "end": pa.array(
-                [int(result.ends[index]) for result, index in rows], type=pa.int64()
-            ),
-            "ratio": pa.array(
-                [float(result.ratios[index]) for result, index in rows],
-                type=pa.float64(),
-                from_pandas=True,
-            ),
-            "zscore": pa.array(
-                [float(result.zscores[index]) for result, index in rows],
-                type=pa.float64(),
-                from_pandas=True,
-            ),
-            "weight": pa.array(
-                [float(result.weights[index]) for result, index in rows],
-                type=pa.float64(),
-            ),
-            "reference_size": pa.array(
-                [int(result.reference_sizes[index]) for result, index in rows],
-                type=pa.int64(),
-            ),
-            "masked": [bool(result.masked[index]) for result, index in rows],
-        }
-    )
-
-
-def _segments_table(results: tuple[SegmentResult, ...]) -> pa.Table:
-    return pa.table(
-        {
-            "contig": [item.contig for item in results],
-            "start": pa.array([item.start for item in results], type=pa.int64()),
-            "end": pa.array([item.end for item in results], type=pa.int64()),
-            "ratio": pa.array([item.ratio for item in results], type=pa.float64()),
-            "zscore": pa.array(
-                [item.zscore for item in results],
-                type=pa.float64(),
-                from_pandas=True,
-            ),
-            "weight": pa.array([item.weight for item in results], type=pa.float64()),
-            "bin_count": pa.array(
-                [item.bin_count for item in results], type=pa.int64()
-            ),
-            "call": pa.array([item.call for item in results], type=pa.string()),
-        }
     )
 
 
