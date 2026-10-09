@@ -72,9 +72,10 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 - **Import Sorting:** Ruff handles this; ensure it's run before committing.
 - **Typing:** Use maximal type annotations
 
-### Code Changes
+### Code Changes and versioning
 
-- All changes should be made through a pull request. Each pull request needs to be recorded in `CHANGELOG.md`, following best practices found [here](https://keepachangelog.com/en/1.1.0/#how)
+- **Code Changes:** All changes should be made through a pull request. Each pull request needs to be recorded in `CHANGELOG.md`, following best practices found [here](https://keepachangelog.com/en/1.1.0/#how)
+- **Versioning:** Follow semantic versioning for releases, updating the version in `pyproject.toml` and `src/ccnv/__init__.py` accordingly.
 
 ### Testing Guidelines
 

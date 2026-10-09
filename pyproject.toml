@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ccnv"
-version = "0.1.0.dev"
+version = "0.1.0dev"
 description = "Copy-number analysis for shallow whole-genome sequencing"
 readme = "README.md"
 requires-python = ">=3.12"
