@@ -42,7 +42,7 @@ class TestReport(unittest.TestCase):
                 contigs=("chr1", "chr1", "chr2", "chr3"),
                 starts=np.array([0, 50_000, 0, 0], dtype=np.int64),
                 ends=np.array([50_000, 100_000, 80_000, 60_000], dtype=np.int64),
-                ratios=np.array([0.5, 0.0, -0.6, 0.1], dtype=np.float64),
+                ratios=np.array([3.5, 0.0, -0.6, 0.1], dtype=np.float64),
                 zscores=np.array([3.0, 0.0, -3.5, 0.5], dtype=np.float64),
                 weights=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float64),
                 reference_sizes=np.array([10, 10, 10, 10], dtype=np.int64),
@@ -50,7 +50,7 @@ class TestReport(unittest.TestCase):
             ),
         )
         segments = (
-            SegmentResult("chr1", 0, 50_000, 0.5, 3.0, 1.0, 1, "gain"),
+            SegmentResult("chr1", 0, 50_000, 3.5, 3.0, 1.0, 1, "gain"),
             SegmentResult("chr2", 0, 80_000, -0.6, -3.5, 1.0, 1, "loss"),
             SegmentResult("chr3", 0, 60_000, 0.1, 0.5, 1.0, 1, None),
         )
@@ -75,6 +75,8 @@ class TestReport(unittest.TestCase):
         self.assertIn('id="r-input"', content)
         self.assertIn("Plotly.newPlot", content)
         self.assertIn("scattergl", content)
+        self.assertIn("const Y_LIM = 2;", content)
+        self.assertIn("fixedrange: true", content)
 
         payload = _extract_payload(content)
         self.assertEqual(payload["sample"], "sample_alpha")
@@ -94,13 +96,13 @@ class TestReport(unittest.TestCase):
         np.testing.assert_array_equal(c_arr, [0, 1, 2])
         np.testing.assert_array_equal(s_arr, [0, 0, 0])
         np.testing.assert_array_equal(e_arr, [50_000, 80_000, 60_000])
-        np.testing.assert_allclose(r_arr, [0.5, -0.6, 0.1], rtol=1e-5)
+        np.testing.assert_allclose(r_arr, [3.5, -0.6, 0.1], rtol=1e-5)
         np.testing.assert_allclose(z_arr, [3.0, -3.5, 0.5], rtol=1e-5)
 
         self.assertEqual(
             payload["segments"],
             [
-                [0, 0, 50_000, 0.5, 3.0, 1],
+                [0, 0, 50_000, 3.5, 3.0, 1],
                 [1, 0, 80_000, -0.6, -3.5, 1],
                 [2, 0, 60_000, 0.1, 0.5, 1],
             ],

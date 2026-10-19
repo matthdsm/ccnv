@@ -247,6 +247,9 @@
     }
   }
 
+  const Y_LIM = 2.5;
+  const clampY = v => Math.max(-Y_LIM, Math.min(Y_LIM, v));
+
   const mkScatter = (name, x, y, text, color, size, op) => ({
     type: "scattergl",
     mode: "markers",
@@ -267,6 +270,7 @@
     text,
     hoverinfo: "text",
     line: { color, width },
+    cliponaxis: false,
     showlegend: false
   });
 
@@ -276,7 +280,7 @@
     const lx = [], ly = [], lt = [];
     for (let i = 0; i < N; i++) {
       const c = classify(binR[i], binZ[i], zT, rT);
-      const yClip = Math.max(-2.4, Math.min(2.4, binR[i]));
+      const yClip = clampY(binR[i]);
       if (c === 1) {
         gx.push(binX[i]);
         gy.push(yClip);
@@ -299,7 +303,7 @@
       const c = classify(r, z, zT, rT);
       const x0 = offsets[ci] + s;
       const x1 = offsets[ci] + e;
-      const yClip = Math.max(-2.4, Math.min(2.4, r));
+      const yClip = clampY(r);
       const h = `${D.contigs[ci]}:${s.toLocaleString()}-${e.toLocaleString()} (${bc} bins)<br>Segment Log2R: ${r.toFixed(3)} | Z: ${z.toFixed(2)}`;
       if (c === 1) {
         sgx.push(x0, x1, null);
@@ -356,7 +360,8 @@
     },
     yaxis: {
       domain: hasCyto ? [0, 0.90] : [0, 1],
-      range: [-2.1, 2.1],
+      range: [-Y_LIM, Y_LIM],
+      fixedrange: true,
       title: "Log2 Ratio",
       zeroline: true,
       zerolinecolor: "#64748b",
@@ -383,7 +388,6 @@
     const zT = Math.max(0, parseFloat(zInput.value) || 0);
     const rT = Math.max(0, parseFloat(rInput.value) || 0);
     layout.xaxis.range = plotEl.layout.xaxis.range;
-    layout.yaxis.range = plotEl.layout.yaxis.range;
     Plotly.react(plotEl, buildTraces(zT, rT), layout, config);
   };
   zInput.addEventListener("input", updateThresholds);
@@ -452,10 +456,7 @@
 
   document.getElementById("reset-btn").addEventListener("click", () => {
     document.getElementById("coord-input").value = "";
-    Plotly.relayout(plotEl, {
-      "xaxis.range": [0, totalLen],
-      "yaxis.range": [-2.1, 2.1]
-    });
+    Plotly.relayout(plotEl, { "xaxis.range": [0, totalLen] });
     errEl.textContent = "";
   });
 })();
