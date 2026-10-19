@@ -443,7 +443,7 @@ def predict(
     prefix: Annotated[
         Path | None,
         typer.Option(
-            help="Output path prefix for BED, VCF, and SVG deliverables",
+            help="Output path prefix for BED, VCF, and HTML deliverables",
         ),
     ] = None,
     sex: Annotated[
@@ -492,8 +492,19 @@ def predict(
     ] = 2_000_000,
     plot: Annotated[
         bool,
-        typer.Option("--plot/--no-plot", help="Write a genome-aware SVG plot"),
+        typer.Option("--plot/--no-plot", help="Write an interactive genome HTML plot"),
     ] = True,
+    cytobands: Annotated[
+        Path | None,
+        typer.Option(
+            "--cytobands",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Cytoband BED/TSV file (.txt/.bed/.gz) to visualize above the plot",
+        ),
+    ] = None,
     vcf: Annotated[
         bool,
         typer.Option(
@@ -527,6 +538,7 @@ def predict(
                 max_blacklist_gap=max_blacklist_gap,
                 plot=plot,
                 vcf=vcf,
+                cytobands=cytobands,
             )
         )
 

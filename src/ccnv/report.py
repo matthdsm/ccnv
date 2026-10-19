@@ -1,12 +1,18 @@
+import base64
+import gzip
+import json
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from importlib.resources import files
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
+import jinja2
 import numpy as np
 import pysam
 
+from ccnv.models import Cytoband
 from ccnv.results import BinResult, PredictionOutputs, SegmentResult
 
 logger = logging.getLogger(__name__)
@@ -34,6 +40,11 @@ SEGMENTS_BED_HEADER = (
     "call",
 )
 CALLS_BED_HEADER = ("#contig", "start", "end", "ratio", "zscore", "type")
+PLOTLY_CDN_URL: Final[str] = "https://cdn.plot.ly/plotly-2.35.2.min.js"
+_JINJA_ENV: Final[jinja2.Environment] = jinja2.Environment(
+    autoescape=jinja2.select_autoescape(["html", "j2"]),
+    keep_trailing_newline=True,
+)
 
 
 def natural_sort_key(name: str) -> tuple[tuple[int, int | str], ...]:
@@ -104,6 +115,60 @@ def sort_segments(segments: Iterable[SegmentResult]) -> tuple[SegmentResult, ...
     )
 
 
+def _strip_chr(name: str) -> str:
+    return name[3:] if name.lower().startswith("chr") else name
+
+
+def read_cytobands(path: Path, contig_lengths: dict[str, int]) -> tuple[Cytoband, ...]:
+    """Parse a UCSC cytoband BED/TSV file (.txt, .bed, or .gz) aligned to contigs."""
+
+    contig_lookup: dict[str, str] = {}
+    for c in contig_lengths:
+        contig_lookup[c.casefold()] = c
+        contig_lookup[_strip_chr(c).casefold()] = c
+
+    open_fn = gzip.open if path.suffix.lower() == ".gz" else open
+    bands: list[Cytoband] = []
+    with open_fn(path, "rt", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith("track"):
+                continue
+            fields = line.split("\t") if "\t" in line else line.split()
+            if len(fields) < 4:
+                continue
+            raw_contig = fields[0]
+            canonical = contig_lookup.get(raw_contig.casefold()) or contig_lookup.get(
+                _strip_chr(raw_contig).casefold()
+            )
+            if canonical is None:
+                continue
+            try:
+                start = int(fields[1])
+                end = int(fields[2])
+            except ValueError:
+                continue
+            max_len = contig_lengths[canonical]
+            start = max(0, min(start, max_len))
+            end = max(0, min(end, max_len))
+            if end <= start:
+                continue
+            name = fields[3]
+            stain = fields[4] if len(fields) >= 5 else "gneg"
+            bands.append(
+                Cytoband(
+                    contig=canonical,
+                    start=start,
+                    end=end,
+                    name=name,
+                    stain=stain,
+                )
+            )
+    return tuple(
+        sorted(bands, key=lambda b: (natural_sort_key(b.contig), b.start, b.end))
+    )
+
+
 def write_outputs(
     prefix: Path,
     bins: tuple[BinResult, ...],
@@ -111,8 +176,12 @@ def write_outputs(
     contig_lengths: dict[str, int],
     plot: bool,
     vcf: bool = True,
+    *,
+    cytobands: Path | Sequence[Cytoband] | None = None,
+    z_threshold: float = 3.0,
+    ratio_threshold: float | None = None,
 ) -> PredictionOutputs:
-    """Write compressed BED evidence, VCFs, and an SVG plot."""
+    """Write compressed BED evidence, VCFs, and an interactive HTML plot."""
 
     prefix.parent.mkdir(parents=True, exist_ok=True)
     bins = sort_bin_results(bins)
@@ -120,7 +189,7 @@ def write_outputs(
     bins_bed = Path(f"{prefix}_bins.bed.gz")
     segments_bed = Path(f"{prefix}_segments.bed.gz")
     calls_bed = Path(f"{prefix}_calls.bed.gz")
-    plot_path = Path(f"{prefix}_plot.svg") if plot else None
+    plot_path = Path(f"{prefix}_plot.html") if plot else None
     sample_name = prefix.name if prefix.name else "SAMPLE"
     calls = [item for item in segments if item.call is not None]
     total_bins = sum(b.starts.size for b in bins)
@@ -198,12 +267,21 @@ def write_outputs(
         calls_bed.name,
     )
     if plot_path is not None:
-        write_genome_plot(plot_path, bins, segments, contig_lengths)
+        write_genome_plot(
+            plot_path,
+            bins,
+            segments,
+            contig_lengths,
+            cytobands=cytobands,
+            z_threshold=z_threshold,
+            ratio_threshold=ratio_threshold,
+            sample_name=sample_name,
+        )
     return PredictionOutputs(
         bins_bed=bins_bed,
         segments_bed=segments_bed,
         calls_bed=calls_bed,
-        plot_svg=plot_path,
+        plot_html=plot_path,
         bins_vcf=bins_vcf,
         segments_vcf=segments_vcf,
         calls_vcf=calls_vcf,
@@ -212,18 +290,33 @@ def write_outputs(
     )
 
 
+def _encode_b64(array: np.ndarray) -> str:
+    return base64.b64encode(np.ascontiguousarray(array).tobytes()).decode("ascii")
+
+
 def write_genome_plot(
     path: Path,
     bins: tuple[BinResult, ...],
     segments: tuple[SegmentResult, ...],
     contig_lengths: dict[str, int],
+    *,
+    cytobands: Path | Sequence[Cytoband] | None = None,
+    z_threshold: float = 3.0,
+    ratio_threshold: float | None = None,
+    sample_name: str | None = None,
 ) -> None:
-    """Write a dependency-free SVG with true contig-length genome offsets."""
+    """Write a minimal interactive Plotly HTML viewer with binary-packed bins."""
 
-    total_raw_bins = sum(b.starts.size for b in bins)
+    parsed_bands: tuple[Cytoband, ...] = ()
+    if isinstance(cytobands, Path):
+        parsed_bands = read_cytobands(cytobands, contig_lengths)
+    elif cytobands is not None:
+        parsed_bands = tuple(cytobands)
+
     raw_contigs = dict.fromkeys(
         [contig for result in bins for contig in result.contigs]
         + [item.contig for item in segments]
+        + [b.contig for b in parsed_bands]
     )
     ordered = tuple(
         sorted(
@@ -231,167 +324,104 @@ def write_genome_plot(
             key=natural_sort_key,
         )
     )
-    logger.debug(
-        "generating genome SVG plot %s (%d contigs, %d raw bins)",
-        path,
-        len(ordered),
-        total_raw_bins,
-    )
-    offsets: dict[str, int] = {}
-    total = 0
-    for contig in ordered:
-        offsets[contig] = total
-        total += contig_lengths[contig]
-    width, height = 1200, 380
-    left, right, top, bottom = 55, 40, 20, 75
-    plot_width, plot_height = width - left - right, height - top - bottom
+    contig_to_idx = {c: i for i, c in enumerate(ordered)}
 
-    def x(contig: str, position: float) -> float:
-        return left + plot_width * (offsets[contig] + position) / max(total, 1)
+    bin_c_list: list[np.ndarray] = []
+    bin_s_list: list[np.ndarray] = []
+    bin_e_list: list[np.ndarray] = []
+    bin_r_list: list[np.ndarray] = []
+    bin_z_list: list[np.ndarray] = []
 
-    def y(value: float) -> float:
-        clipped = min(max(value, -2.0), 2.0)
-        return top + plot_height * (2.0 - clipped) / 4.0
+    for result in bins:
+        valid = (
+            ~result.masked
+            & np.isfinite(result.ratios)
+            & np.array([c in contig_to_idx for c in result.contigs], dtype=bool)
+        )
+        if not np.any(valid):
+            continue
+        valid_idx = np.flatnonzero(valid)
+        c_idx = np.array(
+            [contig_to_idx[result.contigs[i]] for i in valid_idx], dtype="<u2"
+        )
+        bin_c_list.append(c_idx)
+        bin_s_list.append(result.starts[valid_idx].astype("<i4"))
+        bin_e_list.append(result.ends[valid_idx].astype("<i4"))
+        bin_r_list.append(result.ratios[valid_idx].astype("<f4"))
+        z_arr = np.nan_to_num(result.zscores[valid_idx], nan=0.0).astype("<f4")
+        bin_z_list.append(z_arr)
 
-    lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
-        "font-family=\"system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, "
-        'Arial, sans-serif">',
-        '<rect width="100%" height="100%" fill="white"/>',
+    if bin_c_list:
+        c_arr = np.concatenate(bin_c_list)
+        s_arr = np.concatenate(bin_s_list)
+        e_arr = np.concatenate(bin_e_list)
+        r_arr = np.concatenate(bin_r_list)
+        z_arr = np.concatenate(bin_z_list)
+    else:
+        c_arr = np.empty(0, dtype="<u2")
+        s_arr = np.empty(0, dtype="<i4")
+        e_arr = np.empty(0, dtype="<i4")
+        r_arr = np.empty(0, dtype="<f4")
+        z_arr = np.empty(0, dtype="<f4")
+
+    seg_rows = [
+        [
+            contig_to_idx[s.contig],
+            int(s.start),
+            int(s.end),
+            round(float(s.ratio), 5) if np.isfinite(s.ratio) else 0.0,
+            round(float(s.zscore), 4) if np.isfinite(s.zscore) else 0.0,
+            int(s.bin_count),
+        ]
+        for s in segments
+        if s.contig in contig_to_idx and np.isfinite(s.ratio)
     ]
 
-    for i, contig in enumerate(ordered):
-        x_start = x(contig, 0)
-        x_end = x(contig, contig_lengths[contig])
-        w = x_end - x_start
-        if i % 2 == 1:
-            lines.append(
-                f'<rect x="{x_start:g}" y="{top}" width="{w:g}" '
-                f'height="{plot_height}" fill="#f5f5f5"/>'
-            )
-        if i > 0:
-            lines.append(
-                f'<line x1="{x_start:g}" y1="{top}" x2="{x_start:g}" '
-                f'y2="{top + plot_height}" stroke="#e0e0e0" stroke-width="1"/>'
-            )
+    band_rows = [
+        [contig_to_idx[b.contig], int(b.start), int(b.end), b.name, b.stain]
+        for b in parsed_bands
+        if b.contig in contig_to_idx
+    ]
 
-    for tick in (-2, -1, 0, 1, 2):
-        y_pos = y(float(tick))
-        if tick == 0:
-            lines.append(
-                f'<line x1="{left}" y1="{y_pos:g}" x2="{width - right}" '
-                f'y2="{y_pos:g}" stroke="#888" stroke-width="1"/>'
-            )
-        elif tick in (-1, 1):
-            lines.append(
-                f'<line x1="{left}" y1="{y_pos:g}" x2="{width - right}" '
-                f'y2="{y_pos:g}" stroke="#e5e5e5" stroke-width="1" '
-                'stroke-dasharray="4,4"/>'
-            )
-        else:
-            lines.append(
-                f'<line x1="{left}" y1="{y_pos:g}" x2="{width - right}" '
-                f'y2="{y_pos:g}" stroke="#ccc" stroke-width="1"/>'
-            )
-        lines.append(
-            f'<line x1="{left - 4}" y1="{y_pos:g}" x2="{left}" '
-            f'y2="{y_pos:g}" stroke="#333" stroke-width="1"/>'
-        )
-        lines.append(
-            f'<text x="{left - 7}" y="{y_pos:g}" text-anchor="end" '
-            f'dominant-baseline="central" font-size="10" fill="#555">{tick}</text>'
-        )
-
-    seen_points: set[tuple[float, float]] = set()
-    bin_path_cmds: list[str] = []
-    for result in bins:
-        for contig, start, end, ratio, masked in zip(
-            result.contigs,
-            result.starts,
-            result.ends,
-            result.ratios,
-            result.masked,
-            strict=True,
-        ):
-            if masked or not np.isfinite(ratio):
-                continue
-            cx = round(x(contig, (start + end) / 2) * 2) / 2
-            cy = round(y(float(ratio)) * 2) / 2
-            point = (cx, cy)
-            if point in seen_points:
-                continue
-            seen_points.add(point)
-            bin_path_cmds.append(f"M{cx:g},{cy:g}h.1")
-
-    if bin_path_cmds:
-        lines.append(
-            f'<path d="{"".join(bin_path_cmds)}" fill="none" stroke="#4776b4" '
-            'stroke-width="2.4" stroke-linecap="round"/>'
-        )
-
-    segment_colors = {"gain": "#c43c39", "loss": "#3c8c5a"}
-    segment_paths: dict[str, list[str]] = {"gain": [], "loss": [], "neutral": []}
-    for item in segments:
-        cat = item.call if item.call in segment_colors else "neutral"
-        x1 = x(item.contig, item.start)
-        x2 = x(item.contig, item.end)
-        y_val = y(item.ratio)
-        segment_paths[cat].append(f"M{x1:g},{y_val:g}H{x2:g}")
-
-    for cat, cmds in segment_paths.items():
-        if cmds:
-            color = segment_colors.get(cat, "#222")
-            lines.append(
-                f'<path d="{"".join(cmds)}" stroke="{color}" stroke-width="2" '
-                'fill="none"/>'
-            )
-
-    lines.append(
-        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" '
-        'stroke="#333" stroke-width="1"/>'
+    title = sample_name or path.stem.removesuffix("_plot")
+    payload = {
+        "sample": title,
+        "contigs": list(ordered),
+        "lengths": [int(contig_lengths[c]) for c in ordered],
+        "z_thresh": float(z_threshold),
+        "r_thresh": float(ratio_threshold) if ratio_threshold is not None else 0.2,
+        "n_bins": int(c_arr.size),
+        "bins": {
+            "c": _encode_b64(c_arr),
+            "s": _encode_b64(s_arr),
+            "e": _encode_b64(e_arr),
+            "r": _encode_b64(r_arr),
+            "z": _encode_b64(z_arr),
+        },
+        "segments": seg_rows,
+        "cytobands": band_rows,
+    }
+    payload_json = json.dumps(payload, separators=(",", ":"))
+    template_source = (
+        files("ccnv.templates")
+        .joinpath("genome_plot.html.j2")
+        .read_text(encoding="utf-8")
     )
-    lines.append(
-        f'<line x1="{left}" y1="{top + plot_height}" x2="{width - right}" '
-        f'y2="{top + plot_height}" stroke="#333" stroke-width="1"/>'
+    template = _JINJA_ENV.from_string(template_source)
+    html = template.render(
+        title=title,
+        plotly_cdn_url=PLOTLY_CDN_URL,
+        payload_json=payload_json,
     )
-
-    y_mid = top + plot_height / 2
-    lines.append(
-        f'<text transform="rotate(-90)" x="{-y_mid:g}" y="16" '
-        'text-anchor="middle" font-size="11" font-weight="600" fill="#333">'
-        "Log2 Ratio</text>"
-    )
-
-    label_y = top + plot_height + 8
-    for contig in ordered:
-        x_start = x(contig, 0)
-        x_end = x(contig, contig_lengths[contig])
-        if x_end - x_start < 10:
-            continue
-        cx = (x_start + x_end) / 2
-        lines.append(
-            f'<text transform="translate({cx:g},{label_y:g}) rotate(45)" '
-            f'text-anchor="start" font-size="9" fill="#555">'
-            f"{_xml_escape(contig)}</text>"
-        )
-
-    x_mid = left + plot_width / 2
-    lines.append(
-        f'<text x="{x_mid:g}" y="{height - 10}" text-anchor="middle" '
-        'font-size="11" font-weight="600" fill="#333">Chromosome</text>'
-    )
-
-    lines.append("</svg>")
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    reduction = (
-        100.0 * (1.0 - len(seen_points) / total_raw_bins) if total_raw_bins > 0 else 0.0
-    )
+    path.write_text(html, encoding="utf-8")
     logger.debug(
-        "wrote genome SVG plot %s (%.1f KB, %d points, %.1f%% sub-pixel reduction)",
+        "wrote interactive genome HTML plot %s "
+        "(%.1f KB, %d bins, %d segments, %d cytobands)",
         path,
         path.stat().st_size / 1024,
-        len(seen_points),
-        reduction,
+        int(c_arr.size),
+        len(seg_rows),
+        len(band_rows),
     )
 
 
@@ -623,13 +653,4 @@ def _segment_bed_rows(
             item.call or "",
         )
         for item in results
-    )
-
-
-def _xml_escape(value: str) -> str:
-    return (
-        value.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
     )

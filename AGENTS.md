@@ -12,6 +12,7 @@ Copynumber-CNV (`ccnv`) is a bioinformatics toolkit for Copy Number Variation (C
 - **CLI Framework:** Typer
 - **Data Science:** NumPy, SciPy, Polars, Scikit-learn, PyArrow, Ruptures
 - **Bioinformatics:** Pysam
+- **Templating:** Jinja2
 - **Environment & Dependency Management:** [Pixi](https://pixi.sh). The `default` environment includes the `dev` feature; `prod` is the same runtime dependencies without test/lint tools and is what the Docker image installs.
 - **Linting:** Prek & Ruff
 - **Testing:** Pytest (using `unittest` style tests)
@@ -23,7 +24,7 @@ Copynumber-CNV (`ccnv`) is a bioinformatics toolkit for Copy Number Variation (C
 1. **Convert:** Stream a BAM/CRAM once per contig, creating a pysam index when missing, filter reads, calculate binned counts with NumPy, and write canonical sample Parquet plus deterministic QC metadata. Only canonical chromosomes (1-22, X, Y in UCSC or plain spelling) are binned unless `--all-contigs` is set; mitochondrial, ALT, decoy, random, unplaced, and EBV contigs are skipped. `-t/--threads` is a CPU budget split between contig worker processes and per-handle htslib decode threads; output order follows the header.
 2. **Reference:** Validate sample layouts, rebin sample counts to the target bin size (default 5000 bp) when contig lengths match, normalize depth, fit deterministic PCA, construct batched off-contig nearest-bin models, write autosomal/optional sex branches to reference Parquet, and evaluate reference QC (`<prefix>_qc.json`). With a FASTA file and no samples, build a flat uniform-depth model from contig lengths so predict can run without a control cohort (canonical chromosomes including X/Y are autosomal; `--all-contigs` includes every FASTA contig).
 3. **Ref-QC:** Audit an existing reference Parquet file and emit `<prefix>_qc.json` and a stderr usability verdict (`PASS`, `WARN`, `FAIL`).
-4. **Predict:** Project and normalize a sample (rebinning sample counts in memory to reference bin coordinates if bin sizes differ and contig lengths match, leaving reference Parquet untouched), build within-sample references, segment with weighted Ruptures Binseg, call gains/losses, and write bgzipped/indexed bin, segment, and call BED (0-based half-open, extra columns with a `#contig` header), optional VCFv4.2 outputs, and optional SVG. CLI `--prefix` receives the path prefix; canonical suffixes are appended by the tool.
+4. **Predict:** Project and normalize a sample (rebinning sample counts in memory to reference bin coordinates if bin sizes differ and contig lengths match, leaving reference Parquet untouched), build within-sample references, segment with weighted Ruptures Binseg, call gains/losses, and write bgzipped/indexed bin, segment, and call BED (0-based half-open, extra columns with a `#contig` header), optional VCFv4.2 outputs, and optional interactive Plotly HTML (`_plot.html`, with optional `--cytobands` ideogram track). CLI `--prefix` receives the path prefix; canonical suffixes are appended by the tool.
 
 A fixed human chromosome layout is intentionally absent; the tool is organism-agnostic.
 
@@ -37,7 +38,8 @@ A fixed human chromosome layout is intentionally absent; the tool is organism-ag
 - `src/ccnv/reference_qc.py`: Reference quality control metrics and usability verdicts.
 - `src/ccnv/predict.py`: Functional logic for the predict stage.
 - `src/ccnv/segment.py`: Weighted L2 cost and Ruptures Binseg segmentation.
-- `src/ccnv/report.py`: BED, VCF, and SVG writers for prediction artifacts.
+- `src/ccnv/report.py`: BED, VCF, and interactive Plotly HTML writers for prediction artifacts.
+- `src/ccnv/templates/genome_plot.html.j2`: Jinja2 HTML template for the interactive Plotly genome viewer.
 - `src/ccnv/results.py`: Typed bin/segment/output objects shared across stages.
 - `src/ccnv/schemas.py`: Versioned Arrow schemas (`1.0.0`) and metadata validation.
 - `src/ccnv/models.py`: Typed configurations and genomic domain objects.

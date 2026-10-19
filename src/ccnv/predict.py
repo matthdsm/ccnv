@@ -94,6 +94,8 @@ def run(config: PredictConfig) -> PredictionOutputs:
     """Run prediction and write bin, segment, call, and optional plot artifacts."""
 
     _validate_config(config)
+    if config.cytobands is not None and not config.plot:
+        logger.warning("--cytobands is ignored when --no-plot is set")
     logger.debug("loading sample %s and reference %s", config.sample, config.reference)
     inputs = load_inputs(config.sample, config.reference, sex=config.sex)
     logger.debug("using branches %s (sex=%s)", inputs.branches, inputs.sex)
@@ -121,6 +123,9 @@ def run(config: PredictConfig) -> PredictionOutputs:
         inputs.contig_lengths,
         config.plot,
         config.vcf,
+        cytobands=config.cytobands if config.plot else None,
+        z_threshold=config.z_threshold,
+        ratio_threshold=config.ratio_threshold,
     )
 
 

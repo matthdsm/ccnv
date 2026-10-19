@@ -117,6 +117,17 @@ class ReferenceQCConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class Cytoband:
+    """A cytogenetic band interval in 0-based half-open coordinates."""
+
+    contig: str
+    start: int
+    end: int
+    name: str
+    stain: str
+
+
+@dataclass(frozen=True, slots=True)
 class PredictConfig:
     sample: Path
     reference: Path
@@ -130,3 +141,4 @@ class PredictConfig:
     max_blacklist_gap: int = 2_000_000
     plot: bool = True
     vcf: bool = True
+    cytobands: Path | None = None

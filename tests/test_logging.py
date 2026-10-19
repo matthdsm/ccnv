@@ -193,6 +193,5 @@ class TestLoggingVerbosity(unittest.TestCase):
             self.assertIn("segmentation finished:", res.output)
             self.assertIn("called", res.output)
             self.assertIn("writing prediction outputs", res.output)
-            self.assertIn("generating genome SVG plot", res.output)
-            self.assertIn("sub-pixel reduction", res.output)
+            self.assertIn("wrote interactive genome HTML plot", res.output)
             self.assertIn("predict completed in", res.output)

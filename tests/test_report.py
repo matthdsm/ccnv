@@ -1,7 +1,9 @@
+import base64
 import gzip
+import json
+import re
 import tempfile
 import unittest
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
@@ -10,16 +12,29 @@ import pysam
 from ccnv.report import (
     BINS_BED_HEADER,
     CALLS_BED_HEADER,
+    PLOTLY_CDN_URL,
     SEGMENTS_BED_HEADER,
     natural_sort_key,
+    read_cytobands,
     write_genome_plot,
     write_outputs,
 )
 from ccnv.results import BinResult, SegmentResult
 
 
+def _extract_payload(html: str) -> dict[str, object]:
+    match = re.search(
+        r'<script id="ccnv-data" type="application/json">(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError("ccnv-data JSON payload not found in HTML")
+    return json.loads(match.group(1))
+
+
 class TestReport(unittest.TestCase):
-    def test_write_genome_plot_xml_and_elements(self) -> None:
+    def test_write_genome_plot_html_and_binary_payload(self) -> None:
         contig_lengths = {"chr1": 100_000, "chr2": 80_000, "chr3": 60_000}
         bins = (
             BinResult(
@@ -31,7 +46,7 @@ class TestReport(unittest.TestCase):
                 zscores=np.array([3.0, 0.0, -3.5, 0.5], dtype=np.float64),
                 weights=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float64),
                 reference_sizes=np.array([10, 10, 10, 10], dtype=np.int64),
-                masked=np.array([False, False, False, False], dtype=bool),
+                masked=np.array([False, True, False, False], dtype=bool),
             ),
         )
         segments = (
@@ -41,84 +56,114 @@ class TestReport(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            svg_path = Path(tmpdir) / "test_plot.svg"
-            write_genome_plot(svg_path, bins, segments, contig_lengths)
-            self.assertTrue(svg_path.is_file())
-            content = svg_path.read_text(encoding="utf-8")
+            html_path = Path(tmpdir) / "test_plot.html"
+            write_genome_plot(
+                html_path,
+                bins,
+                segments,
+                contig_lengths,
+                z_threshold=3.0,
+                ratio_threshold=0.25,
+                sample_name="sample_alpha",
+            )
+            self.assertTrue(html_path.is_file())
+            content = html_path.read_text(encoding="utf-8")
 
-        root = ET.fromstring(content)
-        self.assertTrue(root.tag.endswith("svg"))
-        self.assertEqual(root.attrib["width"], "1200")
-        self.assertEqual(root.attrib["height"], "380")
+        self.assertIn(PLOTLY_CDN_URL, content)
+        self.assertIn('id="coord-input"', content)
+        self.assertIn('id="z-input"', content)
+        self.assertIn('id="r-input"', content)
+        self.assertIn("Plotly.newPlot", content)
+        self.assertIn("scattergl", content)
 
-        # Check alternating background rect for odd contig chr2
-        rects = root.findall("{http://www.w3.org/2000/svg}rect")
-        self.assertGreaterEqual(len(rects), 2)  # base + chr2
-        bg_fills = [r.attrib.get("fill") for r in rects]
-        self.assertIn("white", bg_fills)
-        self.assertIn("#f5f5f5", bg_fills)
+        payload = _extract_payload(content)
+        self.assertEqual(payload["sample"], "sample_alpha")
+        self.assertEqual(payload["contigs"], ["chr1", "chr2", "chr3"])
+        self.assertEqual(payload["lengths"], [100_000, 80_000, 60_000])
+        self.assertEqual(payload["z_thresh"], 3.0)
+        self.assertEqual(payload["r_thresh"], 0.25)
+        self.assertEqual(payload["n_bins"], 3)
 
-        # Check Y-axis title and X-axis title
-        texts = root.findall("{http://www.w3.org/2000/svg}text")
-        text_values = [t.text for t in texts]
-        self.assertIn("Log2 Ratio", text_values)
-        self.assertIn("Chromosome", text_values)
-        self.assertIn("chr1", text_values)
-        self.assertIn("chr2", text_values)
-        self.assertIn("chr3", text_values)
+        bins_dict = payload["bins"]
+        assert isinstance(bins_dict, dict)
+        c_arr = np.frombuffer(base64.b64decode(bins_dict["c"]), dtype="<u2")
+        s_arr = np.frombuffer(base64.b64decode(bins_dict["s"]), dtype="<i4")
+        e_arr = np.frombuffer(base64.b64decode(bins_dict["e"]), dtype="<i4")
+        r_arr = np.frombuffer(base64.b64decode(bins_dict["r"]), dtype="<f4")
+        z_arr = np.frombuffer(base64.b64decode(bins_dict["z"]), dtype="<f4")
+        np.testing.assert_array_equal(c_arr, [0, 1, 2])
+        np.testing.assert_array_equal(s_arr, [0, 0, 0])
+        np.testing.assert_array_equal(e_arr, [50_000, 80_000, 60_000])
+        np.testing.assert_allclose(r_arr, [0.5, -0.6, 0.1], rtol=1e-5)
+        np.testing.assert_allclose(z_arr, [3.0, -3.5, 0.5], rtol=1e-5)
 
-        # Check 45 degree rotation transform on contig labels
-        rotated_labels = [
-            t for t in texts if "rotate(45)" in t.attrib.get("transform", "")
-        ]
-        self.assertEqual(len(rotated_labels), 3)
+        self.assertEqual(
+            payload["segments"],
+            [
+                [0, 0, 50_000, 0.5, 3.0, 1],
+                [1, 0, 80_000, -0.6, -3.5, 1],
+                [2, 0, 60_000, 0.1, 0.5, 1],
+            ],
+        )
+        self.assertEqual(payload["cytobands"], [])
 
-        # Check Y-axis tick values
-        for tick in ("-2", "-1", "0", "1", "2"):
-            self.assertIn(tick, text_values)
-
-        # Check bin points rendered as single path, not separate circles
-        circles = root.findall("{http://www.w3.org/2000/svg}circle")
-        self.assertEqual(len(circles), 0)
-        paths = root.findall("{http://www.w3.org/2000/svg}path")
-        bin_paths = [p for p in paths if p.attrib.get("stroke") == "#4776b4"]
-        self.assertEqual(len(bin_paths), 1)
-        self.assertIn("h.1", bin_paths[0].attrib["d"])
-
-        # Check segment paths
-        gain_paths = [p for p in paths if p.attrib.get("stroke") == "#c43c39"]
-        loss_paths = [p for p in paths if p.attrib.get("stroke") == "#3c8c5a"]
-        neutral_paths = [p for p in paths if p.attrib.get("stroke") == "#222"]
-        self.assertEqual(len(gain_paths), 1)
-        self.assertEqual(len(loss_paths), 1)
-        self.assertEqual(len(neutral_paths), 1)
-
-    def test_write_genome_plot_deduplicates_overlapping_points(self) -> None:
-        contig_lengths = {"chr1": 100_000}
-        n_duplicate_bins = 50
+    def test_cytobands_parsing_and_plot_embedding(self) -> None:
+        contig_lengths = {"1": 100_000, "chr2": 80_000}
+        cyto_lines = (
+            "#chrom\tchromStart\tchromEnd\tname\tgieStain\n"
+            "chr1\t0\t40000\tp36.33\tgneg\n"
+            "chr1\t40000\t120000\tp36.32\tacen\n"
+            "2\t0\t80000\tq11.1\tgpos75\n"
+            "chrUn_1\t0\t1000\tp1\tgneg\n"
+        )
         bins = (
             BinResult(
                 branch="autosomal",
-                contigs=("chr1",) * n_duplicate_bins,
-                starts=np.array([10_000] * n_duplicate_bins, dtype=np.int64),
-                ends=np.array([20_000] * n_duplicate_bins, dtype=np.int64),
-                ratios=np.array([0.0] * n_duplicate_bins, dtype=np.float64),
-                zscores=np.array([0.0] * n_duplicate_bins, dtype=np.float64),
-                weights=np.array([1.0] * n_duplicate_bins, dtype=np.float64),
-                reference_sizes=np.array([10] * n_duplicate_bins, dtype=np.int64),
-                masked=np.array([False] * n_duplicate_bins, dtype=bool),
+                contigs=("1", "chr2"),
+                starts=np.array([0, 0], dtype=np.int64),
+                ends=np.array([100_000, 80_000], dtype=np.int64),
+                ratios=np.array([0.0, 0.0], dtype=np.float64),
+                zscores=np.array([0.0, 0.0], dtype=np.float64),
+                weights=np.array([1.0, 1.0], dtype=np.float64),
+                reference_sizes=np.array([10, 10], dtype=np.int64),
+                masked=np.array([False, False], dtype=bool),
             ),
         )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            svg_path = Path(tmpdir) / "dedup_plot.svg"
-            write_genome_plot(svg_path, bins, (), contig_lengths)
-            content = svg_path.read_text(encoding="utf-8")
 
-        root = ET.fromstring(content)
-        paths = root.findall("{http://www.w3.org/2000/svg}path")
-        bin_path = next(iter([p for p in paths if p.attrib.get("stroke") == "#4776b4"]))
-        # Should only contain 1 move command despite 50 identical input bins
-        self.assertEqual(bin_path.attrib["d"].count("M"), 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cyto_gz = root / "cytoBand.txt.gz"
+            with gzip.open(cyto_gz, "wt", encoding="utf-8") as handle:
+                handle.write(cyto_lines)
+
+            parsed = read_cytobands(cyto_gz, contig_lengths)
+            self.assertEqual(len(parsed), 3)
+            self.assertEqual(parsed[0].contig, "1")
+            self.assertEqual((parsed[0].start, parsed[0].end), (0, 40_000))
+            self.assertEqual(parsed[1].contig, "1")
+            self.assertEqual((parsed[1].start, parsed[1].end), (40_000, 100_000))
+            self.assertEqual(parsed[1].stain, "acen")
+            self.assertEqual(parsed[2].contig, "chr2")
+            self.assertEqual(parsed[2].name, "q11.1")
+
+            html_path = root / "cyto_plot.html"
+            write_genome_plot(
+                html_path,
+                bins,
+                (),
+                contig_lengths,
+                cytobands=cyto_gz,
+            )
+            payload = _extract_payload(html_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            payload["cytobands"],
+            [
+                [0, 0, 40_000, "p36.33", "gneg"],
+                [0, 40_000, 100_000, "p36.32", "acen"],
+                [1, 0, 80_000, "q11.1", "gpos75"],
+            ],
+        )
 
     def test_write_outputs_creates_all_artifacts(self) -> None:
         contig_lengths = {"chr1": 100_000}
@@ -157,8 +202,9 @@ class TestReport(unittest.TestCase):
             self.assertTrue(Path(str(outputs.calls_vcf) + ".tbi").is_file())
             self.assertFalse(Path(f"{prefix}_bins.ccnv").exists())
             self.assertFalse(Path(f"{prefix}_segments.ccnv").exists())
-            self.assertIsNotNone(outputs.plot_svg)
-            self.assertTrue(outputs.plot_svg.is_file())
+            self.assertIsNotNone(outputs.plot_html)
+            self.assertTrue(outputs.plot_html.is_file())
+            self.assertEqual(outputs.plot_html.suffix, ".html")
 
             with gzip.open(outputs.bins_bed, "rt") as h:
                 bins_lines = h.read().splitlines()
@@ -307,17 +353,11 @@ class TestReport(unittest.TestCase):
             ),
         )
         with tempfile.TemporaryDirectory() as tmpdir:
-            svg_path = Path(tmpdir) / "natural_plot.svg"
-            write_genome_plot(svg_path, bins, (), contig_lengths)
-            content = svg_path.read_text(encoding="utf-8")
+            html_path = Path(tmpdir) / "natural_plot.html"
+            write_genome_plot(html_path, bins, (), contig_lengths)
+            payload = _extract_payload(html_path.read_text(encoding="utf-8"))
 
-        root = ET.fromstring(content)
-        texts = [
-            t.text
-            for t in root.findall("{http://www.w3.org/2000/svg}text")
-            if "rotate(45)" in t.attrib.get("transform", "")
-        ]
-        self.assertEqual(texts, ["chr1", "chr2", "chr10", "chrX", "chrY"])
+        self.assertEqual(payload["contigs"], ["chr1", "chr2", "chr10", "chrX", "chrY"])
 
     def test_write_outputs_naturally_sorts_all_artifacts(self) -> None:
         contig_lengths = {

@@ -10,7 +10,7 @@ flowchart LR
     D -->|ccnv reference| H["Reference QC (<reference>_qc.json)"]
     F["Reference FASTA"] -.->|ccnv reference (flat)| E
     E -->|ccnv ref-qc| H
-    B -->|ccnv predict| G["Prediction Artifacts (BED.gz, VCF.gz, SVG)"]
+    B -->|ccnv predict| G["Prediction Artifacts (BED.gz, VCF.gz, HTML)"]
     E -->|ccnv predict| G
 ```
 
@@ -97,8 +97,8 @@ flowchart TD
     MatchNearest --> IterativeMask["Mask extreme outlier bins (--mask-repeats)"]
     IterativeMask --> SegEngine["Segment with weighted Ruptures Binseg (split gaps > --max-blacklist-gap)"]
     SegEngine --> CallEvents["Call GAIN / LOSS via --z-threshold or --ratio-threshold"]
-    CallEvents --> Outputs["Write bgzipped/tabix BED & VCFv4.2 + SVG plot"]
+    CallEvents --> Outputs["Write bgzipped/tabix BED & VCFv4.2 + interactive HTML plot"]
 ```
 
 - **Precision Weighting & Segmentation**: Each bin receives weight $w = 1 / (\sigma_{\text{null}}^2 + \epsilon)$ from the reference null standard deviation. `ruptures.Binseg` minimizes weighted residual sum-of-squares (`WeightedL2Cost`) with breakpoint penalty `--penalty`, splitting segments across masked gaps larger than `--max-blacklist-gap` (default 2 Mb).
-- **Outputs**: Writes natural-sorted, bgzip-compressed, tabix-indexed `.bed.gz` and `.vcf.gz` files (`_bins`, `_segments`, `_calls`) and `<prefix>_plot.svg`.
+- **Outputs**: Writes natural-sorted, bgzip-compressed, tabix-indexed `.bed.gz` and `.vcf.gz` files (`_bins`, `_segments`, `_calls`) and an interactive Plotly genome profile `<prefix>_plot.html` (with optional cytoband ideogram track via `--cytobands`).

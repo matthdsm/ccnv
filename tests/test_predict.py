@@ -349,7 +349,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
             bins_vcf = Path(f"{predict_prefix}_bins.vcf.gz")
             segments_vcf = Path(f"{predict_prefix}_segments.vcf.gz")
             calls_vcf = Path(f"{predict_prefix}_calls.vcf.gz")
-            plot_svg = Path(f"{predict_prefix}_plot.svg")
+            plot_html = Path(f"{predict_prefix}_plot.html")
             for path in (
                 bins_bed,
                 segments_bed,
@@ -363,7 +363,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
                 Path(str(bins_vcf) + ".tbi"),
                 Path(str(segments_vcf) + ".tbi"),
                 Path(str(calls_vcf) + ".tbi"),
-                plot_svg,
+                plot_html,
             ):
                 self.assertTrue(path.is_file(), path)
             self.assertFalse(Path(f"{predict_prefix}_bins.ccnv").exists())
@@ -395,7 +395,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
                 records = list(tb.fetch("chr21", 0, CHR21_LENGTH))
                 self.assertEqual(len(records), 468)
 
-            self.assertGreater(plot_svg.stat().st_size, 0)
+            self.assertGreater(plot_html.stat().st_size, 0)
 
 
 if __name__ == "__main__":

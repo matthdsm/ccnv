@@ -46,7 +46,7 @@ class PredictionOutputs:
     bins_bed: Path
     segments_bed: Path
     calls_bed: Path
-    plot_svg: Path | None
+    plot_html: Path | None
     bins_vcf: Path | None
     segments_vcf: Path | None
     calls_vcf: Path | None

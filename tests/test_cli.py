@@ -295,6 +295,46 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 config = run.call_args.args[0]
                 self.assertTrue(config.vcf)
 
+    def test_cli_predict_cytobands_and_no_plot_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample = _write_sample(root / "s1.ccnv")
+            reference = _write_reference(root / "ref.ccnv")
+            cyto = root / "cytoBand.txt"
+            cyto.write_text("chr1\t0\t50\tp11.1\tgneg\n", encoding="utf-8")
+
+            with patch("ccnv.cli.run_predict") as run:
+                result = CliRunner().invoke(
+                    app,
+                    [
+                        "predict",
+                        str(sample),
+                        str(reference),
+                        "--cytobands",
+                        str(cyto),
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, result.output)
+                config = run.call_args.args[0]
+                self.assertEqual(config.cytobands, cyto)
+
+            result = CliRunner().invoke(
+                app,
+                [
+                    "predict",
+                    str(sample),
+                    str(reference),
+                    "--prefix",
+                    str(root / "out_no_plot"),
+                    "--no-plot",
+                    "--cytobands",
+                    str(cyto),
+                ],
+            )
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("--cytobands is ignored when --no-plot is set", result.output)
+            self.assertFalse((root / "out_no_plot_plot.html").exists())
+
 
 def _write_sample(path: Path) -> Path:
     metadata = metadata_for(
