@@ -41,7 +41,7 @@ class TestSchemaContracts(unittest.TestCase):
         self.assertEqual(decoded["coordinate_system"], COORDINATE_SYSTEM)
         self.assertEqual(decoded["contig_lengths"], {"chr1": 250_001, "scaffold-A": 99})
 
-    def test_schema_rejects_legacy_one_based_coordinates(self) -> None:
+    def test_schema_rejects_invalid_coordinate_system(self) -> None:
         metadata = metadata_for(
             ArtifactKind.SAMPLE,
             contig_lengths={"chr1": 100},

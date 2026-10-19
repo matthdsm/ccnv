@@ -3,8 +3,7 @@
 The ``penalty`` is measured in weighted squared-error units. PELT minimizes
 ``sum(weighted squared error) + penalty * number of breakpoints``; Binseg
 greedily accepts a breakpoint only when its weighted-error reduction exceeds
-the penalty. This is not DNAcopy's hypothesis-test ``alpha`` and must be tuned
-independently.
+the penalty.
 """
 
 import logging
@@ -22,9 +21,7 @@ logger = logging.getLogger(__name__)
 
 Algorithm = Literal["pelt", "binseg"]
 DEFAULT_MAX_BLACKLIST_GAP = 2_000_000
-PENALTY_SEMANTICS = (
-    "absolute weighted-SSE cost per breakpoint; not equivalent to DNAcopy alpha"
-)
+PENALTY_SEMANTICS = "absolute weighted-SSE cost per breakpoint"
 
 
 @dataclass(frozen=True, slots=True)

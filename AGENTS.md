@@ -1,10 +1,10 @@
 # Copynumber-CNV Agent Guidelines
 
-This document provides project-specific instructions and architectural context for agents when working on the Copynumber-CNV (ccnv for short) codebase.
+This document provides project-specific instructions and architectural context for agents working on the Copynumber-CNV (`ccnv`) codebase.
 
 ## Project Overview
 
-Copynumber-CNV is a bioinformatics tool for Copy Number Variation (CNV) analysis in whole-genome sequencing data. It is a next generation version of the algorithms used by WISECONDOR(X).
+Copynumber-CNV (`ccnv`) is a bioinformatics toolkit for Copy Number Variation (CNV) analysis in shallow whole-genome sequencing data. It is an independent Python implementation inspired by the published statistical methodology of WISECONDOR (Straver et al., 2014) and WisecondorX (Raman et al., 2019).
 
 ### Core Stack
 
@@ -13,7 +13,7 @@ Copynumber-CNV is a bioinformatics tool for Copy Number Variation (CNV) analysis
 - **Data Science:** NumPy, SciPy, Polars, Scikit-learn, PyArrow, Ruptures
 - **Bioinformatics:** Pysam
 - **Environment & Dependency Management:** [Pixi](https://pixi.sh). The `default` environment includes the `dev` feature; `prod` is the same runtime dependencies without test/lint tools and is what the Docker image installs.
-- **Linting**: Prek & Ruff
+- **Linting:** Prek & Ruff
 - **Testing:** Pytest (using `unittest` style tests)
 
 ## Architectural Context
@@ -21,33 +21,37 @@ Copynumber-CNV is a bioinformatics tool for Copy Number Variation (CNV) analysis
 ### Pipeline Stages
 
 1. **Convert:** Stream a BAM/CRAM once per contig, creating a pysam index when missing, filter reads, calculate binned counts with NumPy, and write canonical sample Parquet plus deterministic QC metadata. Only canonical chromosomes (1-22, X, Y in UCSC or plain spelling) are binned unless `--all-contigs` is set; mitochondrial, ALT, decoy, random, unplaced, and EBV contigs are skipped. `-t/--threads` is a CPU budget split between contig worker processes and per-handle htslib decode threads; output order follows the header.
-2. **Reference:** Validate sample layouts, rebin sample counts to the target bin size (default 5000 bp) when contig lengths match, normalize depth, fit deterministic PCA, construct batched off-contig nearest-bin models, and write autosomal/optional sex branches to reference Parquet. With a FASTA file and no samples, build a flat uniform-depth model from contig lengths so predict can run without a control cohort (canonical chromosomes including X/Y are autosomal; `--all-contigs` includes every FASTA contig).
-3. **Predict:** Project and normalize a sample (rebinning sample counts in memory to reference bin coordinates if bin sizes differ and contig lengths match, leaving reference Parquet untouched), build within-sample references, segment with weighted Ruptures Binseg, call gains/losses, and write bgzipped/indexed bin and segment BED (0-based half-open, extra columns with a `#contig` header), calls BED, optional VCFv4.2 outputs, and optional SVG. CLI `--prefix` receives the path prefix; canonical suffixes are appended by the tool.
+2. **Reference:** Validate sample layouts, rebin sample counts to the target bin size (default 5000 bp) when contig lengths match, normalize depth, fit deterministic PCA, construct batched off-contig nearest-bin models, write autosomal/optional sex branches to reference Parquet, and evaluate reference QC (`<prefix>_qc.json`). With a FASTA file and no samples, build a flat uniform-depth model from contig lengths so predict can run without a control cohort (canonical chromosomes including X/Y are autosomal; `--all-contigs` includes every FASTA contig).
+3. **Ref-QC:** Audit an existing reference Parquet file and emit `<prefix>_qc.json` and a stderr usability verdict (`PASS`, `WARN`, `FAIL`).
+4. **Predict:** Project and normalize a sample (rebinning sample counts in memory to reference bin coordinates if bin sizes differ and contig lengths match, leaving reference Parquet untouched), build within-sample references, segment with weighted Ruptures Binseg, call gains/losses, and write bgzipped/indexed bin, segment, and call BED (0-based half-open, extra columns with a `#contig` header), optional VCFv4.2 outputs, and optional SVG. CLI `--prefix` receives the path prefix; canonical suffixes are appended by the tool.
 
-A fixed human chromosome layout is intentionally absent, the tool is meant to be organism agnostic.
+A fixed human chromosome layout is intentionally absent; the tool is organism-agnostic.
 
-### CLI Structure
+### Module Structure
 
-- `src/ccnv/cli.py`: The `ccnv` Typer entry point and subcommands.
-- `src/ccnv/predict.py`: Functional logic for the predict stage.
-- `src/ccnv/report.py`: BED, VCF, and SVG writers for prediction artifacts.
-- `src/ccnv/results.py`: Typed bin/segment/output objects shared by predict and report.
+- `src/ccnv/cli.py`: The `ccnv` Typer entry point and subcommands (`convert`, `reference`, `ref-qc`, `predict`).
 - `src/ccnv/convert.py`: Functional logic for the convert stage.
-- `src/ccnv/reference.py`: Functional logic for creating reference files.
-- `src/ccnv/segment.py`: Weighted L2 cost and Binseg segmentation.
-- `src/ccnv/schemas.py`: Versioned Arrow schemas and metadata validation.
+- `src/ccnv/cohort.py`: Cohort sample discovery, validation, and parallel rebinning.
+- `src/ccnv/reference.py`: Functional logic for creating cohort and flat FASTA reference files.
+- `src/ccnv/reference_compute.py`: PCA, batched off-contig nearest-bin search, and null distribution kernels.
+- `src/ccnv/reference_qc.py`: Reference quality control metrics and usability verdicts.
+- `src/ccnv/predict.py`: Functional logic for the predict stage.
+- `src/ccnv/segment.py`: Weighted L2 cost and Ruptures Binseg segmentation.
+- `src/ccnv/report.py`: BED, VCF, and SVG writers for prediction artifacts.
+- `src/ccnv/results.py`: Typed bin/segment/output objects shared across stages.
+- `src/ccnv/schemas.py`: Versioned Arrow schemas (`1.0.0`) and metadata validation.
 - `src/ccnv/models.py`: Typed configurations and genomic domain objects.
 
-### Storage and coordinate contracts
+### Storage and Coordinate Contracts
 
-- Schema version `1.0.0`; all coordinates are 0-based half-open.
+- Schema version `1.0.0`; all internal and BED coordinates are 0-based half-open.
 - Sample rows are `contig`, `start`, `end`, and `count`.
-- Reference rows add branch, mask, PCA, nearest-reference indices, mean distance, and null-model fields.
+- Reference rows add `branch`, `masked`, `pca_mean`, `pca_loadings`, `nearest_ref_indices`, `mean_distance`, `null_mean`, and `null_std`.
 - Alignment-header contig names, order, lengths, and partial final bins are authoritative. Readers reject incompatible versions, layouts, and bounds.
 
 ## Development Workflow
 
-### CI publish
+### CI Publish
 
 GitHub Actions (`.github/workflows/ci.yml`) runs lint, tests, and hooks on every push and pull request. Pull requests must change `CHANGELOG.md`. After those checks pass:
 
@@ -69,12 +73,12 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 ### Code Style
 
 - Adhere to the Ruff configuration in `pyproject.toml`.
-- **Import Sorting:** Ruff handles this; ensure it's run before committing.
-- **Typing:** Use maximal type annotations
+- **Import Sorting:** Ruff handles this; ensure it is run before committing.
+- **Typing:** Use maximal type annotations.
 
-### Code Changes and versioning
+### Code Changes and Versioning
 
-- **Code Changes:** All changes should be made through a pull request. Each pull request needs to be recorded in `CHANGELOG.md`, following best practices found [here](https://keepachangelog.com/en/1.1.0/#how)
+- **Code Changes:** All changes should be made through a pull request. Each pull request needs to be recorded in `CHANGELOG.md`, following best practices found [here](https://keepachangelog.com/en/1.1.0/#how).
 - **Versioning:** Follow semantic versioning for releases, updating the version in `pyproject.toml` and `src/ccnv/__init__.py` accordingly.
 
 ### Testing Guidelines
@@ -87,5 +91,5 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 
 - **Environment Awareness:** Always prefer `pixi run <command>` over direct execution if a pixi task exists.
 - **Surgical Updates:** When fixing bugs, prioritize small, targeted changes and adding a corresponding test case.
-- **Documentation:** Update this document and README if you make changes that affect the overall architecture or development workflow.
+- **Documentation:** Update this document and README if you make changes that affect the overall architecture or development workflow. Keep all WisecondorX comparisons strictly inside `docs/benchmark.md`.
 - **Markdown Formatting:** Do not hard-wrap lines in Markdown files; rely on editor soft-wrapping for line length. Keep paragraphs and list items on a single logical line. Avoid unnecessary newlines, redundant blank lines, and empty lines inside Mermaid diagram blocks.

@@ -8,11 +8,11 @@ import numpy as np
 from ccnv.predict import call_segment
 from ccnv.segment import segment_contig
 
-FIXTURES = Path(__file__).parent / "fixtures" / "upstream"
+FIXTURES = Path(__file__).parent / "fixtures" / "benchmark"
 BIN_SIZE = 100_000
 
 
-class TestUpstreamNumericAgreement(unittest.TestCase):
+class TestBenchmarkNumericAgreement(unittest.TestCase):
     def test_synthetic_segment_means_and_calls_are_concordant(self) -> None:
         bins_by_contig: dict[str, list[tuple[float, float]]] = {}
         with (FIXTURES / "synthetic" / "normalized_bins.tsv").open() as handle:
@@ -20,7 +20,7 @@ class TestUpstreamNumericAgreement(unittest.TestCase):
                 bins_by_contig.setdefault(row["chr"], []).append(
                     (float(row["ratio"]), float(row["weight"]))
                 )
-        with (FIXTURES / "synthetic" / "dnacopy_segments.tsv").open() as handle:
+        with (FIXTURES / "synthetic" / "expected_segments.tsv").open() as handle:
             expected_segments = {
                 row["chr"]: (
                     int(row["start_bin"]),
@@ -71,14 +71,14 @@ class TestUpstreamNumericAgreement(unittest.TestCase):
         self.assertLessEqual(float(np.max(absolute_errors)), 1e-12)
         self.assertEqual(observed_calls, expected_calls)
 
-    def test_real_fixture_gain_is_concordant_after_coordinate_conversion(self) -> None:
+    def test_real_fixture_gain_is_concordant(self) -> None:
         bins: dict[str, list[tuple[int, int, float, float]]] = {}
         with (FIXTURES / "real" / "ID_bins.bed").open() as handle:
             for row in csv.DictReader(handle, delimiter="\t"):
                 ratio = float(row["ratio"])
                 bins.setdefault(row["chr"], []).append(
                     (
-                        int(row["start"]) - 1,
+                        int(row["start"]),
                         int(row["end"]),
                         ratio,
                         float(math.isfinite(ratio)),
@@ -88,7 +88,7 @@ class TestUpstreamNumericAgreement(unittest.TestCase):
             expected = [
                 (
                     row["chr"],
-                    int(row["start"]) - 1,
+                    int(row["start"]),
                     int(row["end"]),
                     row["type"],
                 )

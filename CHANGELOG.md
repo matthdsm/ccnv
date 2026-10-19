@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Rewrote `README.md`, `docs/cli.md`, `docs/pipeline.md`, and `AGENTS.md` to be clear and concise, crediting the published statistical methodology of WISECONDOR (Straver et al., 2014) and WisecondorX (Raman et al., 2019).
 - Prediction BED outputs (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`) are now always bgzip-compressed and tabix-indexed (`.tbi`), with `#contig` headers for standard tabix/IGV compatibility.
 - Prediction outputs (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`, `_bins.vcf.gz`, `_segments.vcf.gz`, `_calls.vcf.gz`, and `_plot.svg`) now sort chromosomes and intervals in natural sort order (e.g. `chr1`, `chr2`, ..., `chr10`, ..., `chrX`, `chrY`) instead of lexicographical order.
 - Parallelized `ccnv reference` execution controlled by a `-t/--threads` flag (defaulting to system CPU count), multi-processing cohort sample loading and rebinning via `src/ccnv/cohort.py`, parallelizing batched off-contig nearest-bin selection via `src/ccnv/reference_compute.py`, and multi-processing null model derivation.
@@ -35,8 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - VCFv4.2 prediction outputs: `ccnv predict` now generates bgzip-compressed and tabix-indexed VCF files for bins (`_bins.vcf.gz`), segments (`_segments.vcf.gz`), and called events (`_calls.vcf.gz`) using native `pysam.VariantFile` and `pysam.BGZFile` single-pass streaming, containing standard symbolic SV tags (`<DUP>`, `<DEL>`, `<CNV>`), 1-based intervals, and copy ratio / z-score format metrics, enabled by default with `--vcf / --no-vcf` control.
-- `ccnv ref-qc`: evaluate reference model usability and WisecondorX-derived quality heuristics (`PASS`, `WARN`, `FAIL`) on existing reference files, emitting `<prefix>_qc.json` and a stderr summary.
-
+- `ccnv ref-qc`: evaluate reference model usability and quality heuristics (`PASS`, `WARN`, `FAIL`) on existing reference files, emitting `<prefix>_qc.json` and a stderr summary.
 - Reference creation quality control: `ccnv reference` automatically evaluates reference metrics and writes `<prefix>_qc.json` during build (toggleable via `--qc-report / --no-qc-report`).
 - Comprehensive pipeline architecture documentation (`docs/pipeline.md`) with detailed Mermaid flowcharts for all pipeline subcommands (`convert`, `reference`, `ref-qc`, `predict`), and embedded stage flowcharts in the CLI reference (`docs/cli.md`).
 - `rebin_counts` and `rebin_sample_table` for 1D mass-conserving count interpolation across bin grids.
@@ -46,10 +46,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Versioned Parquet contracts (`1.0.0`), header-authoritative contig layouts, and organism-agnostic naming (no fixed 24-chromosome genome).
 - Sex-contig branches inferred from a Y-signal contig (`--sex-cutoff` optional); no per-sample sex labels on the CLI.
 - CI that publishes multi-arch (`linux/amd64`, `linux/arm64`) GHCR images from `pixi.lock` (`latest` on `master`; SHA, version, and `stable` on release) and attaches a Python wheel to GitHub Releases. Local images: `pixi run docker-build`.
-- Real-world NIPT conversion validation and storage comparison against WisecondorX documented in `docs/validation.md`.
-- Reference creation comparison against WisecondorX across 8 pipeline stages, numerical concordance, and 9.2x storage footprint reduction documented in `docs/validation.md`.
-- Predict stage comparison against WisecondorX across 8 pipeline stages, bin concordance (r=0.9869), weighted Ruptures segmentation, and 4.2x Parquet compression advantage documented in `docs/validation.md`.
+- Real-world NIPT conversion, reference creation, and prediction benchmarks documented in `docs/benchmark.md`.
 - CI rejects pull requests that do not update `CHANGELOG.md`.
-
-
-

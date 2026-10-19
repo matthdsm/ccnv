@@ -12,7 +12,7 @@ from ccnv.segment import (
     segment_genome,
 )
 
-FIXTURES = Path(__file__).parent / "fixtures" / "upstream"
+FIXTURES = Path(__file__).parent / "fixtures" / "benchmark"
 
 
 class TestWeightedL2Cost(unittest.TestCase):
@@ -160,7 +160,7 @@ class TestSegmentContig(unittest.TestCase):
             )
 
 
-class TestUpstreamConcordance(unittest.TestCase):
+class TestBenchmarkConcordance(unittest.TestCase):
     def test_synthetic_fixture_breakpoints_and_gain_call(self) -> None:
         bins_by_contig: dict[str, list[tuple[int, float, float]]] = {}
         with (FIXTURES / "synthetic" / "normalized_bins.tsv").open() as handle:
@@ -170,7 +170,7 @@ class TestUpstreamConcordance(unittest.TestCase):
                 )
 
         expected: dict[str, tuple[int, int, str | None]] = {}
-        with (FIXTURES / "synthetic" / "dnacopy_segments.tsv").open() as handle:
+        with (FIXTURES / "synthetic" / "expected_segments.tsv").open() as handle:
             for row in csv.DictReader(handle, delimiter="\t"):
                 expected[row["chr"]] = (
                     int(row["start_bin"]),
@@ -221,7 +221,7 @@ class TestUpstreamConcordance(unittest.TestCase):
                 ratio = float(row["ratio"])
                 bins.setdefault(row["chr"], []).append(
                     [
-                        int(row["start"]) - 1,
+                        int(row["start"]),
                         int(row["end"]),
                         ratio,
                         float(math.isfinite(ratio)),
@@ -232,7 +232,7 @@ class TestUpstreamConcordance(unittest.TestCase):
         with (FIXTURES / "real" / "ID_segments.bed").open() as handle:
             for row in csv.DictReader(handle, delimiter="\t"):
                 expected_segments.append(
-                    (row["chr"], int(row["start"]) - 1, int(row["end"]))
+                    (row["chr"], int(row["start"]), int(row["end"]))
                 )
 
         observed = []
