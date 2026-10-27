@@ -61,6 +61,7 @@ scikit-learn = "*"
 scipy = "*"
 typer = "*"
 jinja2 = ">=3.1.6,<4"
+gcc = ">=16.2.0,<16.3"
 
 [tool.pixi.pypi-dependencies]
 ccnv = { path = ".", editable = true }
