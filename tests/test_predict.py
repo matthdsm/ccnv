@@ -80,6 +80,8 @@ def _reference_table() -> pa.Table:
             "start": pa.array([0, 0], type=pa.int64()),
             "end": pa.array([100, 80], type=pa.int64()),
             "masked": [False, False],
+            "gc": pa.array([float("nan"), float("nan")], type=pa.float32()),
+            "mappability": pa.array([float("nan"), float("nan")], type=pa.float32()),
             "pca_mean": pa.array([0.5, 0.5], type=pa.float64()),
             "pca_loadings": pa.array([[0.0], [0.0]], type=pa.list_(pa.float64())),
             "nearest_ref_indices": pa.array([[1], [0]], type=pa.list_(pa.int32())),

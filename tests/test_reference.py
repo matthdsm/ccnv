@@ -134,6 +134,8 @@ class TestReferenceSchemaRejection(unittest.TestCase):
                 "start": pa.array([0, 0], type=pa.int64()),
                 "end": pa.array([10, 10], type=pa.int64()),
                 "masked": [False, False],
+                "gc": pa.array([-1.0, -1.0], type=pa.float32()),
+                "mappability": pa.array([-1.0, -1.0], type=pa.float32()),
                 "pca_mean": pa.array([0.0, 0.0], type=pa.float64()),
                 "pca_loadings": pa.array([[0.1], [0.1]], type=pa.list_(pa.float64())),
                 "nearest_ref_indices": pa.array([[], []], type=pa.list_(pa.int32())),

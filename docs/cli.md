@@ -63,6 +63,9 @@ ccnv reference GENOME.fa --prefix PREFIX [--bin-size N]
 | `--max-batch-memory-mb` | `256` | Memory cap (MiB) for batched pairwise distance calculation. |
 | `--min-cohort-size` | `10` | Minimum control samples required for the autosomal branch. |
 | `--min-sex-group-size` | `5` | Minimum samples per sex required to build a sex-specific branch. |
+| `--mappability` | unset | Mappability BigWig track (`.bw`/`.bigWig`) for masking and per-sample bias normalization. |
+| `--gc` | unset (or FASTA in flat mode) | GC content track (`.bw`, `.bed`/`.bed.gz`, or `.fa`/`.fasta`/`.fna`). Automatically derived from the input FASTA in flat reference mode when omitted. |
+| `--min-mappability` | `0.5` | Minimum bin mappability in `[0, 1]` required to keep a bin unmasked when `--mappability` is provided. |
 | `--qc-report / --no-qc-report` | `--qc-report` | Write `<prefix>_qc.json` and print a QC summary to `stderr`. |
 | `-t`, `--threads` | CPU count | CPU budget for parallel sample loading and reference modeling. |
 | `--loglevel` | `WARNING` | Logging verbosity. |
@@ -70,7 +73,7 @@ ccnv reference GENOME.fa --prefix PREFIX [--bin-size N]
 ```mermaid
 flowchart LR
     A["Control .ccnv Files or FASTA"] --> B["Validation & Rebinning"]
-    B --> C["Depth Normalization"]
+    B --> C["Depth & Covariate Normalization"]
     C --> D["Sex Inference & Branching"]
     D --> E["PCA Decomposition"]
     E --> F["Nearest Off-Contig Bin Search"]
@@ -111,6 +114,9 @@ ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
 | `--min-reference-bins` | `3` | Minimum within-sample reference bins required to normalize a target bin. |
 | `--mask-repeats` | `3` | Outlier-masking iterations during within-sample normalization. |
 | `--max-blacklist-gap` | `2000000` | Maximum masked gap (bp) bridged within a single segment. |
+| `--mappability` | reference track | Optional mappability BigWig override (`.bw`/`.bigWig`) for prediction normalization. |
+| `--gc` | reference track | Optional GC content track override (`.bw`, `.bed`/`.bed.gz`, or `.fa`/`.fasta`/`.fna`). |
+| `--min-mappability` | `0.5` | Minimum bin mappability in `[0, 1]` required to keep a bin unmasked. |
 | `--plot / --no-plot` | `--plot` | Write interactive genome-wide `<prefix>_plot.html`. |
 | `--cytobands` | unset | Cytoband BED/TSV file (`.txt`, `.bed`, or `.gz`) rendered above the genome plot (ignored with a warning when `--no-plot` is set). |
 | `--vcf / --no-vcf` | `--vcf` | Write bgzipped and tabix-indexed VCFv4.2 files. |
@@ -126,7 +132,7 @@ Prediction outputs:
 ```mermaid
 flowchart LR
     A["Sample & Reference .ccnv"] --> B["In-Memory Rebinning"]
-    B --> C["Branch Selection & Scaling"]
+    B --> C["Branch Selection & Covariate Scaling"]
     C --> D["PCA Bias Subtraction"]
     D --> E["Within-Sample Reference Normalization"]
     E --> F["Weighted Ruptures Binseg"]

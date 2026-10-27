@@ -17,6 +17,7 @@ from ccnv.convert import ConvertError
 from ccnv.convert import run as run_convert
 from ccnv.models import (
     DEFAULT_BIN_SIZE,
+    DEFAULT_MIN_MAPPABILITY,
     ConvertConfig,
     PredictConfig,
     ReadFilters,
@@ -323,6 +324,37 @@ def reference(
             help="Generate reference quality control report",
         ),
     ] = True,
+    mappability: Annotated[
+        Path | None,
+        typer.Option(
+            "--mappability",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Mappability BigWig (.bw/.bigWig) track for covariate normalization",
+        ),
+    ] = None,
+    gc: Annotated[
+        Path | None,
+        typer.Option(
+            "--gc",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="GC content track (.bw/.bigWig, .bed/.bed.gz, or .fa/.fasta/.fna)",
+        ),
+    ] = None,
+    min_mappability: Annotated[
+        float,
+        typer.Option(
+            "--min-mappability",
+            min=0.0,
+            max=1.0,
+            help="Minimum bin mappability in [0, 1] required to stay unmasked",
+        ),
+    ] = DEFAULT_MIN_MAPPABILITY,
     threads: Annotated[
         int,
         typer.Option(
@@ -363,8 +395,11 @@ def reference(
                 ),
                 bin_size=bin_size,
                 fasta=fasta,
+                gc=gc,
+                mappability=mappability,
                 max_batch_memory_mb=max_batch_memory_mb,
                 min_cohort_size=min_cohort_size,
+                min_mappability=min_mappability,
                 min_sex_group_size=min_sex_group_size,
                 nearest_bins=nearest_bins,
                 pca_components=pca_components,
@@ -511,6 +546,37 @@ def predict(
             "--vcf/--no-vcf", help="Write VCFv4.2 outputs for bins and segments"
         ),
     ] = True,
+    mappability: Annotated[
+        Path | None,
+        typer.Option(
+            "--mappability",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Mappability BigWig (.bw/.bigWig) override track for normalization",
+        ),
+    ] = None,
+    gc: Annotated[
+        Path | None,
+        typer.Option(
+            "--gc",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="GC content override track (.bw/.bigWig, .bed/.bed.gz, or .fa/.fasta)",
+        ),
+    ] = None,
+    min_mappability: Annotated[
+        float,
+        typer.Option(
+            "--min-mappability",
+            min=0.0,
+            max=1.0,
+            help="Minimum bin mappability in [0, 1] required to stay unmasked",
+        ),
+    ] = DEFAULT_MIN_MAPPABILITY,
     loglevel: LogLevelOption = LogLevel.warning,
 ) -> None:
     """Predict copy-number events for one sample."""
@@ -539,6 +605,9 @@ def predict(
                 plot=plot,
                 vcf=vcf,
                 cytobands=cytobands,
+                mappability=mappability,
+                gc=gc,
+                min_mappability=min_mappability,
             )
         )
 

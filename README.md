@@ -4,7 +4,7 @@
 
 - **Versioned Parquet Storage (`1.0.0`)**: Sample bin counts and reference models are stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC and provenance metadata.
 - **Organism-Agnostic & 0-Based Half-Open Coordinates**: Contig names, order, and lengths are read directly from alignment or FASTA headers without assuming a fixed 24-chromosome layout. All intervals are 0-based half-open `[start, end)`.
-- **Pure-Python Execution**: Uses `pysam`, `numpy`, `pyarrow`, `scikit-learn`, and weighted `ruptures` Binary Segmentation.
+- **Pure-Python Execution**: Uses `pysam`, `pyBigWig`, `numpy`, `pyarrow`, `scikit-learn`, and weighted `ruptures` Binary Segmentation.
 
 ## Installation
 
@@ -33,11 +33,11 @@ docker run --rm ghcr.io/matthdsm/copynumber-cnv:latest --help
 # 1. Convert BAM or CRAM alignments into binned sample Parquet (.ccnv)
 ccnv convert sample.bam --prefix sample --bin-size 5000
 
-# 2a. Build a reference model from a cohort of control samples
-ccnv reference controls/ --prefix reference --bin-size 5000
+# 2a. Build a reference model from a cohort of control samples (with optional GC & mappability tracks)
+ccnv reference controls/ --prefix reference --bin-size 5000 --gc genome.fa --mappability mappability.bw
 
 # 2b. Or build a flat uniform-depth reference from a FASTA when no controls are available
-ccnv reference genome.fa --prefix reference --bin-size 5000
+ccnv reference genome.fa --prefix reference --bin-size 5000 --mappability mappability.bw
 
 # 3. Inspect reference quality control metrics
 ccnv ref-qc reference.ccnv

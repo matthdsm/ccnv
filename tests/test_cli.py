@@ -391,6 +391,8 @@ def _write_reference(path: Path) -> Path:
             "start": pa.array([0], type=pa.int64()),
             "end": pa.array([100], type=pa.int64()),
             "masked": pa.array([False], type=pa.bool_()),
+            "gc": pa.array([float("nan")], type=pa.float32()),
+            "mappability": pa.array([float("nan")], type=pa.float32()),
             "pca_mean": pa.array([1.0], type=pa.float64()),
             "pca_loadings": pa.array([[0.1]], type=pa.list_(pa.float64())),
             "nearest_ref_indices": pa.array([[0]], type=pa.list_(pa.int32())),

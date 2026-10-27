@@ -26,6 +26,7 @@ dependencies = [
     "polars",
     "polars-runtime-compat",
     "pyarrow",
+    "pybigwig",
     "pysam",
     "ruptures",
     "scikit-learn",
@@ -51,6 +52,7 @@ numpy = "*"
 polars = "*"
 polars-runtime-compat = "*"
 pyarrow = "*"
+pybigwig = "*"
 pysam = "*"
 python = "3.12.*"
 ruptures = "*"

@@ -29,6 +29,15 @@ from ccnv.cohort import (
 from ccnv.cohort import (
     validate_cohort as validate_cohort,
 )
+from ccnv.covariates import (
+    CovariateError,
+    correct_covariate_bias,
+    covariate_features,
+    load_gc_track,
+    load_mappability_track,
+    mask_covariates,
+    validate_min_mappability,
+)
 from ccnv.models import ReferenceConfig, parquet_path
 from ccnv.reference_compute import (
     compute_null_models,
@@ -165,6 +174,13 @@ def fit_pca(
     n_components = min(n_components, samples.shape[0], samples.shape[1])
     if n_components < 1:
         raise ReferenceError("PCA requires at least one sample and one unmasked bin")
+    mean = np.mean(samples, axis=0)
+    if np.allclose(samples, mean):
+        return (
+            np.ones(data.shape, dtype=np.float64),
+            mean.astype(np.float64, copy=False),
+            np.zeros((n_components, samples.shape[1]), dtype=np.float64),
+        )
     pca = PCA(n_components=n_components, svd_solver="full")
     pca.fit(samples)
     if (
@@ -267,6 +283,26 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
         raise ReferenceError(
             f"provide at least {config.min_cohort_size} samples to build a reference"
         )
+    try:
+        validate_min_mappability(config.min_mappability)
+    except CovariateError as error:
+        raise ReferenceError(str(error)) from error
+
+    gc_source = config.gc if config.gc is not None else config.fasta
+    cohort_gc: NDArray[np.float64] | None = None
+    cohort_n_mask: NDArray[np.bool_] | None = None
+    cohort_mappability: NDArray[np.float64] | None = None
+    try:
+        if gc_source is not None:
+            cohort_gc, cohort_n_mask = load_gc_track(
+                gc_source, cohort.contigs, cohort.starts, cohort.ends
+            )
+        if config.mappability is not None:
+            cohort_mappability = load_mappability_track(
+                config.mappability, cohort.contigs, cohort.starts, cohort.ends
+            )
+    except CovariateError as error:
+        raise ReferenceError(str(error)) from error
 
     autosomes, sex_contigs = _resolve_contig_roles(cohort, config)
     logger.debug(
@@ -302,6 +338,9 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
         sample_index=np.arange(cohort.counts.shape[1]),
         contig_names=autosomes,
         config=config,
+        cohort_gc=cohort_gc,
+        cohort_mappability=cohort_mappability,
+        cohort_n_mask=cohort_n_mask,
     )
     built_branches.append(BRANCH_AUTOSOMAL)
 
@@ -317,6 +356,9 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
                 sample_index=female_index,
                 contig_names=sex_contigs,
                 config=config,
+                cohort_gc=cohort_gc,
+                cohort_mappability=cohort_mappability,
+                cohort_n_mask=cohort_n_mask,
             )
             built_branches.append(BRANCH_FEMALE_SEX)
         if male_index.size >= config.min_sex_group_size:
@@ -327,6 +369,9 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
                 sample_index=male_index,
                 contig_names=sex_contigs,
                 config=config,
+                cohort_gc=cohort_gc,
+                cohort_mappability=cohort_mappability,
+                cohort_n_mask=cohort_n_mask,
             )
             built_branches.append(BRANCH_MALE_SEX)
 
@@ -357,6 +402,9 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
                 "nearest_bins": config.nearest_bins,
                 "max_batch_memory_mb": config.max_batch_memory_mb,
                 "flat": config.fasta is not None,
+                "gc_corrected": gc_source is not None,
+                "mappability_corrected": config.mappability is not None,
+                "min_mappability": config.min_mappability,
             },
         },
     )
@@ -367,6 +415,8 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
             "start": pa.array(rows["start"], type=pa.int64()),
             "end": pa.array(rows["end"], type=pa.int64()),
             "masked": pa.array(rows["masked"], type=pa.bool_()),
+            "gc": pa.array(rows["gc"], type=pa.float32()),
+            "mappability": pa.array(rows["mappability"], type=pa.float32()),
             "pca_mean": pa.array(rows["pca_mean"], type=pa.float64()),
             "pca_loadings": pa.array(rows["pca_loadings"], type=pa.list_(pa.float64())),
             "nearest_ref_indices": pa.array(
@@ -401,6 +451,10 @@ def _validate_config(config: ReferenceConfig) -> None:
         raise ReferenceError("min_cohort_size must be a positive integer")
     if config.min_sex_group_size < 1:
         raise ReferenceError("min_sex_group_size must be a positive integer")
+    try:
+        validate_min_mappability(config.min_mappability)
+    except CovariateError as error:
+        raise ReferenceError(str(error)) from error
     _validate_sex_cutoff(config.sex_cutoff)
 
 
@@ -543,6 +597,8 @@ def _empty_branch_columns() -> dict[str, list[object]]:
         "start": [],
         "end": [],
         "masked": [],
+        "gc": [],
+        "mappability": [],
         "pca_mean": [],
         "pca_loadings": [],
         "nearest_ref_indices": [],
@@ -560,6 +616,9 @@ def _append_branch(
     sample_index: NDArray[np.integer],
     contig_names: tuple[str, ...],
     config: ReferenceConfig,
+    cohort_gc: NDArray[np.float64] | None = None,
+    cohort_mappability: NDArray[np.float64] | None = None,
+    cohort_n_mask: NDArray[np.bool_] | None = None,
 ) -> None:
     selected = np.array(
         [name in set(contig_names) for name in cohort.contigs],
@@ -568,6 +627,11 @@ def _append_branch(
     if not np.any(selected):
         raise ReferenceError(f"branch {branch!r} has no bins")
     counts = cohort.counts[np.ix_(selected, sample_index)]
+    branch_gc = cohort_gc[selected] if cohort_gc is not None else None
+    branch_map = (
+        cohort_mappability[selected] if cohort_mappability is not None else None
+    )
+    branch_n_mask = cohort_n_mask[selected] if cohort_n_mask is not None else None
     logger.debug(
         "building %s branch: %d bins, %d samples",
         branch,
@@ -576,6 +640,13 @@ def _append_branch(
     )
     normalized = normalize_depth(counts)
     usable = mask_low_coverage(normalized)
+    usable = mask_covariates(
+        usable,
+        gc=branch_gc,
+        mappability=branch_map,
+        n_mask=branch_n_mask,
+        min_mappability=config.min_mappability,
+    )
     if not np.any(usable):
         raise ReferenceError(f"branch {branch!r} has no unmasked bins")
     n_unmasked = int(np.count_nonzero(usable))
@@ -586,6 +657,10 @@ def _append_branch(
         usable.size,
         100.0 * n_unmasked / usable.size,
         usable.size - n_unmasked,
+    )
+
+    normalized = correct_covariate_bias(
+        normalized, usable, gc=branch_gc, mappability=branch_map
     )
 
     logger.debug("fitting PCA for %s (%d components)", branch, config.pca_components)
@@ -601,8 +676,13 @@ def _append_branch(
         branch,
         n_unmasked,
     )
+    search_profiles = corrected
+    if config.fasta is not None:
+        cov_mat = covariate_features(usable, gc=branch_gc, mappability=branch_map)
+        if cov_mat is not None:
+            search_profiles = cov_mat
     nearest_indices, nearest_distances = select_nearest_bins(
-        corrected,
+        search_profiles,
         contig_ids,
         k=config.nearest_bins,
         max_batch_memory_mb=config.max_batch_memory_mb,
@@ -650,6 +730,16 @@ def _append_branch(
         rows["contig"].append(contig)
         rows["start"].append(int(starts[local]))
         rows["end"].append(int(ends[local]))
+        rows["gc"].append(
+            float(branch_gc[local])
+            if branch_gc is not None and math.isfinite(float(branch_gc[local]))
+            else -1.0
+        )
+        rows["mappability"].append(
+            float(branch_map[local])
+            if branch_map is not None and math.isfinite(float(branch_map[local]))
+            else -1.0
+        )
         if not usable[local]:
             rows["masked"].append(True)
             rows["pca_mean"].append(0.0)

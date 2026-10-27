@@ -404,6 +404,9 @@ def run_reference_qc_on_table(
             "sex_signal_contig": signal_contig,
             "sex_cutoff": model.get("sex_cutoff"),
             "sex_source": model.get("sex_source"),
+            "gc_corrected": bool(model.get("gc_corrected", False)),
+            "mappability_corrected": bool(model.get("mappability_corrected", False)),
+            "min_mappability": model.get("min_mappability"),
         },
         "cohort": {
             "sample_count": sample_count,

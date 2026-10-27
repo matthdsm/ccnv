@@ -27,6 +27,7 @@ environments:
     packages:
       linux-64:
       - conda: https://conda.anaconda.org/bioconda/linux-64/htslib-1.24-ha79157c_0.conda
+      - conda: https://conda.anaconda.org/bioconda/linux-64/pybigwig-0.3.26-py312hca67b4d_1.conda
       - conda: https://conda.anaconda.org/bioconda/linux-64/pysam-0.24.0-py312hf5ad864_1.conda
       - conda: https://conda.anaconda.org/bioconda/linux-64/samtools-1.24-h9dcdb79_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -68,7 +69,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libbrotlienc-1.2.0-h018ffa1_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libcblas-3.11.0-9_h0358290_openblas.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libcrc32c-1.1.2-h9c3ff4c_0.tar.bz2
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/libcurl-8.21.0-ha042cf0_5.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libcurl-8.23.0-ha042cf0_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libdeflate-1.25-hd45a770_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libedit-3.1.20250104-pl5321h373387f_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libev-4.33-h280c20c_3.conda
@@ -166,8 +167,10 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
       - pypi: ./
       - pypi: https://files.pythonhosted.org/packages/55/0f/e7f1ff3a1cabc6c4486a7ee1b0506aedf2f5f8329760ac1f4e8032feef2b/pysam-0.24.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/c3/57/43cfb46cd842f67f8654484eff284d9a922848cc60af42dddcd8d30e4117/pybigwig-0.3.26-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
       linux-aarch64:
       - conda: https://conda.anaconda.org/bioconda/linux-aarch64/htslib-1.24-h190289e_0.conda
+      - conda: https://conda.anaconda.org/bioconda/linux-aarch64/pybigwig-0.3.26-py312h3ce0eb6_1.conda
       - conda: https://conda.anaconda.org/bioconda/linux-aarch64/pysam-0.24.0-py312hfd8969c_1.conda
       - conda: https://conda.anaconda.org/bioconda/linux-aarch64/samtools-1.24-h391949c_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
@@ -209,7 +212,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libbrotlienc-1.2.0-hb247b97_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcblas-3.11.0-9_hd72aa62_openblas.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcrc32c-1.1.2-h01db608_0.tar.bz2
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcurl-8.21.0-h86273da_5.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcurl-8.23.0-h86273da_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libdeflate-1.25-hfa851ae_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libedit-3.1.20250104-pl5321hc48eb74_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libev-4.33-h80f16a2_3.conda
@@ -306,9 +309,11 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.48.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
       - pypi: ./
+      - pypi: https://files.pythonhosted.org/packages/91/9b/85daed040fc5a33117e97dd48047bf771f3caa633537eccd9c24a96377fa/pybigwig-0.3.26.tar.gz
       - pypi: https://files.pythonhosted.org/packages/da/8a/df2be69f699b0a4360fd35a847636a2230a17dbaa02c98dc34831cdfb810/pysam-0.24.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
       osx-arm64:
       - conda: https://conda.anaconda.org/bioconda/osx-arm64/htslib-1.24-hd3c6ec9_0.conda
+      - conda: https://conda.anaconda.org/bioconda/osx-arm64/pybigwig-0.3.26-py312hf9845cc_1.conda
       - conda: https://conda.anaconda.org/bioconda/osx-arm64/pysam-0.24.0-py312h12d0683_1.conda
       - conda: https://conda.anaconda.org/bioconda/osx-arm64/samtools-1.24-h36b3a25_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
@@ -381,7 +386,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libbrotlienc-1.2.0-h2ddc9cb_3.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcblas-3.11.0-9_hb0561ab_openblas.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcrc32c-1.1.2-hbdafb3b_0.tar.bz2
-      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcurl-8.21.0-h6651222_5.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcurl-8.23.0-h6651222_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcxx-22.1.8-h55c6f16_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libdeflate-1.25-he7e0567_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libedit-3.1.20250104-pl5321h26f1114_1.conda
@@ -450,6 +455,7 @@ environments:
     packages:
       linux-64:
       - conda: https://conda.anaconda.org/bioconda/linux-64/htslib-1.24-ha79157c_0.conda
+      - conda: https://conda.anaconda.org/bioconda/linux-64/pybigwig-0.3.26-py312hca67b4d_1.conda
       - conda: https://conda.anaconda.org/bioconda/linux-64/pysam-0.24.0-py312hf5ad864_1.conda
       - conda: https://conda.anaconda.org/bioconda/linux-64/samtools-1.24-h9dcdb79_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -491,7 +497,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libbrotlienc-1.2.0-h018ffa1_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libcblas-3.11.0-9_h0358290_openblas.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libcrc32c-1.1.2-h9c3ff4c_0.tar.bz2
-      - conda: https://conda.anaconda.org/conda-forge/linux-64/libcurl-8.21.0-ha042cf0_5.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/libcurl-8.23.0-ha042cf0_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libdeflate-1.25-hd45a770_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libedit-3.1.20250104-pl5321h373387f_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/libev-4.33-h280c20c_3.conda
@@ -575,8 +581,10 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026c-h151e31d_0.conda
       - pypi: ./
       - pypi: https://files.pythonhosted.org/packages/55/0f/e7f1ff3a1cabc6c4486a7ee1b0506aedf2f5f8329760ac1f4e8032feef2b/pysam-0.24.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/c3/57/43cfb46cd842f67f8654484eff284d9a922848cc60af42dddcd8d30e4117/pybigwig-0.3.26-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
       linux-aarch64:
       - conda: https://conda.anaconda.org/bioconda/linux-aarch64/htslib-1.24-h190289e_0.conda
+      - conda: https://conda.anaconda.org/bioconda/linux-aarch64/pybigwig-0.3.26-py312h3ce0eb6_1.conda
       - conda: https://conda.anaconda.org/bioconda/linux-aarch64/pysam-0.24.0-py312hfd8969c_1.conda
       - conda: https://conda.anaconda.org/bioconda/linux-aarch64/samtools-1.24-h391949c_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
@@ -618,7 +626,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libbrotlienc-1.2.0-hb247b97_3.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcblas-3.11.0-9_hd72aa62_openblas.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcrc32c-1.1.2-h01db608_0.tar.bz2
-      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcurl-8.21.0-h86273da_5.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcurl-8.23.0-h86273da_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libdeflate-1.25-hfa851ae_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libedit-3.1.20250104-pl5321hc48eb74_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libev-4.33-h80f16a2_3.conda
@@ -701,9 +709,11 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/typing_extensions-4.16.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026c-h151e31d_0.conda
       - pypi: ./
+      - pypi: https://files.pythonhosted.org/packages/91/9b/85daed040fc5a33117e97dd48047bf771f3caa633537eccd9c24a96377fa/pybigwig-0.3.26.tar.gz
       - pypi: https://files.pythonhosted.org/packages/da/8a/df2be69f699b0a4360fd35a847636a2230a17dbaa02c98dc34831cdfb810/pysam-0.24.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
       osx-arm64:
       - conda: https://conda.anaconda.org/bioconda/osx-arm64/htslib-1.24-hd3c6ec9_0.conda
+      - conda: https://conda.anaconda.org/bioconda/osx-arm64/pybigwig-0.3.26-py312hf9845cc_1.conda
       - conda: https://conda.anaconda.org/bioconda/osx-arm64/pysam-0.24.0-py312h12d0683_1.conda
       - conda: https://conda.anaconda.org/bioconda/osx-arm64/samtools-1.24-h36b3a25_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
@@ -764,7 +774,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libbrotlienc-1.2.0-h2ddc9cb_3.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcblas-3.11.0-9_hb0561ab_openblas.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcrc32c-1.1.2-hbdafb3b_0.tar.bz2
-      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcurl-8.21.0-h6651222_5.conda
+      - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcurl-8.23.0-h6651222_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcxx-22.1.8-h55c6f16_0.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libdeflate-1.25-he7e0567_1.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libedit-3.1.20250104-pl5321h26f1114_1.conda
@@ -839,6 +849,24 @@ packages:
   license_family: MIT
   size: 1166222
   timestamp: 1783611817902
+- conda: https://conda.anaconda.org/bioconda/linux-64/pybigwig-0.3.26-py312hca67b4d_1.conda
+  sha256: e3c047e1e60065ad50f4b4352d231e8dd78c79bda05d5f1163c1d19595029088
+  md5: 9456a386bdb9dd81781d06c81c7e2db1
+  depends:
+  - libcurl >=8.22.0,<9.0a0
+  - libgcc >=14
+  - libzlib >=1.3.2,<2.0a0
+  - numpy >=1.25,<3
+  - numpy >=2.0.0
+  - python >=3.12,<3.13.0a0
+  - python_abi 3.12.* *_cp312
+  license: MIT
+  license_family: MIT
+  run_exports:
+    weak:
+    - pybigwig >=0.3.26,<0.4.0a0
+  size: 76653
+  timestamp: 1789986525288
 - conda: https://conda.anaconda.org/bioconda/linux-64/pysam-0.24.0-py312hf5ad864_1.conda
   sha256: cea331ad0156a060b4ee9f534daee29da451439679e5b4d2d1558ddaa4102f61
   md5: f94309496d6273c25f0f0a499b75b2fb
@@ -883,6 +911,24 @@ packages:
   license_family: MIT
   size: 1365711
   timestamp: 1783611529314
+- conda: https://conda.anaconda.org/bioconda/linux-aarch64/pybigwig-0.3.26-py312h3ce0eb6_1.conda
+  sha256: aca8ca17c2bc5fa9a230a22c145273cacea4340e52d25f44e328c0109426c662
+  md5: 38cc0aa16c249091f783818b5b5a49d8
+  depends:
+  - libcurl >=8.22.0,<9.0a0
+  - libgcc >=14
+  - libzlib >=1.3.2,<2.0a0
+  - numpy >=1.25,<3
+  - numpy >=2.0.0
+  - python >=3.12,<3.13.0a0
+  - python_abi 3.12.* *_cp312
+  license: MIT
+  license_family: MIT
+  run_exports:
+    weak:
+    - pybigwig >=0.3.26,<0.4.0a0
+  size: 118083
+  timestamp: 1789986096700
 - conda: https://conda.anaconda.org/bioconda/linux-aarch64/pysam-0.24.0-py312hfd8969c_1.conda
   sha256: 21101ddeeb2f4d982962b416d2107947195546454c386e4b54cfd66c6e60dc00
   md5: 392396ebf375462f5acc2235f62a2a71
@@ -924,6 +970,25 @@ packages:
   license_family: MIT
   size: 981565
   timestamp: 1783611550898
+- conda: https://conda.anaconda.org/bioconda/osx-arm64/pybigwig-0.3.26-py312hf9845cc_1.conda
+  sha256: 458c03b4437e96e6bcc8bc9ae0564ac762b667a253b08f97bb841ec720c73e94
+  md5: eafe60f11acd6d60f7a26974c63aaf05
+  depends:
+  - libcurl >=8.22.0,<9.0a0
+  - libzlib >=1.3.2,<2.0a0
+  - numpy >=1.25,<3
+  - numpy >=2.0.0
+  - python >=3.12,<3.13.0a0
+  - python_abi 3.12.* *_cp312
+  license: MIT
+  license_family: MIT
+  purls:
+  - pkg:pypi/pybigwig?source=hash-mapping
+  run_exports:
+    weak:
+    - pybigwig >=0.3.26,<0.4.0a0
+  size: 75838
+  timestamp: 1789985849271
 - conda: https://conda.anaconda.org/bioconda/osx-arm64/pysam-0.24.0-py312h12d0683_1.conda
   sha256: bab067cb5ad9c4603783533b55c0ae8c999e2ae23183a4d150c3c71c9036840f
   md5: 6959148824e8c370a1578914aa2f7d0c
@@ -1641,9 +1706,9 @@ packages:
     - libcrc32c >=1.1.2,<1.2.0a0
   size: 20440
   timestamp: 1633683576494
-- conda: https://conda.anaconda.org/conda-forge/linux-64/libcurl-8.21.0-ha042cf0_5.conda
-  sha256: 0b6cc13e36cf19ae9b764740112fc591682e189c99353be9f72f3d96ccf29d79
-  md5: 0ed167049513943d078a6c997df2b4e0
+- conda: https://conda.anaconda.org/conda-forge/linux-64/libcurl-8.23.0-ha042cf0_0.conda
+  sha256: d2db14d80efb4f2e76e76561c633f1767f7543987f2bcb54a067a9d264d432ab
+  md5: 0ad16151226df493aed967f0efce0e80
   depends:
   - __glibc >=2.17,<3.0.a0
   - krb5 >=1.22.2,<1.23.0a0
@@ -1652,16 +1717,16 @@ packages:
   - libpsl >=0.23.1,<0.24.0a0
   - libssh2 >=1.11.1,<2.0a0
   - libzlib >=1.3.2,<2.0a0
-  - openssl >=3.5.7,<4.0a0
+  - openssl >=3.5.9,<4.0a0
   - zstd >=1.5.7,<1.6.0a0
   license: curl
   license_family: MIT
   purls: []
   run_exports:
     weak:
-    - libcurl >=8.21.0,<9.0a0
-  size: 484517
-  timestamp: 1787183722915
+    - libcurl >=8.23.0,<9.0a0
+  size: 505683
+  timestamp: 1791990900844
 - conda: https://conda.anaconda.org/conda-forge/linux-64/libdeflate-1.25-hd45a770_1.conda
   sha256: 82e134c8a08b1eed9a2ed8ab578b89aa1730dcde3dea8dd87645ed0637878e54
   md5: 40f9b31aa9cf007789867df0decd0492
@@ -3359,9 +3424,9 @@ packages:
     - libcrc32c >=1.1.2,<1.2.0a0
   size: 18669
   timestamp: 1633683724891
-- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcurl-8.21.0-h86273da_5.conda
-  sha256: d7bc660680aee2ce4011779bdfc00b3f8d0c98acf503aa2982874d81b075ff66
-  md5: c2c977033fa833d7f1f83bb34dd52717
+- conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libcurl-8.23.0-h86273da_0.conda
+  sha256: 4a9bc4ef7f6ddaef61a900d360214fb285c6aa474a3d7e1c5e4e42b4b2e36697
+  md5: 23729bcd7d0045ad537a9cfa6329ac51
   depends:
   - krb5 >=1.22.2,<1.23.0a0
   - libgcc >=15
@@ -3369,16 +3434,16 @@ packages:
   - libpsl >=0.23.1,<0.24.0a0
   - libssh2 >=1.11.1,<2.0a0
   - libzlib >=1.3.2,<2.0a0
-  - openssl >=3.5.7,<4.0a0
+  - openssl >=3.5.9,<4.0a0
   - zstd >=1.5.7,<1.6.0a0
   license: curl
   license_family: MIT
   purls: []
   run_exports:
     weak:
-    - libcurl >=8.21.0,<9.0a0
-  size: 508109
-  timestamp: 1787183657716
+    - libcurl >=8.23.0,<9.0a0
+  size: 529565
+  timestamp: 1791990806492
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/libdeflate-1.25-hfa851ae_1.conda
   sha256: 4cb3da1d4ce7540604219d2a016253777da66c1a710c41557bc708aae7f54a75
   md5: 8cdf7f7e4908c9b2cf50c58966f2ff64
@@ -5500,9 +5565,9 @@ packages:
     - libcrc32c >=1.1.2,<1.2.0a0
   size: 18765
   timestamp: 1633683992603
-- conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcurl-8.21.0-h6651222_5.conda
-  sha256: 59dd850def9473e7f63ed72afc750bba9670316f279c0bd409572cd47569ed5f
-  md5: 5ae67c128838b686894b4a3aef015c29
+- conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcurl-8.23.0-h6651222_0.conda
+  sha256: d9f60525b665e50da15c84fcb4e74e6b1f0a56ea4c89a02d4258f23c3fe1f02c
+  md5: b955db4c41b9820eba0aa2c9a3c74a37
   depends:
   - __osx >=11.0
   - krb5 >=1.22.2,<1.23.0a0
@@ -5510,16 +5575,16 @@ packages:
   - libpsl >=0.23.1,<0.24.0a0
   - libssh2 >=1.11.1,<2.0a0
   - libzlib >=1.3.2,<2.0a0
-  - openssl >=3.5.7,<4.0a0
+  - openssl >=3.5.9,<4.0a0
   - zstd >=1.5.7,<1.6.0a0
   license: curl
   license_family: MIT
   purls: []
   run_exports:
     weak:
-    - libcurl >=8.21.0,<9.0a0
-  size: 409852
-  timestamp: 1787183686192
+    - libcurl >=8.23.0,<9.0a0
+  size: 425637
+  timestamp: 1792014025908
 - conda: https://conda.anaconda.org/conda-forge/osx-arm64/libcxx-22.1.8-h55c6f16_0.conda
   sha256: a2e7abab5add9750fab064c024394de48e49f97631c605ad5db5c8ac3fc769ef
   md5: 89f76a2a21a3ec3ec983b5eb237c4113
@@ -6456,6 +6521,7 @@ packages:
   - polars
   - polars-runtime-compat
   - pyarrow
+  - pybigwig
   - pysam
   - ruptures
   - scikit-learn
@@ -6467,11 +6533,21 @@ packages:
   version: 0.24.0
   sha256: 4a642f18649e59817de272173e9c27c031dceaca199809e4f8b338ebfc5d6698
   requires_python: '>=3.8'
+- pypi: https://files.pythonhosted.org/packages/91/9b/85daed040fc5a33117e97dd48047bf771f3caa633537eccd9c24a96377fa/pybigwig-0.3.26.tar.gz
+  name: pybigwig
+  version: 0.3.26
+  sha256: 8b01c6542ed9e65d0758ff18a43d6fd7b1c517e1f6aa6132368fe17ee32c1533
+  requires_python: '>=3.9'
 - pypi: https://files.pythonhosted.org/packages/98/c1/37f2fcccce3f1494147e46ccc04996226defe9ccae8251a9ce61296fa599/pysam-0.24.0-cp312-cp312-macosx_11_0_arm64.whl
   name: pysam
   version: 0.24.0
   sha256: 4da222cf6887b272c09351381efa20bfc96e0a47a944a822785fc5b6bc8b8c9d
   requires_python: '>=3.8'
+- pypi: https://files.pythonhosted.org/packages/c3/57/43cfb46cd842f67f8654484eff284d9a922848cc60af42dddcd8d30e4117/pybigwig-0.3.26-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+  name: pybigwig
+  version: 0.3.26
+  sha256: 3403636c431a5bbab05f5c3ce24acb5ae0fab5e5602c259725ef0f54ddc98817
+  requires_python: '>=3.9'
 - pypi: https://files.pythonhosted.org/packages/da/8a/df2be69f699b0a4360fd35a847636a2230a17dbaa02c98dc34831cdfb810/pysam-0.24.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
   name: pysam
   version: 0.24.0

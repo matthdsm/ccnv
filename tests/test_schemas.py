@@ -165,6 +165,8 @@ class TestSchemaContracts(unittest.TestCase):
                 "start": pa.array([0, 100], type=pa.int64()),
                 "end": pa.array([100, 200], type=pa.int64()),
                 "masked": [False, False],
+                "gc": pa.array([0.42, 0.45], type=pa.float32()),
+                "mappability": pa.array([0.98, 0.99], type=pa.float32()),
                 "pca_mean": [0.0, 0.0],
                 "pca_loadings": [[0.1], [0.1]],
                 "nearest_ref_indices": [[1], [0]],
