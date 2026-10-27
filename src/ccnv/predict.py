@@ -379,10 +379,8 @@ def project_coverage(
         raise PredictError("counts and mask must be aligned one-dimensional arrays")
     if np.any(~np.isfinite(model.counts)) or np.any(model.counts < 0):
         raise PredictError("sample counts must be finite and non-negative")
-    total = float(np.sum(model.counts))
-    if total <= 0:
+    if float(np.sum(model.counts)) <= 0:
         raise PredictError(f"branch {model.branch!r} has zero sample coverage")
-    normalized = model.counts / total
     ref_unmasked = ~model.masked
     gc = gc_override if gc_override is not None else model.gc
     mappability = (
@@ -395,6 +393,12 @@ def project_coverage(
         n_mask=n_mask_override,
         min_mappability=min_mappability,
     )
+    usable_total = float(np.sum(model.counts[cov_usable]))
+    if usable_total <= 0:
+        raise PredictError(
+            f"branch {model.branch!r} has zero sample coverage on usable bins"
+        )
+    normalized = model.counts / usable_total
     normalized = correct_covariate_bias(
         normalized, cov_usable, gc=gc, mappability=mappability
     )
@@ -402,13 +406,14 @@ def project_coverage(
     if selected.shape != model.pca_mean.shape:
         raise PredictError("PCA mean does not align with unmasked sample bins")
     active_sub = cov_usable[ref_unmasked] & np.isfinite(selected)
-    if np.any(active_sub):
+    reconstruction = model.pca_mean.copy()
+    n_active = int(np.count_nonzero(active_sub))
+    if n_active > 0:
         sub_loadings = model.pca_loadings[:, active_sub]
-        sub_centered = selected[active_sub] - model.pca_mean[active_sub]
-        coeffs, *_ = np.linalg.lstsq(sub_loadings.T, sub_centered, rcond=None)
-        reconstruction = (coeffs @ model.pca_loadings) + model.pca_mean
-    else:
-        reconstruction = model.pca_mean.copy()
+        if n_active > int(np.linalg.matrix_rank(sub_loadings.T)):
+            sub_centered = selected[active_sub] - model.pca_mean[active_sub]
+            coeffs, *_ = np.linalg.lstsq(sub_loadings.T, sub_centered, rcond=None)
+            reconstruction = (coeffs @ model.pca_loadings) + model.pca_mean
     corrected = np.full(normalized.shape, np.nan, dtype=np.float64)
     valid = active_sub & np.isfinite(reconstruction) & (reconstruction > 0)
     corrected_values = np.full(selected.shape, np.nan, dtype=np.float64)

@@ -158,17 +158,27 @@ class TestNormalization(unittest.TestCase):
         # 1. Mask bin 0 and 1 -> active_sub is [False, False, True, True]
         n_mask = np.array([True, True, False, False])
         proj = project_coverage(model, n_mask_override=n_mask)
-        # On active bins (index 2, 3), selected is [0.2, 0.3], centered is [-0.05, 0.05]
-        # sub_loadings.T is [[0.5], [0.5]]; lstsq solves c = 0.0 -> recon = 0.25
+        # Usable count sum = 20.0 + 30.0 = 50.0 -> selected is [0.4, 0.6]
+        # sub_loadings.T is [[0.5], [0.5]]; lstsq solves c = 0.5
+        # recon = [0.5, 0.5, 0.5, 0.5]
         self.assertTrue(np.all(proj.usable == np.array([False, False, True, True])))
-        self.assertAlmostEqual(proj.corrected[2], 0.2 / 0.25)
-        self.assertAlmostEqual(proj.corrected[3], 0.3 / 0.25)
+        self.assertAlmostEqual(proj.corrected[2], 0.4 / 0.5)
+        self.assertAlmostEqual(proj.corrected[3], 0.6 / 0.5)
 
-        # 2. All bins masked -> no bins active -> fallback to pca_mean copy
+        # 2. All bins masked -> raises PredictError (zero usable count)
         all_masked = np.ones(4, dtype=np.bool_)
-        proj_none = project_coverage(model, n_mask_override=all_masked)
-        self.assertFalse(np.any(proj_none.usable))
-        self.assertTrue(np.all(np.isnan(proj_none.corrected)))
+        with self.assertRaises(PredictError):
+            project_coverage(model, n_mask_override=all_masked)
+
+        # 3. One active bin -> n_active (1) <= rank (1) -> fallback to pca_mean copy
+        one_active_mask = np.array([True, True, True, False])
+        proj_one = project_coverage(model, n_mask_override=one_active_mask)
+        self.assertTrue(
+            np.all(proj_one.usable == np.array([False, False, False, True]))
+        )
+        # Active bin 3 count 30.0, usable_total=30.0 -> normalized = 1.0
+        # n_active=1 <= rank=1 -> reconstruction is pca_mean[3] = 0.25
+        self.assertAlmostEqual(proj_one.corrected[3], 1.0 / 0.25)
 
 
 class TestCalling(unittest.TestCase):

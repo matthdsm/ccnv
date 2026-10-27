@@ -140,13 +140,18 @@ def run(config: ReferenceConfig) -> None:
         )
 
 
-def normalize_depth(counts: NDArray[np.floating]) -> NDArray[np.float64]:
-    """Scale each sample to unit total depth."""
+def normalize_depth(
+    counts: NDArray[np.floating],
+    mask: NDArray[np.bool_] | None = None,
+) -> NDArray[np.float64]:
+    """Scale each sample to unit total depth, optionally on usable bins."""
 
     matrix = np.asarray(counts, dtype=np.float64)
-    totals = matrix.sum(axis=0)
+    sub = matrix[mask] if mask is not None else matrix
+    totals = sub.sum(axis=0)
     if np.any(totals <= 0):
-        raise ReferenceError("every sample must have a positive total count")
+        suffix = " on usable bins" if mask is not None else ""
+        raise ReferenceError(f"every sample must have a positive total count{suffix}")
     return matrix / totals
 
 
@@ -646,8 +651,8 @@ def _append_branch(
         counts.shape[0],
         counts.shape[1],
     )
-    normalized = normalize_depth(counts)
-    usable = mask_low_coverage(normalized)
+    initial_normalized = normalize_depth(counts)
+    usable = mask_low_coverage(initial_normalized)
     usable = mask_covariates(
         usable,
         gc=branch_gc,
@@ -657,6 +662,7 @@ def _append_branch(
     )
     if not np.any(usable):
         raise ReferenceError(f"branch {branch!r} has no unmasked bins")
+    normalized = normalize_depth(counts, mask=usable)
     n_unmasked = int(np.count_nonzero(usable))
     logger.debug(
         "%s mask kept %d/%d bins (%.1f%% unmasked, %d masked)",

@@ -33,6 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Resolved `UnboundLocalError` for `fasta` variable in `ccnv reference` CLI command.
+- Scaled depth normalization strictly over unmasked bins in reference build and prediction coverage, and guarded PCA reconstruction against underdetermined active bin rank.
 
 ### Added
 
