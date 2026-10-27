@@ -195,20 +195,42 @@ def _load_bigwig_intervals(
             mask = contig_arr == contig
             c_starts = starts[mask]
             c_ends = ends[mask]
-            raw_intervals = bw.intervals(bw_contig)
-            if not raw_intervals:
-                continue
-            arr = np.asarray(raw_intervals, dtype=np.float64)
-            if arr.ndim != 2 or arr.shape[1] != 3:
-                continue
-            out[mask] = _bin_weighted_mean(
-                c_starts,
-                c_ends,
-                arr[:, 0].astype(np.int64),
-                arr[:, 1].astype(np.int64),
-                arr[:, 2],
-                full_bin_denominator=full_bin_denominator,
+            chrom_len = int(bw_chroms[bw_contig])
+            c_vals = np.full(
+                c_starts.size,
+                0.0 if full_bin_denominator else np.nan,
+                dtype=np.float64,
             )
+            for idx in range(c_starts.size):
+                s = int(c_starts[idx])
+                e = int(c_ends[idx])
+                clamped_s = max(0, min(s, chrom_len))
+                clamped_e = max(clamped_s, min(e, chrom_len))
+                if clamped_e <= clamped_s:
+                    continue
+                mean_res = bw.stats(
+                    bw_contig, clamped_s, clamped_e, type="mean", exact=True
+                )
+                if not mean_res or mean_res[0] is None:
+                    continue
+                val = float(mean_res[0])
+                if full_bin_denominator:
+                    cov_res = bw.stats(
+                        bw_contig,
+                        clamped_s,
+                        clamped_e,
+                        type="coverage",
+                        exact=True,
+                    )
+                    cov = (
+                        float(cov_res[0])
+                        if (cov_res and cov_res[0] is not None)
+                        else 0.0
+                    )
+                    covered_bases = (clamped_e - clamped_s) * cov
+                    val *= covered_bases / max(e - s, 1)
+                c_vals[idx] = val
+            out[mask] = c_vals
     finally:
         bw.close()
 
