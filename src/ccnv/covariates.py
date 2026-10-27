@@ -264,18 +264,21 @@ def _compute_fasta_gc(
             mask = contig_arr == contig
             c_starts = starts[mask]
             c_ends = ends[mask]
-            seq_str = handle.fetch(fa_contig)
-            seq_bytes = np.frombuffer(seq_str.encode("ascii"), dtype=np.uint8)
+            seq_bytes = np.frombuffer(
+                handle.fetch(fa_contig).encode("ascii"), dtype=np.uint8
+            )
             seq_len = seq_bytes.size
             if seq_len == 0:
                 continue
             codes = _ASCII_BASE_LUT[seq_bytes]
-            gc_prefix = np.empty(seq_len + 1, dtype=np.int64)
-            at_prefix = np.empty(seq_len + 1, dtype=np.int64)
+            del seq_bytes
+            gc_prefix = np.empty(seq_len + 1, dtype=np.int32)
+            at_prefix = np.empty(seq_len + 1, dtype=np.int32)
             gc_prefix[0] = 0
             at_prefix[0] = 0
-            np.cumsum(codes == 1, dtype=np.int64, out=gc_prefix[1:])
-            np.cumsum(codes == 2, dtype=np.int64, out=at_prefix[1:])
+            np.cumsum(codes == 1, dtype=np.int32, out=gc_prefix[1:])
+            np.cumsum(codes == 2, dtype=np.int32, out=at_prefix[1:])
+            del codes
 
             clamped_s = np.clip(c_starts, 0, seq_len)
             clamped_e = np.clip(c_ends, clamped_s, seq_len)
