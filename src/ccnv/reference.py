@@ -288,14 +288,22 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
     except CovariateError as error:
         raise ReferenceError(str(error)) from error
 
-    gc_source = config.gc if config.gc is not None else config.fasta
     cohort_gc: NDArray[np.float64] | None = None
     cohort_n_mask: NDArray[np.bool_] | None = None
     cohort_mappability: NDArray[np.float64] | None = None
     try:
-        if gc_source is not None:
+        if config.gc is not None:
             cohort_gc, cohort_n_mask = load_gc_track(
-                gc_source, cohort.contigs, cohort.starts, cohort.ends
+                config.gc, cohort.contigs, cohort.starts, cohort.ends
+            )
+            if config.fasta is not None:
+                _, fasta_n_mask = load_gc_track(
+                    config.fasta, cohort.contigs, cohort.starts, cohort.ends
+                )
+                cohort_n_mask = cohort_n_mask | fasta_n_mask
+        elif config.fasta is not None:
+            cohort_gc, cohort_n_mask = load_gc_track(
+                config.fasta, cohort.contigs, cohort.starts, cohort.ends
             )
         if config.mappability is not None:
             cohort_mappability = load_mappability_track(
@@ -402,7 +410,7 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
                 "nearest_bins": config.nearest_bins,
                 "max_batch_memory_mb": config.max_batch_memory_mb,
                 "flat": config.fasta is not None,
-                "gc_corrected": gc_source is not None,
+                "gc_corrected": (config.gc is not None) or (config.fasta is not None),
                 "mappability_corrected": config.mappability is not None,
                 "min_mappability": config.min_mappability,
             },

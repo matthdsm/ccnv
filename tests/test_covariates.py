@@ -565,6 +565,56 @@ class TestEndToEndCovariatePipeline(unittest.TestCase):
                 call_rows = h.read().splitlines()
             self.assertTrue(any("gain" in row for row in call_rows[1:]))
 
+    def test_reference_combines_fasta_n_mask_with_gc_track(self) -> None:
+        contig_names = ("chr1", "chr2")
+        n_per = 10
+        bin_size = 100
+        contigs = [c for c in contig_names for _ in range(n_per)]
+        starts = [i * bin_size for i in range(n_per)] * len(contig_names)
+        ends = [(i + 1) * bin_size for i in range(n_per)] * len(contig_names)
+        n_bins = len(contigs)
+
+        # FASTA has N-gap on bin 0 of chr1
+        seqs = {
+            "chr1": "N" * bin_size + "A" * (bin_size * (n_per - 1)),
+            "chr2": "A" * (bin_size * n_per),
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fasta_path = _write_fasta(root / "genome.fa", seqs)
+
+            # GC BED gives valid GC (0.45) for ALL bins (including bin 0)
+            bed_gc = root / "gc.bed"
+            with bed_gc.open("w", encoding="utf-8") as handle:
+                for i in range(n_bins):
+                    handle.write(f"{contigs[i]}\t{starts[i]}\t{ends[i]}\t0.45\n")
+
+            ref_prefix = root / "ref_fasta_n"
+            run_reference(
+                ReferenceConfig(
+                    samples=(),
+                    fasta=fasta_path,
+                    gc=bed_gc,
+                    bin_size=bin_size,
+                    prefix=ref_prefix,
+                    min_cohort_size=2,
+                    nearest_bins=4,
+                    pca_components=1,
+                )
+            )
+
+            ref_table = pq.read_table(parquet_path(ref_prefix))
+            masked = ref_table.column("masked").to_pylist()
+            gc_vals = ref_table.column("gc").to_pylist()
+
+            # Bin 0 masked due to FASTA N-mask combining with GC track
+            self.assertTrue(masked[0])
+            self.assertFalse(masked[1])
+            # GC column sourced from GC BED (0.45)
+            self.assertAlmostEqual(gc_vals[0], 0.45, places=4)
+            self.assertAlmostEqual(gc_vals[1], 0.45, places=4)
+
 
 if __name__ == "__main__":
     unittest.main()

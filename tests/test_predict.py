@@ -128,6 +128,48 @@ class TestNormalization(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(result.zscores)))
         np.testing.assert_allclose(result.ratios, 0.0)
 
+    def test_project_coverage_lstsq_reconstruction_with_masked_and_empty_active(
+        self,
+    ) -> None:
+        from ccnv.predict import project_coverage
+
+        # 4 bins, 1 component: loading = [0.5, 0.5, 0.5, 0.5]
+        # Mean = [0.25, 0.25, 0.25, 0.25]
+        model = BranchModel(
+            branch=BRANCH_AUTOSOMAL,
+            contigs=("chr1", "chr1", "chr2", "chr2"),
+            starts=np.array([0, 100, 0, 100], dtype=np.int64),
+            ends=np.array([100, 200, 100, 200], dtype=np.int64),
+            counts=np.array([20.0, 30.0, 20.0, 30.0]),
+            masked=np.zeros(4, dtype=np.bool_),
+            pca_mean=np.full(4, 0.25),
+            pca_loadings=np.full((1, 4), 0.5),
+            nearest_indices=(
+                np.array([2, 3]),
+                np.array([2, 3]),
+                np.array([0, 1]),
+                np.array([0, 1]),
+            ),
+            mean_distance=np.ones(4, dtype=np.float32),
+            null_mean=np.zeros(4, dtype=np.float64),
+            null_std=np.full(4, 0.1, dtype=np.float64),
+        )
+
+        # 1. Mask bin 0 and 1 -> active_sub is [False, False, True, True]
+        n_mask = np.array([True, True, False, False])
+        proj = project_coverage(model, n_mask_override=n_mask)
+        # On active bins (index 2, 3), selected is [0.2, 0.3], centered is [-0.05, 0.05]
+        # sub_loadings.T is [[0.5], [0.5]]; lstsq solves c = 0.0 -> recon = 0.25
+        self.assertTrue(np.all(proj.usable == np.array([False, False, True, True])))
+        self.assertAlmostEqual(proj.corrected[2], 0.2 / 0.25)
+        self.assertAlmostEqual(proj.corrected[3], 0.3 / 0.25)
+
+        # 2. All bins masked -> no bins active -> fallback to pca_mean copy
+        all_masked = np.ones(4, dtype=np.bool_)
+        proj_none = project_coverage(model, n_mask_override=all_masked)
+        self.assertFalse(np.any(proj_none.usable))
+        self.assertTrue(np.all(np.isnan(proj_none.corrected)))
+
 
 class TestCalling(unittest.TestCase):
     def test_calls_symmetric_z_and_ratio_thresholds(self) -> None:

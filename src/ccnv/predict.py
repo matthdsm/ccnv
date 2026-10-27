@@ -402,10 +402,13 @@ def project_coverage(
     if selected.shape != model.pca_mean.shape:
         raise PredictError("PCA mean does not align with unmasked sample bins")
     active_sub = cov_usable[ref_unmasked] & np.isfinite(selected)
-    centered = np.where(active_sub, selected - model.pca_mean, 0.0)
-    reconstruction = (
-        centered @ model.pca_loadings.T
-    ) @ model.pca_loadings + model.pca_mean
+    if np.any(active_sub):
+        sub_loadings = model.pca_loadings[:, active_sub]
+        sub_centered = selected[active_sub] - model.pca_mean[active_sub]
+        coeffs, *_ = np.linalg.lstsq(sub_loadings.T, sub_centered, rcond=None)
+        reconstruction = (coeffs @ model.pca_loadings) + model.pca_mean
+    else:
+        reconstruction = model.pca_mean.copy()
     corrected = np.full(normalized.shape, np.nan, dtype=np.float64)
     valid = active_sub & np.isfinite(reconstruction) & (reconstruction > 0)
     corrected_values = np.full(selected.shape, np.nan, dtype=np.float64)
