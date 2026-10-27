@@ -79,11 +79,14 @@ def _bin_weighted_mean(
     iv_starts: NDArray[np.int64],
     iv_ends: NDArray[np.int64],
     iv_values: NDArray[np.float64],
+    *,
+    full_bin_denominator: bool = False,
 ) -> NDArray[np.float64]:
     """Compute overlap-weighted mean track value for sorted non-overlapping bins."""
 
     n_bins = bin_starts.size
-    result = np.full(n_bins, np.nan, dtype=np.float64)
+    default_val = 0.0 if full_bin_denominator else np.nan
+    result = np.full(n_bins, default_val, dtype=np.float64)
     if n_bins == 0 or iv_starts.size == 0:
         return result
 
@@ -140,7 +143,11 @@ def _bin_weighted_mean(
             covered_len[b_slice][pos] += w
 
     has_cov = covered_len > 0
-    result[has_cov] = weighted_sum[has_cov] / covered_len[has_cov]
+    if full_bin_denominator:
+        bin_lengths = np.maximum(bin_ends - bin_starts, 1).astype(np.float64)
+        result[has_cov] = weighted_sum[has_cov] / bin_lengths[has_cov]
+    else:
+        result[has_cov] = weighted_sum[has_cov] / covered_len[has_cov]
     return result
 
 
@@ -151,6 +158,7 @@ def _load_bigwig_intervals(
     ends: NDArray[np.int64],
     *,
     label: str,
+    full_bin_denominator: bool = False,
 ) -> NDArray[np.float64]:
     """Read per-bin overlap-weighted means from a BigWig file via pyBigWig."""
 
@@ -172,7 +180,11 @@ def _load_bigwig_intervals(
         bw_chroms = bw.chroms() or {}
         avail = set(bw_chroms.keys())
         contig_arr = np.asarray(contigs, dtype=object)
-        out = np.full(starts.size, np.nan, dtype=np.float64)
+        out = np.full(
+            starts.size,
+            0.0 if full_bin_denominator else np.nan,
+            dtype=np.float64,
+        )
         matched_any = False
 
         for contig in dict.fromkeys(contigs):
@@ -195,6 +207,7 @@ def _load_bigwig_intervals(
                 arr[:, 0].astype(np.int64),
                 arr[:, 1].astype(np.int64),
                 arr[:, 2],
+                full_bin_denominator=full_bin_denominator,
             )
     finally:
         bw.close()
@@ -214,14 +227,20 @@ def load_mappability_track(
 ) -> NDArray[np.float64]:
     """Load per-bin mean mappability from a BigWig file."""
 
-    values = _load_bigwig_intervals(path, contigs, starts, ends, label="mappability")
-    finite = np.isfinite(values)
-    if np.any(finite):
-        values[finite] = np.clip(values[finite], 0.0, 1.0)
+    values = _load_bigwig_intervals(
+        path,
+        contigs,
+        starts,
+        ends,
+        label="mappability",
+        full_bin_denominator=True,
+    )
+    values = np.nan_to_num(values, nan=0.0)
+    values = np.clip(values, 0.0, 1.0)
     logger.debug(
         "loaded mappability track %s: %d/%d finite bins",
         path,
-        int(np.count_nonzero(finite)),
+        int(np.count_nonzero(np.isfinite(values))),
         values.size,
     )
     return values

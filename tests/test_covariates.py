@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 from ccnv.cli import app
 from ccnv.covariates import (
     CovariateError,
+    _bin_weighted_mean,
     correct_covariate_bias,
     covariate_features,
     load_gc_track,
@@ -90,29 +91,60 @@ def _write_sample_parquet(
 
 
 class TestTrackLoadingAndMasking(unittest.TestCase):
+    def test_bin_weighted_mean_full_bin_vs_covered_len(self) -> None:
+        starts = np.array([0, 100, 200], dtype=np.int64)
+        ends = np.array([100, 200, 300], dtype=np.int64)
+        # Interval covers only 40 bp of bin 0 (value 0.5) and 0 bp of bin 1, 2
+        iv_s = np.array([0], dtype=np.int64)
+        iv_e = np.array([40], dtype=np.int64)
+        iv_v = np.array([0.5], dtype=np.float64)
+
+        # Mappability track: divide by full bin length, uncovered bins at 0.0
+        map_mean = _bin_weighted_mean(
+            starts, ends, iv_s, iv_e, iv_v, full_bin_denominator=True
+        )
+        # (40 * 0.5) / 100 = 0.2; bin 1 and 2 have no coverage -> 0.0
+        np.testing.assert_allclose(map_mean, [0.2, 0.0, 0.0], atol=1e-6)
+
+        # GC track: divide by covered length, uncovered bins at NaN
+        gc_mean = _bin_weighted_mean(
+            starts, ends, iv_s, iv_e, iv_v, full_bin_denominator=False
+        )
+        # (40 * 0.5) / 40 = 0.5; bin 1 and 2 have no coverage -> NaN
+        self.assertAlmostEqual(gc_mean[0], 0.5)
+        self.assertTrue(np.isnan(gc_mean[1]))
+        self.assertTrue(np.isnan(gc_mean[2]))
+
     def test_load_mappability_bigwig_and_chr_alias(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bw_path = _write_bigwig(
                 Path(tmpdir) / "map.bw",
-                {"1": 300, "2": 200},
+                {"1": 300, "2": 400},
                 [
                     ("1", 0, 50, 1.0),
                     ("1", 50, 100, 0.5),
                     ("1", 100, 200, 0.2),
                     ("1", 200, 300, 0.9),
                     ("2", 0, 200, 0.8),
+                    ("2", 200, 250, 0.6),  # Partially covers bin 200..300
                 ],
             )
-            contigs = ["chr1", "chr1", "chr1", "chr2", "chr2"]
-            starts = np.array([0, 100, 200, 0, 100], dtype=np.int64)
-            ends = np.array([100, 200, 300, 100, 200], dtype=np.int64)
+            contigs = ["chr1", "chr1", "chr1", "chr2", "chr2", "chr2", "chr2"]
+            starts = np.array([0, 100, 200, 0, 100, 200, 300], dtype=np.int64)
+            ends = np.array([100, 200, 300, 100, 200, 300, 400], dtype=np.int64)
 
             values = load_mappability_track(bw_path, contigs, starts, ends)
-            np.testing.assert_allclose(values, [0.75, 0.2, 0.9, 0.8, 0.8], atol=1e-6)
+            # Bin 5 (chr2:200..300): (50 * 0.6) / 100 = 0.3
+            # Bin 6 (chr2:300..400): uncovered -> 0.0
+            np.testing.assert_allclose(
+                values, [0.75, 0.2, 0.9, 0.8, 0.8, 0.3, 0.0], atol=1e-6
+            )
 
-            usable = np.ones(5, dtype=np.bool_)
+            usable = np.ones(7, dtype=np.bool_)
             masked = mask_covariates(usable, mappability=values, min_mappability=0.5)
-            np.testing.assert_array_equal(masked, [True, False, True, True, True])
+            np.testing.assert_array_equal(
+                masked, [True, False, True, True, True, False, False]
+            )
 
     def test_load_gc_from_fasta_bed_and_bigwig(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
