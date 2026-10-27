@@ -75,7 +75,7 @@ class TestReport(unittest.TestCase):
         self.assertIn('id="r-input"', content)
         self.assertIn("Plotly.newPlot", content)
         self.assertIn("scattergl", content)
-        self.assertIn("const Y_LIM = 2;", content)
+        self.assertIn("const Y_LIM = 2.5;", content)
         self.assertIn("fixedrange: true", content)
 
         payload = _extract_payload(content)
