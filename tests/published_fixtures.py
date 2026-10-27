@@ -11,7 +11,7 @@ from ccnv.convert import run as convert
 from ccnv.models import ConvertConfig, parquet_path
 
 CONVERT_FIXTURES = Path(__file__).parent / "fixtures" / "convert"
-_DATASETS = "https://raw.githubusercontent.com/nf-cmgg/test-datasets/ccnv/"
+_DATASETS = "https://raw.githubusercontent.com/nf-cmgg/test-datasets/wisecondorx/"
 PUBLISHED_CRAM_URL = f"{_DATASETS}data/genomics/homo_sapiens/illumina/cram/test.cram"
 PUBLISHED_CRAM2_URL = f"{_DATASETS}data/genomics/homo_sapiens/illumina/cram/test2.cram"
 PUBLISHED_FASTA_URL = (

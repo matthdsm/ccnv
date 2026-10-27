@@ -111,7 +111,8 @@ ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
 | `--min-reference-bins` | `3` | Minimum within-sample reference bins required to normalize a target bin. |
 | `--mask-repeats` | `3` | Outlier-masking iterations during within-sample normalization. |
 | `--max-blacklist-gap` | `2000000` | Maximum masked gap (bp) bridged within a single segment. |
-| `--plot / --no-plot` | `--plot` | Write genome-wide `<prefix>_plot.svg`. |
+| `--plot / --no-plot` | `--plot` | Write interactive genome-wide `<prefix>_plot.html`. |
+| `--cytobands` | unset | Cytoband BED/TSV file (`.txt`, `.bed`, or `.gz`) rendered above the genome plot (ignored with a warning when `--no-plot` is set). |
 | `--vcf / --no-vcf` | `--vcf` | Write bgzipped and tabix-indexed VCFv4.2 files. |
 | `--loglevel` | `WARNING` | Logging verbosity. |
 
@@ -120,7 +121,7 @@ Prediction outputs:
 - `<prefix>_bins.bed.gz` (`.tbi`) and `<prefix>_bins.vcf.gz` (`.tbi`): Per-bin $\log_2$ ratio, z-score, precision weight, reference bin count, mask status, and branch.
 - `<prefix>_segments.bed.gz` (`.tbi`) and `<prefix>_segments.vcf.gz` (`.tbi`): Segmented intervals with weighted mean $\log_2$ ratio, z-score, weight, bin count, and call.
 - `<prefix>_calls.bed.gz` (`.tbi`) and `<prefix>_calls.vcf.gz` (`.tbi`): Called `GAIN` and `LOSS` segments only.
-- `<prefix>_plot.svg`: Genome-wide copy-number profile plot.
+- `<prefix>_plot.html`: Interactive Plotly genome-wide copy-number profile with pan/zoom, coordinate/cytoband search, configurable Z-score and $\log_2$ ratio threshold color-coding, and optional cytoband ideogram track.
 
 ```mermaid
 flowchart LR
@@ -130,5 +131,5 @@ flowchart LR
     D --> E["Within-Sample Reference Normalization"]
     E --> F["Weighted Ruptures Binseg"]
     F --> G["Z-Score / Ratio Calling"]
-    G --> H["BED.gz, VCF.gz & SVG"]
+    G --> H["BED.gz, VCF.gz & HTML"]
 ```

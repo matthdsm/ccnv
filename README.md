@@ -48,7 +48,7 @@ ccnv predict sample.ccnv reference.ccnv --prefix results/sample
 
 - `convert` writes `<prefix>.ccnv` (automatically indexing BAM/CRAM files when needed; CRAM inputs also require `--fasta`).
 - `reference` writes `<prefix>.ccnv` and `<prefix>_qc.json` (rebinning input samples in memory when bin sizes differ and contig lengths match).
-- `predict` writes bgzipped and tabix-indexed BED and VCFv4.2 tables (`_bins`, `_segments`, and `_calls`) plus a genome-wide `_plot.svg`.
+- `predict` writes bgzipped and tabix-indexed BED and VCFv4.2 tables (`_bins`, `_segments`, and `_calls`) plus an interactive genome-wide `<prefix>_plot.html`.
 
 ## Documentation
 

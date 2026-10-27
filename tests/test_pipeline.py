@@ -144,7 +144,7 @@ class TestInstalledPipelineContract(unittest.TestCase):
             self.assertTrue(Path(str(outputs.calls_vcf) + ".tbi").is_file())
             self.assertFalse((root / "prediction_bins.ccnv").exists())
             self.assertFalse((root / "prediction_segments.ccnv").exists())
-            self.assertTrue(outputs.plot_svg and outputs.plot_svg.is_file())
+            self.assertTrue(outputs.plot_html and outputs.plot_html.is_file())
             with gzip.open(outputs.bins_bed, "rt") as h:
                 bins_lines = h.read().splitlines()
             bins_header = bins_lines[0].split("\t")

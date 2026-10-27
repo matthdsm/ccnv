@@ -8,9 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Replaced the static `_plot.svg` output in `ccnv predict` with a minimal, interactive Plotly HTML viewer (`_plot.html`) rendered from an external Jinja2 template (`src/ccnv/templates/genome_plot.html.j2`), featuring whole-genome pan/zoom, coordinate and cytoband search, configurable Z-score and $\log_2$ ratio threshold color-coding, base64-encoded binary typed arrays (`scattergl`), and an optional `--cytobands` ideogram track.
 - Rewrote `README.md`, `docs/cli.md`, `docs/pipeline.md`, and `AGENTS.md` to be clear and concise, crediting the published statistical methodology of WISECONDOR (Straver et al., 2014) and WisecondorX (Raman et al., 2019).
 - Prediction BED outputs (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`) are now always bgzip-compressed and tabix-indexed (`.tbi`), with `#contig` headers for standard tabix/IGV compatibility.
-- Prediction outputs (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`, `_bins.vcf.gz`, `_segments.vcf.gz`, `_calls.vcf.gz`, and `_plot.svg`) now sort chromosomes and intervals in natural sort order (e.g. `chr1`, `chr2`, ..., `chr10`, ..., `chrX`, `chrY`) instead of lexicographical order.
+- Prediction outputs (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`, `_bins.vcf.gz`, `_segments.vcf.gz`, `_calls.vcf.gz`, and `_plot.html`) now sort chromosomes and intervals in natural sort order (e.g. `chr1`, `chr2`, ..., `chr10`, ..., `chrX`, `chrY`) instead of lexicographical order.
 - Parallelized `ccnv reference` execution controlled by a `-t/--threads` flag (defaulting to system CPU count), multi-processing cohort sample loading and rebinning via `src/ccnv/cohort.py`, parallelizing batched off-contig nearest-bin selection via `src/ccnv/reference_compute.py`, and multi-processing null model derivation.
 - Extracted cohort ingestion and validation into `src/ccnv/cohort.py` and compute kernels into `src/ccnv/reference_compute.py`, keeping modules modular and strictly below 1,000 lines.
 - Replaced boolean array masking with precomputed contiguous contig slice bounds in `select_nearest_bins`, accelerating per-query candidate masking by over 400x.

@@ -12,7 +12,7 @@ This document summarizes the numerical concordance, storage footprint, and algor
 | **Bin Resolution** | Sample and reference bin sizes must match identically | Dynamic mass-conserving in-memory rebinning during `reference` and `predict` |
 | **Duplicate Filtering** | Single-read adjacent coordinate streaming check | Standard SAM duplicate flag (`0x400`) |
 | **Segmentation Engine** | Unweighted R `DNAcopy` (CBS) via `rpy2` (`alpha`) | Pure-Python weighted `ruptures` Binary Segmentation (`Binseg`) with precision weights $w = 1 / (\sigma_{\text{null}}^2 + \epsilon)$ |
-| **Deliverables** | Plain-text BED and PNG plots | Bgzipped/tabix-indexed BED (`.bed.gz`), VCFv4.2 (`.vcf.gz`), and vector SVG (`_plot.svg`) |
+| **Deliverables** | Plain-text BED and PNG plots | Bgzipped/tabix-indexed BED (`.bed.gz`), VCFv4.2 (`.vcf.gz`), and interactive Plotly HTML (`_plot.html`) |
 
 ## 1. Conversion (`convert`) Benchmark
 

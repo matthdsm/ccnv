@@ -666,6 +666,8 @@ class TestReferencePublishedCrams(unittest.TestCase):
                     *(str(path) for path in sample_paths),
                     "--prefix",
                     str(reference_prefix),
+                    "--bin-size",
+                    str(PUBLISHED_BIN_SIZE),
                     "--min-cohort-size",
                     "2",
                     "--pca-components",

@@ -21,6 +21,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
+    "jinja2",
     "numpy",
     "polars",
     "polars-runtime-compat",
@@ -38,6 +39,9 @@ ccnv = "ccnv.cli:app"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"ccnv.templates" = ["*.html.j2"]
+
 [tool.pixi.workspace]
 channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
@@ -54,6 +58,7 @@ samtools = "*"
 scikit-learn = "*"
 scipy = "*"
 typer = "*"
+jinja2 = ">=3.1.6,<4"
 
 [tool.pixi.pypi-dependencies]
 ccnv = { path = ".", editable = true }
