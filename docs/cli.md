@@ -63,7 +63,7 @@ ccnv reference GENOME.fa --prefix PREFIX [--bin-size N]
 | `--max-batch-memory-mb` | `256` | Memory cap (MiB) for batched pairwise distance calculation. |
 | `--min-cohort-size` | `10` | Minimum control samples required for the autosomal branch. |
 | `--min-sex-group-size` | `5` | Minimum samples per sex required to build a sex-specific branch. |
-| `--mappability` | unset | Mappability BigWig track (`.bw`/`.bigWig`) for masking and per-sample bias normalization. |
+| `--mappability` | unset | Mappability BigWig track (`.bw`/`.bigWig`) for masking and per-sample bias normalization (k-mer length should roughly match average sequencing read length). |
 | `--gc` | unset (or FASTA in flat mode) | GC content track (`.bw`, `.bed`/`.bed.gz`, or `.fa`/`.fasta`/`.fna`). Automatically derived from the input FASTA in flat reference mode when omitted. |
 | `--min-mappability` | `0.5` | Minimum bin mappability in `[0, 1]` required to keep a bin unmasked when `--mappability` is provided. |
 | `--qc-report / --no-qc-report` | `--qc-report` | Write `<prefix>_qc.json` and print a QC summary to `stderr`. |
@@ -114,7 +114,7 @@ ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
 | `--min-reference-bins` | `3` | Minimum within-sample reference bins required to normalize a target bin. |
 | `--mask-repeats` | `3` | Outlier-masking iterations during within-sample normalization. |
 | `--max-blacklist-gap` | `2000000` | Maximum masked gap (bp) bridged within a single segment. |
-| `--mappability` | reference track | Optional mappability BigWig override (`.bw`/`.bigWig`) for prediction normalization. |
+| `--mappability` | reference track | Optional mappability BigWig override (`.bw`/`.bigWig`) for prediction normalization (k-mer length should roughly match average sequencing read length). |
 | `--gc` | reference track | Optional GC content track override (`.bw`, `.bed`/`.bed.gz`, or `.fa`/`.fasta`/`.fna`). |
 | `--min-mappability` | `0.5` | Minimum bin mappability in `[0, 1]` required to keep a bin unmasked. |
 | `--plot / --no-plot` | `--plot` | Write interactive genome-wide `<prefix>_plot.html`. |

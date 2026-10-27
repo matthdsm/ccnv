@@ -332,7 +332,10 @@ def reference(
             file_okay=True,
             dir_okay=False,
             readable=True,
-            help="Mappability BigWig (.bw/.bigWig) track for covariate normalization",
+            help=(
+                "Mappability BigWig (.bw/.bigWig) track for covariate normalization "
+                "(k-mer length should roughly match average sequencing read length)"
+            ),
         ),
     ] = None,
     gc: Annotated[
@@ -554,7 +557,10 @@ def predict(
             file_okay=True,
             dir_okay=False,
             readable=True,
-            help="Mappability BigWig (.bw/.bigWig) override track for normalization",
+            help=(
+                "Mappability BigWig (.bw/.bigWig) override track for normalization "
+                "(k-mer length should roughly match average sequencing read length)"
+            ),
         ),
     ] = None,
     gc: Annotated[
