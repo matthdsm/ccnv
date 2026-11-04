@@ -80,6 +80,8 @@ def _reference_table() -> pa.Table:
             "start": pa.array([0, 0], type=pa.int64()),
             "end": pa.array([100, 80], type=pa.int64()),
             "masked": [False, False],
+            "gc": pa.array([float("nan"), float("nan")], type=pa.float32()),
+            "mappability": pa.array([float("nan"), float("nan")], type=pa.float32()),
             "pca_mean": pa.array([0.5, 0.5], type=pa.float64()),
             "pca_loadings": pa.array([[0.0], [0.0]], type=pa.list_(pa.float64())),
             "nearest_ref_indices": pa.array([[1], [0]], type=pa.list_(pa.int32())),
@@ -125,6 +127,58 @@ class TestNormalization(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(result.ratios)))
         self.assertTrue(np.all(np.isfinite(result.zscores)))
         np.testing.assert_allclose(result.ratios, 0.0)
+
+    def test_project_coverage_lstsq_reconstruction_with_masked_and_empty_active(
+        self,
+    ) -> None:
+        from ccnv.predict import project_coverage
+
+        # 4 bins, 1 component: loading = [0.5, 0.5, 0.5, 0.5]
+        # Mean = [0.25, 0.25, 0.25, 0.25]
+        model = BranchModel(
+            branch=BRANCH_AUTOSOMAL,
+            contigs=("chr1", "chr1", "chr2", "chr2"),
+            starts=np.array([0, 100, 0, 100], dtype=np.int64),
+            ends=np.array([100, 200, 100, 200], dtype=np.int64),
+            counts=np.array([20.0, 30.0, 20.0, 30.0]),
+            masked=np.zeros(4, dtype=np.bool_),
+            pca_mean=np.full(4, 0.25),
+            pca_loadings=np.full((1, 4), 0.5),
+            nearest_indices=(
+                np.array([2, 3]),
+                np.array([2, 3]),
+                np.array([0, 1]),
+                np.array([0, 1]),
+            ),
+            mean_distance=np.ones(4, dtype=np.float32),
+            null_mean=np.zeros(4, dtype=np.float64),
+            null_std=np.full(4, 0.1, dtype=np.float64),
+        )
+
+        # 1. Mask bin 0 and 1 -> active_sub is [False, False, True, True]
+        n_mask = np.array([True, True, False, False])
+        proj = project_coverage(model, n_mask_override=n_mask)
+        # Usable count sum = 20.0 + 30.0 = 50.0 -> selected is [0.4, 0.6]
+        # sub_loadings.T is [[0.5], [0.5]]; lstsq solves c = 0.5
+        # recon = [0.5, 0.5, 0.5, 0.5]
+        self.assertTrue(np.all(proj.usable == np.array([False, False, True, True])))
+        self.assertAlmostEqual(proj.corrected[2], 0.4 / 0.5)
+        self.assertAlmostEqual(proj.corrected[3], 0.6 / 0.5)
+
+        # 2. All bins masked -> raises PredictError (zero usable count)
+        all_masked = np.ones(4, dtype=np.bool_)
+        with self.assertRaises(PredictError):
+            project_coverage(model, n_mask_override=all_masked)
+
+        # 3. One active bin -> n_active (1) <= rank (1) -> fallback to pca_mean copy
+        one_active_mask = np.array([True, True, True, False])
+        proj_one = project_coverage(model, n_mask_override=one_active_mask)
+        self.assertTrue(
+            np.all(proj_one.usable == np.array([False, False, False, True]))
+        )
+        # Active bin 3 count 30.0, usable_total=30.0 -> normalized = 1.0
+        # n_active=1 <= rank=1 -> reconstruction is pca_mean[3] = 0.25
+        self.assertAlmostEqual(proj_one.corrected[3], 1.0 / 0.25)
 
 
 class TestCalling(unittest.TestCase):

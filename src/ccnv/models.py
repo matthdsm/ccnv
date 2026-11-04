@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Final, Literal
 
 DEFAULT_BIN_SIZE: Final[int] = 5000
+DEFAULT_MIN_MAPPABILITY: Final[float] = 0.5
 
 
 def parquet_path(prefix: Path) -> Path:
@@ -104,6 +105,9 @@ class ReferenceConfig:
     all_contigs: bool = False
     qc_report: bool = True
     threads: int = 1
+    mappability: Path | None = None
+    gc: Path | None = None
+    min_mappability: float = DEFAULT_MIN_MAPPABILITY
 
     def __post_init__(self) -> None:
         if self.threads <= 0:
@@ -142,3 +146,6 @@ class PredictConfig:
     plot: bool = True
     vcf: bool = True
     cytobands: Path | None = None
+    mappability: Path | None = None
+    gc: Path | None = None
+    min_mappability: float = DEFAULT_MIN_MAPPABILITY

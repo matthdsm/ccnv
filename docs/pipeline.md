@@ -55,10 +55,12 @@ Constructs an autosomal and optional sex-chromosome background model from contro
 ```mermaid
 flowchart TD
     InputArg["Input: SAMPLES... or FASTA"] --> ModeDecision{"Single FASTA provided?"}
-    ModeDecision -- Yes --> FlatMode["Flat Mode: uniform depth proportional to bin width"]
+    ModeDecision -- Yes --> FlatMode["Flat Mode: uniform depth + FASTA GC & N-masking"]
     ModeDecision -- No --> CohortMode["Cohort Mode: load & validate sample Parquets"]
     CohortMode --> RebinCheck["Rebin in memory if sample bin size != --bin-size"]
-    RebinCheck --> DepthNorm["Normalize depth per branch"]
+    FlatMode --> CovTrack["Load optional --gc & --mappability tracks"]
+    RebinCheck --> CovTrack
+    CovTrack --> DepthNorm["Normalize depth, mask low-mappability/N bins & remove GC/mappability trend"]
     DepthNorm --> SexInference["Infer sex from signal contig coverage (or --sex-cutoff)"]
     SexInference --> BranchPartition["Build autosomal, female_sex, and male_sex branches"]
     BranchPartition --> FitPCA["Fit PCA (--pca-components) & subtract systemic bias"]
@@ -66,13 +68,13 @@ flowchart TD
     FitNearest --> FitNull["Compute per-bin null_mean and null_std"]
     FitNull --> WriteRef["Write <prefix>.ccnv (REFERENCE_SCHEMA 1.0.0)"]
     WriteRef --> WriteQC["Write <prefix>_qc.json (unless --no-qc-report)"]
-    FlatMode --> WriteRef
 ```
 
 - **In-Memory Rebinning**: Control samples converted at a finer or coarser resolution are rebinned to `--bin-size` via mass-conserving geometric overlap when contig lengths match.
+- **Covariate Masking & Bias Removal**: Optional `--mappability` BigWig (where k-mer length should roughly match average sequencing read length) and `--gc` (FASTA, BigWig, or BED/TSV; derived automatically from the input FASTA in flat mode) tracks mask bins with mappability below `--min-mappability` (default `0.5`) or `>50%` `N` bases, and fit a per-sample Huber-weighted polynomial trend on unmasked bins to divide out multiplicative GC wave and mappability bias before PCA.
 - **Sex Inference & Branches**: Coverage on `--sex-signal-contig` (`chrY`/`Y`) separates female and male controls automatically (or via `--sex-cutoff`). The `autosomal` branch models autosomes across all controls; `female_sex` and `male_sex` model sex contigs for each group when at least `--min-sex-group-size` samples are present.
-- **Between- & Within-Sample Modeling**: PCA captures cohort-wide technical bias (such as GC wave and batch effects). Residual profiles are compared across contigs via batched BLAS matrix multiplication to select the `--nearest-bins` off-contig reference neighbors and estimate `null_mean` and `null_std` per bin.
-- **Schema**: Columns `branch`, `contig`, `start`, `end`, `masked`, `pca_mean`, `pca_loadings`, `nearest_ref_indices` (`DELTA_BINARY_PACKED`), `mean_distance`, `null_mean`, and `null_std`.
+- **Between- & Within-Sample Modeling**: PCA captures cohort-wide technical bias (such as residual GC wave and batch effects). Residual profiles (or standardized `(GC, mappability)` feature vectors in flat mode when covariates are present) are compared across contigs via batched BLAS matrix multiplication to select the `--nearest-bins` off-contig reference neighbors and estimate `null_mean` and `null_std` per bin.
+- **Schema**: Columns `branch`, `contig`, `start`, `end`, `masked`, `gc`, `mappability`, `pca_mean`, `pca_loadings`, `nearest_ref_indices` (`DELTA_BINARY_PACKED`), `mean_distance`, `null_mean`, and `null_std`.
 
 ## 3. `ref-qc`
 
@@ -92,7 +94,7 @@ flowchart TD
     InRef["Reference Parquet (<reference>.ccnv)"] --> LoadCompat
     LoadCompat --> RebinCheck["Rebin sample counts in memory if bin sizes differ"]
     RebinCheck --> BranchSelect["Select autosomal and sex branch"]
-    BranchSelect --> ProjectPCA["Scale depth, project onto PCA basis & remove systemic bias"]
+    BranchSelect --> ProjectPCA["Scale depth, remove GC/mappability bias, project onto PCA basis & remove systemic bias"]
     ProjectPCA --> MatchNearest["Compute log2 ratio against median of nearest off-contig bins"]
     MatchNearest --> IterativeMask["Mask extreme outlier bins (--mask-repeats)"]
     IterativeMask --> SegEngine["Segment with weighted Ruptures Binseg (split gaps > --max-blacklist-gap)"]

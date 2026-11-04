@@ -11,3 +11,6 @@ dist/
 *.npz
 *.parquet
 *.ccnv
+*bed.gz*
+*vcf.gz*
+*html

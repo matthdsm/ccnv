@@ -7,7 +7,7 @@ name = "ccnv"
 version = "0.1.0dev"
 description = "Copy-number analysis for shallow whole-genome sequencing"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 license = "MIT"
 license-files = ["LICENSE.md"]
 authors = [
@@ -17,7 +17,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
@@ -26,6 +26,7 @@ dependencies = [
     "polars",
     "polars-runtime-compat",
     "pyarrow",
+    "pybigwig",
     "pysam",
     "ruptures",
     "scikit-learn",
@@ -51,14 +52,16 @@ numpy = "*"
 polars = "*"
 polars-runtime-compat = "*"
 pyarrow = "*"
+pybigwig = "*"
 pysam = "*"
-python = "3.12.*"
+python = "3.14.*"
 ruptures = "*"
 samtools = "*"
 scikit-learn = "*"
 scipy = "*"
 typer = "*"
 jinja2 = ">=3.1.6,<4"
+gcc = ">=16.2.0,<16.3"
 
 [tool.pixi.pypi-dependencies]
 ccnv = { path = ".", editable = true }
@@ -87,7 +90,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

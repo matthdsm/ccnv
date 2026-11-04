@@ -11,7 +11,7 @@ Copynumber-CNV (`ccnv`) is a bioinformatics toolkit for Copy Number Variation (C
 - **Language:** Python 3.12+
 - **CLI Framework:** Typer
 - **Data Science:** NumPy, SciPy, Polars, Scikit-learn, PyArrow, Ruptures
-- **Bioinformatics:** Pysam
+- **Bioinformatics:** Pysam, pyBigWig
 - **Templating:** Jinja2
 - **Environment & Dependency Management:** [Pixi](https://pixi.sh). The `default` environment includes the `dev` feature; `prod` is the same runtime dependencies without test/lint tools and is what the Docker image installs.
 - **Linting:** Prek & Ruff
@@ -22,9 +22,9 @@ Copynumber-CNV (`ccnv`) is a bioinformatics toolkit for Copy Number Variation (C
 ### Pipeline Stages
 
 1. **Convert:** Stream a BAM/CRAM once per contig, creating a pysam index when missing, filter reads, calculate binned counts with NumPy, and write canonical sample Parquet plus deterministic QC metadata. Only canonical chromosomes (1-22, X, Y in UCSC or plain spelling) are binned unless `--all-contigs` is set; mitochondrial, ALT, decoy, random, unplaced, and EBV contigs are skipped. `-t/--threads` is a CPU budget split between contig worker processes and per-handle htslib decode threads; output order follows the header.
-2. **Reference:** Validate sample layouts, rebin sample counts to the target bin size (default 5000 bp) when contig lengths match, normalize depth, fit deterministic PCA, construct batched off-contig nearest-bin models, write autosomal/optional sex branches to reference Parquet, and evaluate reference QC (`<prefix>_qc.json`). With a FASTA file and no samples, build a flat uniform-depth model from contig lengths so predict can run without a control cohort (canonical chromosomes including X/Y are autosomal; `--all-contigs` includes every FASTA contig).
+2. **Reference:** Validate sample layouts, rebin sample counts to the target bin size (default 5000 bp) when contig lengths match, normalize depth, optionally load GC content (`--gc`, or automatically from FASTA in flat mode) and mappability BigWig (`--mappability`, where k-mer length should roughly match average sequencing read length) tracks to mask low-mappability/high-N bins (`--min-mappability`, default 0.5) and remove per-sample multiplicative GC/mappability bias, fit deterministic PCA, construct batched off-contig nearest-bin models (using standardized covariate distance in flat mode when covariates are present), write autosomal/optional sex branches to reference Parquet, and evaluate reference QC (`<prefix>_qc.json`). With a FASTA file and no samples, build a flat uniform-depth model from contig lengths so predict can run without a control cohort (canonical chromosomes including X/Y are autosomal; `--all-contigs` includes every FASTA contig).
 3. **Ref-QC:** Audit an existing reference Parquet file and emit `<prefix>_qc.json` and a stderr usability verdict (`PASS`, `WARN`, `FAIL`).
-4. **Predict:** Project and normalize a sample (rebinning sample counts in memory to reference bin coordinates if bin sizes differ and contig lengths match, leaving reference Parquet untouched), build within-sample references, segment with weighted Ruptures Binseg, call gains/losses, and write bgzipped/indexed bin, segment, and call BED (0-based half-open, extra columns with a `#contig` header), optional VCFv4.2 outputs, and optional interactive Plotly HTML (`_plot.html`, with optional `--cytobands` ideogram track). CLI `--prefix` receives the path prefix; canonical suffixes are appended by the tool.
+4. **Predict:** Project and normalize a sample (rebinning sample counts in memory to reference bin coordinates if bin sizes differ and contig lengths match, leaving reference Parquet untouched), apply stored or overridden (`--gc`, `--mappability`, `--min-mappability`) per-sample GC and mappability normalization before PCA projection, build within-sample references, segment with weighted Ruptures Binseg, call gains/losses, and write bgzipped/indexed bin, segment, and call BED (0-based half-open, extra columns with a `#contig` header), optional VCFv4.2 outputs, and optional interactive Plotly HTML (`_plot.html`, with optional `--cytobands` ideogram track). CLI `--prefix` receives the path prefix; canonical suffixes are appended by the tool.
 
 A fixed human chromosome layout is intentionally absent; the tool is organism-agnostic.
 
@@ -33,6 +33,7 @@ A fixed human chromosome layout is intentionally absent; the tool is organism-ag
 - `src/ccnv/cli.py`: The `ccnv` Typer entry point and subcommands (`convert`, `reference`, `ref-qc`, `predict`).
 - `src/ccnv/convert.py`: Functional logic for the convert stage.
 - `src/ccnv/cohort.py`: Cohort sample discovery, validation, and parallel rebinning.
+- `src/ccnv/covariates.py`: Mappability BigWig and GC content (FASTA, BigWig, BED/TSV) loading, bin masking, and robust Huber IRLS polynomial bias normalization.
 - `src/ccnv/reference.py`: Functional logic for creating cohort and flat FASTA reference files.
 - `src/ccnv/reference_compute.py`: PCA, batched off-contig nearest-bin search, and null distribution kernels.
 - `src/ccnv/reference_qc.py`: Reference quality control metrics and usability verdicts.
@@ -48,7 +49,7 @@ A fixed human chromosome layout is intentionally absent; the tool is organism-ag
 
 - Schema version `1.0.0`; all internal and BED coordinates are 0-based half-open.
 - Sample rows are `contig`, `start`, `end`, and `count`.
-- Reference rows add `branch`, `masked`, `pca_mean`, `pca_loadings`, `nearest_ref_indices`, `mean_distance`, `null_mean`, and `null_std`.
+- Reference rows add `branch`, `masked`, `gc`, `mappability`, `pca_mean`, `pca_loadings`, `nearest_ref_indices`, `mean_distance`, `null_mean`, and `null_std`.
 - Alignment-header contig names, order, lengths, and partial final bins are authoritative. Readers reject incompatible versions, layouts, and bounds.
 
 ## Development Workflow

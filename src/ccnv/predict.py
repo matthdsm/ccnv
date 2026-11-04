@@ -13,7 +13,15 @@ import pyarrow.parquet as pq
 from numpy.typing import ArrayLike, NDArray
 
 from ccnv.convert import read_sample_parquet, rebin_sample_table
-from ccnv.models import PredictConfig
+from ccnv.covariates import (
+    CovariateError,
+    correct_covariate_bias,
+    load_gc_track,
+    load_mappability_track,
+    mask_covariates,
+    validate_min_mappability,
+)
+from ccnv.models import DEFAULT_MIN_MAPPABILITY, PredictConfig
 from ccnv.reference import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
@@ -79,6 +87,8 @@ class BranchModel:
     mean_distance: NDArray[np.float32]
     null_mean: NDArray[np.float64]
     null_std: NDArray[np.float64]
+    gc: NDArray[np.float64] | None = None
+    mappability: NDArray[np.float64] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +327,26 @@ def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
         if np.any(indexes < 0) or np.any(indexes >= unmasked_count):
             raise PredictError(f"branch {branch!r} has invalid nearest references")
 
+    gc: NDArray[np.float64] | None = None
+    if "gc" in branch_table.schema.names:
+        gc_raw = (
+            branch_table.column("gc").to_numpy(zero_copy_only=False).astype(np.float64)
+        )
+        gc_raw[gc_raw < 0.0] = np.nan
+        if np.any(np.isfinite(gc_raw)):
+            gc = gc_raw
+
+    mappability: NDArray[np.float64] | None = None
+    if "mappability" in branch_table.schema.names:
+        map_raw = (
+            branch_table.column("mappability")
+            .to_numpy(zero_copy_only=False)
+            .astype(np.float64)
+        )
+        map_raw[map_raw < 0.0] = np.nan
+        if np.any(np.isfinite(map_raw)):
+            mappability = map_raw
+
     return BranchModel(
         branch=branch,
         contigs=branch_contigs,
@@ -330,34 +360,66 @@ def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
         mean_distance=mean_distance,
         null_mean=null_mean,
         null_std=null_std,
+        gc=gc,
+        mappability=mappability,
     )
 
 
-def project_coverage(model: BranchModel) -> ProjectedCoverage:
-    """Normalize branch depth and remove the fitted PCA coverage trend."""
+def project_coverage(
+    model: BranchModel,
+    *,
+    gc_override: NDArray[np.float64] | None = None,
+    mappability_override: NDArray[np.float64] | None = None,
+    n_mask_override: NDArray[np.bool_] | None = None,
+    min_mappability: float = DEFAULT_MIN_MAPPABILITY,
+) -> ProjectedCoverage:
+    """Normalize branch depth, remove covariate bias, and subtract PCA trend."""
 
     if model.counts.ndim != 1 or model.counts.size != model.masked.size:
         raise PredictError("counts and mask must be aligned one-dimensional arrays")
     if np.any(~np.isfinite(model.counts)) or np.any(model.counts < 0):
         raise PredictError("sample counts must be finite and non-negative")
-    total = float(np.sum(model.counts))
-    if total <= 0:
+    if float(np.sum(model.counts)) <= 0:
         raise PredictError(f"branch {model.branch!r} has zero sample coverage")
-    normalized = model.counts / total
-    usable = ~model.masked
-    selected = normalized[usable]
+    ref_unmasked = ~model.masked
+    gc = gc_override if gc_override is not None else model.gc
+    mappability = (
+        mappability_override if mappability_override is not None else model.mappability
+    )
+    cov_usable = mask_covariates(
+        ref_unmasked,
+        gc=gc,
+        mappability=mappability,
+        n_mask=n_mask_override,
+        min_mappability=min_mappability,
+    )
+    usable_total = float(np.sum(model.counts[cov_usable]))
+    if usable_total <= 0:
+        raise PredictError(
+            f"branch {model.branch!r} has zero sample coverage on usable bins"
+        )
+    normalized = model.counts / usable_total
+    normalized = correct_covariate_bias(
+        normalized, cov_usable, gc=gc, mappability=mappability
+    )
+    selected = normalized[ref_unmasked]
     if selected.shape != model.pca_mean.shape:
         raise PredictError("PCA mean does not align with unmasked sample bins")
-    centered = selected - model.pca_mean
-    reconstruction = (
-        centered @ model.pca_loadings.T
-    ) @ model.pca_loadings + model.pca_mean
+    active_sub = cov_usable[ref_unmasked] & np.isfinite(selected)
+    reconstruction = model.pca_mean.copy()
+    n_active = int(np.count_nonzero(active_sub))
+    if n_active > 0:
+        sub_loadings = model.pca_loadings[:, active_sub]
+        if n_active > int(np.linalg.matrix_rank(sub_loadings.T)):
+            sub_centered = selected[active_sub] - model.pca_mean[active_sub]
+            coeffs, *_ = np.linalg.lstsq(sub_loadings.T, sub_centered, rcond=None)
+            reconstruction = (coeffs @ model.pca_loadings) + model.pca_mean
     corrected = np.full(normalized.shape, np.nan, dtype=np.float64)
-    valid = np.isfinite(reconstruction) & (reconstruction > 0)
+    valid = active_sub & np.isfinite(reconstruction) & (reconstruction > 0)
     corrected_values = np.full(selected.shape, np.nan, dtype=np.float64)
     corrected_values[valid] = selected[valid] / reconstruction[valid]
-    corrected[usable] = corrected_values
-    usable &= np.isfinite(corrected) & (corrected > 0)
+    corrected[ref_unmasked] = corrected_values
+    usable = cov_usable & np.isfinite(corrected) & (corrected > 0)
     return ProjectedCoverage(normalized, corrected, usable)
 
 
@@ -365,7 +427,28 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
     """Calculate within-sample log2 ratios, null z-scores, and segment weights."""
 
     logger.debug("normalizing branch %s (%d bins)", model.branch, model.counts.size)
-    projected = project_coverage(model)
+    gc_override: NDArray[np.float64] | None = None
+    n_mask_override: NDArray[np.bool_] | None = None
+    map_override: NDArray[np.float64] | None = None
+    try:
+        if config.gc is not None:
+            gc_override, n_mask_override = load_gc_track(
+                config.gc, model.contigs, model.starts, model.ends
+            )
+        if config.mappability is not None:
+            map_override = load_mappability_track(
+                config.mappability, model.contigs, model.starts, model.ends
+            )
+    except CovariateError as error:
+        raise PredictError(str(error)) from error
+
+    projected = project_coverage(
+        model,
+        gc_override=gc_override,
+        mappability_override=map_override,
+        n_mask_override=n_mask_override,
+        min_mappability=config.min_mappability,
+    )
     unmasked_positions = np.flatnonzero(~model.masked)
     corrected = projected.corrected[unmasked_positions]
     n_unmasked = unmasked_positions.size
@@ -403,7 +486,18 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
             ratio = float(np.log2(val / baseline))
             local_ratios[index] = ratio
             s = null_std[index]
-            local_zscores[index] = (ratio - null_mean[index]) / s if s > 0 else 0.0
+            local_zscores[index] = (ratio - null_mean[index]) / s if s > 0 else np.nan
+
+        missing_z = np.isfinite(local_ratios) & ~np.isfinite(local_zscores)
+        if np.any(missing_z):
+            finite_r = local_ratios[np.isfinite(local_ratios)]
+            med_r = float(np.median(finite_r))
+            mad_r = float(np.median(np.abs(finite_r - med_r)))
+            emp_std = 1.4826 * mad_r
+            if emp_std > 1e-12:
+                local_zscores[missing_z] = (local_ratios[missing_z] - med_r) / emp_std
+            else:
+                local_zscores[missing_z] = 0.0
 
         eligible = (
             np.isfinite(corrected)
@@ -639,6 +733,10 @@ def _validate_config(config: PredictConfig) -> None:
         raise PredictError("mask_repeats must be positive")
     if config.max_blacklist_gap < 0:
         raise PredictError("max_blacklist_gap must be non-negative")
+    try:
+        validate_min_mappability(config.min_mappability)
+    except CovariateError as error:
+        raise PredictError(str(error)) from error
 
 
 def _require_aligned(length: int, *arrays: ArrayLike) -> None:
