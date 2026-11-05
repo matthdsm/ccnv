@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
@@ -21,16 +22,25 @@ from ccnv.covariates import (
     mask_covariates,
     validate_min_mappability,
 )
-from ccnv.models import DEFAULT_MIN_MAPPABILITY, PredictConfig
+from ccnv.models import DEFAULT_MIN_MAPPABILITY, AnalysisMode, PredictConfig
+from ccnv.predict_qc import build_predict_qc_payload, write_predict_qc_json
+from ccnv.prenatal import annotate_prenatal_segments, predict_prenatal
 from ccnv.reference import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
 )
 from ccnv.report import write_outputs
-from ccnv.results import BinResult, CallType, PredictionOutputs, SegmentResult
+from ccnv.results import (
+    BinResult,
+    CallType,
+    FetalFractionResult,
+    PredictionOutputs,
+    SegmentResult,
+)
 from ccnv.schemas import (
     ArtifactKind,
+    PrenatalModelMetadata,
     SchemaError,
     bin_coordinates,
     decode_metadata,
@@ -107,7 +117,9 @@ def run(config: PredictConfig) -> PredictionOutputs:
     if config.cytobands is not None and not config.plot:
         logger.warning("--cytobands is ignored when --no-plot is set")
     logger.debug("loading sample %s and reference %s", config.sample, config.reference)
-    inputs = load_inputs(config.sample, config.reference, sex=config.sex)
+    inputs = load_inputs(
+        config.sample, config.reference, sex=config.sex, mode=config.mode
+    )
     logger.debug("using branches %s (sex=%s)", inputs.branches, inputs.sex)
     bin_results = tuple(
         normalize_branch(build_branch_model(inputs, branch), config)
@@ -126,6 +138,35 @@ def run(config: PredictConfig) -> PredictionOutputs:
         ratio_threshold=config.ratio_threshold,
         max_blacklist_gap=config.max_blacklist_gap,
     )
+
+    prenatal_result: FetalFractionResult | None = None
+    if config.mode == "prenatal":
+        prenatal_meta = PrenatalModelMetadata.from_table(inputs.reference)
+        if prenatal_meta is None:
+            raise PredictError("reference is missing prenatal metadata (ccnv.prenatal)")
+        prenatal_result = predict_prenatal(
+            inputs.sample,
+            inputs.reference,
+            prenatal_meta,
+            min_ff_warning=config.min_fetal_fraction_warning,
+        )
+        segments = tuple(
+            annotate_prenatal_segments(
+                segments,
+                prenatal_result,
+                z_threshold=config.z_threshold,
+            )
+        )
+
+    qc_json_path = Path(f"{config.prefix}_qc.json")
+    qc_payload = build_predict_qc_payload(
+        mode=config.mode,
+        sample_table=inputs.sample,
+        segments=segments,
+        prenatal_result=prenatal_result,
+    )
+    write_predict_qc_json(qc_json_path, qc_payload)
+
     return write_outputs(
         config.prefix,
         bin_results,
@@ -136,6 +177,9 @@ def run(config: PredictConfig) -> PredictionOutputs:
         cytobands=config.cytobands if config.plot else None,
         z_threshold=config.z_threshold,
         ratio_threshold=config.ratio_threshold,
+        prenatal_result=prenatal_result,
+        mode=config.mode,
+        qc_json_path=qc_json_path,
     )
 
 
@@ -144,6 +188,7 @@ def load_inputs(
     reference_path: Path,
     *,
     sex: Literal["autosomal", "female", "male"] = "autosomal",
+    mode: AnalysisMode = "germline",
 ) -> PredictionInput:
     """Read artifacts through their contracts and select model branches."""
 
@@ -163,20 +208,47 @@ def load_inputs(
 
     sample_meta = decode_metadata(sample.schema.metadata)
     reference_meta = decode_metadata(reference.schema.metadata)
+    ref_model = reference_meta.get("model")
+    ref_mode = (
+        ref_model.get("mode", "germline")
+        if isinstance(ref_model, Mapping)
+        else "germline"
+    )
+
+    if mode == "prenatal" and ref_mode != "prenatal":
+        raise PredictError(
+            "reference was built in germline mode and lacks prenatal models; "
+            "rebuild reference with --mode prenatal or run predict with --mode germline"
+        )
+    if mode == "germline" and ref_mode == "prenatal":
+        logger.warning(
+            "reference was built in prenatal mode; "
+            "prenatal models are ignored in germline mode"
+        )
+
     sample_lengths = _contig_lengths(sample_meta)
     reference_lengths = _contig_lengths(reference_meta)
     branch_values = set(reference.column("branch").unique().to_pylist())
-    chosen_sex = _resolve_sample_sex(sex, sample, reference_meta, branch_values)
-    branches = [BRANCH_AUTOSOMAL]
     if BRANCH_AUTOSOMAL not in branch_values:
         raise PredictError("reference has no autosomal branch")
-    if chosen_sex is not None:
-        sex_branch = BRANCH_FEMALE_SEX if chosen_sex == "female" else BRANCH_MALE_SEX
-        if sex_branch not in branch_values:
-            if sex != "autosomal":
-                raise PredictError(f"reference has no {sex_branch!r} branch")
-        else:
-            branches.append(sex_branch)
+
+    if mode == "prenatal":
+        branches = [BRANCH_AUTOSOMAL]
+        if BRANCH_FEMALE_SEX in branch_values:
+            branches.append(BRANCH_FEMALE_SEX)
+        chosen_sex = "female" if BRANCH_FEMALE_SEX in branch_values else None
+    else:
+        chosen_sex = _resolve_sample_sex(sex, sample, reference_meta, branch_values)
+        branches = [BRANCH_AUTOSOMAL]
+        if chosen_sex is not None:
+            sex_branch = (
+                BRANCH_FEMALE_SEX if chosen_sex == "female" else BRANCH_MALE_SEX
+            )
+            if sex_branch not in branch_values:
+                if sex != "autosomal":
+                    raise PredictError(f"reference has no {sex_branch!r} branch")
+            else:
+                branches.append(sex_branch)
 
     ref_model = reference_meta.get("model")
     ref_bin_size = ref_model.get("bin_size") if isinstance(ref_model, dict) else None

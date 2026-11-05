@@ -84,6 +84,28 @@
     color: #dc2626;
     font-size: 12px;
   }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    background: #f1f5f9;
+    border: 1px solid #cbd5e1;
+    color: #334155;
+  }
+  .badge-warn {
+    background: #fffbeb;
+    border-color: #fde68a;
+    color: #b45309;
+  }
+  .badge-alert {
+    background: #fef2f2;
+    border-color: #fecaca;
+    color: #dc2626;
+  }
   #plot {
     flex: 1;
     width: 100%;
@@ -113,10 +135,12 @@
     <label for="r-input">|Log2R| &ge;</label>
     <input id="r-input" type="number" step="0.05" min="0">
   </div>
+  <div id="prenatal-badge" class="badge" style="display:none"></div>
   <div class="legend">
     <span><i class="dot" style="background:#c43c39"></i>Gain</span>
     <span><i class="dot" style="background:#3c8c5a"></i>Loss</span>
     <span><i class="dot" style="background:#64748b"></i>Neutral</span>
+    <span id="disc-legend" style="display:none"><i class="dot" style="background:#9333ea"></i>Discordant</span>
   </div>
 </div>
 <div id="plot"></div>
@@ -162,6 +186,29 @@
   const rInput = document.getElementById("r-input");
   zInput.value = D.z_thresh;
   rInput.value = D.r_thresh;
+
+  const badgeEl = document.getElementById("prenatal-badge");
+  const discLegend = document.getElementById("disc-legend");
+  if (D.prenatal && badgeEl) {
+    const p = D.prenatal;
+    if (p.is_aneuploid) {
+      badgeEl.className = "badge badge-alert";
+    } else if (p.low_ff_warning) {
+      badgeEl.className = "badge badge-warn";
+    } else {
+      badgeEl.className = "badge";
+    }
+    const ffPct = (p.active_ff * 100).toFixed(1);
+    const ffyStr = p.ffy !== null && p.ffy !== undefined ? `${(p.ffy * 100).toFixed(1)}%` : "N/A";
+    const prefStr = p.preface !== null && p.preface !== undefined ? `${(p.preface * 100).toFixed(1)}%` : "N/A";
+    const ffxStr = p.ffx !== null && p.ffx !== undefined ? `${(p.ffx * 100).toFixed(1)}%` : "N/A";
+    badgeEl.innerHTML = `<span><strong>Fetal Sex:</strong> ${p.fetal_sex}</span>` +
+      `<span>|</span><span><strong>Active FF:</strong> ${ffPct}% (${p.active_ff_source})</span>` +
+      `<span>|</span><span><strong>FF:</strong> ${ffyStr} / ${prefStr} / ${ffxStr}</span>` +
+      `<span>|</span><span><strong>SCA:</strong> ${p.sca_call}</span>`;
+    badgeEl.style.display = "inline-flex";
+    if (discLegend) discLegend.style.display = "inline";
+  }
 
   const classify = (r, z, zT, rT) => {
     if (Math.abs(z) >= zT && Math.abs(r) >= rT) {
@@ -217,6 +264,25 @@
         y0: 0,
         y1: 1,
         line: { color: "#e2e8f0", width: 1 },
+        layer: "below"
+      });
+    }
+  }
+
+  if (D.prenatal && typeof D.prenatal.active_ff === "number" && D.prenatal.active_ff > 0) {
+    const aff = D.prenatal.active_ff;
+    const posRef = Math.log2(1 + 0.5 * aff);
+    const negRef = Math.log2(Math.max(1e-4, 1 - 0.5 * aff));
+    for (const yVal of [posRef, negRef]) {
+      baseShapes.push({
+        type: "line",
+        xref: "paper",
+        yref: "y",
+        x0: 0,
+        x1: 1,
+        y0: yVal,
+        y1: yVal,
+        line: { color: "#9333ea", width: 1.5, dash: "dash" },
         layer: "below"
       });
     }
@@ -299,13 +365,32 @@
     const snx = [], sny = [], snt = [];
     const sgx = [], sgy = [], sgt = [];
     const slx = [], sly = [], slt = [];
-    for (const [ci, s, e, r, z, bc] of D.segments) {
+    const sdx = [], sdy = [], sdt = [];
+    for (const seg of D.segments) {
+      const ci = seg[0];
+      const s = seg[1];
+      const e = seg[2];
+      const r = seg[3];
+      const z = seg[4];
+      const bc = seg[5];
+      const isDisc = Boolean(seg[6]);
+      const impliedFF = seg[7];
+      const expR = seg[8];
+      const discReason = seg[9];
+
       const c = classify(r, z, zT, rT);
       const x0 = offsets[ci] + s;
       const x1 = offsets[ci] + e;
       const yClip = clampY(r);
-      const h = `${D.contigs[ci]}:${s.toLocaleString()}-${e.toLocaleString()} (${bc} bins)<br>Segment Log2R: ${r.toFixed(3)} | Z: ${z.toFixed(2)}`;
-      if (c === 1) {
+      let h = `${D.contigs[ci]}:${s.toLocaleString()}-${e.toLocaleString()} (${bc} bins)<br>Segment Log2R: ${r.toFixed(3)} | Z: ${z.toFixed(2)}`;
+      if (isDisc) {
+        h += `<br>Discordant: ${discReason || "YES"}`;
+        if (expR !== null && expR !== undefined) h += ` | Expected: ${Number(expR).toFixed(3)}`;
+        if (impliedFF !== null && impliedFF !== undefined) h += ` | Implied FF: ${(Number(impliedFF) * 100).toFixed(1)}%`;
+        sdx.push(x0, x1, null);
+        sdy.push(yClip, yClip, null);
+        sdt.push(h, h, "");
+      } else if (c === 1) {
         sgx.push(x0, x1, null);
         sgy.push(yClip, yClip, null);
         sgt.push(h, h, "");
@@ -326,7 +411,20 @@
       mkScatter("Bins (Loss)", lx, ly, lt, "#16a34a", 4.5, 0.85),
       mkLines("Segments (Neutral)", snx, sny, snt, "#1e293b", 2.2),
       mkLines("Segments (Gain)", sgx, sgy, sgt, "#c43c39", 3),
-      mkLines("Segments (Loss)", slx, sly, slt, "#3c8c5a", 3)
+      mkLines("Segments (Loss)", slx, sly, slt, "#3c8c5a", 3),
+      {
+        type: "scatter",
+        mode: "lines+markers",
+        name: "Segments (Discordant)",
+        x: sdx,
+        y: sdy,
+        text: sdt,
+        hoverinfo: "text",
+        line: { color: "#9333ea", width: 6.0 },
+        marker: { symbol: "diamond", size: 7, color: "#9333ea" },
+        cliponaxis: false,
+        showlegend: false
+      }
     ];
     if (hasCyto) {
       traces.push({

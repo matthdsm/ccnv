@@ -12,8 +12,13 @@ import jinja2
 import numpy as np
 import pysam
 
-from ccnv.models import Cytoband
-from ccnv.results import BinResult, PredictionOutputs, SegmentResult
+from ccnv.models import AnalysisMode, Cytoband
+from ccnv.results import (
+    BinResult,
+    FetalFractionResult,
+    PredictionOutputs,
+    SegmentResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,32 @@ SEGMENTS_BED_HEADER = (
     "call",
 )
 CALLS_BED_HEADER = ("#contig", "start", "end", "ratio", "zscore", "type")
+PRENATAL_SEGMENTS_BED_HEADER = (
+    "#contig",
+    "start",
+    "end",
+    "ratio",
+    "zscore",
+    "weight",
+    "bin_count",
+    "call",
+    "expected_ratio",
+    "implied_ff",
+    "discordant",
+    "discordance_reason",
+)
+PRENATAL_CALLS_BED_HEADER = (
+    "#contig",
+    "start",
+    "end",
+    "ratio",
+    "zscore",
+    "type",
+    "expected_ratio",
+    "implied_ff",
+    "discordant",
+    "discordance_reason",
+)
 PLOTLY_CDN_URL: Final[str] = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 _JINJA_ENV: Final[jinja2.Environment] = jinja2.Environment(
     autoescape=jinja2.select_autoescape(["html", "j2"]),
@@ -180,6 +211,9 @@ def write_outputs(
     cytobands: Path | Sequence[Cytoband] | None = None,
     z_threshold: float = 3.0,
     ratio_threshold: float | None = None,
+    prenatal_result: FetalFractionResult | None = None,
+    mode: AnalysisMode = "germline",
+    qc_json_path: Path | None = None,
 ) -> PredictionOutputs:
     """Write compressed BED evidence, VCFs, and an interactive HTML plot."""
 
@@ -193,31 +227,27 @@ def write_outputs(
     sample_name = prefix.name if prefix.name else "SAMPLE"
     calls = [item for item in segments if item.call is not None]
     total_bins = sum(b.starts.size for b in bins)
+    is_prenatal = mode == "prenatal"
+    seg_header = PRENATAL_SEGMENTS_BED_HEADER if is_prenatal else SEGMENTS_BED_HEADER
+    call_header = PRENATAL_CALLS_BED_HEADER if is_prenatal else CALLS_BED_HEADER
+
     logger.debug(
-        "writing prediction outputs to prefix %s (%d bins, %d segments, %d calls)",
+        "writing prediction outputs to prefix %s "
+        "(%d bins, %d segments, %d calls, mode=%s)",
         prefix,
         total_bins,
         len(segments),
         len(calls),
+        mode,
     )
     _write_compressed_bed(bins_bed, BINS_BED_HEADER, _bin_bed_rows(bins))
     _write_compressed_bed(
-        segments_bed, SEGMENTS_BED_HEADER, _segment_bed_rows(segments)
+        segments_bed, seg_header, _segment_bed_rows(segments, is_prenatal=is_prenatal)
     )
     _write_compressed_bed(
         calls_bed,
-        CALLS_BED_HEADER,
-        (
-            (
-                item.contig,
-                item.start,
-                item.end,
-                _format_bed_float(item.ratio),
-                _format_bed_float(item.zscore),
-                item.call,
-            )
-            for item in calls
-        ),
+        call_header,
+        _calls_bed_rows(calls, is_prenatal=is_prenatal),
     )
     bins_vcf: Path | None = None
     segments_vcf: Path | None = None
@@ -244,9 +274,11 @@ def write_outputs(
                 sample_name,
                 "segments",
                 extra_contigs=(s.contig for s in segments),
+                prenatal_result=prenatal_result if is_prenatal else None,
             ),
             segments,
             sample_name,
+            is_prenatal=is_prenatal,
         )
         _write_segments_vcf(
             calls_vcf,
@@ -255,10 +287,12 @@ def write_outputs(
                 sample_name,
                 "segments",
                 extra_contigs=(s.contig for s in segments),
+                prenatal_result=prenatal_result if is_prenatal else None,
             ),
             segments,
             sample_name,
             calls_only=True,
+            is_prenatal=is_prenatal,
         )
     logger.debug(
         "wrote %s, %s, %s",
@@ -276,6 +310,7 @@ def write_outputs(
             z_threshold=z_threshold,
             ratio_threshold=ratio_threshold,
             sample_name=sample_name,
+            prenatal_result=prenatal_result if is_prenatal else None,
         )
     return PredictionOutputs(
         bins_bed=bins_bed,
@@ -287,6 +322,8 @@ def write_outputs(
         calls_vcf=calls_vcf,
         bins=bins,
         segments=segments,
+        qc_json_path=qc_json_path,
+        prenatal_result=prenatal_result,
     )
 
 
@@ -304,6 +341,7 @@ def write_genome_plot(
     z_threshold: float = 3.0,
     ratio_threshold: float | None = None,
     sample_name: str | None = None,
+    prenatal_result: FetalFractionResult | None = None,
 ) -> None:
     """Write a minimal interactive Plotly HTML viewer with binary-packed bins."""
 
@@ -364,18 +402,40 @@ def write_genome_plot(
         r_arr = np.empty(0, dtype="<f4")
         z_arr = np.empty(0, dtype="<f4")
 
-    seg_rows = [
-        [
-            contig_to_idx[s.contig],
-            int(s.start),
-            int(s.end),
-            round(float(s.ratio), 5) if np.isfinite(s.ratio) else 0.0,
-            round(float(s.zscore), 4) if np.isfinite(s.zscore) else 0.0,
-            int(s.bin_count),
+    if prenatal_result is not None:
+        seg_rows: list[list[object]] = [
+            [
+                contig_to_idx[s.contig],
+                int(s.start),
+                int(s.end),
+                round(float(s.ratio), 5) if np.isfinite(s.ratio) else 0.0,
+                round(float(s.zscore), 4) if np.isfinite(s.zscore) else 0.0,
+                int(s.bin_count),
+                bool(s.discordant),
+                round(float(s.implied_ff), 4)
+                if s.implied_ff is not None and np.isfinite(s.implied_ff)
+                else None,
+                round(float(s.expected_ratio), 5)
+                if s.expected_ratio is not None and np.isfinite(s.expected_ratio)
+                else None,
+                s.discordance_reason,
+            ]
+            for s in segments
+            if s.contig in contig_to_idx and np.isfinite(s.ratio)
         ]
-        for s in segments
-        if s.contig in contig_to_idx and np.isfinite(s.ratio)
-    ]
+    else:
+        seg_rows = [
+            [
+                contig_to_idx[s.contig],
+                int(s.start),
+                int(s.end),
+                round(float(s.ratio), 5) if np.isfinite(s.ratio) else 0.0,
+                round(float(s.zscore), 4) if np.isfinite(s.zscore) else 0.0,
+                int(s.bin_count),
+            ]
+            for s in segments
+            if s.contig in contig_to_idx and np.isfinite(s.ratio)
+        ]
 
     band_rows = [
         [contig_to_idx[b.contig], int(b.start), int(b.end), b.name, b.stain]
@@ -384,7 +444,7 @@ def write_genome_plot(
     ]
 
     title = sample_name or path.stem.removesuffix("_plot")
-    payload = {
+    payload: dict[str, object] = {
         "sample": title,
         "contigs": list(ordered),
         "lengths": [int(contig_lengths[c]) for c in ordered],
@@ -401,6 +461,27 @@ def write_genome_plot(
         "segments": seg_rows,
         "cytobands": band_rows,
     }
+    if prenatal_result is not None:
+        payload["prenatal"] = {
+            "fetal_sex": prenatal_result.fetal_sex,
+            "active_ff": float(prenatal_result.active_ff),
+            "active_ff_source": prenatal_result.active_ff_source,
+            "ffy": (
+                float(prenatal_result.ffy) if prenatal_result.ffy is not None else None
+            ),
+            "ffx": (
+                float(prenatal_result.ffx) if prenatal_result.ffx is not None else None
+            ),
+            "preface": (
+                float(prenatal_result.preface)
+                if prenatal_result.preface is not None
+                else None
+            ),
+            "sca_call": prenatal_result.sca.call,
+            "is_aneuploid": bool(prenatal_result.sca.is_aneuploid),
+            "low_ff_warning": bool(prenatal_result.low_ff_warning),
+            "warnings": list(prenatal_result.warnings),
+        }
     payload_json = json.dumps(payload, separators=(",", ":"))
     template_source = (
         files("ccnv.templates")
@@ -451,6 +532,7 @@ def _build_vcf_header(
     sample_name: str,
     record_type: Literal["bins", "segments"],
     extra_contigs: Iterable[str] = (),
+    prenatal_result: FetalFractionResult | None = None,
 ) -> pysam.VariantHeader:
     header = pysam.VariantHeader()
     header.add_line("##source=ccnv_predict")
@@ -527,6 +609,27 @@ def _build_vcf_header(
             "##FORMAT=<ID=BINS,Number=1,Type=Integer,"
             'Description="Number of bins in segment">'
         )
+        if prenatal_result is not None:
+            header.add_line(f"##fetalSex={prenatal_result.fetal_sex}")
+            header.add_line(f"##fetalFraction={prenatal_result.active_ff:.4f}")
+            header.add_line(f"##scaCall={prenatal_result.sca.call}")
+            header.add_line(
+                "##INFO=<ID=DISCORDANT,Number=0,Type=Flag,"
+                'Description="Segment ratio is discordant with fetal '
+                'fraction or karyotype">'
+            )
+            header.add_line(
+                "##INFO=<ID=DISC_REASON,Number=1,Type=String,"
+                'Description="Reason for discordance flag">'
+            )
+            header.add_line(
+                "##FORMAT=<ID=EXP_LOG2R,Number=1,Type=Float,"
+                'Description="Expected log2 ratio based on active fetal fraction">'
+            )
+            header.add_line(
+                "##FORMAT=<ID=IMPLIED_FF,Number=1,Type=Float,"
+                'Description="Implied fetal fraction based on segment ratio">'
+            )
 
     header.add_sample(sample_name)
     return header
@@ -574,6 +677,7 @@ def _write_segments_vcf(
     sample_name: str,
     *,
     calls_only: bool = False,
+    is_prenatal: bool = False,
 ) -> Path:
     with pysam.VariantFile(str(gz_path), "wz", header=header) as vf:
         for item in results:
@@ -604,11 +708,20 @@ def _write_segments_vcf(
             )
             rec.info["SVTYPE"] = svtype
             rec.info["IMPRECISE"] = True
+            if is_prenatal and item.discordant:
+                rec.info["DISCORDANT"] = True
+                if item.discordance_reason:
+                    rec.info["DISC_REASON"] = item.discordance_reason
             sample = rec.samples[sample_name]
             sample["LOG2R"] = _vcf_float(item.ratio)
             sample["ZSCORE"] = _vcf_float(item.zscore)
             sample["WEIGHT"] = _vcf_float(item.weight)
             sample["BINS"] = int(item.bin_count)
+            if is_prenatal and item.discordant:
+                if item.expected_ratio is not None:
+                    sample["EXP_LOG2R"] = _vcf_float(item.expected_ratio)
+                if item.implied_ff is not None:
+                    sample["IMPLIED_FF"] = _vcf_float(item.implied_ff)
             vf.write(rec)
     pysam.tabix_index(str(gz_path), preset="vcf", force=True)
     return gz_path
@@ -640,7 +753,35 @@ def _bin_bed_rows(results: tuple[BinResult, ...]) -> tuple[tuple[object, ...], .
 
 def _segment_bed_rows(
     results: tuple[SegmentResult, ...],
+    *,
+    is_prenatal: bool = False,
 ) -> tuple[tuple[object, ...], ...]:
+    if is_prenatal:
+        return tuple(
+            (
+                item.contig,
+                item.start,
+                item.end,
+                _format_bed_float(item.ratio),
+                _format_bed_float(item.zscore),
+                _format_bed_float(item.weight),
+                item.bin_count,
+                item.call or "",
+                (
+                    _format_bed_float(item.expected_ratio)
+                    if item.expected_ratio is not None
+                    else ""
+                ),
+                (
+                    _format_bed_float(item.implied_ff)
+                    if item.implied_ff is not None
+                    else ""
+                ),
+                "true" if item.discordant else "false",
+                item.discordance_reason or "",
+            )
+            for item in results
+        )
     return tuple(
         (
             item.contig,
@@ -653,4 +794,46 @@ def _segment_bed_rows(
             item.call or "",
         )
         for item in results
+    )
+
+
+def _calls_bed_rows(
+    calls: Sequence[SegmentResult],
+    *,
+    is_prenatal: bool = False,
+) -> tuple[tuple[object, ...], ...]:
+    if is_prenatal:
+        return tuple(
+            (
+                item.contig,
+                item.start,
+                item.end,
+                _format_bed_float(item.ratio),
+                _format_bed_float(item.zscore),
+                item.call,
+                (
+                    _format_bed_float(item.expected_ratio)
+                    if item.expected_ratio is not None
+                    else ""
+                ),
+                (
+                    _format_bed_float(item.implied_ff)
+                    if item.implied_ff is not None
+                    else ""
+                ),
+                "true" if item.discordant else "false",
+                item.discordance_reason or "",
+            )
+            for item in calls
+        )
+    return tuple(
+        (
+            item.contig,
+            item.start,
+            item.end,
+            _format_bed_float(item.ratio),
+            _format_bed_float(item.zscore),
+            item.call,
+        )
+        for item in calls
     )
