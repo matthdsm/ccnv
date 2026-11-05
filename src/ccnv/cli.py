@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
 from time import perf_counter
-from typing import Annotated, NoReturn
+from typing import Annotated, NoReturn, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -23,6 +23,9 @@ from ccnv.models import (
     ReadFilters,
     ReferenceConfig,
     ReferenceQCConfig,
+)
+from ccnv.models import (
+    AnalysisMode as AnalysisModeLiteral,
 )
 from ccnv.predict import PredictError
 from ccnv.predict import run as run_predict
@@ -66,6 +69,13 @@ class SexBranch(StrEnum):
     autosomal = "autosomal"
     female = "female"
     male = "male"
+
+
+class AnalysisMode(StrEnum):
+    """Allowed pipeline analysis modes."""
+
+    germline = "germline"
+    prenatal = "prenatal"
 
 
 def configure_logging(level: LogLevel) -> None:
@@ -131,7 +141,7 @@ def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
 def _is_sample_parquet(path: Path) -> bool:
     try:
         metadata = decode_metadata(pq.read_schema(path).metadata)
-    except (OSError, TypeError, ValueError, SchemaError, pa.ArrowException):
+    except OSError, TypeError, ValueError, SchemaError, pa.ArrowException:
         return False
     return metadata.get("artifact_kind") == ArtifactKind.SAMPLE.value
 
@@ -248,17 +258,49 @@ def reference(
     samples: Annotated[
         list[Path] | None,
         typer.Argument(
-            exists=True,
-            file_okay=True,
-            dir_okay=True,
-            readable=True,
-            help=(
-                "Sample Parquet files and/or directories; directories are searched"
-                " recursively for sample Parquet."
-                "To build a flat reference, provide exactly one fasta file."
-            ),
+            hidden=True,
+            help="Deprecated: provide --samplesheet or --fasta instead",
         ),
     ] = None,
+    samplesheet: Annotated[
+        Path | None,
+        typer.Option(
+            "-s",
+            "--samplesheet",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Root-list samplesheet (.yaml, .yml, or .json) describing the cohort",
+        ),
+    ] = None,
+    fasta: Annotated[
+        Path | None,
+        typer.Option(
+            "--fasta",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Reference FASTA for flat reference building",
+        ),
+    ] = None,
+    mode: Annotated[
+        AnalysisMode,
+        typer.Option(
+            "--mode",
+            case_sensitive=False,
+            help="Analysis mode: germline constitutional CNV or prenatal NIPS cfDNA",
+        ),
+    ] = AnalysisMode.germline,
+    prenatal_binsize: Annotated[
+        int,
+        typer.Option(
+            "--prenatal-binsize",
+            min=1,
+            help="Bin size in bases for prenatal models (default: 100000)",
+        ),
+    ] = 100_000,
     bin_size: Annotated[
         int, typer.Option(min=1, help="Target bin size in bases")
     ] = DEFAULT_BIN_SIZE,
@@ -373,22 +415,37 @@ def reference(
 
     configure_logging(loglevel)
     cli_logger.debug(
-        "starting reference: prefix=%s, bin_size=%d, threads=%d",
+        "starting reference: prefix=%s, bin_size=%d, mode=%s, threads=%d",
         prefix,
         bin_size,
+        mode.value,
         threads,
     )
     started = perf_counter()
     sample_paths: tuple[Path, ...] = ()
-    fasta: Path | None = None
-    if samples:
-        if len(samples) == 1 and samples[0].suffix.lower() in (".fasta", ".fa", ".fna"):
-            fasta = samples[0]
+    if samplesheet is None and fasta is None:
+        if samples:
+            if len(samples) == 1 and samples[0].suffix.lower() in (
+                ".fasta",
+                ".fa",
+                ".fna",
+            ):
+                fasta = samples[0]
+            else:
+                try:
+                    sample_paths = expand_sample_inputs(samples)
+                except SampleInputError as error:
+                    _fail(error, 2)
         else:
-            try:
-                sample_paths = expand_sample_inputs(samples)
-            except SampleInputError as error:
-                _fail(error, 2)
+            _fail(
+                ValueError("provide exactly one of --samplesheet or --fasta"),
+                2,
+            )
+    elif samplesheet is not None and fasta is not None:
+        _fail(
+            ValueError("provide either --samplesheet or --fasta, not both"),
+            2,
+        )
     try:
         run_reference(
             ReferenceConfig(
@@ -404,11 +461,14 @@ def reference(
                 min_cohort_size=min_cohort_size,
                 min_mappability=min_mappability,
                 min_sex_group_size=min_sex_group_size,
+                mode=cast(AnalysisModeLiteral, mode.value),
                 nearest_bins=nearest_bins,
                 pca_components=pca_components,
                 prefix=prefix,
+                prenatal_bin_size=prenatal_binsize,
                 qc_report=qc_report,
                 samples=sample_paths,
+                samplesheet_path=samplesheet,
                 sex_contigs=tuple(sex_contig),
                 sex_cutoff=sex_cutoff,
                 sex_signal_contig=sex_signal_contig,
@@ -583,16 +643,25 @@ def predict(
             help="Minimum bin mappability in [0, 1] required to stay unmasked",
         ),
     ] = DEFAULT_MIN_MAPPABILITY,
+    mode: Annotated[
+        AnalysisMode,
+        typer.Option(
+            "--mode",
+            case_sensitive=False,
+            help="Analysis mode: germline constitutional CNV or prenatal NIPS cfDNA",
+        ),
+    ] = AnalysisMode.germline,
     loglevel: LogLevelOption = LogLevel.warning,
 ) -> None:
     """Predict copy-number events for one sample."""
 
     configure_logging(loglevel)
     cli_logger.debug(
-        "starting predict: sample=%s, reference=%s, sex=%s",
+        "starting predict: sample=%s, reference=%s, sex=%s, mode=%s",
         sample,
         reference,
         sex.value,
+        mode.value,
     )
     started = perf_counter()
     try:
@@ -614,6 +683,7 @@ def predict(
                 mappability=mappability,
                 gc=gc,
                 min_mappability=min_mappability,
+                mode=cast(AnalysisModeLiteral, mode.value),
             )
         )
 
