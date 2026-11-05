@@ -341,14 +341,18 @@ def run_reference_qc_on_table(
     severities: list[int] = []
     messages: list[str] = []
 
-    branch_names = tuple(dict.fromkeys(table.column("branch").to_pylist()))
+    cnv_branch_names = tuple(
+        b
+        for b in dict.fromkeys(table.column("branch").to_pylist())
+        if b in ("autosomal", "female_sex", "male_sex")
+    )
     logger.debug(
         "evaluating reference QC (branches=%s, flat=%s, %d rows)",
-        branch_names,
+        cnv_branch_names,
         is_flat,
         table.num_rows,
     )
-    for branch_name in branch_names:
+    for branch_name in cnv_branch_names:
         b_qc = compute_branch_qc(
             table,
             branch_name=branch_name,
@@ -388,6 +392,39 @@ def run_reference_qc_on_table(
     sample_identities = metadata.get("sample_identities", [])
     sample_count = len(sample_identities) if isinstance(sample_identities, list) else 0
 
+    mode = model.get("mode", "germline")
+    prenatal_qc: dict[str, object] | None = None
+    if mode == "prenatal":
+        prenatal_meta_dict = metadata.get("prenatal")
+        if not isinstance(prenatal_meta_dict, dict):
+            prenatal_meta_dict = {}
+
+        auto_rows = table.filter(pc.equal(table["branch"], "prenatal_autosomal"))
+        usable_auto = (
+            int(pc.sum(pc.invert(auto_rows["masked"])).as_py() or 0)
+            if auto_rows.num_rows > 0
+            else 0
+        )
+
+        ffy_rows = table.filter(pc.equal(table["branch"], "prenatal_ffy"))
+        informative_ffy = (
+            int(pc.sum(pc.invert(ffy_rows["masked"])).as_py() or 0)
+            if ffy_rows.num_rows > 0
+            else 0
+        )
+
+        yfrac_threshold = float(prenatal_meta_dict.get("yfrac_threshold", 0.0))
+        female_chrx_ratio_std = float(
+            prenatal_meta_dict.get("female_chrx_ratio_std", 0.0)
+        )
+
+        prenatal_qc = {
+            "usable_autosomal_bins": usable_auto,
+            "informative_ffy_bins": informative_ffy,
+            "yfrac_threshold": yfrac_threshold,
+            "female_chrx_ratio_std": female_chrx_ratio_std,
+        }
+
     json_path = Path(f"{prefix}_qc.json")
     qc_data: dict[str, object] = {
         "overall_verdict": overall_verdict,
@@ -395,6 +432,8 @@ def run_reference_qc_on_table(
         "messages": messages,
         "parameters": {
             "bin_size": model.get("bin_size"),
+            "mode": mode,
+            "prenatal_bin_size": model.get("prenatal_bin_size"),
             "pca_components": model.get("pca_components"),
             "nearest_bins": nearest_bins,
             "min_ref_bins": min_ref_bins,
@@ -416,6 +455,8 @@ def run_reference_qc_on_table(
         },
         "branches": branches_qc,
     }
+    if prenatal_qc is not None:
+        qc_data["prenatal"] = prenatal_qc
     if reference_path is not None:
         qc_data["reference_path"] = str(reference_path)
 
@@ -471,3 +512,6 @@ def run_reference_qc(config: ReferenceQCConfig) -> ReferenceQCOutputs:
         write_json=True,
         emit_stderr=True,
     )
+
+
+evaluate_reference_qc = run_reference_qc_on_table

@@ -133,6 +133,7 @@ class ReferenceConfig:
     input_paths: tuple[Path, ...] = ()
     mode: AnalysisMode = "germline"
     prenatal_bin_size: int = 100000
+    seed: int = 42
 
     def __post_init__(self) -> None:
         if isinstance(self.samples, (Path, str)):

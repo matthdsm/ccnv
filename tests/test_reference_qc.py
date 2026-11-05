@@ -16,6 +16,7 @@ from ccnv.reference_qc import (
     compute_signal_contig_metrics,
     evaluate_autosomal_or_female_verdict,
     evaluate_male_verdict,
+    evaluate_reference_qc,
     run_reference_qc,
     run_reference_qc_on_table,
 )
@@ -283,6 +284,114 @@ class TestReferenceQC(unittest.TestCase):
             nonexistent = tmp_path / "does_not_exist.ccnv"
             with self.assertRaises(ReferenceQCError):
                 run_reference_qc(ReferenceQCConfig(reference=nonexistent))
+
+    def test_evaluate_reference_qc_prenatal_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            metadata = metadata_for(
+                ArtifactKind.REFERENCE,
+                contig_lengths={"chr1": 200000, "chrY": 100000},
+                values={
+                    "sample_identities": [{"path": "s1.ccnv"}, {"path": "s2.ccnv"}],
+                    "model": {
+                        "bin_size": 5000,
+                        "prenatal_bin_size": 100000,
+                        "mode": "prenatal",
+                        "branches": [
+                            "autosomal",
+                            "prenatal_autosomal",
+                            "prenatal_ffy",
+                        ],
+                        "autosomal_contigs": ["chr1"],
+                        "sex_contigs": ["chrY"],
+                        "sex_signal_contig": None,
+                        "sex_cutoff": None,
+                        "sex_source": "prenatal_model",
+                        "sample_sexes": ["female", "male"],
+                        "sex_inference": None,
+                        "pca_components": 2,
+                        "nearest_bins": 5,
+                        "max_batch_memory_mb": 64,
+                        "flat": False,
+                    },
+                    "prenatal": {
+                        "prenatal_bin_size": 100000,
+                        "yfrac_threshold": 0.005,
+                        "ffy_intercept": 0.0,
+                        "ffy_slope": 1.0,
+                        "mlp_w1": [[0.1, -0.1]],
+                        "mlp_b1": [0.0, 0.0],
+                        "mlp_w2": [[0.5], [-0.5]],
+                        "mlp_b2": [0.0],
+                        "mlp_skew_intercept": 0.0,
+                        "mlp_skew_slope": 1.0,
+                        "olm_weights": [0.1],
+                        "olm_bias": 0.0,
+                        "olm_skew_intercept": 0.0,
+                        "olm_skew_slope": 1.0,
+                        "ffx_intercept": 2.0,
+                        "ffx_slope": -2.0,
+                        "female_chrx_ratio_mean": 1.0,
+                        "female_chrx_ratio_std": 0.015,
+                    },
+                },
+            )
+
+            # 10 autosomal bins, 2 prenatal_autosomal bins, 20 prenatal_ffy bins
+            branches = (
+                ["autosomal"] * 10 + ["prenatal_autosomal"] * 2 + ["prenatal_ffy"] * 20
+            )
+            contigs = ["chr1"] * 10 + ["chr1"] * 2 + ["chrY"] * 20
+            starts = (
+                [i * 5000 for i in range(10)]
+                + [0, 100000]
+                + [i * 5000 for i in range(20)]
+            )
+            ends = (
+                [(i + 1) * 5000 for i in range(10)]
+                + [100000, 200000]
+                + [(i + 1) * 5000 for i in range(20)]
+            )
+            n_total = len(branches)
+            masked = [False] * 10 + [False, True] + [False] * 15 + [True] * 5
+
+            table = pa.table(
+                {
+                    "branch": branches,
+                    "contig": contigs,
+                    "start": starts,
+                    "end": ends,
+                    "masked": masked,
+                    "gc": pa.array([0.42] * n_total, type=pa.float32()),
+                    "mappability": pa.array([0.95] * n_total, type=pa.float32()),
+                    "pca_mean": [1.0] * n_total,
+                    "pca_loadings": [[0.1, 0.2]] * n_total,
+                    "nearest_ref_indices": [[1, 2]] * n_total,
+                    "mean_distance": [0.55] * n_total,
+                    "null_mean": [0.0] * n_total,
+                    "null_std": [0.1] * n_total,
+                },
+                schema=REFERENCE_SCHEMA.with_metadata(metadata),
+            )
+
+            outputs = evaluate_reference_qc(
+                table,
+                prefix=tmp_path / "prenatal_qc_ref",
+                write_json=True,
+                emit_stderr=False,
+            )
+            self.assertEqual(outputs.overall_verdict, "PASS")
+            self.assertIn("prenatal", outputs.data)
+            p_qc = outputs.data["prenatal"]
+            self.assertEqual(p_qc["usable_autosomal_bins"], 1)  # 1 unmasked
+            self.assertEqual(p_qc["informative_ffy_bins"], 15)  # 15 unmasked
+            self.assertAlmostEqual(p_qc["yfrac_threshold"], 0.005)
+            self.assertAlmostEqual(p_qc["female_chrx_ratio_std"], 0.015)
+
+            # Branches should only contain CNV branches
+            self.assertIn("autosomal", outputs.data["branches"])
+            self.assertNotIn("prenatal_autosomal", outputs.data["branches"])
+            self.assertNotIn("prenatal_ffy", outputs.data["branches"])
 
 
 if __name__ == "__main__":

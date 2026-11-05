@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from dataclasses import asdict, replace
@@ -7,6 +8,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pysam
+import yaml
 from published_fixtures import (
     CHR21_LENGTH,
     PUBLISHED_BIN_SIZE,
@@ -837,6 +839,23 @@ class TestFlatFastaReference(unittest.TestCase):
         with self.assertRaisesRegex(ReferenceError, "sample Parquet paths or a FASTA"):
             run(ReferenceConfig(samples=(), prefix=Path("ref")))
 
+    def test_prenatal_mode_rejects_fasta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fasta = _write_tiny_fasta(Path(tmpdir) / "genome.fa", (("chr1", 100),))
+            with self.assertRaisesRegex(
+                ReferenceError,
+                "Flat FASTA references are only supported in --mode germline; "
+                "--mode prenatal requires a cohort --samplesheet.",
+            ):
+                run(
+                    ReferenceConfig(
+                        prefix=Path(tmpdir) / "ref",
+                        fasta=fasta,
+                        bin_size=100,
+                        mode="prenatal",
+                    )
+                )
+
 
 class TestParallelReference(unittest.TestCase):
     def test_reference_config_threads_validation(self) -> None:
@@ -899,6 +918,139 @@ class TestParallelReference(unittest.TestCase):
             np.testing.assert_array_equal(cohort_seq.ends, cohort_par.ends)
             self.assertEqual(cohort_seq.contig_lengths, cohort_par.contig_lengths)
             self.assertEqual(cohort_seq.bin_size, cohort_par.bin_size)
+
+
+class TestPrenatalReference(unittest.TestCase):
+    def test_prenatal_reference_build_and_qc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            contig_lengths = {
+                "chr1": 200_000,
+                "chr2": 200_000,
+                "chrX": 200_000,
+                "chrY": 300_000,
+            }
+            sample_paths = []
+            entries_data = []
+            rng = np.random.default_rng(42)
+
+            for i in range(6):
+                is_male = i >= 3
+                ff = 0.08 + 0.02 * (i - 3) if is_male else None
+                s_path = tmp_path / f"sample_{i}.ccnv"
+                sample_paths.append(s_path)
+                entries_data.append(
+                    {
+                        "filepath": str(s_path),
+                        "sex": "M" if is_male else "F",
+                        "ff": ff,
+                    }
+                )
+
+                contig_list: list[str] = []
+                starts_list: list[int] = []
+                ends_list: list[int] = []
+                counts_list: list[int] = []
+
+                for contig, length in contig_lengths.items():
+                    n_bins = length // 5000
+                    starts = [b * 5000 for b in range(n_bins)]
+                    ends = [(b + 1) * 5000 for b in range(n_bins)]
+                    if contig == "chrY":
+                        mean_c = 100.0 * (0.5 * (ff or 0.0)) if is_male else 0.5
+                    elif contig == "chrX":
+                        mean_c = 100.0 * (1.0 - 0.5 * (ff or 0.0))
+                    else:
+                        mean_c = 100.0
+                    noise = rng.normal(loc=0.0, scale=0.1, size=n_bins)
+                    raw_c = np.clip(np.round(mean_c + noise), 0, None).astype(np.uint64)
+
+                    contig_list.extend([contig] * n_bins)
+                    starts_list.extend(starts)
+                    ends_list.extend(ends)
+                    counts_list.extend(raw_c.tolist())
+
+                metadata = metadata_for(
+                    ArtifactKind.SAMPLE,
+                    contig_lengths=contig_lengths,
+                    values={
+                        "bin_size": 5000,
+                        "source_identity": {"id": f"sample_{i}"},
+                        "reference_identity": {"name": "test_ref"},
+                        "qc": {},
+                        "filters": asdict(ReadFilters()),
+                    },
+                )
+                tbl = pa.table(
+                    {
+                        "contig": pa.array(contig_list, type=pa.string()),
+                        "start": pa.array(starts_list, type=pa.int64()),
+                        "end": pa.array(ends_list, type=pa.int64()),
+                        "count": pa.array(counts_list, type=pa.uint64()),
+                    },
+                    schema=SAMPLE_SCHEMA.with_metadata(metadata),
+                )
+                pq.write_table(tbl, s_path)
+
+            sheet_path = tmp_path / "samplesheet.yaml"
+            with open(sheet_path, "w", encoding="utf-8") as f:
+                yaml.dump(entries_data, f)
+
+            ref_prefix = tmp_path / "prenatal_ref"
+            config = ReferenceConfig(
+                samplesheet_path=sheet_path,
+                prefix=ref_prefix,
+                mode="prenatal",
+                bin_size=5000,
+                prenatal_bin_size=100000,
+                min_cohort_size=4,
+                min_sex_group_size=2,
+                nearest_bins=5,
+                pca_components=2,
+            )
+            run(config)
+
+            out_parquet = parquet_path(ref_prefix)
+            self.assertTrue(out_parquet.is_file())
+            ref_table = pq.read_table(out_parquet)
+            validate_table(ref_table, ArtifactKind.REFERENCE)
+
+            meta = decode_metadata(ref_table.schema.metadata)
+            model = meta.get("model", {})
+            self.assertEqual(model.get("mode"), "prenatal")
+            self.assertEqual(model.get("prenatal_bin_size"), 100000)
+
+            # Check branches
+            branches = set(ref_table.column("branch").unique().to_pylist())
+            self.assertIn("autosomal", branches)
+            self.assertIn("female_sex", branches)
+            self.assertIn("male_sex", branches)
+            self.assertIn("prenatal_autosomal", branches)
+            self.assertIn("prenatal_ffy", branches)
+
+            # Check prenatal metadata
+            self.assertIn("prenatal", meta)
+            prenatal_dict = meta["prenatal"]
+            self.assertIn("yfrac_threshold", prenatal_dict)
+            self.assertIn("ffy_slope", prenatal_dict)
+
+            # Check QC JSON
+            qc_json_path = tmp_path / "prenatal_ref_qc.json"
+            self.assertTrue(qc_json_path.is_file())
+            with open(qc_json_path, encoding="utf-8") as f:
+                qc_data = json.load(f)
+
+            self.assertIn("prenatal", qc_data)
+            p_qc = qc_data["prenatal"]
+            self.assertGreater(p_qc["usable_autosomal_bins"], 0)
+            self.assertGreater(p_qc["informative_ffy_bins"], 0)
+            self.assertIn("yfrac_threshold", p_qc)
+            self.assertIn("female_chrx_ratio_std", p_qc)
+
+            # Ensure branches in QC data only contains CNV branches
+            self.assertIn("autosomal", qc_data["branches"])
+            self.assertNotIn("prenatal_autosomal", qc_data["branches"])
+            self.assertNotIn("prenatal_ffy", qc_data["branches"])
 
 
 def _write_tiny_fasta(path: Path, records: tuple[tuple[str, int], ...]) -> Path:

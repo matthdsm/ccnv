@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
 from typing import Final, Literal
 
 import numpy as np
@@ -29,6 +30,7 @@ from ccnv.cohort import (
 from ccnv.cohort import (
     validate_cohort as validate_cohort,
 )
+from ccnv.convert import rebin_sample_table
 from ccnv.covariates import (
     CovariateError,
     correct_covariate_bias,
@@ -38,7 +40,8 @@ from ccnv.covariates import (
     mask_covariates,
     validate_min_mappability,
 )
-from ccnv.models import ReferenceConfig, parquet_path
+from ccnv.models import ReadFilters, ReferenceConfig, SamplesheetEntry, parquet_path
+from ccnv.prenatal import fit_prenatal_models
 from ccnv.reference_compute import (
     compute_null_models,
 )
@@ -46,9 +49,14 @@ from ccnv.reference_compute import (
     select_nearest_bins as select_nearest_bins,
 )
 from ccnv.reference_qc import run_reference_qc_on_table
+from ccnv.samplesheet import load_samplesheet
 from ccnv.schemas import (
+    BRANCH_PRENATAL_AUTOSOMAL,
+    BRANCH_PRENATAL_FFY,
     REFERENCE_SCHEMA,
+    SAMPLE_SCHEMA,
     ArtifactKind,
+    decode_metadata,
     metadata_for,
     validate_table,
 )
@@ -82,6 +90,41 @@ def run(config: ReferenceConfig) -> None:
     """Validate a cohort and write a versioned reference Parquet file."""
 
     _validate_config(config)
+    if config.samplesheet_path is not None:
+        entries = load_samplesheet(config.samplesheet_path)
+        sample_paths = tuple(entry.filepath for entry in entries)
+        config = replace(
+            config,
+            entries=entries,
+            samples=sample_paths,
+            input_paths=sample_paths,
+        )
+    elif config.entries:
+        entries = config.entries
+        sample_paths = tuple(entry.filepath for entry in entries)
+        config = replace(
+            config,
+            samples=sample_paths,
+            input_paths=sample_paths,
+        )
+    elif config.input_paths:
+        entries = tuple(SamplesheetEntry(filepath=p) for p in config.input_paths)
+        config = replace(
+            config,
+            entries=entries,
+            samples=config.input_paths,
+        )
+    elif config.samples:
+        entries = tuple(SamplesheetEntry(filepath=p) for p in config.samples)
+        config = replace(
+            config,
+            entries=entries,
+            input_paths=config.samples,
+        )
+    else:
+        entries = ()
+
+    sample_tables: list[pa.Table] | None = None
     if config.fasta is not None:
         assert config.bin_size is not None
         logger.debug("building flat reference from FASTA %s", config.fasta)
@@ -101,6 +144,11 @@ def run(config: ReferenceConfig) -> None:
             target_bin_size=config.bin_size,
             threads=config.threads,
         )
+        if config.mode == "prenatal":
+            sample_tables = _load_sample_tables(
+                entries,
+                target_bin_size=config.bin_size,
+            )
     logger.debug(
         "loaded cohort: %d bins, %d samples, bin_size=%d",
         cohort.counts.shape[0],
@@ -108,7 +156,7 @@ def run(config: ReferenceConfig) -> None:
         cohort.bin_size,
     )
 
-    table = build_reference_table(cohort, config)
+    table = build_reference_table(cohort, config, sample_tables=sample_tables)
     validate_table(table, ArtifactKind.REFERENCE)
     path = parquet_path(config.prefix)
     logger.debug("writing reference parquet %s (%d rows)", path, table.num_rows)
@@ -281,7 +329,59 @@ def infer_sample_sexes(
     )
 
 
-def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
+def _sample_tables_from_cohort(cohort: Cohort) -> list[pa.Table]:
+    tables: list[pa.Table] = []
+    for i in range(cohort.counts.shape[1]):
+        metadata = metadata_for(
+            ArtifactKind.SAMPLE,
+            contig_lengths=cohort.contig_lengths,
+            values={
+                "bin_size": cohort.bin_size,
+                "source_identity": (
+                    cohort.identities[i]
+                    if i < len(cohort.identities)
+                    else {"id": f"sample_{i}"}
+                ),
+                "reference_identity": {"name": "test"},
+                "qc": {},
+                "filters": asdict(ReadFilters()),
+            },
+        )
+        table = pa.table(
+            {
+                "contig": pa.array(cohort.contigs, type=pa.string()),
+                "start": pa.array(cohort.starts, type=pa.int64()),
+                "end": pa.array(cohort.ends, type=pa.int64()),
+                "count": pa.array(
+                    cohort.counts[:, i].astype(np.uint64), type=pa.uint64()
+                ),
+            },
+            schema=SAMPLE_SCHEMA.with_metadata(metadata),
+        )
+        tables.append(table)
+    return tables
+
+
+def _load_sample_tables(
+    entries: Sequence[SamplesheetEntry],
+    target_bin_size: int | None = None,
+) -> list[pa.Table]:
+    tables: list[pa.Table] = []
+    for entry in entries:
+        table = pq.read_table(entry.filepath)
+        if target_bin_size is not None:
+            metadata = decode_metadata(table.schema.metadata)
+            if metadata.get("bin_size") != target_bin_size:
+                table = rebin_sample_table(table, target_bin_size)
+        tables.append(table)
+    return tables
+
+
+def build_reference_table(
+    cohort: Cohort,
+    config: ReferenceConfig,
+    sample_tables: Sequence[pa.Table] | None = None,
+) -> pa.Table:
     """Fit autosomal and optional sex-contig branches into one reference table."""
 
     if cohort.counts.shape[1] < config.min_cohort_size:
@@ -323,7 +423,55 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
         autosomes,
         sex_contigs,
     )
-    sexes, sex_source, inference, signal = _resolve_sexes(cohort, config, sex_contigs)
+
+    prenatal_meta = None
+    prenatal_auto_table = None
+    prenatal_ffy_table = None
+    if config.mode == "prenatal":
+        effective_bin_size = (
+            config.bin_size if config.bin_size is not None else cohort.bin_size
+        )
+        if sample_tables is None:
+            if config.entries and all(e.filepath.is_file() for e in config.entries):
+                sample_tables = _load_sample_tables(
+                    config.entries, target_bin_size=effective_bin_size
+                )
+            else:
+                sample_tables = _sample_tables_from_cohort(cohort)
+
+        entries = config.entries
+        if len(entries) != len(sample_tables):
+            entries = tuple(
+                SamplesheetEntry(filepath=Path(f"sample_{i}.ccnv"))
+                for i in range(len(sample_tables))
+            )
+            config = replace(config, entries=entries)
+
+        seed = getattr(config, "seed", 42)
+        (
+            prenatal_auto_table,
+            prenatal_ffy_table,
+            prenatal_meta,
+            is_male_tuple,
+        ) = fit_prenatal_models(
+            sample_tables,
+            entries,
+            bin_size=effective_bin_size,
+            prenatal_bin_size=config.prenatal_bin_size,
+            seed=seed,
+        )
+        is_male_arr = np.array(is_male_tuple, dtype=np.bool_)
+        sexes: tuple[SexLabel, ...] | None = tuple(
+            "male" if m else "female" for m in is_male_arr
+        )
+        sex_source = "prenatal_model"
+        signal = _resolve_sex_signal(cohort, config)
+        inference = None
+    else:
+        sexes, sex_source, inference, signal = _resolve_sexes(
+            cohort, config, sex_contigs
+        )
+
     if inference is not None:
         cutoff_str = (
             f"{inference.cutoff:.4f}" if inference.cutoff is not None else "None"
@@ -388,40 +536,7 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
             )
             built_branches.append(BRANCH_MALE_SEX)
 
-    inference_meta: dict[str, object] | None = None
-    if inference is not None:
-        inference_meta = {
-            "passed": inference.passed,
-            "cutoff": inference.cutoff,
-            "fractions": list(inference.fractions),
-            "reason": inference.reason,
-        }
-    metadata = metadata_for(
-        ArtifactKind.REFERENCE,
-        contig_lengths=cohort.contig_lengths,
-        values={
-            "sample_identities": list(cohort.identities),
-            "model": {
-                "bin_size": cohort.bin_size,
-                "branches": built_branches,
-                "autosomal_contigs": list(autosomes),
-                "sex_contigs": list(sex_contigs),
-                "sex_signal_contig": signal,
-                "sex_cutoff": config.sex_cutoff,
-                "sex_source": sex_source,
-                "sample_sexes": list(sexes) if sexes is not None else None,
-                "sex_inference": inference_meta,
-                "pca_components": config.pca_components,
-                "nearest_bins": config.nearest_bins,
-                "max_batch_memory_mb": config.max_batch_memory_mb,
-                "flat": config.fasta is not None,
-                "gc_corrected": (config.gc is not None) or (config.fasta is not None),
-                "mappability_corrected": config.mappability is not None,
-                "min_mappability": config.min_mappability,
-            },
-        },
-    )
-    return pa.table(
+    cnv_table = pa.table(
         {
             "branch": pa.array(rows["branch"], type=pa.string()),
             "contig": pa.array(rows["contig"], type=pa.string()),
@@ -439,12 +554,78 @@ def build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table:
             "null_mean": pa.array(rows["null_mean"], type=pa.float64()),
             "null_std": pa.array(rows["null_std"], type=pa.float64()),
         },
-        schema=REFERENCE_SCHEMA.with_metadata(metadata),
+        schema=REFERENCE_SCHEMA,
     )
+
+    if config.mode == "prenatal":
+        assert prenatal_auto_table is not None and prenatal_ffy_table is not None
+        if prenatal_auto_table.num_rows > 0:
+            built_branches.append(BRANCH_PRENATAL_AUTOSOMAL)
+        if prenatal_ffy_table.num_rows > 0:
+            built_branches.append(BRANCH_PRENATAL_FFY)
+        full_table = pa.concat_tables(
+            [cnv_table, prenatal_auto_table, prenatal_ffy_table]
+        )
+    else:
+        full_table = cnv_table
+
+    inference_meta: dict[str, object] | None = None
+    if inference is not None:
+        inference_meta = {
+            "passed": inference.passed,
+            "cutoff": inference.cutoff,
+            "fractions": list(inference.fractions),
+            "reason": inference.reason,
+        }
+
+    model_metadata: dict[str, object] = {
+        "bin_size": cohort.bin_size,
+        "branches": built_branches,
+        "autosomal_contigs": list(autosomes),
+        "sex_contigs": list(sex_contigs),
+        "sex_signal_contig": signal,
+        "sex_cutoff": config.sex_cutoff,
+        "sex_source": sex_source,
+        "sample_sexes": list(sexes) if sexes is not None else None,
+        "sex_inference": inference_meta,
+        "pca_components": config.pca_components,
+        "nearest_bins": config.nearest_bins,
+        "max_batch_memory_mb": config.max_batch_memory_mb,
+        "flat": config.fasta is not None,
+        "gc_corrected": (config.gc is not None) or (config.fasta is not None),
+        "mappability_corrected": config.mappability is not None,
+        "min_mappability": config.min_mappability,
+        "mode": config.mode,
+    }
+    values: dict[str, object] = {
+        "sample_identities": list(cohort.identities),
+        "model": model_metadata,
+    }
+    if config.mode == "prenatal":
+        assert prenatal_meta is not None
+        model_metadata["prenatal_bin_size"] = config.prenatal_bin_size
+        values["prenatal"] = prenatal_meta.to_dict()
+
+    metadata = metadata_for(
+        ArtifactKind.REFERENCE,
+        contig_lengths=cohort.contig_lengths,
+        values=values,
+    )
+    return full_table.replace_schema_metadata(metadata)
 
 
 def _validate_config(config: ReferenceConfig) -> None:
-    has_samples = bool(config.samples)
+    if config.mode == "prenatal" and config.fasta is not None:
+        raise ReferenceError(
+            "Flat FASTA references are only supported in --mode germline; "
+            "--mode prenatal requires a cohort --samplesheet."
+        )
+    has_samples = bool(
+        config.samples
+        or config.entries
+        or config.input_paths
+        or config.samplesheet_path
+    )
     has_fasta = config.fasta is not None
     if not has_samples and not has_fasta:
         raise ReferenceError(
