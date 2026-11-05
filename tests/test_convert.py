@@ -23,7 +23,9 @@ from ccnv.convert import (
     ConvertError,
     bin_counts,
     bin_intervals,
+    empty_qc,
     is_canonical_contig,
+    normalize_chr,
     read_sample_parquet,
     rebin_counts,
     rebin_sample_table,
@@ -331,6 +333,10 @@ class TestConvertAlignment(unittest.TestCase):
             qc = metadata["qc"]
             self.assertEqual(qc["reads_seen"], 8)
             self.assertEqual(qc["reads_kept"], 6)
+            self.assertEqual(qc["effective_reads_examined"], 8)
+            self.assertEqual(qc["effective_reads_kept"], 6)
+            self.assertEqual(qc["autosomal_reads_kept"], 4)
+            self.assertEqual(qc["sex_reads_kept"], 0)
             self.assertEqual(qc["filter_mapq"], 1)
             self.assertEqual(qc["filter_duplicate"], 1)
             self.assertEqual(set(qc), set(QC_COUNTERS))
@@ -632,6 +638,10 @@ class TestCanonicalContigs(unittest.TestCase):
             self.assertEqual(metadata["reference_identity"]["contig_order"], ["chr1"])
             self.assertEqual(metadata["qc"]["reads_seen"], 1)
             self.assertEqual(metadata["qc"]["reads_kept"], 1)
+            self.assertEqual(metadata["qc"]["effective_reads_examined"], 1)
+            self.assertEqual(metadata["qc"]["effective_reads_kept"], 1)
+            self.assertEqual(metadata["qc"]["autosomal_reads_kept"], 1)
+            self.assertEqual(metadata["qc"]["sex_reads_kept"], 0)
 
     def test_all_contigs_keeps_every_header_contig(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -676,6 +686,115 @@ class TestCanonicalContigs(unittest.TestCase):
                 run(ConvertConfig(bam_path, Path(tmpdir) / "sample", bin_size=100))
 
 
+class TestEffectiveReadMetrics(unittest.TestCase):
+    def test_empty_qc_contains_all_counters_initialized_to_zero(self) -> None:
+        qc = empty_qc()
+        self.assertEqual(set(qc.keys()), set(QC_COUNTERS))
+        self.assertTrue(all(val == 0 for val in qc.values()))
+        self.assertEqual(qc["effective_reads_examined"], 0)
+        self.assertEqual(qc["effective_reads_kept"], 0)
+        self.assertEqual(qc["autosomal_reads_kept"], 0)
+        self.assertEqual(qc["sex_reads_kept"], 0)
+
+    def test_normalize_chr(self) -> None:
+        cases = {
+            "chr1": "1",
+            "chr22": "22",
+            "1": "1",
+            "22": "22",
+            "chrX": "X",
+            "chrx": "X",
+            "X": "X",
+            "x": "X",
+            "chrY": "Y",
+            "chry": "Y",
+            "Y": "Y",
+            "y": "Y",
+            "chrM": "M",
+            "chrEBV": "EBV",
+            "scaffold-A": "scaffold-A",
+        }
+        for contig, expected in cases.items():
+            with self.subTest(contig=contig):
+                self.assertEqual(normalize_chr(contig), expected)
+
+    def test_effective_and_autosomal_sex_qc_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bam_path = Path(tmpdir) / "sample.bam"
+            prefix = Path(tmpdir) / "sample"
+            header = {
+                "HD": {"VN": "1.6", "SO": "coordinate"},
+                "SQ": [
+                    {"SN": "chr1", "LN": 200},
+                    {"SN": "chr2", "LN": 200},
+                    {"SN": "chrX", "LN": 200},
+                    {"SN": "chrY", "LN": 200},
+                    {"SN": "chrM", "LN": 100},
+                ],
+            }
+            reads = [
+                _read("c1_k1", 0, 0, 60),
+                _read("c1_k2", 0, 10, 60),
+                _read("c1_drop", 0, 20, 0),
+                _read("c2_k1", 1, 0, 60),
+                _read("c2_dup", 1, 10, 60, is_duplicate=True),
+                _read("cx_k1", 2, 0, 60),
+                _read("cx_k2", 2, 10, 60),
+                _read("cx_k3", 2, 20, 60),
+                _read("cy_k1", 3, 0, 60),
+                _read("cy_k2", 3, 10, 60),
+                _read("cm_k1", 4, 0, 60),
+            ]
+            _write_bam(bam_path, reads, header=header, index=True)
+            run(ConvertConfig(bam_path, prefix, bin_size=100))
+
+            table = read_sample_parquet(parquet_path(prefix))
+            metadata = decode_metadata(table.schema.metadata)
+            qc = metadata["qc"]
+
+            self.assertEqual(qc["reads_seen"], 10)
+            self.assertEqual(qc["reads_kept"], 8)
+            self.assertEqual(qc["effective_reads_examined"], 10)
+            self.assertEqual(qc["effective_reads_kept"], 8)
+            self.assertEqual(qc["autosomal_reads_kept"], 3)
+            self.assertEqual(qc["sex_reads_kept"], 5)
+            self.assertEqual(qc["filter_mapq"], 1)
+            self.assertEqual(qc["filter_duplicate"], 1)
+            self.assertEqual(set(qc), set(QC_COUNTERS))
+
+    def test_effective_and_autosomal_sex_qc_metrics_all_contigs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bam_path = Path(tmpdir) / "sample.bam"
+            prefix = Path(tmpdir) / "sample"
+            header = {
+                "HD": {"VN": "1.6", "SO": "coordinate"},
+                "SQ": [
+                    {"SN": "chr1", "LN": 200},
+                    {"SN": "chrX", "LN": 200},
+                    {"SN": "chrM", "LN": 100},
+                ],
+            }
+            reads = [
+                _read("c1_k1", 0, 0, 60),
+                _read("cx_k1", 1, 0, 60),
+                _read("cm_k1", 2, 0, 60),
+            ]
+            _write_bam(bam_path, reads, header=header, index=True)
+            run(ConvertConfig(bam_path, prefix, bin_size=100, all_contigs=True))
+
+            table = read_sample_parquet(parquet_path(prefix))
+            metadata = decode_metadata(table.schema.metadata)
+            qc = metadata["qc"]
+
+            self.assertEqual(qc["reads_seen"], 3)
+            self.assertEqual(qc["reads_kept"], 3)
+            self.assertEqual(qc["effective_reads_examined"], 3)
+            self.assertEqual(qc["effective_reads_kept"], 3)
+            self.assertEqual(qc["autosomal_reads_kept"], 1)
+            self.assertEqual(qc["sex_reads_kept"], 1)
+            self.assertEqual(set(qc), set(QC_COUNTERS))
+
+
 class TestConvertPublishedCram(unittest.TestCase):
     def test_cli_converts_published_chr21_cram(self) -> None:
         cram = ensure_published_file(PUBLISHED_CRAM, PUBLISHED_CRAM_URL)
@@ -708,6 +827,9 @@ class TestConvertPublishedCram(unittest.TestCase):
             self.assertEqual(metadata["bin_size"], PUBLISHED_BIN_SIZE)
             self.assertEqual(metadata["source_identity"]["format"], "cram")
             self.assertEqual(metadata["qc"]["reads_kept"], 1_049_534)
+            self.assertEqual(metadata["qc"]["effective_reads_kept"], 1_049_534)
+            self.assertEqual(metadata["qc"]["autosomal_reads_kept"], 1_049_534)
+            self.assertEqual(metadata["qc"]["sex_reads_kept"], 0)
 
 
 def _read(

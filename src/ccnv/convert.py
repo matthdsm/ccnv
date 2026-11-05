@@ -30,6 +30,10 @@ QC_COUNTERS: Final[tuple[str, ...]] = (
     "header_no_coordinate",
     "reads_seen",
     "reads_kept",
+    "effective_reads_examined",
+    "effective_reads_kept",
+    "autosomal_reads_kept",
+    "sex_reads_kept",
     "filter_unmapped",
     "filter_no_start",
     "filter_secondary",
@@ -144,6 +148,13 @@ def select_layout(
     )
 
 
+def normalize_chr(name: str) -> str:
+    """Normalize a contig name by stripping any leading 'chr' prefix."""
+
+    bare = name[3:] if name.lower().startswith("chr") else name
+    return bare.upper() if bare.upper() in {"X", "Y"} else bare
+
+
 def is_canonical_contig(name: str) -> bool:
     """Report whether a contig is a canonical autosome or sex chromosome.
 
@@ -152,8 +163,8 @@ def is_canonical_contig(name: str) -> bool:
     are not canonical.
     """
 
-    bare = name[3:] if name[:3].lower() == "chr" else name
-    return (bare.isdigit() and 1 <= int(bare) <= 22) or bare.upper() in {"X", "Y"}
+    norm = normalize_chr(name)
+    return (norm.isdigit() and 1 <= int(norm) <= 22) or norm in {"X", "Y"}
 
 
 def bin_intervals(length: int, bin_size: int) -> tuple[np.ndarray, np.ndarray]:
@@ -472,6 +483,11 @@ def run(config: ConvertConfig) -> None:
             for task, (counts, contig_qc) in zip(tasks, results, strict=True):
                 for counter, value in contig_qc.items():
                     qc[counter] += value
+                norm = normalize_chr(task.name)
+                if norm in {"X", "Y"}:
+                    qc["sex_reads_kept"] += contig_qc["reads_kept"]
+                elif norm.isdigit():
+                    qc["autosomal_reads_kept"] += contig_qc["reads_kept"]
                 starts, ends = bin_intervals(task.length, config.bin_size)
                 logger.debug(
                     "binned contig %s (%d bp): %d bins, %d reads kept",
@@ -497,6 +513,9 @@ def run(config: ConvertConfig) -> None:
     finally:
         bam.close()
 
+    qc["effective_reads_examined"] = qc["reads_seen"]
+    qc["effective_reads_kept"] = qc["reads_kept"]
+
     logger.debug(
         "convert QC summary: %d reads examined, %d kept (%.1f%%), %d duplicate, "
         "%d low_mapq, %d unmapped",
@@ -506,6 +525,11 @@ def run(config: ConvertConfig) -> None:
         qc["filter_duplicate"],
         qc["filter_mapq"],
         qc["filter_unmapped"],
+    )
+    logger.debug(
+        "convert QC effective: %d autosomal kept, %d sex kept",
+        qc["autosomal_reads_kept"],
+        qc["sex_reads_kept"],
     )
 
     table = _sample_table(
