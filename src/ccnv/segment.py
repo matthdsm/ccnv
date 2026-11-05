@@ -59,7 +59,7 @@ class WeightedL2Cost(BaseCost):
 
     def fit(
         self, signal: ArrayLike, weights: ArrayLike | None = None
-    ) -> WeightedL2Cost:
+    ) -> "WeightedL2Cost":
         """Fit cumulative sums from values and optional non-negative weights."""
 
         array = np.asarray(signal, dtype=np.float64)

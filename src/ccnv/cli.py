@@ -131,7 +131,7 @@ def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
 def _is_sample_parquet(path: Path) -> bool:
     try:
         metadata = decode_metadata(pq.read_schema(path).metadata)
-    except OSError, TypeError, ValueError, SchemaError, pa.ArrowException:
+    except (OSError, TypeError, ValueError, SchemaError, pa.ArrowException):
         return False
     return metadata.get("artifact_kind") == ArtifactKind.SAMPLE.value
 
