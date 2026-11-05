@@ -2,9 +2,10 @@
 
 `ccnv` is an independent Python 3.12+ bioinformatics toolkit for copy-number variation (CNV) detection in shallow whole-genome sequencing (sWGS) data, inspired by the published statistical methodology of WISECONDOR (Straver et al., *Nucleic Acids Research*, 2014) and WisecondorX (Raman et al., *Nucleic Acids Research*, 2019).
 
-- **Versioned Parquet Storage (`1.0.0`)**: Sample bin counts and reference models are stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC and provenance metadata.
+- **Versioned Parquet Storage (`2.0.0`)**: Sample bin counts and reference models are stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC, provenance, and optional prenatal model metadata.
+- **Constitutional & Prenatal Analysis Modes**: Supports standard germline CNV profiling (`--mode germline`) as well as cell-free DNA (cfDNA) non-invasive prenatal screening (`--mode prenatal`) with pure NumPy/SciPy fetal fraction estimation (`FFY`, `FFX`, `PREFACE`), sex chromosome aneuploidy calling, and discordance filtering.
 - **Organism-Agnostic & 0-Based Half-Open Coordinates**: Contig names, order, and lengths are read directly from alignment or FASTA headers without assuming a fixed 24-chromosome layout. All intervals are 0-based half-open `[start, end)`.
-- **Pure-Python Execution**: Uses `pysam`, `pyBigWig`, `numpy`, `pyarrow`, `scikit-learn`, and weighted `ruptures` Binary Segmentation.
+- **Pure-Python Execution**: Uses `pysam`, `pyBigWig`, `numpy`, `scipy`, `pyarrow`, `scikit-learn`, and weighted `ruptures` Binary Segmentation without heavy ML container dependencies.
 
 ## System Overview
 
@@ -16,8 +17,8 @@ flowchart LR
         BAM["BAM / CRAM Alignment"] --> C["Sample Parquet (.ccnv)"]
     end
     subgraph S2["2. Reference"]
-        C --> REF["Reference Parquet (.ccnv)"]
-        FASTA["FASTA / GC / BigWig"] --> REF
+        SS["Samplesheet / FASTA"] --> REF["Reference Parquet (.ccnv)"]
+        GC["GC / Mappability Tracks"] --> REF
         REF --> QC["Reference QC (.json)"]
     end
     subgraph S3["3. Ref-QC"]
@@ -26,6 +27,7 @@ flowchart LR
     subgraph S4["4. Predict"]
         C --> P["Segment & Call"]
         REF --> P
+        P --> PQC["Predict QC (.json)"]
         P --> BED["BED Tables (.bed.gz)"]
         P --> VCF["VCFv4.2 (.vcf.gz)"]
         P --> HTML["Plotly Viewer (.html)"]
@@ -56,21 +58,35 @@ During prediction, the test sample is projected into PCA space to compute expect
 $$\mathcal{L}(\mathcal{T}) = \sum_{m=1}^{M+1} \mathrm{cost}(t_{m-1}, t_m) + \beta M, \quad \mathrm{cost}(s, e) = \sum_{i=s}^{e-1} w_i (y_i - \bar{y}_{w})^2$$
 where weights $w_i = \sigma_i^{-2}$, $y_i = \log_2(\text{depth}_i / \text{expected}_i)$, and $\bar{y}_w = \frac{\sum w_i y_i}{\sum w_i}$. Contiguous unmapped tracts exceeding $\Delta_{\text{max}}$ (default $2\,000\,000\text{ bp}$) enforce segment breaks across centromeres and assembly gaps. Segments are called as gains or losses when $|\bar{Z}| \ge Z_{\text{thresh}}$ (default 3.0) and $|\bar{y}_w| \ge r_{\text{thresh}}$ (default 0.2).
 
-## Subdirectories & System Boundaries
+#### 5. Prenatal Fetal Fraction Estimation & Sex Chromosome Analysis
+In `--mode prenatal`, `ccnv` integrates non-invasive prenatal analysis directly into reference building and prediction without heavy machine learning dependencies. During `reference`, a 5 kb `chrY` non-negative Lasso regression (`FFY`) is calibrated alongside a 20x coarsened 100 kb autosomal PCA, full-batch Resilient Backpropagation Sigmoid neural network / Ordinary Linear Model (`PREFACE`), and robust Huber M-estimation on `chrX` (`FFX`). During `predict`, `chrX` is normalized against the diploid `XX` (`female_sex`) reference branch, fetal sex and sex chromosome aneuploidies (`XX`, `XY`, `XO`, `XXX`, `XXY`, `XYY`, `DISCORDANT_MIXED`) are classified, and active fetal fraction is selected. Predicted CNV segments are evaluated against expected prenatal copy ratios $\log_2(1 \pm 0.5 \cdot \text{active\_ff})$, flagging sub-fetal noise, super-fetal maternal changes, or gonosome shifts with dedicated discordance highlighting and structured `<prefix>_qc.json` reporting.
 
-- `src`: [src/README.md](./src/README.md) - Root source directory containing the implementation packages for the pipeline, computational kernels, and template renderers.
+## Subdirectories & Key Modules
+
+- `src/ccnv/convert.py`: BAM/CRAM read ingestion, canonical contig binning, and effective target-contig read QC.
+- `src/ccnv/samplesheet.py`: Root-list YAML/JSON cohort samplesheet parsing and validation against `samplesheet.schema.json`.
+- `src/ccnv/reference.py`: Reference Parquet synthesis and cohort rebinning across germline and prenatal modes.
+- `src/ccnv/reference_compute.py`: Deterministic PCA, batched nearest-neighbor Euclidean distance search, and empirical null kernels.
+- `src/ccnv/reference_qc.py`: Reference model quality auditing emitting `<prefix>_qc.json`.
+- `src/ccnv/prenatal_math.py`: Pure NumPy and SciPy algorithms for 1D 2-GMM, FISTA non-negative Lasso (`FFY`), centered unscaled PCA, full-batch Rprop Sigmoid MLP / OLM (`PREFACE`), and Huber RLM (`FFX`).
+- `src/ccnv/prenatal.py`: Prenatal reference fitting, multi-resolution coarsening, single-sample prenatal inference, sex chromosome aneuploidy classification, and segment discordance annotation.
+- `src/ccnv/predict.py`: Sample projection, within-sample normalization, Ruptures segmentation, and event calling across germline and prenatal modes.
+- `src/ccnv/predict_qc.py`: Prediction QC payload assembly and `<prefix>_qc.json` generation.
+- `src/ccnv/report.py`: Bgzipped/tabix-indexed BED, VCFv4.2, and interactive Plotly HTML report generation (`_plot.html`).
+- `src/ccnv/schemas.py`: Versioned Arrow schemas (`2.0.0`) and coordinate validation.
 
 ## Global Invariants
 
-- Schema Version: All serialized `.ccnv` Parquet files strictly conform to Arrow schema version `1.0.0` and validate against `ccnv.schemas:validate_table`.
+- Schema Version: All serialized `.ccnv` Parquet files strictly conform to Arrow schema version `2.0.0` and validate against `ccnv.schemas:validate_table`.
 - Coordinate System: All intervals across memory representations, Parquet tables, and output BED/VCF files are 0-based half-open `[start, end)`.
 - Contig Authority: Contig names, order, and lengths from alignment headers or reference FASTA files are authoritative; arbitrary 24-chromosome layouts are forbidden.
 - Off-Contig Neighbor Separation: Reference bin neighbors must never be drawn from the same contig as the target bin ($d_{\text{intra-contig}} = \infty$).
 - Masked Bin Propagation: Bins flagged as masked during covariate or coverage filtering are propagated consistently through PCA projection and excluded from segmentation cost evaluation.
+- Diploid XX Gonosome Baseline: In prenatal mode, `chrX` normalization is always evaluated against the diploid `XX` (`female_sex`) reference branch to accurately capture fetal sex-chromosome dosage changes.
 
 ## Global Side Effects
 
-- Filesystem Persistence: Writes zstd-compressed Parquet tables (`.ccnv`), bgzipped and tabix-indexed BED tables (`.bed.gz`, `.tbi`), bgzipped VCF files (`.vcf.gz`, `.tbi`), and standalone HTML visualization files (`.html`).
+- Filesystem Persistence: Writes zstd-compressed Parquet tables (`.ccnv`), bgzipped and tabix-indexed BED tables (`.bed.gz`, `.tbi`), bgzipped VCF files (`.vcf.gz`, `.tbi`), quality metrics JSON (`<prefix>_qc.json` for both `reference` and `predict`), and standalone HTML visualization files (`.html`).
 - Alignment Indexing: Automatically generates missing BAM (`.bai`), CRAM (`.crai`), or FASTA (`.fai`) index files in place on the filesystem.
 - Process Concurrency: Spawns worker process pools (`ProcessPoolExecutor`) for parallel contig read binning, cohort rebinning, and batched nearest-neighbor Euclidean distance matrix computations.
 
@@ -101,22 +117,29 @@ docker run --rm ghcr.io/matthdsm/copynumber-cnv:latest --help
 # 1. Convert BAM or CRAM alignments into binned sample Parquet (.ccnv)
 ccnv convert sample.bam --prefix sample --bin-size 5000
 
-# 2a. Build a reference model from a cohort of control samples (with optional GC & mappability tracks)
-ccnv reference controls/ --prefix reference --bin-size 5000 --gc genome.fa --mappability mappability.bw
+# 2a. Build a germline reference model from a cohort samplesheet (with optional GC & mappability tracks)
+ccnv reference -s cohort.yaml --prefix reference --bin-size 5000 --gc genome.fa --mappability mappability.bw
 
-# 2b. Or build a flat uniform-depth reference from a FASTA when no controls are available
-ccnv reference genome.fa --prefix reference --bin-size 5000 --mappability mappability.bw
+# 2b. Or build a flat uniform-depth germline reference from a FASTA when no controls are available
+ccnv reference --fasta genome.fa --prefix reference --bin-size 5000 --mappability mappability.bw
+
+# 2c. Or build a unified prenatal reference from a maternal cfDNA cohort samplesheet
+ccnv reference -s cohort.yaml --mode prenatal --prefix prenatal_ref --bin-size 5000
 
 # 3. Inspect reference quality control metrics
 ccnv ref-qc reference.ccnv
 
-# 4. Normalize, segment, and call copy-number gains and losses
+# 4a. Predict copy-number gains and losses in constitutional/germline mode
 ccnv predict sample.ccnv reference.ccnv --prefix results/sample
+
+# 4b. Or run prenatal prediction with fetal fraction estimation and sex chromosome analysis
+ccnv predict sample.ccnv prenatal_ref.ccnv --mode prenatal --prefix results/sample_prenatal
 ```
 
-- `convert` writes `<prefix>.ccnv` (automatically indexing BAM/CRAM files when needed; CRAM inputs also require `--fasta`).
-- `reference` writes `<prefix>.ccnv` and `<prefix>_qc.json` (rebinning input samples in memory when bin sizes differ and contig lengths match).
-- `predict` writes bgzipped and tabix-indexed BED and VCFv4.2 tables (`_bins`, `_segments`, and `_calls`) plus an interactive genome-wide `<prefix>_plot.html`.
+- `convert` writes `<prefix>.ccnv` (automatically indexing BAM/CRAM files when needed; CRAM inputs also require `--fasta`). Metadata records effective read counts and filter drops on target contigs.
+- `reference` writes `<prefix>.ccnv` and `<prefix>_qc.json` from a cohort samplesheet (`-s/--samplesheet`) or flat FASTA (`--fasta`). In `--mode prenatal`, it fits multi-resolution `FFY`, `PREFACE`, and `FFX` models alongside 5 kb CNV branches.
+- `ref-qc` audits `<prefix>.ccnv` and outputs `<prefix>_qc.json` with a usability verdict (`PASS`, `WARN`, `FAIL`).
+- `predict` writes bgzipped and tabix-indexed BED and VCFv4.2 tables (`_bins`, `_segments`, `_calls`), an interactive genome viewer (`<prefix>_plot.html`), and a run quality metrics report (`<prefix>_qc.json`). In `--mode prenatal`, segments include prenatal scaling and discordance tags, the viewer highlights discordant calls in high contrast, and `_qc.json` details fetal fraction and aneuploidy calls.
 
 ## Documentation
 
