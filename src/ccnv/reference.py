@@ -466,7 +466,13 @@ def build_reference_table(
         )
         sex_source = "prenatal_model"
         signal = _resolve_sex_signal(cohort, config)
-        inference = None
+        inference = SexInference(
+            labels=sexes,
+            cutoff=float(prenatal_meta.yfrac_threshold),
+            fractions=(),
+            passed=True,
+            reason="prenatal_model",
+        )
     else:
         sexes, sex_source, inference, signal = _resolve_sexes(
             cohort, config, sex_contigs

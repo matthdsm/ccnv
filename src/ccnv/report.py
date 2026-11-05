@@ -623,12 +623,24 @@ def _build_vcf_header(
                 'Description="Reason for discordance flag">'
             )
             header.add_line(
+                "##INFO=<ID=DISCREASON,Number=1,Type=String,"
+                'Description="Reason for discordance flag (alias for DISC_REASON)">'
+            )
+            header.add_line(
                 "##FORMAT=<ID=EXP_LOG2R,Number=1,Type=Float,"
                 'Description="Expected log2 ratio based on active fetal fraction">'
             )
             header.add_line(
+                "##FORMAT=<ID=EXPRATIO,Number=1,Type=Float,"
+                'Description="Expected ratio (alias for EXP_LOG2R)">'
+            )
+            header.add_line(
                 "##FORMAT=<ID=IMPLIED_FF,Number=1,Type=Float,"
                 'Description="Implied fetal fraction based on segment ratio">'
+            )
+            header.add_line(
+                "##FORMAT=<ID=IMPFF,Number=1,Type=Float,"
+                'Description="Implied fetal fraction (alias for IMPLIED_FF)">'
             )
 
     header.add_sample(sample_name)

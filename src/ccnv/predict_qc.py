@@ -107,6 +107,7 @@ def build_predict_qc_payload(
             "fetal_sex": prenatal_result.fetal_sex,
             "active_ff": float(prenatal_result.active_ff),
             "active_ff_source": prenatal_result.active_ff_source,
+            "active_method": prenatal_result.active_ff_source,
             "ffy": (
                 float(prenatal_result.ffy) if prenatal_result.ffy is not None else None
             ),
@@ -121,6 +122,7 @@ def build_predict_qc_payload(
             "chrx_ratio": float(prenatal_result.chrx_ratio),
             "chry_score": float(prenatal_result.chry_score),
             "yfrac_threshold": float(prenatal_result.yfrac_threshold),
+            "discordant_segments_count": discordant_segments,
             "sca": {
                 "call": prenatal_result.sca.call,
                 "is_aneuploid": bool(prenatal_result.sca.is_aneuploid),

@@ -76,6 +76,8 @@ class AnalysisMode(StrEnum):
 
     germline = "germline"
     prenatal = "prenatal"
+    GERMLINE = "germline"
+    PRENATAL = "prenatal"
 
 
 def configure_logging(level: LogLevel) -> None:

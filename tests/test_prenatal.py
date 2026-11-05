@@ -2,21 +2,48 @@
 
 from __future__ import annotations
 
+import gzip
+import json
 import math
+import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
+import pysam
+import yaml
 
+from ccnv.cli import AnalysisMode
 from ccnv.convert import bin_intervals
-from ccnv.models import ReadFilters, SamplesheetEntry
+from ccnv.models import (
+    PredictConfig,
+    ReadFilters,
+    ReferenceConfig,
+    SamplesheetEntry,
+    parquet_path,
+)
+from ccnv.predict import PredictError
+from ccnv.predict import run as run_predict
 from ccnv.prenatal import (
     annotate_prenatal_segments,
     classify_sca,
     fit_prenatal_models,
     predict_prenatal,
+)
+from ccnv.reference import (
+    BRANCH_AUTOSOMAL,
+    BRANCH_FEMALE_SEX,
+    BRANCH_MALE_SEX,
+)
+from ccnv.reference import (
+    run as run_reference,
+)
+from ccnv.report import (
+    PRENATAL_SEGMENTS_BED_HEADER,
+    SEGMENTS_BED_HEADER,
 )
 from ccnv.results import (
     FetalFractionResult,
@@ -41,6 +68,7 @@ def _build_synthetic_sample(
     sample_id: str = "sample",
     noise_scale: float = 0.5,
     seed: int = 42,
+    cnv_region: tuple[str, int, int, float] | None = None,
 ) -> pa.Table:
     """Create a synthetic 5 kb sample table conforming to SAMPLE_SCHEMA."""
     rng = np.random.default_rng(seed)
@@ -52,8 +80,13 @@ def _build_synthetic_sample(
     for contig, length in contig_lengths.items():
         starts, ends = bin_intervals(length, bin_size)
         mean_c = contig_mean_counts.get(contig, 100.0)
+        base = np.full(starts.size, mean_c, dtype=np.float64)
+        if cnv_region is not None and cnv_region[0] == contig:
+            _, c_start, c_end, mult = cnv_region
+            mask = (starts >= c_start) & (ends <= c_end)
+            base[mask] *= mult
         noise = rng.normal(loc=0.0, scale=noise_scale, size=starts.size)
-        raw_c = np.clip(np.round(mean_c + noise), 0, None).astype(np.uint64)
+        raw_c = np.clip(np.round(base + noise), 0, None).astype(np.uint64)
 
         contig_list.extend([contig] * starts.size)
         starts_list.extend(starts.tolist())
@@ -67,7 +100,12 @@ def _build_synthetic_sample(
             "bin_size": bin_size,
             "source_identity": {"id": sample_id},
             "reference_identity": {"name": "test_ref"},
-            "qc": {},
+            "qc": {
+                "effective_reads_examined": 1000,
+                "effective_reads_kept": 800,
+                "autosomal_reads_kept": 760,
+                "sex_reads_kept": 40,
+            },
             "filters": asdict(ReadFilters()),
         },
     )
@@ -587,6 +625,257 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         res = annotate_prenatal_segments([seg], ff_active, z_threshold=3.0)
         self.assertTrue(res[0].discordant)
         self.assertEqual(res[0].discordance_reason, "SUB_FETAL_RATIO")
+
+
+def _setup_synthetic_cohort_and_references(
+    root: Path,
+    contig_lengths: dict[str, int],
+) -> tuple[Path, Path, Path]:
+    sample_dir = root / "cohort"
+    sample_dir.mkdir()
+    entries_data = []
+
+    for i in range(6):
+        is_male = i >= 3
+        ff = 0.08 + 0.02 * (i - 3) if is_male else None
+        counts = {
+            "chr1": 100.0,
+            "chr2": 100.0,
+            "chrX": 100.0 * (1.0 - 0.5 * (ff or 0.0)),
+            "chrY": 100.0 * (0.5 * (ff or 0.0)) if is_male else 0.5,
+        }
+        s_tbl = _build_synthetic_sample(
+            contig_lengths,
+            counts,
+            bin_size=5000,
+            sample_id=f"cohort_{i}",
+            noise_scale=0.1,
+            seed=200 + i,
+        )
+        s_path = sample_dir / f"cohort_{i}.ccnv"
+        pq.write_table(s_tbl, s_path)
+        entries_data.append(
+            {
+                "filepath": str(s_path),
+                "sex": "M" if is_male else "F",
+                "ff": ff,
+            }
+        )
+
+    sheet_path = root / "samplesheet.yaml"
+    with open(sheet_path, "w", encoding="utf-8") as f:
+        yaml.dump(entries_data, f)
+
+    prenatal_prefix = root / "prenatal_ref"
+    run_reference(
+        ReferenceConfig(
+            samplesheet_path=sheet_path,
+            prefix=prenatal_prefix,
+            mode="prenatal",
+            bin_size=5000,
+            prenatal_bin_size=100000,
+            min_cohort_size=4,
+            min_sex_group_size=2,
+            nearest_bins=5,
+            pca_components=2,
+            qc_report=False,
+        )
+    )
+
+    germline_prefix = root / "germline_ref"
+    run_reference(
+        ReferenceConfig(
+            samplesheet_path=sheet_path,
+            prefix=germline_prefix,
+            mode="germline",
+            bin_size=5000,
+            min_cohort_size=4,
+            min_sex_group_size=2,
+            nearest_bins=5,
+            pca_components=2,
+            qc_report=False,
+        )
+    )
+
+    test_counts = {
+        "chr1": 100.0,
+        "chr2": 100.0,
+        "chrX": 130.625,
+        "chrY": 6.875,
+    }
+    test_sample_tbl = _build_synthetic_sample(
+        contig_lengths,
+        test_counts,
+        bin_size=5000,
+        sample_id="test_male_sample",
+        noise_scale=0.1,
+        seed=999,
+        cnv_region=("chr1", 100_000, 200_000, 2.5),
+    )
+    test_sample_path = root / "test_male_sample.ccnv"
+    pq.write_table(test_sample_tbl, test_sample_path)
+
+    return (
+        parquet_path(prenatal_prefix),
+        parquet_path(germline_prefix),
+        test_sample_path,
+    )
+
+
+class TestPrenatalEndToEndIntegration(unittest.TestCase):
+    def setUp(self) -> None:
+        self.contig_lengths = {
+            "chr1": 200_000,
+            "chr2": 200_000,
+            "chrX": 200_000,
+            "chrY": 300_000,
+        }
+
+    def test_prenatal_pipeline_deliverables(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            prenatal_ref, _, test_sample = _setup_synthetic_cohort_and_references(
+                root, self.contig_lengths
+            )
+
+            # Validate reference branches
+            ref_table = pq.read_table(prenatal_ref)
+            branches = set(ref_table.column("branch").unique().to_pylist())
+            for branch in (
+                BRANCH_AUTOSOMAL,
+                BRANCH_FEMALE_SEX,
+                BRANCH_MALE_SEX,
+                BRANCH_PRENATAL_AUTOSOMAL,
+                BRANCH_PRENATAL_FFY,
+            ):
+                self.assertIn(branch, branches)
+
+            pred_prefix = root / "predict_out"
+            outputs = run_predict(
+                PredictConfig(
+                    sample=test_sample,
+                    reference=prenatal_ref,
+                    prefix=pred_prefix,
+                    mode=AnalysisMode.PRENATAL,
+                    plot=True,
+                    vcf=True,
+                    penalty=0.5,
+                    min_reference_bins=1,
+                    z_threshold=1.5,
+                )
+            )
+
+            # 1. Assert <prefix>_qc.json
+            self.assertIsNotNone(outputs.qc_json_path)
+            self.assertTrue(outputs.qc_json_path.is_file())
+            with open(outputs.qc_json_path, encoding="utf-8") as f:
+                qc = json.load(f)
+            self.assertEqual(qc["mode"], "prenatal")
+            self.assertIn("prenatal", qc)
+            p_qc = qc["prenatal"]
+            self.assertIsNotNone(p_qc)
+            for key in (
+                "fetal_sex",
+                "active_ff",
+                "active_method",
+                "sca",
+                "ffy",
+                "preface",
+                "ffx",
+                "discordant_segments_count",
+            ):
+                self.assertIn(key, p_qc)
+            self.assertEqual(p_qc["fetal_sex"], "M")
+            self.assertGreater(p_qc["active_ff"], 0.0)
+            self.assertEqual(p_qc["active_method"], "FFY")
+            self.assertGreaterEqual(p_qc["discordant_segments_count"], 1)
+
+            # 2. Assert <prefix>_segments.bed.gz (12 columns with #contig header)
+            self.assertTrue(outputs.segments_bed.is_file())
+            with gzip.open(outputs.segments_bed, "rt") as f:
+                bed_lines = [
+                    line.rstrip("\r\n").split("\t") for line in f if line.strip()
+                ]
+            self.assertGreater(len(bed_lines), 1)
+            self.assertEqual(tuple(bed_lines[0]), PRENATAL_SEGMENTS_BED_HEADER)
+            self.assertEqual(len(bed_lines[0]), 12)
+            for expected_col in (
+                "expected_ratio",
+                "implied_ff",
+                "discordant",
+                "discordance_reason",
+            ):
+                self.assertIn(expected_col, bed_lines[0])
+            for row in bed_lines[1:]:
+                self.assertEqual(len(row), 12)
+            disc_rows = [r for r in bed_lines[1:] if r[10] == "true"]
+            self.assertGreaterEqual(len(disc_rows), 1)
+            disc_reasons = {r[11] for r in disc_rows}
+            self.assertIn("SUPER_FETAL_RATIO", disc_reasons)
+
+            # 3. Assert <prefix>_segments.vcf.gz (VCF headers for prenatal tags)
+            self.assertIsNotNone(outputs.segments_vcf)
+            self.assertTrue(outputs.segments_vcf.is_file())
+            with pysam.VariantFile(str(outputs.segments_vcf)) as vf:
+                vcf_header_text = str(vf.header)
+                for tag in ("EXPRATIO", "IMPFF", "DISCORDANT", "DISCREASON"):
+                    self.assertIn(f"ID={tag}", vcf_header_text)
+                records = list(vf.fetch("chr1"))
+                self.assertTrue(any(rec.info.get("DISCORDANT") for rec in records))
+
+            # 4. Assert <prefix>_plot.html (status badge and discordant traces)
+            plot_path = Path(f"{pred_prefix}_plot.html")
+            self.assertTrue(plot_path.is_file())
+            html_text = plot_path.read_text(encoding="utf-8")
+            self.assertIn('id="prenatal-badge"', html_text)
+            self.assertIn("Fetal Sex:", html_text)
+            self.assertIn("Active FF:", html_text)
+            self.assertIn("#9333ea", html_text)
+            self.assertIn("Discordant", html_text)
+
+    def test_mode_guardrail_prenatal_mode_on_germline_reference_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _, germline_ref, test_sample = _setup_synthetic_cohort_and_references(
+                root, self.contig_lengths
+            )
+            with self.assertRaises(PredictError) as cm:
+                run_predict(
+                    PredictConfig(
+                        sample=test_sample,
+                        reference=germline_ref,
+                        prefix=root / "out",
+                        mode=AnalysisMode.PRENATAL,
+                    )
+                )
+            self.assertIn(
+                "reference was built in germline mode and lacks prenatal models",
+                str(cm.exception),
+            )
+
+    def test_mode_guardrail_germline_mode_on_prenatal_reference_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            prenatal_ref, _, test_sample = _setup_synthetic_cohort_and_references(
+                root, self.contig_lengths
+            )
+            outputs = run_predict(
+                PredictConfig(
+                    sample=test_sample,
+                    reference=prenatal_ref,
+                    prefix=root / "out",
+                    mode=AnalysisMode.GERMLINE,
+                    plot=False,
+                )
+            )
+            self.assertTrue(outputs.bins_bed.is_file())
+            self.assertTrue(outputs.segments_bed.is_file())
+            self.assertIsNone(outputs.prenatal_result)
+
+            with gzip.open(outputs.segments_bed, "rt") as f:
+                header = f.readline().rstrip("\r\n").split("\t")
+            self.assertEqual(tuple(header), SEGMENTS_BED_HEADER)
+            self.assertEqual(len(header), 8)
 
 
 if __name__ == "__main__":
