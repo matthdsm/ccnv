@@ -22,12 +22,14 @@ classifiers = [
 ]
 dependencies = [
     "jinja2",
+    "jsonschema>=4.20.0",
     "numpy",
     "polars",
     "polars-runtime-compat",
     "pyarrow",
     "pybigwig",
     "pysam",
+    "pyyaml>=6.0",
     "ruptures",
     "scikit-learn",
     "scipy",
@@ -41,6 +43,7 @@ ccnv = "ccnv.cli:app"
 where = ["src"]
 
 [tool.setuptools.package-data]
+"ccnv" = ["*.json"]
 "ccnv.templates" = ["*.html.j2"]
 
 [tool.pixi.workspace]
@@ -62,6 +65,8 @@ scipy = "*"
 typer = "*"
 jinja2 = ">=3.1.6,<4"
 gcc = ">=16.2.0,<16.3"
+pyyaml = ">=6.0"
+jsonschema = ">=4.20.0"
 
 [tool.pixi.pypi-dependencies]
 ccnv = { path = ".", editable = true }
