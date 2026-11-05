@@ -512,6 +512,82 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         self.assertIsNone(res[0].discordance_reason)
         self.assertEqual(res[0].expected_ratio, 0.0)
 
+    def test_predict_prenatal_autosomal_coordinate_fallback_with_extra_contigs(
+        self,
+    ) -> None:
+        auto_tbl, ffy_tbl, meta, _ = fit_prenatal_models(
+            self.sample_tables, self.entries, 5000, 100000
+        )
+        ref_table = pa.concat_tables([auto_tbl, ffy_tbl])
+
+        # Extra contigs (chr13, chr18, chr21) present in sample
+        # but not in prenatal_autosomal reference
+        sample_lengths = {
+            "chr1": 200_000,
+            "chr2": 200_000,
+            "chr13": 200_000,
+            "chr18": 200_000,
+            "chr21": 200_000,
+            "chrX": 200_000,
+            "chrY": 300_000,
+        }
+        counts = {
+            "chr1": 100.0,
+            "chr2": 100.0,
+            "chr13": 100.0,
+            "chr18": 100.0,
+            "chr21": 100.0,
+            "chrX": 95.0,
+            "chrY": 5.0,
+        }
+        sample_with_extra = _build_synthetic_sample(
+            sample_lengths, counts, bin_size=5000, sample_id="sample_extra"
+        )
+
+        res = predict_prenatal(sample_with_extra, ref_table, meta)
+        self.assertEqual(res.fetal_sex, "M")
+        self.assertIsNotNone(res.ffy)
+        self.assertGreater(res.active_ff, 0.0)
+
+    def test_predict_prenatal_chry_coordinate_fallback_with_mismatched_bins(
+        self,
+    ) -> None:
+        auto_tbl, ffy_tbl, meta, _ = fit_prenatal_models(
+            self.sample_tables, self.entries, 5000, 100000
+        )
+        ref_table = pa.concat_tables([auto_tbl, ffy_tbl])
+
+        # Fewer chrY bins (200 kb vs reference 300 kb)
+        sample_lengths = {
+            "chr1": 200_000,
+            "chr2": 200_000,
+            "chrX": 200_000,
+            "chrY": 200_000,
+        }
+        counts = {
+            "chr1": 100.0,
+            "chr2": 100.0,
+            "chrX": 95.0,
+            "chrY": 5.0,
+        }
+        sample_short_chry = _build_synthetic_sample(
+            sample_lengths, counts, bin_size=5000, sample_id="sample_short_chry"
+        )
+
+        res = predict_prenatal(sample_short_chry, ref_table, meta)
+        self.assertEqual(res.fetal_sex, "M")
+        self.assertIsNotNone(res.ffy)
+
+    def test_annotate_prenatal_segments_z_threshold_without_call(self) -> None:
+        sca = SCAResult("XX", False, 0.9, 0.0)
+        ff_active = FetalFractionResult(
+            "F", 0.10, "PREFACE", None, None, 0.10, 1.0, 0.001, 0.005, sca
+        )
+        seg = SegmentResult("chr1", 0, 1000, 0.01, 3.5, 1.0, 5, None)
+        res = annotate_prenatal_segments([seg], ff_active, z_threshold=3.0)
+        self.assertTrue(res[0].discordant)
+        self.assertEqual(res[0].discordance_reason, "SUB_FETAL_RATIO")
+
 
 if __name__ == "__main__":
     unittest.main()

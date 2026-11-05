@@ -631,7 +631,11 @@ def predict_prenatal(
                 )
                 ref_idx = ref_chry_coords.get(key)
                 if ref_idx is not None:
-                    raw_ffy += float(y_norm[ref_idx] * weights[ref_idx])
+                    sample_w_val = sample_w[idx]
+                    raw_ffy += float(
+                        (sample_counts[idx] / (r_auto_5k * sample_w_val))
+                        * weights[ref_idx]
+                    )
 
         ffy_computed = float(
             prenatal_meta.ffy_intercept + prenatal_meta.ffy_slope * raw_ffy
@@ -703,8 +707,10 @@ def predict_prenatal(
             )
         ):
             idx = sample_100k_coords.get((normalize_chr(str(rc)), int(rs), int(re)))
-            if idx is not None and exp_counts[idx] > 0 and counts_100k[idx] > 0:
-                aligned_ratios[j] = math.log2(counts_100k[idx] / exp_counts[idx])
+            if idx is not None:
+                exp_count = r_auto_100k * w_100k[idx]
+                if exp_count > 0 and counts_100k[idx] > 0:
+                    aligned_ratios[j] = math.log2(counts_100k[idx] / exp_count)
         log2_ratios = aligned_ratios
 
     imputed = np.where(np.isnan(log2_ratios), ref_null_mean, log2_ratios)
@@ -812,7 +818,7 @@ def annotate_prenatal_segments(
 
         norm_contig = normalize_chr(seg.contig)
         is_gonosome = norm_contig in {"X", "Y"}
-        has_call = seg.call is not None
+        has_call = (seg.call is not None) or (abs(seg.zscore) >= z_threshold)
 
         discordant = False
         reason: str | None = None
