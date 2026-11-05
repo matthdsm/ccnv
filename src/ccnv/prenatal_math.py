@@ -85,7 +85,7 @@ def infer_sex_gmm_1d(
 
     f_low = _posterior_diff(mu_low)
     f_high = _posterior_diff(mu_high)
-    if f_low * f_high < 0.0:
+    if f_low * f_high <= 0.0:
         thresh = float(scipy.optimize.brentq(_posterior_diff, mu_low, mu_high))
     else:
         thresh = 0.5 * (mu_low + mu_high)
@@ -344,9 +344,12 @@ def rlm_huber(
         tol=tol,
         alpha=0.0,
     )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
-        model.fit(xv.reshape(-1, 1), yv)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ConvergenceWarning)
+            model.fit(xv.reshape(-1, 1), yv)
+    except ValueError:
+        return ols_fit(xv, yv)
     intercept = float(model.intercept_)
     slope = float(model.coef_[0])
     if math.isfinite(intercept) and math.isfinite(slope):

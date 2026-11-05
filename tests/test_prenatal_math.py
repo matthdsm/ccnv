@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import unittest.mock
 
 import numpy as np
 import scipy.special
@@ -336,3 +337,15 @@ class TestRLMHuber(unittest.TestCase):
         intercept, slope = rlm_huber(x, y)
         self.assertAlmostEqual(intercept, 1.5, delta=0.1)
         self.assertAlmostEqual(slope, -0.5, delta=0.05)
+
+    def test_rlm_huber_fallback_on_value_error(self) -> None:
+        x = np.array([1.0, 2.0, 3.0, 4.0])
+        y = np.array([2.0, 4.0, 6.0, 8.0])
+        with unittest.mock.patch(
+            "ccnv.prenatal_math.HuberRegressor.fit",
+            side_effect=ValueError("convergence failed"),
+        ):
+            intercept, slope = rlm_huber(x, y)
+        o_intercept, o_slope = ols_fit(x, y)
+        self.assertAlmostEqual(intercept, o_intercept, places=9)
+        self.assertAlmostEqual(slope, o_slope, places=9)
