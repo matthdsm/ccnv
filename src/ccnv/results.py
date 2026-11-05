@@ -8,6 +8,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 CallType = Literal["gain", "loss"]
+SCACall = Literal["XX", "XY", "XO", "XXX", "XXY", "XYY", "DISCORDANT_MIXED"]
+FetalSex = Literal["M", "F"]
+ActiveFFSource = Literal["FFY", "PREFACE"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +40,54 @@ class SegmentResult:
     weight: float
     bin_count: int
     call: CallType | None
+    expected_ratio: float | None = None
+    implied_ff: float | None = None
+    discordant: bool = False
+    discordance_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SCAResult:
+    """Sex Chromosome Aneuploidy (SCA) classification result."""
+
+    call: SCACall
+    is_aneuploid: bool
+    confidence: float
+    chrx_zscore: float
+    ff_delta: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.call not in ("XX", "XY", "XO", "XXX", "XXY", "XYY", "DISCORDANT_MIXED"):
+            raise ValueError(f"invalid SCA call: {self.call!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class FetalFractionResult:
+    """Prenatal fetal fraction and sex chromosome analysis results."""
+
+    fetal_sex: FetalSex
+    active_ff: float
+    active_ff_source: ActiveFFSource
+    ffy: float | None
+    ffx: float | None
+    preface: float | None
+    chrx_ratio: float
+    chry_score: float
+    yfrac_threshold: float
+    sca: SCAResult
+    low_ff_warning: bool = False
+    warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.fetal_sex not in ("M", "F"):
+            raise ValueError(f"fetal_sex must be 'M' or 'F', got {self.fetal_sex!r}")
+        if self.active_ff_source not in ("FFY", "PREFACE"):
+            raise ValueError(
+                f"active_ff_source must be 'FFY' or 'PREFACE', "
+                f"got {self.active_ff_source!r}"
+            )
+        if not isinstance(self.warnings, tuple):
+            object.__setattr__(self, "warnings", tuple(self.warnings))
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +103,12 @@ class PredictionOutputs:
     calls_vcf: Path | None
     bins: tuple[BinResult, ...]
     segments: tuple[SegmentResult, ...]
+    qc_json_path: Path | None = None
+    prenatal_result: FetalFractionResult | None = None
+
+
+PredictResult = PredictionOutputs
+PredictOutputPaths = PredictionOutputs
 
 
 @dataclass(frozen=True, slots=True)

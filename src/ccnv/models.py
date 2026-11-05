@@ -6,12 +6,32 @@ from typing import Final, Literal
 
 DEFAULT_BIN_SIZE: Final[int] = 5000
 DEFAULT_MIN_MAPPABILITY: Final[float] = 0.5
+AnalysisMode = Literal["germline", "prenatal"]
 
 
 def parquet_path(prefix: Path) -> Path:
     """Canonical sample or reference Parquet path for a CLI prefix."""
 
     return Path(f"{prefix}.ccnv")
+
+
+@dataclass(frozen=True, slots=True)
+class SamplesheetEntry:
+    """One entry in a cohort reference samplesheet."""
+
+    filepath: Path
+    sex: Literal["M", "F"] | None = None
+    ff: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.filepath, Path):
+            object.__setattr__(self, "filepath", Path(self.filepath))
+        if self.sex is not None and self.sex not in ("M", "F"):
+            raise ValueError(f"sex must be 'M' or 'F', got {self.sex!r}")
+        if self.ff is not None and not (0.0 <= self.ff <= 1.0):
+            raise ValueError(
+                f"fetal fraction ff must be between 0.0 and 1.0, got {self.ff}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,8 +109,8 @@ class ConvertConfig:
 
 @dataclass(frozen=True, slots=True)
 class ReferenceConfig:
-    samples: tuple[Path, ...]
-    prefix: Path
+    samples: tuple[Path, ...] = ()
+    prefix: Path = Path()
     autosomal_contigs: tuple[str, ...] | None = None
     sex_contigs: tuple[str, ...] | None = None
     sex_signal_contig: str | None = None
@@ -108,10 +128,42 @@ class ReferenceConfig:
     mappability: Path | None = None
     gc: Path | None = None
     min_mappability: float = DEFAULT_MIN_MAPPABILITY
+    samplesheet_path: Path | None = None
+    entries: tuple[SamplesheetEntry, ...] = ()
+    input_paths: tuple[Path, ...] = ()
+    mode: AnalysisMode = "germline"
+    prenatal_bin_size: int = 100000
 
     def __post_init__(self) -> None:
+        if isinstance(self.samples, (Path, str)):
+            object.__setattr__(self, "prefix", Path(self.samples))
+            object.__setattr__(self, "samples", ())
+
         if self.threads <= 0:
             raise ValueError("threads must be a positive integer")
+        if self.prenatal_bin_size <= 0:
+            raise ValueError("prenatal_bin_size must be a positive integer")
+        if self.mode not in ("germline", "prenatal"):
+            raise ValueError(
+                f"mode must be 'germline' or 'prenatal', got {self.mode!r}"
+            )
+
+        # Keep samples, input_paths, and entries synchronized for backward compatibility
+        if not self.samples and self.input_paths:
+            object.__setattr__(self, "samples", self.input_paths)
+        elif not self.input_paths and self.samples:
+            object.__setattr__(self, "input_paths", self.samples)
+
+        if not self.entries and self.samples:
+            object.__setattr__(
+                self,
+                "entries",
+                tuple(SamplesheetEntry(filepath=path) for path in self.samples),
+            )
+        elif not self.samples and self.entries:
+            paths = tuple(entry.filepath for entry in self.entries)
+            object.__setattr__(self, "samples", paths)
+            object.__setattr__(self, "input_paths", paths)
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,3 +201,13 @@ class PredictConfig:
     mappability: Path | None = None
     gc: Path | None = None
     min_mappability: float = DEFAULT_MIN_MAPPABILITY
+    mode: AnalysisMode = "germline"
+    min_fetal_fraction_warning: float = 0.04
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("germline", "prenatal"):
+            raise ValueError(
+                f"mode must be 'germline' or 'prenatal', got {self.mode!r}"
+            )
+        if not (0.0 <= self.min_fetal_fraction_warning <= 1.0):
+            raise ValueError("min_fetal_fraction_warning must be between 0.0 and 1.0")
