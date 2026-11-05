@@ -97,6 +97,13 @@ class TestFitLassoFISTA(unittest.TestCase):
         self.assertEqual(weights.shape, (5,))
         np.testing.assert_array_equal(weights, 0.0)
 
+    def test_fit_lasso_fista_all_zero_target_no_warning(self) -> None:
+        rng = np.random.default_rng(42)
+        x = rng.uniform(0.0, 1.0, size=(20, 10))
+        y = np.zeros(20, dtype=np.float64)
+        w = fit_lasso_fista(x, y, alpha=1e-4)
+        np.testing.assert_allclose(w, 0.0, atol=1e-12)
+
 
 class TestPCAIrlbaNumpy(unittest.TestCase):
     def test_orthogonality_and_centering_svd_branch(self) -> None:
@@ -158,6 +165,16 @@ class TestPCAIrlbaNumpy(unittest.TestCase):
         self.assertEqual(scores.shape, (5, 8))
         self.assertEqual(rotation.shape, (10, 8))
         np.testing.assert_allclose(center, np.mean(x, axis=0), atol=1e-12)
+
+    def test_pca_irlba_numpy_all_nan_column_imputed_to_zero(self) -> None:
+        rng = np.random.default_rng(42)
+        x = rng.normal(size=(15, 8))
+        x[:, 3] = np.nan
+        scores, center, rotation = pca_irlba_numpy(x, n_components=3, seed=42)
+        self.assertEqual(scores.shape, (15, 3))
+        self.assertEqual(center[3], 0.0)
+        self.assertTrue(np.all(np.isfinite(scores)))
+        self.assertTrue(np.all(np.isfinite(rotation)))
 
 
 class TestFitRpropMLP(unittest.TestCase):
@@ -311,3 +328,11 @@ class TestRLMHuber(unittest.TestCase):
         o_intercept, o_slope = ols_fit(x, y)
         self.assertAlmostEqual(h_intercept, o_intercept, places=5)
         self.assertAlmostEqual(h_slope, o_slope, places=5)
+
+    def test_rlm_huber_matches_sklearn_huber_on_clean_and_outlier_data(self) -> None:
+        x = np.linspace(0.0, 10.0, 50)
+        y = 1.5 - 0.5 * x
+        y[0] = 50.0
+        intercept, slope = rlm_huber(x, y)
+        self.assertAlmostEqual(intercept, 1.5, delta=0.1)
+        self.assertAlmostEqual(slope, -0.5, delta=0.05)

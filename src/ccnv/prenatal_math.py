@@ -1,23 +1,21 @@
-"""Pure NumPy and SciPy numerical kernels for prenatal copy number analysis."""
+"""NumPy, SciPy, and scikit-learn numerical kernels for prenatal analysis."""
 
 from __future__ import annotations
 
 import math
-from typing import Final
+import warnings
 
 import numpy as np
-import scipy.linalg
 import scipy.optimize
-import scipy.sparse.linalg
 import scipy.special
+import scipy.stats
 from numpy.typing import NDArray
-
-_RPROP_ETA_PLUS: Final[float] = 1.2
-_RPROP_ETA_MINUS: Final[float] = 0.5
-_RPROP_DELTA_0: Final[float] = 0.01
-_RPROP_DELTA_MIN: Final[float] = 1e-6
-_RPROP_DELTA_MAX: Final[float] = 50.0
-_HUBER_SCALE_FACTOR: Final[float] = 1.4826
+from sklearn.decomposition import PCA
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import HuberRegressor, Lasso, LinearRegression
+from sklearn.mixture import GaussianMixture
+from sklearn.utils.extmath import svd_flip
 
 __all__ = [
     "fit_lasso_fista",
@@ -36,10 +34,9 @@ def infer_sex_gmm_1d(
 ) -> tuple[NDArray[np.bool_], float]:
     """Fit a 2-component 1D Gaussian Mixture Model on chrY read fractions.
 
-    Uses deterministic quantile initialization (25th and 75th percentiles) and
-    expectation-maximization updates with variance regularization, returning
-    boolean is_male classifications and the posterior probability P = 0.5 decision
-    threshold.
+    Uses deterministic quantile initialization (25th and 75th percentiles) with
+    scikit-learn GaussianMixture and brentq root-finding for the P = 0.5
+    posterior decision threshold.
     """
     y = np.asarray(yfracs, dtype=np.float64).ravel()
     n = y.size
@@ -50,107 +47,50 @@ def infer_sex_gmm_1d(
 
     mu0 = float(np.percentile(y, 25.0))
     mu1 = float(np.percentile(y, 75.0))
-    sample_var = float(np.var(y))
-    var0 = max(sample_var * 0.5, 1e-8)
-    var1 = max(sample_var * 0.5, 1e-8)
-    pi0 = 0.5
-    pi1 = 0.5
-
     if mu0 > mu1:
         mu0, mu1 = mu1, mu0
 
-    if abs(mu1 - mu0) >= 1e-8 and sample_var >= 1e-8:
-        for _ in range(100):
-            prev_mu0, prev_mu1 = mu0, mu1
-
-            log_p0 = (
-                math.log(max(pi0, 1e-12))
-                - 0.5 * math.log(2.0 * math.pi * var0)
-                - 0.5 * ((y - mu0) ** 2) / var0
-            )
-            log_p1 = (
-                math.log(max(pi1, 1e-12))
-                - 0.5 * math.log(2.0 * math.pi * var1)
-                - 0.5 * ((y - mu1) ** 2) / var1
-            )
-
-            max_log = np.maximum(log_p0, log_p1)
-            exp0 = np.exp(log_p0 - max_log)
-            exp1 = np.exp(log_p1 - max_log)
-            denom = exp0 + exp1
-            gamma0 = exp0 / denom
-            gamma1 = 1.0 - gamma0
-
-            n0 = float(np.sum(gamma0))
-            n1 = float(np.sum(gamma1))
-            if n0 < 1e-6 or n1 < 1e-6:
-                break
-
-            pi0 = float(np.clip(n0 / n, 1e-6, 1.0 - 1e-6))
-            pi1 = 1.0 - pi0
-            mu0 = float(np.sum(gamma0 * y) / n0)
-            mu1 = float(np.sum(gamma1 * y) / n1)
-            var0 = max(float(np.sum(gamma0 * ((y - mu0) ** 2)) / n0), 1e-8)
-            var1 = max(float(np.sum(gamma1 * ((y - mu1) ** 2)) / n1), 1e-8)
-
-            if abs(mu0 - prev_mu0) < 1e-6 and abs(mu1 - prev_mu1) < 1e-6:
-                break
-
-        if mu0 > mu1:
-            mu0, mu1 = mu1, mu0
-            var0, var1 = var1, var0
-            pi0, pi1 = pi1, pi0
-
-    if mu1 - mu0 < 1e-8:
+    sample_var = float(np.var(y))
+    if mu1 - mu0 < 1e-8 or sample_var < 1e-8:
         thresh = float(mu0)
         return y >= thresh, thresh
 
-    def _log_posterior_diff(val: float) -> float:
-        lp0 = (
-            math.log(pi0)
-            - 0.5 * math.log(2.0 * math.pi * var0)
-            - 0.5 * ((val - mu0) ** 2) / var0
-        )
-        lp1 = (
-            math.log(pi1)
-            - 0.5 * math.log(2.0 * math.pi * var1)
-            - 0.5 * ((val - mu1) ** 2) / var1
-        )
-        return lp1 - lp0
+    gmm = GaussianMixture(
+        n_components=2,
+        covariance_type="full",
+        tol=1e-6,
+        reg_covar=1e-8,
+        max_iter=100,
+        means_init=np.array([[mu0], [mu1]], dtype=np.float64),
+        weights_init=np.array([0.5, 0.5], dtype=np.float64),
+        random_state=seed,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        gmm.fit(y.reshape(-1, 1))
 
-    f_low = _log_posterior_diff(mu0)
-    f_high = _log_posterior_diff(mu1)
+    means = gmm.means_.ravel()
+    male_idx = int(np.argmax(means))
+    female_idx = 1 - male_idx
+    mu_low = float(means[female_idx])
+    mu_high = float(means[male_idx])
 
-    if f_low < 0.0 < f_high or f_high < 0.0 < f_low:
-        thresh = float(scipy.optimize.brentq(_log_posterior_diff, mu0, mu1))
+    if mu_high - mu_low < 1e-8:
+        thresh = mu_low
+        return y >= thresh, thresh
+
+    def _posterior_diff(val: float) -> float:
+        probs = gmm.predict_proba(np.array([[val]], dtype=np.float64))
+        return float(probs[0, male_idx] - 0.5)
+
+    f_low = _posterior_diff(mu_low)
+    f_high = _posterior_diff(mu_high)
+    if f_low * f_high < 0.0:
+        thresh = float(scipy.optimize.brentq(_posterior_diff, mu_low, mu_high))
     else:
-        a = (1.0 / (2.0 * var0)) - (1.0 / (2.0 * var1))
-        b = -(mu0 / var0) + (mu1 / var1)
-        c = (
-            (mu0**2 / (2.0 * var0))
-            - (mu1**2 / (2.0 * var1))
-            + math.log(pi0 / pi1)
-            + 0.5 * math.log(var1 / var0)
-        )
-        if abs(a) < 1e-12:
-            thresh = -c / b if abs(b) > 1e-12 else 0.5 * (mu0 + mu1)
-        else:
-            disc = b * b - 4.0 * a * c
-            if disc >= 0.0:
-                sqrt_disc = math.sqrt(disc)
-                r1 = (-b - sqrt_disc) / (2.0 * a)
-                r2 = (-b + sqrt_disc) / (2.0 * a)
-                valid = [r for r in (r1, r2) if mu0 <= r <= mu1]
-                if valid:
-                    thresh = valid[0]
-                else:
-                    mid = 0.5 * (mu0 + mu1)
-                    thresh = r1 if abs(r1 - mid) < abs(r2 - mid) else r2
-            else:
-                thresh = 0.5 * (mu0 + mu1)
+        thresh = 0.5 * (mu_low + mu_high)
 
-    is_male = y >= thresh
-    return is_male, float(thresh)
+    return y >= thresh, float(thresh)
 
 
 def fit_lasso_fista(
@@ -160,7 +100,7 @@ def fit_lasso_fista(
     max_iter: int = 2000,
     tol: float = 1e-6,
 ) -> NDArray[np.float64]:
-    """Solve non-negative Lasso regression via FISTA with Nesterov momentum.
+    """Solve non-negative Lasso regression via scikit-learn coordinate descent.
 
     Minimizes (1 / (2 * N)) * ||Xw - y||_2^2 + alpha * ||w||_1 subject to w >= 0.
     """
@@ -168,44 +108,30 @@ def fit_lasso_fista(
     y_arr = np.asarray(y, dtype=np.float64).ravel()
     n_samples, n_features = x_arr.shape
 
-    if n_samples == 0 or n_features == 0:
+    if (
+        n_samples == 0
+        or n_features == 0
+        or np.allclose(x_arr, 0.0)
+        or np.allclose(y_arr, 0.0)
+    ):
         return np.zeros(n_features, dtype=np.float64)
 
-    s_max = float(scipy.linalg.svdvals(x_arr)[0]) if n_features > 0 else 0.0
-    lipschitz = max((s_max * s_max) / n_samples, 1e-12)
-    step = 1.0 / lipschitz
-    thresh = step * alpha
+    if alpha <= 0.0:
+        w, _ = scipy.optimize.nnls(x_arr, y_arr, maxiter=max_iter)
+        return np.asarray(w, dtype=np.float64)
 
-    w = np.zeros(n_features, dtype=np.float64)
-    v = np.zeros(n_features, dtype=np.float64)
-    t = 1.0
-    prev_obj = 0.5 * float(np.mean(y_arr * y_arr))
-
-    for _ in range(max_iter):
-        grad = (x_arr.T @ (x_arr @ v - y_arr)) / n_samples
-        w_next = np.maximum(0.0, v - step * grad - thresh)
-
-        diff_w = float(np.max(np.abs(w_next - w)))
-        scale_w = max(float(np.max(np.abs(w_next))), 1e-12)
-        rel_w_diff = diff_w / scale_w
-
-        residuals = x_arr @ w_next - y_arr
-        obj = 0.5 * float(np.mean(residuals * residuals)) + alpha * float(
-            np.sum(w_next)
-        )
-        rel_obj_diff = abs(obj - prev_obj) / max(abs(prev_obj), 1e-12)
-
-        if rel_w_diff < tol or rel_obj_diff < tol:
-            w = w_next
-            break
-
-        t_next = 0.5 * (1.0 + math.sqrt(1.0 + 4.0 * t * t))
-        v = w_next + ((t - 1.0) / t_next) * (w_next - w)
-        w = w_next
-        t = t_next
-        prev_obj = obj
-
-    return w
+    model = Lasso(
+        alpha=float(alpha),
+        fit_intercept=False,
+        positive=True,
+        max_iter=max_iter,
+        tol=tol,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        warnings.simplefilter("ignore", UserWarning)
+        model.fit(x_arr, y_arr)
+    return np.asarray(model.coef_, dtype=np.float64)
 
 
 def pca_irlba_numpy(
@@ -221,41 +147,34 @@ def pca_irlba_numpy(
     n_samples, n_features = x_arr.shape
     k = max(0, min(n_components, n_samples, n_features))
 
-    center = np.nanmean(x_arr, axis=0)
-    if not np.all(np.isfinite(center)):
-        center = np.nan_to_num(center, nan=0.0)
-    x_centered = np.nan_to_num(x_arr - center, nan=0.0)
+    if n_samples == 0 or n_features == 0:
+        return (
+            np.zeros((n_samples, n_components), dtype=np.float64),
+            np.zeros(n_features, dtype=np.float64),
+            np.zeros((n_features, n_components), dtype=np.float64),
+        )
 
-    if k == 0:
+    imputer = SimpleImputer(strategy="mean", keep_empty_features=True)
+    x_imputed = imputer.fit_transform(np.where(np.isfinite(x_arr), x_arr, np.nan))
+    center = np.nan_to_num(imputer.statistics_, nan=0.0)
+    x_centered = x_imputed - center
+
+    if k == 0 or np.allclose(x_centered, 0.0):
         return (
             np.zeros((n_samples, n_components), dtype=np.float64),
             center,
             np.zeros((n_features, n_components), dtype=np.float64),
         )
 
-    if k < min(n_samples, n_features) and k >= 1:
-        u_k, s_k, vh_k = scipy.sparse.linalg.svds(x_centered, k=k, random_state=seed)
-        order = np.argsort(s_k)[::-1]
-        rotation = vh_k[order, :].T
-    else:
-        if n_samples <= n_features:
-            gram = x_centered @ x_centered.T
-            evals, evecs = scipy.linalg.eigh(gram)
-            evals = np.maximum(evals[::-1][:k], 0.0)
-            u_k = evecs[:, ::-1][:, :k]
-            s_k = np.sqrt(evals)
-            safe_s = np.where(s_k > 1e-12, s_k, 1.0)
-            rotation = (x_centered.T @ u_k) / safe_s[np.newaxis, :]
-        else:
-            _, _, vh_full = scipy.linalg.svd(x_centered, full_matrices=False)
-            rotation = vh_full[:k, :].T
-
-    for j in range(k):
-        col = rotation[:, j]
-        max_idx = int(np.argmax(np.abs(col)))
-        if col[max_idx] < 0.0:
-            rotation[:, j] = -col
-
+    solver = "arpack" if k < min(n_samples, n_features) - 1 else "full"
+    pca = PCA(n_components=k, svd_solver=solver, random_state=seed)
+    pca.fit(x_centered)
+    _, components = svd_flip(
+        np.zeros((n_samples, k), dtype=np.float64),
+        pca.components_,
+        u_based_decision=False,
+    )
+    rotation = np.asarray(components.T, dtype=np.float64)
     scores = x_centered @ rotation
 
     if k < n_components:
@@ -281,7 +200,7 @@ def fit_rprop_mlp(
     NDArray[np.float64],
     NDArray[np.float64],
 ]:
-    """Fit D -> hidden_dim -> 1 Sigmoid neural network with full-batch Rprop-.
+    """Fit D -> hidden_dim -> 1 Sigmoid neural network via L-BFGS-B optimization.
 
     Evaluates across n_inits deterministic initializations, returning the weights
     and biases (w1, b1, w2, b2) achieving the lowest training MSE.
@@ -298,6 +217,35 @@ def fit_rprop_mlp(
             np.zeros(1, dtype=np.float64),
         )
 
+    s1 = n_features * hidden_dim
+    s2 = s1 + hidden_dim
+    s3 = s2 + hidden_dim
+
+    def _loss_and_grad(
+        theta: NDArray[np.float64],
+    ) -> tuple[float, NDArray[np.float64]]:
+        w1 = theta[:s1].reshape(n_features, hidden_dim)
+        b1 = theta[s1:s2]
+        w2 = theta[s2:s3].reshape(hidden_dim, 1)
+        b2 = theta[s3:]
+
+        h = scipy.special.expit(x_arr @ w1 + b1)
+        pred = scipy.special.expit(h @ w2 + b2)
+
+        error = pred - y_arr
+        loss = 0.5 * float(np.mean(error * error))
+
+        d_out = (error * pred * (1.0 - pred)) / n_samples
+        gw2 = h.T @ d_out
+        gb2 = np.sum(d_out, axis=0)
+
+        d_hidden = (d_out @ w2.T) * h * (1.0 - h)
+        gw1 = x_arr.T @ d_hidden
+        gb1 = np.sum(d_hidden, axis=0)
+
+        grad = np.concatenate([gw1.ravel(), gb1, gw2.ravel(), gb2])
+        return loss, grad
+
     best_mse = float("inf")
     best_weights: (
         tuple[
@@ -309,71 +257,31 @@ def fit_rprop_mlp(
         | None
     ) = None
 
+    limit1 = math.sqrt(6.0 / (n_features + hidden_dim))
+    limit2 = math.sqrt(6.0 / (hidden_dim + 1))
+
     for init_idx in range(n_inits):
         rng = np.random.default_rng(seed + init_idx)
-        limit1 = math.sqrt(6.0 / (n_features + hidden_dim))
-        w1 = rng.uniform(-limit1, limit1, size=(n_features, hidden_dim)).astype(
+        w1_0 = rng.uniform(-limit1, limit1, size=(n_features, hidden_dim)).astype(
             np.float64
         )
-        b1 = np.zeros(hidden_dim, dtype=np.float64)
+        b1_0 = np.zeros(hidden_dim, dtype=np.float64)
+        w2_0 = rng.uniform(-limit2, limit2, size=(hidden_dim, 1)).astype(np.float64)
+        b2_0 = np.zeros(1, dtype=np.float64)
+        theta0 = np.concatenate([w1_0.ravel(), b1_0, w2_0.ravel(), b2_0])
 
-        limit2 = math.sqrt(6.0 / (hidden_dim + 1))
-        w2 = rng.uniform(-limit2, limit2, size=(hidden_dim, 1)).astype(np.float64)
-        b2 = np.zeros(1, dtype=np.float64)
-
-        delta_w1 = np.full_like(w1, _RPROP_DELTA_0)
-        delta_b1 = np.full_like(b1, _RPROP_DELTA_0)
-        delta_w2 = np.full_like(w2, _RPROP_DELTA_0)
-        delta_b2 = np.full_like(b2, _RPROP_DELTA_0)
-
-        prev_gw1 = np.zeros_like(w1)
-        prev_gb1 = np.zeros_like(b1)
-        prev_gw2 = np.zeros_like(w2)
-        prev_gb2 = np.zeros_like(b2)
-
-        for _ in range(max_epochs):
-            h = scipy.special.expit(x_arr @ w1 + b1)
-            pred = scipy.special.expit(h @ w2 + b2)
-
-            error = pred - y_arr
-            d_out = (error * pred * (1.0 - pred)) / n_samples
-            gw2 = h.T @ d_out
-            gb2 = np.sum(d_out, axis=0)
-
-            d_hidden = (d_out @ w2.T) * h * (1.0 - h)
-            gw1 = x_arr.T @ d_hidden
-            gb1 = np.sum(d_hidden, axis=0)
-
-            max_grad = max(
-                float(np.max(np.abs(gw1))),
-                float(np.max(np.abs(gb1))),
-                float(np.max(np.abs(gw2))),
-                float(np.max(np.abs(gb2))),
-            )
-            if max_grad < 1e-4:
-                break
-
-            for p, g, prev_g, delta in (
-                (w1, gw1, prev_gw1, delta_w1),
-                (b1, gb1, prev_gb1, delta_b1),
-                (w2, gw2, prev_gw2, delta_w2),
-                (b2, gb2, prev_gb2, delta_b2),
-            ):
-                sign_change = g * prev_g
-                np.copyto(
-                    delta,
-                    np.where(
-                        sign_change > 0.0,
-                        np.minimum(delta * _RPROP_ETA_PLUS, _RPROP_DELTA_MAX),
-                        np.where(
-                            sign_change < 0.0,
-                            np.maximum(delta * _RPROP_ETA_MINUS, _RPROP_DELTA_MIN),
-                            delta,
-                        ),
-                    ),
-                )
-                p -= np.sign(g) * delta
-                np.copyto(prev_g, np.where(sign_change < 0.0, 0.0, g))
+        res = scipy.optimize.minimize(
+            _loss_and_grad,
+            theta0,
+            method="L-BFGS-B",
+            jac=True,
+            options={"maxiter": max_epochs, "gtol": 1e-4},
+        )
+        theta_opt = np.asarray(res.x, dtype=np.float64)
+        w1 = theta_opt[:s1].reshape(n_features, hidden_dim).copy()
+        b1 = theta_opt[s1:s2].copy()
+        w2 = theta_opt[s2:s3].reshape(hidden_dim, 1).copy()
+        b2 = theta_opt[s3:].copy()
 
         final_h = scipy.special.expit(x_arr @ w1 + b1)
         final_pred = scipy.special.expit(final_h @ w2 + b2)
@@ -381,7 +289,7 @@ def fit_rprop_mlp(
 
         if mse < best_mse or best_weights is None:
             best_mse = mse
-            best_weights = (w1.copy(), b1.copy(), w2.copy(), b2.copy())
+            best_weights = (w1, b1, w2, b2)
 
     assert best_weights is not None
     return best_weights
@@ -391,7 +299,7 @@ def train_olm(
     X: NDArray[np.floating] | np.ndarray,
     y: NDArray[np.floating] | np.ndarray,
 ) -> tuple[NDArray[np.float64], float]:
-    """Fit ordinary linear model via least squares returning (weights, bias)."""
+    """Fit ordinary linear model via scikit-learn returning (weights, bias)."""
     x_arr = np.asarray(X, dtype=np.float64)
     y_arr = np.asarray(y, dtype=np.float64).ravel()
     n_samples, n_features = x_arr.shape
@@ -399,11 +307,8 @@ def train_olm(
     if n_samples < 2 or n_features == 0:
         return np.zeros(n_features, dtype=np.float64), 0.0
 
-    design = np.column_stack([np.ones(n_samples, dtype=np.float64), x_arr])
-    coeffs, _, _, _ = np.linalg.lstsq(design, y_arr, rcond=None)
-    bias = float(coeffs[0])
-    weights = coeffs[1:].astype(np.float64, copy=False)
-    return weights, bias
+    reg = LinearRegression().fit(x_arr, y_arr)
+    return np.asarray(reg.coef_, dtype=np.float64), float(reg.intercept_)
 
 
 def ols_fit(
@@ -416,9 +321,8 @@ def ols_fit(
     if xv.size < 2 or float(np.var(xv)) < 1e-12:
         return 0.0, 1.0
 
-    design = np.column_stack([np.ones_like(xv), xv])
-    coeffs, _, _, _ = np.linalg.lstsq(design, yv, rcond=None)
-    return float(coeffs[0]), float(coeffs[1])
+    res = scipy.stats.linregress(xv, yv)
+    return float(res.intercept), float(res.slope)
 
 
 def rlm_huber(
@@ -428,38 +332,23 @@ def rlm_huber(
     max_iter: int = 50,
     tol: float = 1e-6,
 ) -> tuple[float, float]:
-    """Robust linear model using Huber M-estimation and residual MAD scale."""
+    """Robust linear model using scikit-learn HuberRegressor."""
     xv = np.asarray(x, dtype=np.float64).ravel()
     yv = np.asarray(y, dtype=np.float64).ravel()
-    if xv.size < 2 or float(np.var(xv)) < 1e-12:
+    if xv.size < 2 or float(np.var(xv)) < 1e-12 or float(np.var(yv)) < 1e-12:
         return ols_fit(xv, yv)
 
-    design = np.column_stack([np.ones_like(xv), xv])
-    coeffs, _, _, _ = np.linalg.lstsq(design, yv, rcond=None)
-    fitted = design @ coeffs
-    resid = yv - fitted
-
-    for _ in range(max_iter):
-        med_res = float(np.median(resid))
-        mad = float(np.median(np.abs(resid - med_res)))
-        scale = _HUBER_SCALE_FACTOR * mad
-        if scale < 1e-12:
-            break
-
-        u = np.abs(resid / scale)
-        weights = np.where(u <= k, 1.0, k / np.maximum(u, 1e-12))
-
-        sqrt_w = np.sqrt(weights)
-        new_coeffs, _, _, _ = np.linalg.lstsq(
-            design * sqrt_w[:, np.newaxis],
-            yv * sqrt_w,
-            rcond=None,
-        )
-        diff = float(np.max(np.abs(new_coeffs - coeffs)))
-        coeffs = new_coeffs
-        fitted = design @ coeffs
-        resid = yv - fitted
-        if diff < tol:
-            break
-
-    return float(coeffs[0]), float(coeffs[1])
+    model = HuberRegressor(
+        epsilon=max(float(k), 1.0),
+        max_iter=max(max_iter, 100),
+        tol=tol,
+        alpha=0.0,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        model.fit(xv.reshape(-1, 1), yv)
+    intercept = float(model.intercept_)
+    slope = float(model.coef_[0])
+    if math.isfinite(intercept) and math.isfinite(slope):
+        return intercept, slope
+    return ols_fit(xv, yv)

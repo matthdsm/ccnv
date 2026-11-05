@@ -11,6 +11,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import scipy.special
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import KFold
 
 from ccnv.convert import normalize_chr, rebin_sample_table
 from ccnv.models import SamplesheetEntry
@@ -348,17 +350,17 @@ def fit_prenatal_models(
     if np.all(auto_masked):
         auto_masked[:] = False
 
-    mean_features = np.zeros(n_auto_100k, dtype=np.float64)
-    for j in range(n_auto_100k):
-        col_valid = valid_bins[:, j]
-        mean_features[j] = (
-            float(np.nanmean(log2_ratios_100k[col_valid, j]))
-            if np.any(col_valid)
-            else 0.0
-        )
-
-    X_autosomal = np.where(valid_bins, log2_ratios_100k, mean_features)
-    X_autosomal = np.nan_to_num(X_autosomal, nan=0.0)
+    imputer = SimpleImputer(strategy="mean", keep_empty_features=True)
+    X_autosomal = np.nan_to_num(
+        np.asarray(
+            imputer.fit_transform(np.where(valid_bins, log2_ratios_100k, np.nan)),
+            dtype=np.float64,
+        ),
+        nan=0.0,
+    )
+    mean_features = np.nan_to_num(
+        np.asarray(imputer.statistics_, dtype=np.float64), nan=0.0
+    )
 
     # Truncated PCA
     n_feat = min(50, max(1, n_samples - 1))
@@ -393,12 +395,9 @@ def fit_prenatal_models(
     if k_folds >= 2:
         cv_mlp = np.zeros(labeled_idx.size, dtype=np.float64)
         cv_olm = np.zeros(labeled_idx.size, dtype=np.float64)
-        rng = np.random.default_rng(seed)
-        shuffled = rng.permutation(labeled_idx.size)
-        split_folds = np.array_split(shuffled, k_folds)
+        kf = KFold(n_splits=k_folds, shuffle=True, random_state=seed)
 
-        for fold_idx, test_part in enumerate(split_folds):
-            train_part = np.setdiff1d(shuffled, test_part)
+        for fold_idx, (train_part, test_part) in enumerate(kf.split(X_labeled)):
             X_tr, y_tr = X_labeled[train_part], y_labeled[train_part]
             X_te = X_labeled[test_part]
 

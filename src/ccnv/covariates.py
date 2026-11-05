@@ -12,6 +12,8 @@ from typing import Final
 import numpy as np
 import pyBigWig
 import pysam
+import scipy.stats
+from numpy.polynomial.polynomial import polyvander
 from numpy.typing import NDArray
 
 from ccnv.models import DEFAULT_MIN_MAPPABILITY
@@ -22,7 +24,6 @@ _MAX_N_FRACTION: Final[float] = 0.5
 _MIN_VARIANCE_STD: Final[float] = 1e-6
 _MIN_TREND_FLOOR: Final[float] = 0.05
 _IRLS_ITERATIONS: Final[int] = 3
-_MAD_SIGMA_SCALE: Final[float] = 1.4826
 _OUTLIER_SIGMA_CUTOFF: Final[float] = 2.5
 
 _FASTA_SUFFIXES: Final[frozenset[str]] = frozenset({".fa", ".fasta", ".fna"})
@@ -511,17 +512,16 @@ def _build_1d_basis(
     std = float(np.std(values))
     if std <= _MIN_VARIANCE_STD:
         return None
-    z = np.clip((values - float(np.mean(values))) / std, -2.5, 2.5)
+    z = np.clip(
+        np.asarray(scipy.stats.zscore(values, ddof=0), dtype=np.float64),
+        -2.5,
+        2.5,
+    )
     n_rows = values.size
     max_cols = min(degree + 1, max(1, n_rows - 1))
     if max_cols <= 1:
         return None
-    cols = [np.ones(n_rows, dtype=np.float64)]
-    power = np.ones(n_rows, dtype=np.float64)
-    for _ in range(1, max_cols):
-        power = power * z
-        cols.append(power)
-    return np.column_stack(cols)
+    return np.asarray(polyvander(z, max_cols - 1), dtype=np.float64)
 
 
 def _fit_sample_trend(
@@ -552,8 +552,8 @@ def _fit_sample_trend(
         pred = design @ beta
         residuals = scaled_y[valid] - pred[valid]
         med_res = float(np.median(residuals))
-        mad = float(np.median(np.abs(residuals - med_res)))
-        delta = max(_OUTLIER_SIGMA_CUTOFF * _MAD_SIGMA_SCALE * mad, 0.08)
+        sigma = float(scipy.stats.median_abs_deviation(residuals, scale="normal"))
+        delta = max(_OUTLIER_SIGMA_CUTOFF * sigma, 0.08)
         abs_dev = np.abs((scaled_y - pred) - med_res)
         huber_w = np.where(
             abs_dev <= delta,
@@ -665,7 +665,9 @@ def covariate_features(
             continue
         std = float(np.std(sub))
         if std > _MIN_VARIANCE_STD:
-            features.append((sub - float(np.mean(sub))) / std)
+            features.append(
+                np.asarray(scipy.stats.zscore(sub, ddof=0), dtype=np.float64)
+            )
 
     if not features:
         return None

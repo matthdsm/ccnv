@@ -6,6 +6,7 @@ from typing import Final
 
 import numpy as np
 from numpy.typing import NDArray
+from sklearn.metrics.pairwise import euclidean_distances
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +62,7 @@ def _chunk_nearest_worker(
     for b_start in range(start, stop, _w_batch_size):
         b_stop = min(b_start + _w_batch_size, stop)
         batch = _w_data[b_start:b_stop]
-        query_norm = np.sum(batch * batch, axis=1, keepdims=True)
-        dist = query_norm + _w_norm - 2.0 * (batch @ _w_data.T)
-        np.maximum(dist, 0.0, out=dist)
+        dist = euclidean_distances(batch, _w_data, squared=True, Y_norm_squared=_w_norm)
 
         for offset, query in enumerate(range(b_start, b_stop)):
             row = dist[offset]

@@ -12,6 +12,7 @@ from typing import Final, Literal
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import scipy.stats
 from numpy.typing import NDArray
 from sklearn.decomposition import PCA
 
@@ -961,5 +962,4 @@ def _append_branch(
 
 
 def _median_abs_deviation(values: NDArray[np.floating]) -> float:
-    median = float(np.median(values))
-    return float(np.median(np.abs(values - median)))
+    return float(scipy.stats.median_abs_deviation(values, scale=1.0))
