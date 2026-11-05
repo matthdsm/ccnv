@@ -631,6 +631,73 @@ class TestSchemaContracts(unittest.TestCase):
         ):
             validate_reference_table(table_unaligned_start)
 
+    def test_validate_reference_table_large_table_fast_path(self) -> None:
+        # > 1000 rows to exercise the vectorized fast path
+        n_bins = 1005
+        bin_size = 5000
+        contig_len = n_bins * bin_size
+        starts = [i * bin_size for i in range(n_bins)]
+        ends = [(i + 1) * bin_size for i in range(n_bins)]
+
+        ref_meta = metadata_for(
+            ArtifactKind.REFERENCE,
+            contig_lengths={"chr1": contig_len},
+            values={
+                "sample_identities": ["s1"],
+                "model": {
+                    "bin_size": bin_size,
+                    "branches": [BRANCH_AUTOSOMAL],
+                },
+            },
+        )
+        table = pa.table(
+            {
+                "branch": [BRANCH_AUTOSOMAL] * n_bins,
+                "contig": ["chr1"] * n_bins,
+                "start": pa.array(starts, type=pa.int64()),
+                "end": pa.array(ends, type=pa.int64()),
+                "masked": [False] * n_bins,
+                "gc": pa.array([0.4] * n_bins, type=pa.float32()),
+                "mappability": pa.array([1.0] * n_bins, type=pa.float32()),
+                "pca_mean": [0.0] * n_bins,
+                "pca_loadings": [[0.1]] * n_bins,
+                "nearest_ref_indices": [[0]] * n_bins,
+                "mean_distance": pa.array([0.1] * n_bins, type=pa.float32()),
+                "null_mean": [0.0] * n_bins,
+                "null_std": [0.1] * n_bins,
+            },
+            schema=REFERENCE_SCHEMA.with_metadata(ref_meta),
+        )
+
+        # Valid > 1000 row table passes
+        validate_reference_table(table)
+
+        # > 1000 row table with undeclared contig must raise SchemaError, not KeyError
+        contigs_with_undeclared = ["chr1"] * (n_bins - 1) + ["chrUndeclared"]
+        bad_table = pa.table(
+            {
+                "branch": [BRANCH_AUTOSOMAL] * n_bins,
+                "contig": contigs_with_undeclared,
+                "start": pa.array(starts, type=pa.int64()),
+                "end": pa.array(ends, type=pa.int64()),
+                "masked": [False] * n_bins,
+                "gc": pa.array([0.4] * n_bins, type=pa.float32()),
+                "mappability": pa.array([1.0] * n_bins, type=pa.float32()),
+                "pca_mean": [0.0] * n_bins,
+                "pca_loadings": [[0.1]] * n_bins,
+                "nearest_ref_indices": [[0]] * n_bins,
+                "mean_distance": pa.array([0.1] * n_bins, type=pa.float32()),
+                "null_mean": [0.0] * n_bins,
+                "null_std": [0.1] * n_bins,
+            },
+            schema=REFERENCE_SCHEMA.with_metadata(ref_meta),
+        )
+
+        with self.assertRaisesRegex(
+            SchemaError, "uses undeclared contig 'chrUndeclared'"
+        ):
+            validate_reference_table(bad_table)
+
 
 if __name__ == "__main__":
     unittest.main()

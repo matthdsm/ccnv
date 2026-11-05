@@ -704,39 +704,40 @@ def _validate_reference_table_content(
             == table.num_rows
         )
 
-        spacing_ok = True
-        for b in unique_branches:
-            target_size = (
-                prenatal_bin_size if b == BRANCH_PRENATAL_AUTOSOMAL else bin_size
-            )
-            if target_size is not None:
-                mask = branch_arr == b
-                b_starts = starts[mask]
-                b_ends = ends[mask]
-                b_contigs = contig_arr[mask]
-                widths = b_ends - b_starts
+        spacing_ok = all_contigs_declared
+        if spacing_ok:
+            for b in unique_branches:
+                target_size = (
+                    prenatal_bin_size if b == BRANCH_PRENATAL_AUTOSOMAL else bin_size
+                )
+                if target_size is not None:
+                    mask = branch_arr == b
+                    b_starts = starts[mask]
+                    b_ends = ends[mask]
+                    b_contigs = contig_arr[mask]
+                    widths = b_ends - b_starts
 
-                if not bool(np.all(b_starts % target_size == 0)):
-                    spacing_ok = False
-                    break
-
-                for c in set(b_contigs):
-                    c_mask = b_contigs == c
-                    c_ends = b_ends[c_mask]
-                    c_widths = widths[c_mask]
-                    c_len = contig_lengths[c]
-                    is_final = c_ends == c_len
-                    if not bool(
-                        np.all(c_widths[~is_final] == target_size)
-                        and np.all(
-                            (c_widths[is_final] > 0)
-                            & (c_widths[is_final] <= target_size)
-                        )
-                    ):
+                    if not bool(np.all(b_starts % target_size == 0)):
                         spacing_ok = False
                         break
-                if not spacing_ok:
-                    break
+
+                    for c in set(b_contigs):
+                        c_mask = b_contigs == c
+                        c_ends = b_ends[c_mask]
+                        c_widths = widths[c_mask]
+                        c_len = contig_lengths[c]
+                        is_final = c_ends == c_len
+                        if not bool(
+                            np.all(c_widths[~is_final] == target_size)
+                            and np.all(
+                                (c_widths[is_final] > 0)
+                                & (c_widths[is_final] <= target_size)
+                            )
+                        ):
+                            spacing_ok = False
+                            break
+                    if not spacing_ok:
+                        break
 
         if (
             all_contigs_declared
