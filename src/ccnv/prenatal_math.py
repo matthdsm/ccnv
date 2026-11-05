@@ -290,6 +290,14 @@ def fit_rprop_mlp(
     y_arr = np.asarray(y, dtype=np.float64).reshape(-1, 1)
     n_samples, n_features = x_arr.shape
 
+    if n_samples < 2 or n_features == 0:
+        return (
+            np.zeros((n_features, hidden_dim), dtype=np.float64),
+            np.zeros(hidden_dim, dtype=np.float64),
+            np.zeros((hidden_dim, 1), dtype=np.float64),
+            np.zeros(1, dtype=np.float64),
+        )
+
     best_mse = float("inf")
     best_weights: (
         tuple[
@@ -388,7 +396,7 @@ def train_olm(
     y_arr = np.asarray(y, dtype=np.float64).ravel()
     n_samples, n_features = x_arr.shape
 
-    if n_samples == 0 or n_features == 0:
+    if n_samples < 2 or n_features == 0:
         return np.zeros(n_features, dtype=np.float64), 0.0
 
     design = np.column_stack([np.ones(n_samples, dtype=np.float64), x_arr])

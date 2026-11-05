@@ -209,6 +209,21 @@ class TestFitRpropMLP(unittest.TestCase):
         np.testing.assert_array_equal(w2_a, w2_b)
         np.testing.assert_array_equal(b2_a, b2_b)
 
+    def test_insufficient_samples_guard(self) -> None:
+        w1, b1, w2, b2 = fit_rprop_mlp(np.empty((0, 3)), np.empty(0))
+        self.assertEqual(w1.shape, (3, 2))
+        np.testing.assert_array_equal(w1, 0.0)
+        np.testing.assert_array_equal(b1, 0.0)
+        np.testing.assert_array_equal(w2, 0.0)
+        np.testing.assert_array_equal(b2, 0.0)
+
+        w1_s, b1_s, w2_s, b2_s = fit_rprop_mlp(np.ones((1, 3)), np.ones(1))
+        self.assertEqual(w1_s.shape, (3, 2))
+        np.testing.assert_array_equal(w1_s, 0.0)
+        np.testing.assert_array_equal(b1_s, 0.0)
+        np.testing.assert_array_equal(w2_s, 0.0)
+        np.testing.assert_array_equal(b2_s, 0.0)
+
 
 class TestTrainOLM(unittest.TestCase):
     def test_recovers_linear_parameters(self) -> None:
@@ -227,6 +242,12 @@ class TestTrainOLM(unittest.TestCase):
         weights, bias = train_olm(np.empty((0, 4)), np.empty(0))
         self.assertEqual(weights.shape, (4,))
         self.assertEqual(bias, 0.0)
+
+    def test_single_sample_guard(self) -> None:
+        weights, bias = train_olm(np.ones((1, 4)), np.ones(1))
+        self.assertEqual(weights.shape, (4,))
+        self.assertEqual(bias, 0.0)
+        np.testing.assert_array_equal(weights, 0.0)
 
 
 class TestOLSFit(unittest.TestCase):

@@ -859,14 +859,17 @@ class TestPrenatalEndToEndIntegration(unittest.TestCase):
             prenatal_ref, _, test_sample = _setup_synthetic_cohort_and_references(
                 root, self.contig_lengths
             )
-            outputs = run_predict(
-                PredictConfig(
-                    sample=test_sample,
-                    reference=prenatal_ref,
-                    prefix=root / "out",
-                    mode=AnalysisMode.GERMLINE,
-                    plot=False,
-                )
+            predict_cfg = PredictConfig(
+                sample=test_sample,
+                reference=prenatal_ref,
+                prefix=root / "out",
+                mode=AnalysisMode.GERMLINE,
+                plot=False,
+            )
+            with self.assertLogs("ccnv", level="WARNING") as logs:
+                outputs = run_predict(predict_cfg)
+            self.assertTrue(
+                any("prenatal mode" in rec.getMessage() for rec in logs.records)
             )
             self.assertTrue(outputs.bins_bed.is_file())
             self.assertTrue(outputs.segments_bed.is_file())

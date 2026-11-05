@@ -143,7 +143,13 @@ def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
 def _is_sample_parquet(path: Path) -> bool:
     try:
         metadata = decode_metadata(pq.read_schema(path).metadata)
-    except OSError, TypeError, ValueError, SchemaError, pa.ArrowException:
+    except (
+        OSError,
+        TypeError,
+        ValueError,
+        SchemaError,
+        pa.ArrowException,
+    ):
         return False
     return metadata.get("artifact_kind") == ArtifactKind.SAMPLE.value
 
@@ -425,6 +431,14 @@ def reference(
     )
     started = perf_counter()
     sample_paths: tuple[Path, ...] = ()
+    if samples and (samplesheet is not None or fasta is not None):
+        _fail(
+            ValueError(
+                "cannot combine positional sample arguments with "
+                "--samplesheet or --fasta"
+            ),
+            2,
+        )
     if samplesheet is None and fasta is None:
         if samples:
             if len(samples) == 1 and samples[0].suffix.lower() in (

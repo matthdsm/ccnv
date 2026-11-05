@@ -318,6 +318,46 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 _cli_text(result.output),
             )
 
+    def test_reference_rejects_samples_with_samplesheet_or_fasta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample = _write_sample(root / "s1.ccnv")
+            sheet = _write_samplesheet(root / "samples.yaml", [sample])
+            fasta = root / "genome.fa"
+            fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+            expected = (
+                "cannot combine positional sample arguments with "
+                "--samplesheet or --fasta"
+            )
+
+            res1 = CliRunner().invoke(
+                app,
+                [
+                    "reference",
+                    str(sample),
+                    "--samplesheet",
+                    str(sheet),
+                    "--prefix",
+                    str(root / "ref"),
+                ],
+            )
+            self.assertEqual(res1.exit_code, 2)
+            self.assertIn(expected, _cli_text(res1.output))
+
+            res2 = CliRunner().invoke(
+                app,
+                [
+                    "reference",
+                    str(sample),
+                    "--fasta",
+                    str(fasta),
+                    "--prefix",
+                    str(root / "ref"),
+                ],
+            )
+            self.assertEqual(res2.exit_code, 2)
+            self.assertIn(expected, _cli_text(res2.output))
+
     def test_reference_forwards_fasta(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
