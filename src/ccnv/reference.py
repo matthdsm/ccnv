@@ -11,7 +11,6 @@ from typing import Final, Literal
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 import scipy.stats
 from numpy.typing import NDArray
 
@@ -39,6 +38,7 @@ from ccnv.covariates import (
     mask_covariates,
     validate_min_mappability,
 )
+from ccnv.io.parquet import write_reference_parquet
 from ccnv.models import ReferenceConfig, SamplesheetEntry, parquet_path
 from ccnv.prenatal import fit_prenatal_models
 from ccnv.reference_compute import (
@@ -58,7 +58,6 @@ from ccnv.schemas import (
     REFERENCE_SCHEMA,
     ArtifactKind,
     metadata_for,
-    validate_table,
 )
 from ccnv.stats.neighbors import distance_cutoff as distance_cutoff
 from ccnv.stats.pca import fit_pca as fit_pca
@@ -139,22 +138,9 @@ def run(config: ReferenceConfig) -> None:
     )
 
     table = build_reference_table(cohort, config)
-    validate_table(table, ArtifactKind.REFERENCE)
     path = parquet_path(config.prefix)
     logger.debug("writing reference parquet %s (%d rows)", path, table.num_rows)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(
-        table,
-        path,
-        compression="zstd",
-        compression_level=3,
-        use_dictionary=["branch", "contig"],
-        column_encoding={
-            "start": "DELTA_BINARY_PACKED",
-            "end": "DELTA_BINARY_PACKED",
-            "nearest_ref_indices.list.element": "DELTA_BINARY_PACKED",
-        },
-    )
+    write_reference_parquet(table, path)
     logger.debug(
         "wrote reference parquet %s (%.1f KB)",
         path,

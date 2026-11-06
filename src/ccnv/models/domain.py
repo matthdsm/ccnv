@@ -1,5 +1,6 @@
 """Core genomic and domain entities for ccnv."""
 
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -117,6 +118,16 @@ def is_canonical_contig(name: str) -> bool:
     return is_autosome_name(name) or normalize_chr(name) in {"X", "Y"}
 
 
+def natural_sort_key(name: str) -> tuple[tuple[int, int | str], ...]:
+    """Return key for natural sort order treating embedded numbers as integers."""
+
+    return tuple(
+        (0, int(chunk)) if chunk.isdigit() else (1, chunk.casefold())
+        for chunk in re.split(r"(\d+)", name)
+        if chunk
+    )
+
+
 def select_layout(
     names: Sequence[str],
     lengths: Sequence[int],
@@ -145,6 +156,7 @@ __all__ = [
     "SamplesheetEntry",
     "is_autosome_name",
     "is_canonical_contig",
+    "natural_sort_key",
     "normalize_chr",
     "resolve_contig_name",
     "select_layout",

@@ -10,11 +10,10 @@ from typing import Final, Literal
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 import scipy.stats
 from numpy.typing import ArrayLike, NDArray
 
-from ccnv.convert import read_sample_parquet, rebin_sample_table
+from ccnv.convert import rebin_sample_table
 from ccnv.covariates import (
     CovariateError,
     correct_covariate_bias,
@@ -23,6 +22,7 @@ from ccnv.covariates import (
     mask_covariates,
     validate_min_mappability,
 )
+from ccnv.io.parquet import read_reference_parquet, read_sample_parquet
 from ccnv.models import (
     DEFAULT_MIN_MAPPABILITY,
     AnalysisMode,
@@ -43,12 +43,10 @@ from ccnv.schemas import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
-    ArtifactKind,
     PrenatalModelMetadata,
     SchemaError,
     bin_coordinates,
     decode_metadata,
-    validate_table,
 )
 from ccnv.segment import segment_genome
 
@@ -199,8 +197,7 @@ def load_inputs(
             f"{sample_path}: cannot read sample Parquet ({error})"
         ) from error
     try:
-        reference = pq.read_table(reference_path)
-        validate_table(reference, ArtifactKind.REFERENCE)
+        reference = read_reference_parquet(reference_path)
     except (FileNotFoundError, OSError, pa.ArrowInvalid, SchemaError) as error:
         raise PredictError(
             f"{reference_path}: cannot read reference Parquet ({error})"

@@ -10,9 +10,25 @@ from typing import Final
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pysam
 
+from ccnv.io.alignments import (
+    alignment_format as _alignment_format,
+)
+from ccnv.io.alignments import (
+    ensure_index as _ensure_index,
+)
+from ccnv.io.alignments import (
+    open_alignment as _open_alignment,
+)
+from ccnv.io.alignments import (
+    rejection_reason,
+    stream_contig_reads,
+)
+from ccnv.io.parquet import (
+    read_sample_parquet,
+    write_sample_parquet,
+)
 from ccnv.models import (
     ConvertConfig,
     ConvertError,
@@ -30,7 +46,6 @@ from ccnv.schemas import (
     ArtifactKind,
     decode_metadata,
     metadata_for,
-    validate_table,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,7 +160,20 @@ def bin_contig_with_handle(
 
     starts, _ = bin_intervals(task.length, task.bin_size)
     qc = empty_qc()
-    kept_starts = _kept_starts(handle.fetch(task.name), task.filters, qc, task.length)
+    starts_list = list(
+        stream_contig_reads(
+            handle,
+            task.name,
+            task.filters,
+            contig_length=task.length,
+            qc=qc,
+        )
+    )
+    kept_starts = (
+        np.fromiter(starts_list, dtype=np.int64, count=len(starts_list))
+        if starts_list
+        else np.empty(0, dtype=np.int64)
+    )
     return bin_counts(kept_starts, task.bin_size, starts.size), qc
 
 
@@ -326,43 +354,6 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
     )
 
 
-def rejection_reason(read: pysam.AlignedSegment, filters: ReadFilters) -> str | None:
-    """Return the first matching QC counter name, or ``None`` if kept."""
-
-    if filters.exclude_unmapped and read.is_unmapped:
-        return "filter_unmapped"
-    start = read.reference_start
-    if start is None or int(start) < 0:
-        return "filter_no_start"
-    if filters.exclude_secondary and read.is_secondary:
-        return "filter_secondary"
-    if filters.exclude_supplementary and read.is_supplementary:
-        return "filter_supplementary"
-    if filters.exclude_duplicates and read.is_duplicate:
-        return "filter_duplicate"
-    if filters.require_proper_pair and read.is_paired and not read.is_proper_pair:
-        return "filter_improper_pair"
-    if int(read.mapping_quality) < filters.min_mapping_quality:
-        return "filter_mapq"
-    return None
-
-
-def write_sample_parquet(path: Path, table: pa.Table) -> None:
-    """Validate the sample contract, then persist Parquet."""
-
-    validate_table(table, ArtifactKind.SAMPLE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, path, compression="zstd")
-
-
-def read_sample_parquet(path: Path) -> pa.Table:
-    """Read sample Parquet and reject contract violations."""
-
-    table = pq.read_table(path)
-    validate_table(table, ArtifactKind.SAMPLE)
-    return table
-
-
 @contextmanager
 def _binned_contigs(
     tasks: Sequence[_ContigTask],
@@ -390,6 +381,8 @@ def run(config: ConvertConfig) -> None:
     logger.debug("opening alignment %s as %s", alignment, fmt)
     bam = _open_alignment(alignment, fmt, config.fasta)
     try:
+        if bam.has_index():
+            logger.debug("%s already has an index", alignment)
         bam = _ensure_index(alignment, fmt, bam, config.fasta, threads=1)
         header_names = list(bam.references)
         header_lengths = [int(length) for length in bam.lengths]
@@ -538,89 +531,6 @@ def run(config: ConvertConfig) -> None:
         output,
         output.stat().st_size / 1024,
     )
-
-
-def _alignment_format(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix == ".bam":
-        return "bam"
-    if suffix == ".cram":
-        return "cram"
-    raise ConvertError(f"{path} must be BAM or CRAM (found suffix {path.suffix!r})")
-
-
-def _open_alignment(
-    path: Path,
-    fmt: str,
-    fasta: Path | None,
-    threads: int = 1,
-) -> pysam.AlignmentFile:
-    decode_threads = max(1, threads)
-    if fmt == "cram":
-        if fasta is None:
-            raise ConvertError(
-                f"{path} is CRAM and requires a reference FASTA. "
-                "Pass --fasta /path/to/reference.fa (indexed with samtools faidx)."
-            )
-        if not fasta.is_file():
-            raise ConvertError(f"CRAM reference FASTA not found: {fasta}")
-        return pysam.AlignmentFile(
-            str(path),
-            "rc",
-            reference_filename=str(fasta),
-            threads=decode_threads,
-        )
-    return pysam.AlignmentFile(str(path), "rb", threads=decode_threads)
-
-
-def _ensure_index(
-    path: Path,
-    fmt: str,
-    handle: pysam.AlignmentFile,
-    fasta: Path | None,
-    threads: int = 1,
-) -> pysam.AlignmentFile:
-    if handle.has_index():
-        logger.debug("%s already has an index", path)
-        return handle
-    handle.close()
-    kind = "CRAM" if fmt == "cram" else "BAM"
-    logger.debug("creating %s index for %s", kind, path)
-    try:
-        pysam.index(str(path))
-    except Exception as error:
-        raise ConvertError(
-            f"failed to create {kind} index for {path}: {error}"
-        ) from error
-    handle = _open_alignment(path, fmt, fasta, threads=threads)
-    if handle.has_index():
-        return handle
-    handle.close()
-    raise ConvertError(f"failed to create {kind} index for {path}")
-
-
-def _kept_starts(
-    reads: Iterator[object],
-    filters: ReadFilters,
-    qc: dict[str, int],
-    contig_length: int,
-) -> np.ndarray:
-    starts: list[int] = []
-    for read in reads:
-        qc["reads_seen"] += 1
-        reason = rejection_reason(read, filters)
-        if reason is not None:
-            qc[reason] += 1
-            continue
-        start = int(read.reference_start)
-        if start >= contig_length:
-            qc["filter_no_start"] += 1
-            continue
-        starts.append(start)
-        qc["reads_kept"] += 1
-    if not starts:
-        return np.empty(0, dtype=np.int64)
-    return np.fromiter(starts, dtype=np.int64, count=len(starts))
 
 
 def _reference_identity(
