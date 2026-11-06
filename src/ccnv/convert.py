@@ -1,7 +1,7 @@
 """Stream BAM/CRAM alignments into canonical sample Parquet bins."""
 
 import logging
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -13,7 +13,18 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pysam
 
-from ccnv.models import Contig, ConvertConfig, GenomeProfile, ReadFilters, parquet_path
+from ccnv.models import (
+    ConvertConfig,
+    ConvertError,
+    GenomeProfile,
+    ReadFilters,
+    is_autosome_name,
+    is_canonical_contig,
+    normalize_chr,
+    parquet_path,
+    resolve_contig_name,
+    select_layout,
+)
 from ccnv.schemas import (
     SAMPLE_SCHEMA,
     ArtifactKind,
@@ -43,9 +54,26 @@ QC_COUNTERS: Final[tuple[str, ...]] = (
     "filter_mapq",
 )
 
-
-class ConvertError(ValueError):
-    """Raised when conversion cannot proceed with the given inputs."""
+__all__ = [
+    "QC_COUNTERS",
+    "ConvertError",
+    "bin_contig_with_handle",
+    "bin_counts",
+    "bin_intervals",
+    "empty_qc",
+    "is_autosome_name",
+    "is_canonical_contig",
+    "normalize_chr",
+    "read_sample_parquet",
+    "rebin_counts",
+    "rebin_sample_table",
+    "rejection_reason",
+    "resolve_contig_name",
+    "run",
+    "select_layout",
+    "split_thread_budget",
+    "write_sample_parquet",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,68 +153,6 @@ def empty_qc() -> dict[str, int]:
     """Return a complete QC counter map with deterministic key order."""
 
     return {name: 0 for name in QC_COUNTERS}
-
-
-def select_layout(
-    names: Sequence[str],
-    lengths: Sequence[int],
-    *,
-    all_contigs: bool,
-) -> tuple[Contig, ...]:
-    """Keep canonical chromosomes unless ``all_contigs`` is set.
-
-    The result may be empty; callers decide how to report that. Header
-    names and lengths must already be aligned.
-    """
-
-    if len(names) != len(lengths):
-        raise ValueError("contig names and lengths must have equal length")
-    return tuple(
-        Contig(name, length)
-        for name, length in zip(names, lengths, strict=True)
-        if all_contigs or is_canonical_contig(name)
-    )
-
-
-def normalize_chr(name: str) -> str:
-    """Normalize a contig name by stripping any leading 'chr' prefix."""
-
-    bare = name[3:] if name.lower().startswith("chr") else name
-    return bare.upper() if bare.upper() in {"X", "Y"} else bare
-
-
-def is_autosome_name(name: str) -> bool:
-    """Return True if contig is a canonical numbered autosome (1..22)."""
-
-    stripped = normalize_chr(name)
-    return stripped.isdigit() and 1 <= int(stripped) <= 22
-
-
-def resolve_contig_name(contig: str, available: Iterable[str]) -> str | None:
-    """Resolve contig name against available keys with chr-prefix and case fallback."""
-
-    avail_set = set(available)
-    if contig in avail_set:
-        return contig
-    stripped = normalize_chr(contig)
-    if stripped in avail_set:
-        return stripped
-    prefixed = f"chr{stripped}"
-    if prefixed in avail_set:
-        return prefixed
-    lower_map = {normalize_chr(k).lower(): k for k in available}
-    return lower_map.get(stripped.lower())
-
-
-def is_canonical_contig(name: str) -> bool:
-    """Report whether a contig is a canonical autosome or sex chromosome.
-
-    Accepts UCSC (``chr1``, ``chrX``) and plain NCBI/Ensembl (``1``, ``X``) spellings.
-    Mitochondrial contigs, ALT/decoy scaffolds, unplaced scaffolds, and EBV
-    are not canonical.
-    """
-
-    return is_autosome_name(name) or normalize_chr(name) in {"X", "Y"}
 
 
 def bin_intervals(length: int, bin_size: int) -> tuple[np.ndarray, np.ndarray]:

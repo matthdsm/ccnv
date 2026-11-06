@@ -1,8 +1,10 @@
-"""Typed domain objects shared by pipeline stages."""
+"""Configuration objects for ccnv pipeline stages."""
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
+
+from ccnv.models.domain import SamplesheetEntry
 
 DEFAULT_BIN_SIZE: Final[int] = 5000
 DEFAULT_MIN_MAPPABILITY: Final[float] = 0.5
@@ -13,65 +15,6 @@ def parquet_path(prefix: Path) -> Path:
     """Canonical sample or reference Parquet path for a CLI prefix."""
 
     return Path(f"{prefix}.ccnv")
-
-
-@dataclass(frozen=True, slots=True)
-class SamplesheetEntry:
-    """One entry in a cohort reference samplesheet."""
-
-    filepath: Path
-    sex: Literal["M", "F"] | None = None
-    ff: float | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.filepath, Path):
-            object.__setattr__(self, "filepath", Path(self.filepath))
-        if self.sex is not None and self.sex not in ("M", "F"):
-            raise ValueError(f"sex must be 'M' or 'F', got {self.sex!r}")
-        if self.ff is not None and not (0.0 <= self.ff <= 1.0):
-            raise ValueError(
-                f"fetal fraction ff must be between 0.0 and 1.0, got {self.ff}"
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class Contig:
-    """A contig exactly as declared by an alignment header."""
-
-    name: str
-    length: int
-    role: str | None = None
-
-    def __post_init__(self) -> None:
-        if not self.name:
-            raise ValueError("contig name must not be empty")
-        if self.length <= 0:
-            raise ValueError("contig length must be positive")
-
-
-@dataclass(frozen=True, slots=True)
-class GenomeProfile:
-    """Ordered contigs and optional biological roles for one genome."""
-
-    contigs: tuple[Contig, ...]
-
-    def __post_init__(self) -> None:
-        names = [contig.name for contig in self.contigs]
-        if not names:
-            raise ValueError("genome profile must contain at least one contig")
-        if len(names) != len(set(names)):
-            raise ValueError("contig names must be unique")
-
-    @property
-    def names(self) -> tuple[str, ...]:
-        return tuple(contig.name for contig in self.contigs)
-
-    @property
-    def lengths(self) -> tuple[int, ...]:
-        return tuple(contig.length for contig in self.contigs)
-
-    def length_map(self) -> dict[str, int]:
-        return {contig.name: contig.length for contig in self.contigs}
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,17 +114,6 @@ class ReferenceQCConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class Cytoband:
-    """A cytogenetic band interval in 0-based half-open coordinates."""
-
-    contig: str
-    start: int
-    end: int
-    name: str
-    stain: str
-
-
-@dataclass(frozen=True, slots=True)
 class PredictConfig:
     sample: Path
     reference: Path
@@ -209,3 +141,16 @@ class PredictConfig:
             )
         if not (0.0 <= self.min_fetal_fraction_warning <= 1.0):
             raise ValueError("min_fetal_fraction_warning must be between 0.0 and 1.0")
+
+
+__all__ = [
+    "DEFAULT_BIN_SIZE",
+    "DEFAULT_MIN_MAPPABILITY",
+    "AnalysisMode",
+    "ConvertConfig",
+    "PredictConfig",
+    "ReadFilters",
+    "ReferenceConfig",
+    "ReferenceQCConfig",
+    "parquet_path",
+]

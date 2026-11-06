@@ -423,5 +423,180 @@ class TestPredictionOutputsAliasesAndFields(unittest.TestCase):
         self.assertEqual(outputs.prenatal_result, prenatal)
 
 
+class TestExceptions(unittest.TestCase):
+    def test_exception_hierarchy(self) -> None:
+        from ccnv.models.exceptions import (
+            CcnvError,
+            ConvertError,
+            CovariateError,
+            PredictError,
+            ReferenceError,
+            ReferenceQCError,
+            SchemaError,
+        )
+
+        for err_cls in (
+            ConvertError,
+            CovariateError,
+            PredictError,
+            ReferenceError,
+            ReferenceQCError,
+            SchemaError,
+        ):
+            self.assertTrue(issubclass(err_cls, CcnvError))
+            self.assertTrue(issubclass(err_cls, Exception))
+
+    def test_exception_instantiation(self) -> None:
+        from ccnv.models.exceptions import CcnvError, ReferenceError
+
+        err = ReferenceError("reference build failed")
+        self.assertIsInstance(err, CcnvError)
+        self.assertEqual(str(err), "reference build failed")
+
+
+class TestDomainModels(unittest.TestCase):
+    def test_contig_validation(self) -> None:
+        from ccnv.models.domain import Contig
+
+        c = Contig("chr1", 1000)
+        self.assertEqual(c.name, "chr1")
+        self.assertEqual(c.length, 1000)
+        with self.assertRaisesRegex(ValueError, "contig name must not be empty"):
+            Contig("", 1000)
+        with self.assertRaisesRegex(ValueError, "contig length must be positive"):
+            Contig("chr1", 0)
+
+    def test_genome_profile(self) -> None:
+        from ccnv.models.domain import Contig, GenomeProfile
+
+        c1 = Contig("chr1", 1000)
+        c2 = Contig("chr2", 2000)
+        gp = GenomeProfile((c1, c2))
+        self.assertEqual(gp.names, ("chr1", "chr2"))
+        self.assertEqual(gp.lengths, (1000, 2000))
+        self.assertEqual(gp.length_map(), {"chr1": 1000, "chr2": 2000})
+
+        with self.assertRaisesRegex(
+            ValueError, "genome profile must contain at least one contig"
+        ):
+            GenomeProfile(())
+        with self.assertRaisesRegex(ValueError, "contig names must be unique"):
+            GenomeProfile((c1, Contig("chr1", 500)))
+
+    def test_cytoband(self) -> None:
+        from ccnv.models.domain import Cytoband
+
+        band = Cytoband("chr1", 0, 10000, "p36.33", "gneg")
+        self.assertEqual(band.contig, "chr1")
+        self.assertEqual(band.start, 0)
+        self.assertEqual(band.end, 10000)
+        self.assertEqual(band.name, "p36.33")
+        self.assertEqual(band.stain, "gneg")
+
+    def test_chromosome_helpers(self) -> None:
+        from ccnv.models.domain import (
+            is_autosome_name,
+            is_canonical_contig,
+            normalize_chr,
+            resolve_contig_name,
+            select_layout,
+        )
+
+        self.assertEqual(normalize_chr("chr1"), "1")
+        self.assertEqual(normalize_chr("chrX"), "X")
+        self.assertEqual(normalize_chr("chrx"), "X")
+        self.assertEqual(normalize_chr("chrY"), "Y")
+        self.assertEqual(normalize_chr("1"), "1")
+
+        self.assertTrue(is_autosome_name("chr1"))
+        self.assertTrue(is_autosome_name("22"))
+        self.assertFalse(is_autosome_name("chrX"))
+        self.assertFalse(is_autosome_name("chrM"))
+
+        self.assertTrue(is_canonical_contig("chr1"))
+        self.assertTrue(is_canonical_contig("chrX"))
+        self.assertTrue(is_canonical_contig("chrY"))
+        self.assertFalse(is_canonical_contig("chrM"))
+
+        self.assertEqual(resolve_contig_name("1", ["chr1", "chr2"]), "chr1")
+        self.assertEqual(resolve_contig_name("chr1", ["1", "2"]), "1")
+        self.assertIsNone(resolve_contig_name("chrZ", ["chr1", "chr2"]))
+
+        layout = select_layout(["chr1", "chrM"], [1000, 500], all_contigs=False)
+        self.assertEqual(len(layout), 1)
+        self.assertEqual(layout[0].name, "chr1")
+
+
+class TestModelReExports(unittest.TestCase):
+    def test_reexports_from_root_models(self) -> None:
+        import ccnv.models as models
+
+        expected_symbols = [
+            "ConvertConfig",
+            "ReferenceConfig",
+            "PredictConfig",
+            "ReferenceQCConfig",
+            "ReadFilters",
+            "DEFAULT_BIN_SIZE",
+            "DEFAULT_MIN_MAPPABILITY",
+            "AnalysisMode",
+            "parquet_path",
+            "Contig",
+            "GenomeProfile",
+            "SamplesheetEntry",
+            "Cytoband",
+            "select_layout",
+            "is_canonical_contig",
+            "is_autosome_name",
+            "resolve_contig_name",
+            "normalize_chr",
+            "BinResult",
+            "SegmentResult",
+            "SCAResult",
+            "FetalFractionResult",
+            "PredictionOutputs",
+            "ReferenceQCOutputs",
+            "CallType",
+            "SCACall",
+            "FetalSex",
+            "ActiveFFSource",
+            "SAMPLE_SCHEMA",
+            "REFERENCE_SCHEMA",
+            "SCHEMA_VERSION",
+            "BRANCH_AUTOSOMAL",
+            "BRANCH_FEMALE_SEX",
+            "BRANCH_MALE_SEX",
+            "BRANCH_PRENATAL_AUTOSOMAL",
+            "BRANCH_PRENATAL_FFY",
+            "KNOWN_REFERENCE_BRANCHES",
+            "CNV_REFERENCE_BRANCHES",
+            "ArtifactKind",
+            "ReferenceMetadata",
+            "PrenatalModelMetadata",
+            "PRENATAL_METADATA_KEY",
+            "COORDINATE_SYSTEM",
+            "decode_metadata",
+            "metadata_for",
+            "encode_metadata",
+            "validate_metadata",
+            "validate_table",
+            "validate_schema",
+            "validate_sample_table",
+            "validate_reference_table",
+            "bin_coordinates",
+            "CcnvError",
+            "ReferenceError",
+            "CovariateError",
+            "PredictError",
+            "SchemaError",
+            "ConvertError",
+            "ReferenceQCError",
+        ]
+        for sym in expected_symbols:
+            self.assertTrue(
+                hasattr(models, sym), f"ccnv.models missing re-export {sym}"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

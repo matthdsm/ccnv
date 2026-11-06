@@ -23,7 +23,12 @@ from ccnv.covariates import (
     mask_covariates,
     validate_min_mappability,
 )
-from ccnv.models import DEFAULT_MIN_MAPPABILITY, AnalysisMode, PredictConfig
+from ccnv.models import (
+    DEFAULT_MIN_MAPPABILITY,
+    AnalysisMode,
+    PredictConfig,
+    PredictError,
+)
 from ccnv.predict_qc import build_predict_qc_payload, write_predict_qc_json
 from ccnv.prenatal import annotate_prenatal_segments, predict_prenatal
 from ccnv.report import write_outputs
@@ -63,10 +68,6 @@ logger = logging.getLogger(__name__)
 
 Sex = Literal["female", "male"]
 _MASK_Z_THRESHOLD: Final[float] = 2.326347874
-
-
-class PredictError(ValueError):
-    """Raised when prediction inputs or intermediate values are invalid."""
 
 
 @dataclass(frozen=True, slots=True)

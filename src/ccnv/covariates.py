@@ -16,7 +16,7 @@ import scipy.stats
 from numpy.polynomial.polynomial import polyvander
 from numpy.typing import NDArray
 
-from ccnv.models import DEFAULT_MIN_MAPPABILITY
+from ccnv.models import DEFAULT_MIN_MAPPABILITY, CovariateError
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +36,6 @@ for _ch in b"GgCc":
     _ASCII_BASE_LUT[_ch] = 1
 for _ch in b"AaTtUu":
     _ASCII_BASE_LUT[_ch] = 2
-
-
-class CovariateError(ValueError):
-    """Raised when a GC or mappability covariate track cannot be read or aligned."""
 
 
 def validate_min_mappability(min_mappability: float) -> None:

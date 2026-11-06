@@ -10,6 +10,7 @@ import pyarrow.parquet as pq
 from numpy.typing import NDArray
 
 from ccnv.convert import bin_intervals, rebin_sample_table, select_layout
+from ccnv.models import ReferenceError
 from ccnv.schemas import ArtifactKind, SchemaError, decode_metadata, validate_table
 
 logger = logging.getLogger(__name__)
@@ -22,10 +23,6 @@ _ParsedSample = tuple[
     NDArray[np.int64],
     NDArray[np.float64],
 ]
-
-
-class ReferenceError(ValueError):
-    """Raised when a cohort cannot be turned into a reference."""
 
 
 @dataclass(frozen=True, slots=True)

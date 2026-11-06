@@ -14,7 +14,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from numpy.typing import NDArray
 
-from ccnv.models import ReferenceQCConfig
+from ccnv.models import ReferenceQCConfig, ReferenceQCError
 from ccnv.results import ReferenceQCOutputs
 from ccnv.schemas import (
     BRANCH_AUTOSOMAL,
@@ -36,10 +36,6 @@ CHRY_MEAN_DIST_WARN: Final[float] = 5.0
 CHRY_MEAN_DIST_FAIL: Final[float] = 100.0
 
 logger = logging.getLogger(__name__)
-
-
-class ReferenceQCError(ValueError):
-    """Raised when reference quality control cannot be performed."""
 
 
 VERDICT_SEVERITY: Final[dict[str, int]] = {
