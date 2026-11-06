@@ -6,12 +6,19 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Final
 
 import numpy as np
 import pyarrow as pa
 import pysam
 
+from ccnv.features.binning import (
+    bin_counts,
+    bin_intervals,
+    rebin_counts,
+)
+from ccnv.features.cohort import (
+    rebin_sample_table,
+)
 from ccnv.io.alignments import (
     alignment_format as _alignment_format,
 )
@@ -41,33 +48,18 @@ from ccnv.models import (
     resolve_contig_name,
     select_layout,
 )
+from ccnv.qc.sample import (
+    QC_COUNTERS,
+    build_sample_qc,
+    empty_qc,
+)
 from ccnv.schemas import (
     SAMPLE_SCHEMA,
     ArtifactKind,
-    decode_metadata,
     metadata_for,
 )
 
 logger = logging.getLogger(__name__)
-
-QC_COUNTERS: Final[tuple[str, ...]] = (
-    "header_mapped",
-    "header_unmapped",
-    "header_no_coordinate",
-    "reads_seen",
-    "reads_kept",
-    "effective_reads_examined",
-    "effective_reads_kept",
-    "autosomal_reads_kept",
-    "sex_reads_kept",
-    "filter_unmapped",
-    "filter_no_start",
-    "filter_secondary",
-    "filter_supplementary",
-    "filter_duplicate",
-    "filter_improper_pair",
-    "filter_mapq",
-)
 
 __all__ = [
     "QC_COUNTERS",
@@ -75,6 +67,7 @@ __all__ = [
     "bin_contig_with_handle",
     "bin_counts",
     "bin_intervals",
+    "build_sample_qc",
     "empty_qc",
     "is_autosome_name",
     "is_canonical_contig",
@@ -175,183 +168,6 @@ def bin_contig_with_handle(
         else np.empty(0, dtype=np.int64)
     )
     return bin_counts(kept_starts, task.bin_size, starts.size), qc
-
-
-def empty_qc() -> dict[str, int]:
-    """Return a complete QC counter map with deterministic key order."""
-
-    return {name: 0 for name in QC_COUNTERS}
-
-
-def bin_intervals(length: int, bin_size: int) -> tuple[np.ndarray, np.ndarray]:
-    """Return 0-based half-open bin edges, keeping a partial last bin."""
-
-    if length <= 0:
-        raise ValueError("contig length must be positive")
-    if bin_size <= 0:
-        raise ValueError("bin_size must be a positive integer")
-    n_bins = (length + bin_size - 1) // bin_size
-    starts = np.arange(n_bins, dtype=np.int64) * np.int64(bin_size)
-    ends = np.minimum(starts + np.int64(bin_size), np.int64(length))
-    return starts, ends
-
-
-def bin_counts(starts: np.ndarray, bin_size: int, n_bins: int) -> np.ndarray:
-    """Count start positions into bins with a single ``numpy.bincount``."""
-
-    if n_bins <= 0:
-        raise ValueError("n_bins must be positive")
-    if starts.size == 0:
-        return np.zeros(n_bins, dtype=np.uint64)
-    indices = starts // bin_size
-    valid = (indices >= 0) & (indices < n_bins)
-    return np.bincount(indices[valid], minlength=n_bins).astype(np.uint64)
-
-
-def rebin_counts(
-    source_starts: np.ndarray,
-    source_ends: np.ndarray,
-    source_counts: np.ndarray,
-    target_starts: np.ndarray,
-    target_ends: np.ndarray,
-) -> np.ndarray:
-    """Redistribute 1D binned counts from source intervals to target intervals.
-
-    Both intervals must partition the same contig length [0, L].
-    Coarsening sums nested bins; refining splits counts uniformly by overlap length.
-    """
-    if target_starts.size == 0:
-        return np.empty(0, dtype=np.float64)
-    if source_starts.size == 0:
-        return np.zeros(target_starts.size, dtype=np.float64)
-    if source_ends[-1] != target_ends[-1]:
-        raise ValueError(
-            f"contig length mismatch: source ends at {source_ends[-1]}, "
-            f"target ends at {target_ends[-1]}"
-        )
-    if (
-        source_starts.size == target_starts.size
-        and np.array_equal(source_starts, target_starts)
-        and np.array_equal(source_ends, target_ends)
-    ):
-        return np.asarray(source_counts, dtype=np.float64).copy()
-
-    source_knots = np.concatenate(([source_starts[0]], source_ends))
-    source_cum = np.concatenate(([0.0], np.cumsum(source_counts, dtype=np.float64)))
-    target_knots = np.concatenate(([target_starts[0]], target_ends))
-    target_cum = np.interp(target_knots, source_knots, source_cum)
-    target_counts = np.diff(target_cum)
-    return np.maximum(target_counts, 0.0)
-
-
-def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
-    """Rescale sample Parquet counts to target_bin_size without changing length."""
-    if target_bin_size <= 0:
-        raise ValueError("target_bin_size must be a positive integer")
-    metadata = decode_metadata(table.schema.metadata)
-    current_bin_size = metadata.get("bin_size")
-    if current_bin_size == target_bin_size:
-        return table
-
-    contig_lengths = metadata.get("contig_lengths")
-    if not isinstance(contig_lengths, dict) or not contig_lengths:
-        raise ValueError("table metadata lacks contig_lengths")
-
-    contig_arr = np.asarray(table.column("contig"))
-    start_col = np.asarray(
-        table.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    end_col = np.asarray(
-        table.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    count_col = np.asarray(
-        table.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
-    )
-
-    new_contigs: list[np.ndarray] = []
-    new_starts: list[np.ndarray] = []
-    new_ends: list[np.ndarray] = []
-    new_counts: list[np.ndarray] = []
-
-    if len(contig_arr) == 0:
-        contig_slices: dict[str, tuple[int, int]] = {}
-    else:
-        changes = np.flatnonzero(contig_arr[1:] != contig_arr[:-1]) + 1
-        starts = np.concatenate(([0], changes))
-        ends = np.concatenate((changes, [len(contig_arr)]))
-        contig_slices = {
-            str(contig_arr[s]): (int(s), int(e))
-            for s, e in zip(starts, ends, strict=True)
-        }
-
-    for contig_name, length in contig_lengths.items():
-        target_starts, target_ends = bin_intervals(int(length), target_bin_size)
-        span = contig_slices.get(contig_name)
-        if span is None:
-            target_counts = np.zeros(target_starts.size, dtype=np.float64)
-        else:
-            s, e = span
-            s_starts = start_col[s:e]
-            s_ends = end_col[s:e]
-            s_counts = count_col[s:e]
-            target_counts = rebin_counts(
-                s_starts, s_ends, s_counts, target_starts, target_ends
-            )
-        new_contigs.append(np.full(target_starts.size, contig_name, dtype=object))
-        new_starts.append(target_starts)
-        new_ends.append(target_ends)
-        new_counts.append(target_counts)
-
-    meta_values = {
-        key: val
-        for key, val in metadata.items()
-        if key
-        not in (
-            "artifact_kind",
-            "schema_version",
-            "coordinate_system",
-            "contig_lengths",
-        )
-    }
-    meta_values["bin_size"] = target_bin_size
-    new_metadata = metadata_for(
-        ArtifactKind.SAMPLE,
-        contig_lengths={str(k): int(v) for k, v in contig_lengths.items()},
-        values=meta_values,
-    )
-    new_schema = pa.schema(
-        [
-            pa.field("contig", pa.string(), nullable=False),
-            pa.field("start", pa.int64(), nullable=False),
-            pa.field("end", pa.int64(), nullable=False),
-            pa.field("count", pa.float64(), nullable=False),
-        ]
-    ).with_metadata(new_metadata)
-
-    empty_str = np.array([], dtype=object)
-    empty_i64 = np.empty(0, dtype=np.int64)
-    empty_f64 = np.empty(0, dtype=np.float64)
-    return pa.table(
-        {
-            "contig": pa.array(
-                np.concatenate(new_contigs) if new_contigs else empty_str,
-                type=pa.string(),
-            ),
-            "start": pa.array(
-                np.concatenate(new_starts) if new_starts else empty_i64,
-                type=pa.int64(),
-            ),
-            "end": pa.array(
-                np.concatenate(new_ends) if new_ends else empty_i64,
-                type=pa.int64(),
-            ),
-            "count": pa.array(
-                np.concatenate(new_counts) if new_counts else empty_f64,
-                type=pa.float64(),
-            ),
-        },
-        schema=new_schema,
-    )
 
 
 @contextmanager
@@ -489,8 +305,7 @@ def run(config: ConvertConfig) -> None:
     finally:
         bam.close()
 
-    qc["effective_reads_examined"] = qc["reads_seen"]
-    qc["effective_reads_kept"] = qc["reads_kept"]
+    qc = build_sample_qc(qc)
 
     logger.debug(
         "convert QC summary: %d reads examined, %d kept (%.1f%%), %d duplicate, "

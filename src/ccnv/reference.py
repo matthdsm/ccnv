@@ -5,13 +5,12 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final
 
 import numpy as np
 import pyarrow as pa
-import scipy.stats
 from numpy.typing import NDArray
 
 from ccnv.cohort import (
@@ -37,6 +36,21 @@ from ccnv.covariates import (
     load_mappability_track,
     mask_covariates,
     validate_min_mappability,
+)
+from ccnv.features.cohort import (
+    SexInference as SexInference,
+)
+from ccnv.features.cohort import (
+    SexLabel as SexLabel,
+)
+from ccnv.features.cohort import (
+    infer_sample_sexes as infer_sample_sexes,
+)
+from ccnv.features.cohort import (
+    mask_low_coverage as mask_low_coverage,
+)
+from ccnv.features.cohort import (
+    normalize_depth as normalize_depth,
 )
 from ccnv.io.parquet import write_reference_parquet
 from ccnv.models import ReferenceConfig, SamplesheetEntry, parquet_path
@@ -65,22 +79,7 @@ from ccnv.stats.pca import fit_pca as fit_pca
 DEFAULT_SEX_CONTIGS: Final[tuple[str, ...]] = ("X", "Y", "chrX", "chrY")
 DEFAULT_SEX_SIGNAL_CONTIGS: Final[tuple[str, ...]] = ("chrY", "Y")
 
-SexLabel = Literal["female", "male"]
-_MASK_FRACTION: Final[float] = 0.05
-_SEPARATION_MAD_MULTIPLIER: Final[float] = 4.0
-
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True, slots=True)
-class SexInference:
-    """Deterministic sex assignments, or a rejected inference."""
-
-    labels: tuple[SexLabel, ...] | None
-    cutoff: float | None
-    fractions: tuple[float, ...]
-    passed: bool
-    reason: str
 
 
 def run(config: ReferenceConfig) -> None:
@@ -154,103 +153,6 @@ def run(config: ReferenceConfig) -> None:
             write_json=True,
             emit_stderr=True,
         )
-
-
-def normalize_depth(
-    counts: NDArray[np.floating],
-    mask: NDArray[np.bool_] | None = None,
-) -> NDArray[np.float64]:
-    """Scale each sample to unit total depth, optionally on usable bins."""
-
-    matrix = np.asarray(counts, dtype=np.float64)
-    sub = matrix[mask] if mask is not None else matrix
-    totals = sub.sum(axis=0)
-    if np.any(totals <= 0):
-        suffix = " on usable bins" if mask is not None else ""
-        raise ReferenceError(f"every sample must have a positive total count{suffix}")
-    return matrix / totals
-
-
-def mask_low_coverage(normalized: NDArray[np.floating]) -> NDArray[np.bool_]:
-    """Mask bins with no coverage or coverage below 5% of the positive median."""
-
-    per_bin = np.asarray(normalized, dtype=np.float64).sum(axis=1)
-    positive = per_bin[per_bin > 0]
-    if positive.size == 0:
-        return np.zeros(per_bin.shape, dtype=np.bool_)
-    threshold = _MASK_FRACTION * float(np.median(positive))
-    return per_bin > threshold
-
-
-def infer_sample_sexes(
-    fractions: NDArray[np.floating],
-    min_group_size: int,
-    min_separation: float = 0.0,
-    cutoff: float | None = None,
-) -> SexInference:
-    """Split Y-like fractions into female/male groups when separation is clear."""
-
-    values = np.asarray(fractions, dtype=np.float64)
-    recorded = tuple(float(value) for value in values)
-    if min_group_size < 1:
-        raise ReferenceError("min_sex_group_size must be a positive integer")
-    if cutoff is not None:
-        return _labels_from_cutoff(values, recorded, cutoff)
-    if values.size < 2 * min_group_size:
-        return SexInference(
-            labels=None,
-            cutoff=None,
-            fractions=recorded,
-            passed=False,
-            reason="cohort is too small for sex inference",
-        )
-
-    order = np.argsort(values, kind="mergesort")
-    sorted_values = values[order]
-    best_gap = -np.inf
-    best_split = -1
-    for split in range(min_group_size, values.size - min_group_size + 1):
-        gap = float(sorted_values[split] - sorted_values[split - 1])
-        if gap > best_gap:
-            best_gap = gap
-            best_split = split
-
-    if best_split < 0 or best_gap <= 0:
-        return SexInference(
-            labels=None,
-            cutoff=None,
-            fractions=recorded,
-            passed=False,
-            reason="sex-signal fractions are not separable",
-        )
-
-    low = sorted_values[:best_split]
-    high = sorted_values[best_split:]
-    spread = max(
-        _median_abs_deviation(low),
-        _median_abs_deviation(high),
-        1e-12,
-    )
-    cutoff = float((low[-1] + high[0]) / 2.0)
-    if best_gap < max(min_separation, _SEPARATION_MAD_MULTIPLIER * spread):
-        return SexInference(
-            labels=None,
-            cutoff=cutoff,
-            fractions=recorded,
-            passed=False,
-            reason="sex-signal groups are not sufficiently separated",
-        )
-
-    labels = ["female"] * values.size
-    for index in order[best_split:]:
-        labels[int(index)] = "male"
-    return SexInference(
-        labels=tuple(labels),
-        cutoff=cutoff,
-        fractions=recorded,
-        passed=True,
-        reason="separated",
-    )
 
 
 def build_reference_table(
@@ -600,22 +502,6 @@ def _validate_sex_cutoff(cutoff: float | None) -> None:
         raise ReferenceError("sex_cutoff must be a finite number in [0, 1]")
 
 
-def _labels_from_cutoff(
-    values: NDArray[np.float64],
-    recorded: tuple[float, ...],
-    cutoff: float,
-) -> SexInference:
-    _validate_sex_cutoff(cutoff)
-    labels = tuple("male" if float(value) > cutoff else "female" for value in values)
-    return SexInference(
-        labels=labels,
-        cutoff=float(cutoff),
-        fractions=recorded,
-        passed=True,
-        reason="cutoff",
-    )
-
-
 def _contig_fractions(cohort: Cohort, contig: str) -> NDArray[np.float64]:
     totals = cohort.counts.sum(axis=0)
     if np.any(totals <= 0):
@@ -789,7 +675,3 @@ def _build_branch_table(
         },
         schema=REFERENCE_SCHEMA,
     )
-
-
-def _median_abs_deviation(values: NDArray[np.floating]) -> float:
-    return float(scipy.stats.median_abs_deviation(values, scale=1.0))
