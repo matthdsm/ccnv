@@ -11,6 +11,7 @@ from typing import Final, Literal
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import scipy.stats
 from numpy.typing import ArrayLike, NDArray
 
 from ccnv.convert import read_sample_parquet, rebin_sample_table
@@ -25,11 +26,6 @@ from ccnv.covariates import (
 from ccnv.models import DEFAULT_MIN_MAPPABILITY, AnalysisMode, PredictConfig
 from ccnv.predict_qc import build_predict_qc_payload, write_predict_qc_json
 from ccnv.prenatal import annotate_prenatal_segments, predict_prenatal
-from ccnv.reference import (
-    BRANCH_AUTOSOMAL,
-    BRANCH_FEMALE_SEX,
-    BRANCH_MALE_SEX,
-)
 from ccnv.report import write_outputs
 from ccnv.results import (
     BinResult,
@@ -39,6 +35,9 @@ from ccnv.results import (
     SegmentResult,
 )
 from ccnv.schemas import (
+    BRANCH_AUTOSOMAL,
+    BRANCH_FEMALE_SEX,
+    BRANCH_MALE_SEX,
     ArtifactKind,
     PrenatalModelMetadata,
     SchemaError,
@@ -399,25 +398,8 @@ def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
         if np.any(indexes < 0) or np.any(indexes >= unmasked_count):
             raise PredictError(f"branch {branch!r} has invalid nearest references")
 
-    gc: NDArray[np.float64] | None = None
-    if "gc" in branch_table.schema.names:
-        gc_raw = (
-            branch_table.column("gc").to_numpy(zero_copy_only=False).astype(np.float64)
-        )
-        gc_raw[gc_raw < 0.0] = np.nan
-        if np.any(np.isfinite(gc_raw)):
-            gc = gc_raw
-
-    mappability: NDArray[np.float64] | None = None
-    if "mappability" in branch_table.schema.names:
-        map_raw = (
-            branch_table.column("mappability")
-            .to_numpy(zero_copy_only=False)
-            .astype(np.float64)
-        )
-        map_raw[map_raw < 0.0] = np.nan
-        if np.any(np.isfinite(map_raw)):
-            mappability = map_raw
+    gc = _extract_covariate_col(branch_table, "gc")
+    mappability = _extract_covariate_col(branch_table, "mappability")
 
     return BranchModel(
         branch=branch,
@@ -435,6 +417,14 @@ def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
         gc=gc,
         mappability=mappability,
     )
+
+
+def _extract_covariate_col(table: pa.Table, name: str) -> NDArray[np.float64] | None:
+    if name not in table.schema.names:
+        return None
+    raw = table.column(name).to_numpy(zero_copy_only=False).astype(np.float64)
+    raw[raw < 0.0] = np.nan
+    return raw if np.any(np.isfinite(raw)) else None
 
 
 def project_coverage(
@@ -534,7 +524,9 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
     local_ratios = np.full(corrected.shape, np.nan, dtype=np.float64)
     local_zscores = np.full(corrected.shape, np.nan, dtype=np.float64)
 
-    filtered_neighbors = model.nearest_indices
+    filtered_neighbors = tuple(
+        nbrs[nbrs != i] for i, nbrs in enumerate(model.nearest_indices)
+    )
     null_mean = model.null_mean
     null_std = model.null_std
 
@@ -544,7 +536,7 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
         for index in range(n_unmasked):
             val = corrected[index]
             neighbors = filtered_neighbors[index]
-            mask = eligible[neighbors] & (neighbors != index)
+            mask = eligible[neighbors]
             selected = neighbors[mask]
             n_sel = int(selected.size)
             reference_sizes[unmasked_positions[index]] = n_sel
@@ -564,7 +556,7 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
         if np.any(missing_z):
             finite_r = local_ratios[np.isfinite(local_ratios)]
             med_r = float(np.median(finite_r))
-            mad_r = float(np.median(np.abs(finite_r - med_r)))
+            mad_r = float(scipy.stats.median_abs_deviation(finite_r, scale=1.0))
             emp_std = 1.4826 * mad_r
             if emp_std > 1e-12:
                 local_zscores[missing_z] = (local_ratios[missing_z] - med_r) / emp_std
@@ -669,19 +661,35 @@ def segment_and_call(
             int,
         ],
     ] = {}
-    evidence: dict[str, tuple[BinResult, NDArray[np.bool_]]] = {}
+    evidence: dict[
+        str,
+        tuple[
+            NDArray[np.int64],
+            NDArray[np.int64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+        ],
+    ] = {}
     for result in bins:
         contig_array = np.asarray(result.contigs, dtype=object)
         for contig in dict.fromkeys(result.contigs):
             selected = contig_array == contig
+            c_starts = result.starts[selected]
+            c_ends = result.ends[selected]
+            c_weights = result.weights[selected]
             by_contig[contig] = (
-                result.starts[selected],
-                result.ends[selected],
+                c_starts,
+                c_ends,
                 result.ratios[selected],
-                result.weights[selected],
+                c_weights,
                 contig_lengths[contig],
             )
-            evidence[contig] = (result, selected)
+            evidence[contig] = (
+                c_starts,
+                c_ends,
+                result.zscores[selected],
+                c_weights,
+            )
     raw_segments = segment_genome(
         by_contig,
         penalty=penalty,
@@ -690,16 +698,15 @@ def segment_and_call(
     )
     output: list[SegmentResult] = []
     for segment in raw_segments:
-        result, contig_mask = evidence[segment.contig]
+        c_starts, c_ends, c_zscores, c_weights = evidence[segment.contig]
         overlap = (
-            contig_mask
-            & (result.starts < segment.end)
-            & (result.ends > segment.start)
-            & np.isfinite(result.zscores)
-            & (result.weights > 0)
+            (c_starts < segment.end)
+            & (c_ends > segment.start)
+            & np.isfinite(c_zscores)
+            & (c_weights > 0)
         )
         segment_z = (
-            float(np.average(result.zscores[overlap], weights=result.weights[overlap]))
+            float(np.average(c_zscores[overlap], weights=c_weights[overlap]))
             if np.any(overlap)
             else np.nan
         )

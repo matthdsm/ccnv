@@ -267,28 +267,23 @@ def write_outputs(
             bins,
             sample_name,
         )
+        seg_header = _build_vcf_header(
+            contig_lengths,
+            sample_name,
+            "segments",
+            extra_contigs=(s.contig for s in segments),
+            prenatal_result=prenatal_result if is_prenatal else None,
+        )
         _write_segments_vcf(
             segments_vcf,
-            _build_vcf_header(
-                contig_lengths,
-                sample_name,
-                "segments",
-                extra_contigs=(s.contig for s in segments),
-                prenatal_result=prenatal_result if is_prenatal else None,
-            ),
+            seg_header,
             segments,
             sample_name,
             is_prenatal=is_prenatal,
         )
         _write_segments_vcf(
             calls_vcf,
-            _build_vcf_header(
-                contig_lengths,
-                sample_name,
-                "segments",
-                extra_contigs=(s.contig for s in segments),
-                prenatal_result=prenatal_result if is_prenatal else None,
-            ),
+            seg_header,
             segments,
             sample_name,
             calls_only=True,
@@ -402,40 +397,39 @@ def write_genome_plot(
         r_arr = np.empty(0, dtype="<f4")
         z_arr = np.empty(0, dtype="<f4")
 
-    if prenatal_result is not None:
-        seg_rows: list[list[object]] = [
-            [
-                contig_to_idx[s.contig],
-                int(s.start),
-                int(s.end),
-                round(float(s.ratio), 5) if np.isfinite(s.ratio) else 0.0,
-                round(float(s.zscore), 4) if np.isfinite(s.zscore) else 0.0,
-                int(s.bin_count),
-                bool(s.discordant),
-                round(float(s.implied_ff), 4)
-                if s.implied_ff is not None and np.isfinite(s.implied_ff)
-                else None,
-                round(float(s.expected_ratio), 5)
-                if s.expected_ratio is not None and np.isfinite(s.expected_ratio)
-                else None,
-                s.discordance_reason,
-            ]
-            for s in segments
-            if s.contig in contig_to_idx and np.isfinite(s.ratio)
+    seg_rows: list[list[object]] = []
+    for s in segments:
+        if s.contig not in contig_to_idx or not np.isfinite(s.ratio):
+            continue
+        row: list[object] = [
+            contig_to_idx[s.contig],
+            int(s.start),
+            int(s.end),
+            round(float(s.ratio), 5),
+            round(float(s.zscore), 4) if np.isfinite(s.zscore) else 0.0,
+            int(s.bin_count),
         ]
-    else:
-        seg_rows = [
-            [
-                contig_to_idx[s.contig],
-                int(s.start),
-                int(s.end),
-                round(float(s.ratio), 5) if np.isfinite(s.ratio) else 0.0,
-                round(float(s.zscore), 4) if np.isfinite(s.zscore) else 0.0,
-                int(s.bin_count),
-            ]
-            for s in segments
-            if s.contig in contig_to_idx and np.isfinite(s.ratio)
-        ]
+        if prenatal_result is not None:
+            row.extend(
+                [
+                    bool(s.discordant),
+                    (
+                        round(float(s.implied_ff), 4)
+                        if s.implied_ff is not None and np.isfinite(s.implied_ff)
+                        else None
+                    ),
+                    (
+                        round(float(s.expected_ratio), 5)
+                        if (
+                            s.expected_ratio is not None
+                            and np.isfinite(s.expected_ratio)
+                        )
+                        else None
+                    ),
+                    s.discordance_reason,
+                ]
+            )
+        seg_rows.append(row)
 
     band_rows = [
         [contig_to_idx[b.contig], int(b.start), int(b.end), b.name, b.stain]
@@ -469,20 +463,14 @@ def write_genome_plot(
             "ffy": (
                 float(prenatal_result.ffy) if prenatal_result.ffy is not None else None
             ),
-            "ffx": (
-                float(prenatal_result.ffx) if prenatal_result.ffx is not None else None
-            ),
-            "preface": (
-                float(prenatal_result.preface)
-                if prenatal_result.preface is not None
-                else None
-            ),
+            "ffx": float(prenatal_result.ffx),
+            "preface": float(prenatal_result.preface),
             "sca_call": prenatal_result.sca.call,
             "is_aneuploid": bool(prenatal_result.sca.is_aneuploid),
             "low_ff_warning": bool(prenatal_result.low_ff_warning),
             "warnings": list(prenatal_result.warnings),
         }
-    payload_json = json.dumps(payload, separators=(",", ":"))
+    payload_json = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
     template_source = (
         files("ccnv.templates")
         .joinpath("genome_plot.html.j2")
@@ -544,34 +532,35 @@ def _build_vcf_header(
         else:
             header.contigs.add(contig)
 
+    header.add_line(
+        "##INFO=<ID=END,Number=1,Type=Integer,"
+        'Description="End coordinate of structural variant">'
+    )
+    header.add_line(
+        "##INFO=<ID=SVTYPE,Number=1,Type=String,"
+        'Description="Type of structural variant">'
+    )
+    header.add_line(
+        "##FORMAT=<ID=LOG2R,Number=1,Type=Float,"
+        'Description="Log2 copy ratio against within-sample reference">'
+    )
+    header.add_line(
+        "##FORMAT=<ID=ZSCORE,Number=1,Type=Float,"
+        'Description="Z-score relative to reference cohort null model">'
+    )
+    header.add_line(
+        "##FORMAT=<ID=WEIGHT,Number=1,Type=Float,"
+        'Description="Precision weight for segmentation">'
+    )
+
     if record_type == "bins":
         header.add_line('##ALT=<ID=CNV,Description="Copy number variation">')
-        header.add_line(
-            "##INFO=<ID=END,Number=1,Type=Integer,"
-            'Description="End coordinate of structural variant">'
-        )
-        header.add_line(
-            "##INFO=<ID=SVTYPE,Number=1,Type=String,"
-            'Description="Type of structural variant">'
-        )
         header.add_line(
             '##INFO=<ID=BRANCH,Number=1,Type=String,Description="Model branch">'
         )
         header.add_line(
             "##FILTER=<ID=MASKED,"
             'Description="Bin masked due to low coverage or quality filters">'
-        )
-        header.add_line(
-            "##FORMAT=<ID=LOG2R,Number=1,Type=Float,"
-            'Description="Log2 copy ratio against within-sample reference">'
-        )
-        header.add_line(
-            "##FORMAT=<ID=ZSCORE,Number=1,Type=Float,"
-            'Description="Z-score relative to reference cohort null model">'
-        )
-        header.add_line(
-            "##FORMAT=<ID=WEIGHT,Number=1,Type=Float,"
-            'Description="Precision weight for segmentation">'
         )
         header.add_line(
             "##FORMAT=<ID=REF_SIZE,Number=1,Type=Integer,"
@@ -582,28 +571,8 @@ def _build_vcf_header(
         header.add_line('##ALT=<ID=DEL,Description="Deletion / copy number loss">')
         header.add_line('##ALT=<ID=CNV,Description="Copy number variation">')
         header.add_line(
-            "##INFO=<ID=END,Number=1,Type=Integer,"
-            'Description="End coordinate of structural variant">'
-        )
-        header.add_line(
-            "##INFO=<ID=SVTYPE,Number=1,Type=String,"
-            'Description="Type of structural variant">'
-        )
-        header.add_line(
             "##INFO=<ID=IMPRECISE,Number=0,Type=Flag,"
             'Description="Imprecise structural variation">'
-        )
-        header.add_line(
-            "##FORMAT=<ID=LOG2R,Number=1,Type=Float,"
-            'Description="Log2 copy ratio against within-sample reference">'
-        )
-        header.add_line(
-            "##FORMAT=<ID=ZSCORE,Number=1,Type=Float,"
-            'Description="Z-score relative to reference cohort null model">'
-        )
-        header.add_line(
-            "##FORMAT=<ID=WEIGHT,Number=1,Type=Float,"
-            'Description="Precision weight for segmentation">'
         )
         header.add_line(
             "##FORMAT=<ID=BINS,Number=1,Type=Integer,"
@@ -623,24 +592,12 @@ def _build_vcf_header(
                 'Description="Reason for discordance flag">'
             )
             header.add_line(
-                "##INFO=<ID=DISCREASON,Number=1,Type=String,"
-                'Description="Reason for discordance flag (alias for DISC_REASON)">'
-            )
-            header.add_line(
                 "##FORMAT=<ID=EXP_LOG2R,Number=1,Type=Float,"
                 'Description="Expected log2 ratio based on active fetal fraction">'
             )
             header.add_line(
-                "##FORMAT=<ID=EXPRATIO,Number=1,Type=Float,"
-                'Description="Expected ratio (alias for EXP_LOG2R)">'
-            )
-            header.add_line(
                 "##FORMAT=<ID=IMPLIED_FF,Number=1,Type=Float,"
                 'Description="Implied fetal fraction based on segment ratio">'
-            )
-            header.add_line(
-                "##FORMAT=<ID=IMPFF,Number=1,Type=Float,"
-                'Description="Implied fetal fraction (alias for IMPLIED_FF)">'
             )
 
     header.add_sample(sample_name)
@@ -763,37 +720,26 @@ def _bin_bed_rows(results: tuple[BinResult, ...]) -> tuple[tuple[object, ...], .
     return tuple(rows)
 
 
+def _prenatal_bed_fields(item: SegmentResult) -> tuple[object, ...]:
+    ratio_str = (
+        _format_bed_float(item.expected_ratio)
+        if item.expected_ratio is not None
+        else ""
+    )
+    ff_str = _format_bed_float(item.implied_ff) if item.implied_ff is not None else ""
+    return (
+        ratio_str,
+        ff_str,
+        "true" if item.discordant else "false",
+        item.discordance_reason or "",
+    )
+
+
 def _segment_bed_rows(
     results: tuple[SegmentResult, ...],
     *,
     is_prenatal: bool = False,
 ) -> tuple[tuple[object, ...], ...]:
-    if is_prenatal:
-        return tuple(
-            (
-                item.contig,
-                item.start,
-                item.end,
-                _format_bed_float(item.ratio),
-                _format_bed_float(item.zscore),
-                _format_bed_float(item.weight),
-                item.bin_count,
-                item.call or "",
-                (
-                    _format_bed_float(item.expected_ratio)
-                    if item.expected_ratio is not None
-                    else ""
-                ),
-                (
-                    _format_bed_float(item.implied_ff)
-                    if item.implied_ff is not None
-                    else ""
-                ),
-                "true" if item.discordant else "false",
-                item.discordance_reason or "",
-            )
-            for item in results
-        )
     return tuple(
         (
             item.contig,
@@ -804,6 +750,7 @@ def _segment_bed_rows(
             _format_bed_float(item.weight),
             item.bin_count,
             item.call or "",
+            *(_prenatal_bed_fields(item) if is_prenatal else ()),
         )
         for item in results
     )
@@ -814,30 +761,6 @@ def _calls_bed_rows(
     *,
     is_prenatal: bool = False,
 ) -> tuple[tuple[object, ...], ...]:
-    if is_prenatal:
-        return tuple(
-            (
-                item.contig,
-                item.start,
-                item.end,
-                _format_bed_float(item.ratio),
-                _format_bed_float(item.zscore),
-                item.call,
-                (
-                    _format_bed_float(item.expected_ratio)
-                    if item.expected_ratio is not None
-                    else ""
-                ),
-                (
-                    _format_bed_float(item.implied_ff)
-                    if item.implied_ff is not None
-                    else ""
-                ),
-                "true" if item.discordant else "false",
-                item.discordance_reason or "",
-            )
-            for item in calls
-        )
     return tuple(
         (
             item.contig,
@@ -846,6 +769,7 @@ def _calls_bed_rows(
             _format_bed_float(item.ratio),
             _format_bed_float(item.zscore),
             item.call,
+            *(_prenatal_bed_fields(item) if is_prenatal else ()),
         )
         for item in calls
     )

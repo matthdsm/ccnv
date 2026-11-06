@@ -5,16 +5,22 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import scipy.special
-from sklearn.impute import SimpleImputer
+from numpy.typing import NDArray
 from sklearn.model_selection import KFold
 
-from ccnv.convert import normalize_chr, rebin_sample_table
+from ccnv.convert import (
+    bin_intervals,
+    is_autosome_name,
+    normalize_chr,
+    rebin_counts,
+    rebin_sample_table,
+)
 from ccnv.models import SamplesheetEntry
 from ccnv.prenatal_math import (
     fit_lasso_fista,
@@ -40,6 +46,9 @@ from ccnv.schemas import (
     PrenatalModelMetadata,
 )
 
+if TYPE_CHECKING:
+    from ccnv.cohort import Cohort
+
 _PAR1_START: Final[int] = 2_781_479
 _YQ12_END: Final[int] = 28_800_000
 _EXCLUDED_PRENATAL_AUTOSOMES: Final[frozenset[int]] = frozenset({13, 18, 21})
@@ -55,10 +64,81 @@ __all__ = [
 def _is_preface_autosome(norm_contig: str) -> bool:
     """Return True if contig is a canonical autosome excluding 13, 18, 21."""
     return (
-        norm_contig.isdigit()
-        and 1 <= int(norm_contig) <= 22
+        is_autosome_name(norm_contig)
         and int(norm_contig) not in _EXCLUDED_PRENATAL_AUTOSOMES
     )
+
+
+def _build_prenatal_branch_table(
+    *,
+    branch: str,
+    contigs: Sequence[str],
+    starts: NDArray[np.int64],
+    ends: NDArray[np.int64],
+    masked: NDArray[np.bool_],
+    pca_mean: NDArray[np.float64],
+    pca_loadings: list[list[float]] | None = None,
+    null_mean: NDArray[np.float64] | None = None,
+) -> pa.Table:
+    n_bins = len(contigs)
+    return pa.table(
+        {
+            "branch": pa.array([branch] * n_bins, type=pa.string()),
+            "contig": pa.array(contigs, type=pa.string()),
+            "start": pa.array(starts, type=pa.int64()),
+            "end": pa.array(ends, type=pa.int64()),
+            "masked": pa.array(masked, type=pa.bool_()),
+            "gc": pa.array(np.zeros(n_bins, dtype=np.float32), type=pa.float32()),
+            "mappability": pa.array(
+                np.zeros(n_bins, dtype=np.float32), type=pa.float32()
+            ),
+            "pca_mean": pa.array(pca_mean, type=pa.float64()),
+            "pca_loadings": pa.array(
+                pca_loadings
+                if pca_loadings is not None
+                else [[] for _ in range(n_bins)],
+                type=pa.list_(pa.float64()),
+            ),
+            "nearest_ref_indices": pa.array(
+                [[] for _ in range(n_bins)], type=pa.list_(pa.int32())
+            ),
+            "mean_distance": pa.array(
+                np.zeros(n_bins, dtype=np.float32), type=pa.float32()
+            ),
+            "null_mean": pa.array(
+                null_mean
+                if null_mean is not None
+                else np.zeros(n_bins, dtype=np.float64),
+                type=pa.float64(),
+            ),
+            "null_std": pa.array(np.zeros(n_bins, dtype=np.float64), type=pa.float64()),
+        },
+        schema=REFERENCE_SCHEMA,
+    )
+
+
+def _align_sample_to_ref(
+    sample_contigs: Sequence[str],
+    sample_starts: NDArray[np.int64],
+    sample_ends: NDArray[np.int64],
+    ref_table: pa.Table,
+) -> NDArray[np.int32]:
+    """Map reference rows to matching sample bin indices, or -1 if missing."""
+    sample_index = {
+        (normalize_chr(c), int(s), int(e)): idx
+        for idx, (c, s, e) in enumerate(
+            zip(sample_contigs, sample_starts, sample_ends, strict=True)
+        )
+    }
+    ref_c = [normalize_chr(str(c)) for c in ref_table.column("contig").to_pylist()]
+    ref_s = ref_table.column("start").to_numpy(zero_copy_only=False)
+    ref_e = ref_table.column("end").to_numpy(zero_copy_only=False)
+    aligned = np.full(ref_table.num_rows, -1, dtype=np.int32)
+    for j, key in enumerate(zip(ref_c, ref_s, ref_e, strict=True)):
+        idx = sample_index.get(key)
+        if idx is not None:
+            aligned[j] = idx
+    return aligned
 
 
 def _autosomal_density(
@@ -166,14 +246,45 @@ def classify_sca(
 
 
 def fit_prenatal_models(
-    sample_tables: Sequence[pa.Table],
+    sample_tables: Sequence[pa.Table] | Cohort,
     entries: Sequence[SamplesheetEntry],
     bin_size: int,
     prenatal_bin_size: int,
     seed: int = 42,
 ) -> tuple[pa.Table, pa.Table, PrenatalModelMetadata, tuple[bool, ...]]:
     """Fit FFY, PREFACE, and FFX models on cohort samples."""
-    n_samples = len(sample_tables)
+    # 1. Extract 5 kb coordinates, chrY fractions, and sex classification
+    if not isinstance(sample_tables, Sequence):
+        cohort = sample_tables
+        n_samples = cohort.counts.shape[1]
+        c_5k = list(cohort.contigs)
+        s_5k = cohort.starts
+        e_5k = cohort.ends
+        w_5k = e_5k - s_5k
+        counts_5k_matrix = cohort.counts
+    else:
+        n_samples = len(sample_tables)
+        if n_samples == 0:
+            raise ValueError("sample_tables must contain at least one sample table")
+        ref_table = sample_tables[0]
+        c_5k = [str(x) for x in ref_table.column("contig").to_pylist()]
+        s_5k = np.asarray(
+            ref_table.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
+        )
+        e_5k = np.asarray(
+            ref_table.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
+        )
+        w_5k = e_5k - s_5k
+        counts_5k_matrix = np.column_stack(
+            [
+                np.asarray(
+                    table.column("count").to_numpy(zero_copy_only=False),
+                    dtype=np.float64,
+                )
+                for table in sample_tables
+            ]
+        )
+
     if n_samples == 0:
         raise ValueError("sample_tables must contain at least one sample table")
     if len(entries) != n_samples:
@@ -182,47 +293,34 @@ def fit_prenatal_models(
             f"must have the same length"
         )
 
-    # 1. 5 kb coordinates, chrY fractions, and sex classification
-    ref_table = sample_tables[0]
-    c_5k = [str(x) for x in ref_table.column("contig").to_pylist()]
-    s_5k = np.asarray(
-        ref_table.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    e_5k = np.asarray(
-        ref_table.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    w_5k = e_5k - s_5k
     norm_c_5k = np.array([normalize_chr(c) for c in c_5k], dtype=object)
-
     chry_mask_5k = norm_c_5k == "Y"
     auto_mask_5k = np.array(
         [_is_preface_autosome(c) for c in norm_c_5k], dtype=np.bool_
     )
     if not np.any(auto_mask_5k):
         auto_mask_5k = np.array(
-            [c.isdigit() and 1 <= int(c) <= 22 for c in norm_c_5k], dtype=np.bool_
+            [is_autosome_name(c) for c in norm_c_5k], dtype=np.bool_
         )
 
-    yfracs = np.zeros(n_samples, dtype=np.float64)
-    y_norm_all = (
-        np.zeros((n_samples, int(np.sum(chry_mask_5k))), dtype=np.float64)
-        if np.any(chry_mask_5k)
-        else np.zeros((n_samples, 0), dtype=np.float64)
+    n_chry_bins = int(np.sum(chry_mask_5k))
+    total_reads = np.sum(counts_5k_matrix, axis=0)
+    chry_reads = (
+        np.sum(counts_5k_matrix[chry_mask_5k, :], axis=0)
+        if n_chry_bins > 0
+        else np.zeros(n_samples, dtype=np.float64)
     )
+    yfracs = chry_reads / np.maximum(total_reads, 1.0)
 
-    for i, table in enumerate(sample_tables):
-        counts_5k = np.asarray(
-            table.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
-        )
-        total_reads = float(np.sum(counts_5k))
-        chry_reads = (
-            float(np.sum(counts_5k[chry_mask_5k])) if np.any(chry_mask_5k) else 0.0
-        )
-        yfracs[i] = chry_reads / max(total_reads, 1.0)
-
-        if np.any(chry_mask_5k):
-            r_auto = _autosomal_density(counts_5k, w_5k, auto_mask_5k, bin_size)
-            y_norm_all[i, :] = counts_5k[chry_mask_5k] / (r_auto * w_5k[chry_mask_5k])
+    y_norm_all = np.zeros((n_samples, n_chry_bins), dtype=np.float64)
+    if n_chry_bins > 0:
+        for i in range(n_samples):
+            r_auto = _autosomal_density(
+                counts_5k_matrix[:, i], w_5k, auto_mask_5k, bin_size
+            )
+            y_norm_all[i, :] = counts_5k_matrix[chry_mask_5k, i] / (
+                r_auto * w_5k[chry_mask_5k]
+            )
 
     is_male_gmm, yfrac_threshold = infer_sex_gmm_1d(yfracs, seed=seed)
     is_male_resolved: list[bool] = []
@@ -237,7 +335,6 @@ def fit_prenatal_models(
     is_male_arr = np.array(is_male_resolved, dtype=np.bool_)
 
     # 2. Informative chrY mask and FFY fitting
-    n_chry_bins = int(np.sum(chry_mask_5k))
     if n_chry_bins > 0:
         chry_starts = s_5k[chry_mask_5k]
         chry_ends = e_5k[chry_mask_5k]
@@ -297,17 +394,84 @@ def fit_prenatal_models(
         final_ffy = np.zeros(n_samples, dtype=np.float64)
 
     # 3. Rebin to prenatal_bin_size (100 kb) for PREFACE and FFX
-    tables_100k = [
-        rebin_sample_table(table, prenatal_bin_size) for table in sample_tables
-    ]
-    ref_100k = tables_100k[0]
-    c_100k = [str(x) for x in ref_100k.column("contig").to_pylist()]
-    s_100k = np.asarray(
-        ref_100k.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    e_100k = np.asarray(
-        ref_100k.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
+    if not isinstance(sample_tables, Sequence):
+        new_c_100k: list[str] = []
+        new_s_100k: list[np.ndarray] = []
+        new_e_100k: list[np.ndarray] = []
+        new_counts_100k: list[np.ndarray] = []
+
+        contig_arr = np.asarray(cohort.contigs)
+        if len(contig_arr) == 0:
+            contig_slices: dict[str, tuple[int, int]] = {}
+        else:
+            changes = np.flatnonzero(contig_arr[1:] != contig_arr[:-1]) + 1
+            starts_idx = np.concatenate(([0], changes))
+            ends_idx = np.concatenate((changes, [len(contig_arr)]))
+            contig_slices = {
+                str(contig_arr[s]): (int(s), int(e))
+                for s, e in zip(starts_idx, ends_idx, strict=True)
+            }
+
+        for c_name, c_len in cohort.contig_lengths.items():
+            t_starts, t_ends = bin_intervals(int(c_len), prenatal_bin_size)
+            span = contig_slices.get(c_name)
+            if span is None:
+                t_counts = np.zeros((t_starts.size, n_samples), dtype=np.float64)
+            else:
+                s_i, e_i = span
+                src_s = cohort.starts[s_i:e_i]
+                src_e = cohort.ends[s_i:e_i]
+                t_counts = np.column_stack(
+                    [
+                        rebin_counts(
+                            src_s,
+                            src_e,
+                            cohort.counts[s_i:e_i, j],
+                            t_starts,
+                            t_ends,
+                        )
+                        for j in range(n_samples)
+                    ]
+                )
+            new_c_100k.extend([c_name] * t_starts.size)
+            new_s_100k.append(t_starts)
+            new_e_100k.append(t_ends)
+            new_counts_100k.append(t_counts)
+
+        c_100k = new_c_100k
+        s_100k = (
+            np.concatenate(new_s_100k) if new_s_100k else np.empty(0, dtype=np.int64)
+        )
+        e_100k = (
+            np.concatenate(new_e_100k) if new_e_100k else np.empty(0, dtype=np.int64)
+        )
+        counts_100k_matrix = (
+            np.vstack(new_counts_100k)
+            if new_counts_100k
+            else np.empty((0, n_samples), dtype=np.float64)
+        )
+    else:
+        tables_100k = [
+            rebin_sample_table(table, prenatal_bin_size) for table in sample_tables
+        ]
+        ref_100k = tables_100k[0]
+        c_100k = [str(x) for x in ref_100k.column("contig").to_pylist()]
+        s_100k = np.asarray(
+            ref_100k.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
+        )
+        e_100k = np.asarray(
+            ref_100k.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
+        )
+        counts_100k_matrix = np.column_stack(
+            [
+                np.asarray(
+                    table.column("count").to_numpy(zero_copy_only=False),
+                    dtype=np.float64,
+                )
+                for table in tables_100k
+            ]
+        )
+
     w_100k = e_100k - s_100k
     norm_c_100k = np.array([normalize_chr(c) for c in c_100k], dtype=object)
 
@@ -316,7 +480,7 @@ def fit_prenatal_models(
     )
     if not np.any(auto_mask_100k):
         auto_mask_100k = np.array(
-            [c.isdigit() and 1 <= int(c) <= 22 for c in norm_c_100k], dtype=np.bool_
+            [is_autosome_name(c) for c in norm_c_100k], dtype=np.bool_
         )
     chrx_mask_100k = norm_c_100k == "X"
 
@@ -324,11 +488,8 @@ def fit_prenatal_models(
     log2_ratios_100k = np.zeros((n_samples, n_auto_100k), dtype=np.float64)
     chrx_ratios = np.ones(n_samples, dtype=np.float64)
 
-    for i, table_100k in enumerate(tables_100k):
-        counts_100k = np.asarray(
-            table_100k.column("count").to_numpy(zero_copy_only=False),
-            dtype=np.float64,
-        )
+    for i in range(n_samples):
+        counts_100k = counts_100k_matrix[:, i]
         r_auto_100k = _autosomal_density(
             counts_100k, w_100k, auto_mask_100k, prenatal_bin_size
         )
@@ -350,17 +511,15 @@ def fit_prenatal_models(
     if np.all(auto_masked):
         auto_masked[:] = False
 
-    imputer = SimpleImputer(strategy="mean", keep_empty_features=True)
-    X_autosomal = np.nan_to_num(
-        np.asarray(
-            imputer.fit_transform(np.where(valid_bins, log2_ratios_100k, np.nan)),
-            dtype=np.float64,
-        ),
-        nan=0.0,
-    )
-    mean_features = np.nan_to_num(
-        np.asarray(imputer.statistics_, dtype=np.float64), nan=0.0
-    )
+    raw_ratios = np.where(valid_bins, log2_ratios_100k, np.nan)
+    with np.errstate(all="ignore"):
+        mean_features = np.nanmean(raw_ratios, axis=0)
+    mean_features = np.nan_to_num(mean_features, nan=0.0)
+
+    nan_r, nan_c = np.where(np.isnan(raw_ratios))
+    X_autosomal = raw_ratios.copy()
+    X_autosomal[nan_r, nan_c] = np.take(mean_features, nan_c)
+    X_autosomal = np.nan_to_num(X_autosomal, nan=0.0)
 
     # Truncated PCA
     n_feat = min(50, max(1, n_samples - 1))
@@ -467,68 +626,25 @@ def fit_prenatal_models(
 
     # 7. Construct Arrow Reference Tables
     auto_indices = np.flatnonzero(auto_mask_100k)
-    prenatal_auto_table = pa.table(
-        {
-            "branch": pa.array(
-                [BRANCH_PRENATAL_AUTOSOMAL] * n_auto_100k, type=pa.string()
-            ),
-            "contig": pa.array([c_100k[i] for i in auto_indices], type=pa.string()),
-            "start": pa.array(s_100k[auto_indices], type=pa.int64()),
-            "end": pa.array(e_100k[auto_indices], type=pa.int64()),
-            "masked": pa.array(auto_masked, type=pa.bool_()),
-            "gc": pa.array(np.zeros(n_auto_100k, dtype=np.float32), type=pa.float32()),
-            "mappability": pa.array(
-                np.zeros(n_auto_100k, dtype=np.float32), type=pa.float32()
-            ),
-            "pca_mean": pa.array(pca_center, type=pa.float64()),
-            "pca_loadings": pa.array(
-                [[float(v) for v in row] for row in pca_rotation],
-                type=pa.list_(pa.float64()),
-            ),
-            "nearest_ref_indices": pa.array(
-                [[] for _ in range(n_auto_100k)], type=pa.list_(pa.int32())
-            ),
-            "mean_distance": pa.array(
-                np.zeros(n_auto_100k, dtype=np.float32), type=pa.float32()
-            ),
-            "null_mean": pa.array(mean_features, type=pa.float64()),
-            "null_std": pa.array(
-                np.zeros(n_auto_100k, dtype=np.float64), type=pa.float64()
-            ),
-        },
-        schema=REFERENCE_SCHEMA,
+    prenatal_auto_table = _build_prenatal_branch_table(
+        branch=BRANCH_PRENATAL_AUTOSOMAL,
+        contigs=[c_100k[i] for i in auto_indices],
+        starts=s_100k[auto_indices],
+        ends=e_100k[auto_indices],
+        masked=auto_masked,
+        pca_mean=pca_center,
+        pca_loadings=[[float(v) for v in row] for row in pca_rotation],
+        null_mean=mean_features,
     )
 
     chry_indices = np.flatnonzero(chry_mask_5k)
-    prenatal_ffy_table = pa.table(
-        {
-            "branch": pa.array([BRANCH_PRENATAL_FFY] * n_chry_bins, type=pa.string()),
-            "contig": pa.array([c_5k[i] for i in chry_indices], type=pa.string()),
-            "start": pa.array(s_5k[chry_indices], type=pa.int64()),
-            "end": pa.array(e_5k[chry_indices], type=pa.int64()),
-            "masked": pa.array(~informative_mask, type=pa.bool_()),
-            "gc": pa.array(np.zeros(n_chry_bins, dtype=np.float32), type=pa.float32()),
-            "mappability": pa.array(
-                np.zeros(n_chry_bins, dtype=np.float32), type=pa.float32()
-            ),
-            "pca_mean": pa.array(ffy_weights, type=pa.float64()),
-            "pca_loadings": pa.array(
-                [[] for _ in range(n_chry_bins)], type=pa.list_(pa.float64())
-            ),
-            "nearest_ref_indices": pa.array(
-                [[] for _ in range(n_chry_bins)], type=pa.list_(pa.int32())
-            ),
-            "mean_distance": pa.array(
-                np.zeros(n_chry_bins, dtype=np.float32), type=pa.float32()
-            ),
-            "null_mean": pa.array(
-                np.zeros(n_chry_bins, dtype=np.float64), type=pa.float64()
-            ),
-            "null_std": pa.array(
-                np.zeros(n_chry_bins, dtype=np.float64), type=pa.float64()
-            ),
-        },
-        schema=REFERENCE_SCHEMA,
+    prenatal_ffy_table = _build_prenatal_branch_table(
+        branch=BRANCH_PRENATAL_FFY,
+        contigs=[c_5k[i] for i in chry_indices],
+        starts=s_5k[chry_indices],
+        ends=e_5k[chry_indices],
+        masked=~informative_mask,
+        pca_mean=ffy_weights,
     )
 
     return (
@@ -590,7 +706,7 @@ def predict_prenatal(
         )
         if not np.any(auto_mask_5k):
             auto_mask_5k = np.array(
-                [c.isdigit() and 1 <= int(c) <= 22 for c in norm_sample_c],
+                [is_autosome_name(c) for c in norm_sample_c],
                 dtype=np.bool_,
             )
         r_auto_5k = _autosomal_density(sample_counts, sample_w, auto_mask_5k, 5000)
@@ -609,31 +725,13 @@ def predict_prenatal(
         if y_norm.size == weights.size:
             raw_ffy = float(np.sum(y_norm * weights))
         else:
-            ref_chry_coords = {
-                (normalize_chr(str(c)), int(s), int(e)): idx
-                for idx, (c, s, e) in enumerate(
-                    zip(
-                        ffy_ref.column("contig").to_pylist(),
-                        ffy_ref.column("start").to_pylist(),
-                        ffy_ref.column("end").to_pylist(),
-                        strict=True,
-                    )
-                )
-            }
-            sample_chry_idx = np.flatnonzero(chry_mask)
+            aligned = _align_sample_to_ref(sample_c, sample_s, sample_e, ffy_ref)
             raw_ffy = 0.0
-            for idx in sample_chry_idx:
-                key = (
-                    norm_sample_c[idx],
-                    int(sample_s[idx]),
-                    int(sample_e[idx]),
-                )
-                ref_idx = ref_chry_coords.get(key)
-                if ref_idx is not None:
-                    sample_w_val = sample_w[idx]
+            for j, s_idx in enumerate(aligned):
+                if s_idx >= 0 and weights[j] != 0.0:
+                    s_w = sample_w[s_idx]
                     raw_ffy += float(
-                        (sample_counts[idx] / (r_auto_5k * sample_w_val))
-                        * weights[ref_idx]
+                        (sample_counts[s_idx] / (r_auto_5k * s_w)) * weights[j]
                     )
 
         ffy_computed = float(
@@ -664,7 +762,7 @@ def predict_prenatal(
     )
     if not np.any(auto_mask_100k):
         auto_mask_100k = np.array(
-            [c.isdigit() and 1 <= int(c) <= 22 for c in norm_c_100k],
+            [is_autosome_name(c) for c in norm_c_100k],
             dtype=np.bool_,
         )
     chrx_mask_100k = norm_c_100k == "X"
@@ -691,25 +789,13 @@ def predict_prenatal(
     )
 
     if log2_ratios.size != ref_null_mean.size:
-        # Align coordinates via key dictionary
-        sample_100k_coords = {
-            (norm_c_100k[i], int(s_100k[i]), int(e_100k[i])): i
-            for i in np.flatnonzero(auto_mask_100k)
-        }
+        aligned = _align_sample_to_ref(c_100k, s_100k, e_100k, auto_ref)
         aligned_ratios = np.full(ref_null_mean.size, np.nan, dtype=np.float64)
-        for j, (rc, rs, re) in enumerate(
-            zip(
-                auto_ref.column("contig").to_pylist(),
-                auto_ref.column("start").to_pylist(),
-                auto_ref.column("end").to_pylist(),
-                strict=True,
-            )
-        ):
-            idx = sample_100k_coords.get((normalize_chr(str(rc)), int(rs), int(re)))
-            if idx is not None:
-                exp_count = r_auto_100k * w_100k[idx]
-                if exp_count > 0 and counts_100k[idx] > 0:
-                    aligned_ratios[j] = math.log2(counts_100k[idx] / exp_count)
+        for j, s_idx in enumerate(aligned):
+            if s_idx >= 0:
+                exp_count = r_auto_100k * w_100k[s_idx]
+                if exp_count > 0 and counts_100k[s_idx] > 0:
+                    aligned_ratios[j] = math.log2(counts_100k[s_idx] / exp_count)
         log2_ratios = aligned_ratios
 
     imputed = np.where(np.isnan(log2_ratios), ref_null_mean, log2_ratios)

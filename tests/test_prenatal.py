@@ -7,7 +7,7 @@ import json
 import math
 import tempfile
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -25,7 +25,6 @@ from ccnv.models import (
     SamplesheetEntry,
     parquet_path,
 )
-from ccnv.predict import PredictError
 from ccnv.predict import run as run_predict
 from ccnv.prenatal import (
     annotate_prenatal_segments,
@@ -43,7 +42,6 @@ from ccnv.reference import (
 )
 from ccnv.report import (
     PRENATAL_SEGMENTS_BED_HEADER,
-    SEGMENTS_BED_HEADER,
 )
 from ccnv.results import (
     FetalFractionResult,
@@ -494,6 +492,27 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         self.assertIsNone(res_female.ffy)
         self.assertEqual(res_female.active_ff_source, "PREFACE")
 
+    def test_predict_prenatal_olm_fallback(self) -> None:
+        auto_tbl, ffy_tbl, meta, _ = fit_prenatal_models(
+            self.sample_tables,
+            self.entries,
+            bin_size=5000,
+            prenatal_bin_size=100000,
+            seed=42,
+        )
+        ref_table = pa.concat_tables([auto_tbl, ffy_tbl])
+        fallback_meta = replace(
+            meta,
+            mlp_b2=[-20.0],
+            olm_bias=0.12,
+            olm_skew_intercept=0.0,
+            olm_skew_slope=1.0,
+        )
+        female_sample = self.sample_tables[1]
+        res = predict_prenatal(female_sample, ref_table, fallback_meta)
+        self.assertEqual(res.active_ff_source, "PREFACE")
+        self.assertAlmostEqual(res.preface, 0.12, places=1)
+
     def test_fit_prenatal_models_validation_errors(self) -> None:
         with self.assertRaises(ValueError):
             fit_prenatal_models([], [], 5000, 100000)
@@ -630,7 +649,10 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
 def _setup_synthetic_cohort_and_references(
     root: Path,
     contig_lengths: dict[str, int],
-) -> tuple[Path, Path, Path]:
+    *,
+    build_germline: bool = False,
+    qc_report: bool = True,
+) -> tuple[Path, Path | None, Path]:
     sample_dir = root / "cohort"
     sample_dir.mkdir()
     entries_data = []
@@ -678,24 +700,27 @@ def _setup_synthetic_cohort_and_references(
             min_sex_group_size=2,
             nearest_bins=5,
             pca_components=2,
-            qc_report=False,
+            qc_report=qc_report,
         )
     )
 
-    germline_prefix = root / "germline_ref"
-    run_reference(
-        ReferenceConfig(
-            samplesheet_path=sheet_path,
-            prefix=germline_prefix,
-            mode="germline",
-            bin_size=5000,
-            min_cohort_size=4,
-            min_sex_group_size=2,
-            nearest_bins=5,
-            pca_components=2,
-            qc_report=False,
+    germline_ref: Path | None = None
+    if build_germline:
+        germline_prefix = root / "germline_ref"
+        run_reference(
+            ReferenceConfig(
+                samplesheet_path=sheet_path,
+                prefix=germline_prefix,
+                mode="germline",
+                bin_size=5000,
+                min_cohort_size=4,
+                min_sex_group_size=2,
+                nearest_bins=5,
+                pca_components=2,
+                qc_report=qc_report,
+            )
         )
-    )
+        germline_ref = parquet_path(germline_prefix)
 
     test_counts = {
         "chr1": 100.0,
@@ -717,7 +742,7 @@ def _setup_synthetic_cohort_and_references(
 
     return (
         parquet_path(prenatal_prefix),
-        parquet_path(germline_prefix),
+        germline_ref,
         test_sample_path,
     )
 
@@ -756,7 +781,7 @@ class TestPrenatalEndToEndIntegration(unittest.TestCase):
                     sample=test_sample,
                     reference=prenatal_ref,
                     prefix=pred_prefix,
-                    mode=AnalysisMode.PRENATAL,
+                    mode=AnalysisMode.prenatal,
                     plot=True,
                     vcf=True,
                     penalty=0.5,
@@ -777,18 +802,17 @@ class TestPrenatalEndToEndIntegration(unittest.TestCase):
             for key in (
                 "fetal_sex",
                 "active_ff",
-                "active_method",
+                "active_ff_source",
                 "sca",
                 "ffy",
                 "preface",
                 "ffx",
-                "discordant_segments_count",
             ):
                 self.assertIn(key, p_qc)
             self.assertEqual(p_qc["fetal_sex"], "M")
             self.assertGreater(p_qc["active_ff"], 0.0)
-            self.assertEqual(p_qc["active_method"], "FFY")
-            self.assertGreaterEqual(p_qc["discordant_segments_count"], 1)
+            self.assertEqual(p_qc["active_ff_source"], "FFY")
+            self.assertTrue(any(s.discordant for s in outputs.segments))
 
             # 2. Assert <prefix>_segments.bed.gz (12 columns with #contig header)
             self.assertTrue(outputs.segments_bed.is_file())
@@ -818,7 +842,7 @@ class TestPrenatalEndToEndIntegration(unittest.TestCase):
             self.assertTrue(outputs.segments_vcf.is_file())
             with pysam.VariantFile(str(outputs.segments_vcf)) as vf:
                 vcf_header_text = str(vf.header)
-                for tag in ("EXPRATIO", "IMPFF", "DISCORDANT", "DISCREASON"):
+                for tag in ("EXP_LOG2R", "IMPLIED_FF", "DISCORDANT", "DISC_REASON"):
                     self.assertIn(f"ID={tag}", vcf_header_text)
                 records = list(vf.fetch("chr1"))
                 self.assertTrue(any(rec.info.get("DISCORDANT") for rec in records))
@@ -832,53 +856,6 @@ class TestPrenatalEndToEndIntegration(unittest.TestCase):
             self.assertIn("Active FF:", html_text)
             self.assertIn("#9333ea", html_text)
             self.assertIn("Discordant", html_text)
-
-    def test_mode_guardrail_prenatal_mode_on_germline_reference_raises(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            _, germline_ref, test_sample = _setup_synthetic_cohort_and_references(
-                root, self.contig_lengths
-            )
-            with self.assertRaises(PredictError) as cm:
-                run_predict(
-                    PredictConfig(
-                        sample=test_sample,
-                        reference=germline_ref,
-                        prefix=root / "out",
-                        mode=AnalysisMode.PRENATAL,
-                    )
-                )
-            self.assertIn(
-                "reference was built in germline mode and lacks prenatal models",
-                str(cm.exception),
-            )
-
-    def test_mode_guardrail_germline_mode_on_prenatal_reference_succeeds(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            prenatal_ref, _, test_sample = _setup_synthetic_cohort_and_references(
-                root, self.contig_lengths
-            )
-            predict_cfg = PredictConfig(
-                sample=test_sample,
-                reference=prenatal_ref,
-                prefix=root / "out",
-                mode=AnalysisMode.GERMLINE,
-                plot=False,
-            )
-            with self.assertLogs("ccnv", level="WARNING") as logs:
-                outputs = run_predict(predict_cfg)
-            self.assertTrue(
-                any("prenatal mode" in rec.getMessage() for rec in logs.records)
-            )
-            self.assertTrue(outputs.bins_bed.is_file())
-            self.assertTrue(outputs.segments_bed.is_file())
-            self.assertIsNone(outputs.prenatal_result)
-
-            with gzip.open(outputs.segments_bed, "rt") as f:
-                header = f.readline().rstrip("\r\n").split("\t")
-            self.assertEqual(tuple(header), SEGMENTS_BED_HEADER)
-            self.assertEqual(len(header), 8)
 
 
 if __name__ == "__main__":

@@ -341,31 +341,26 @@
   });
 
   const buildTraces = (zT, rT) => {
-    const nx = [], ny = [], nt = [];
-    const gx = [], gy = [], gt = [];
-    const lx = [], ly = [], lt = [];
+    const binBuckets = { 0: { x: [], y: [], t: [] }, 1: { x: [], y: [], t: [] }, [-1]: { x: [], y: [], t: [] } };
     for (let i = 0; i < N; i++) {
-      const c = classify(binR[i], binZ[i], zT, rT);
-      const yClip = clampY(binR[i]);
-      if (c === 1) {
-        gx.push(binX[i]);
-        gy.push(yClip);
-        gt.push(binHover[i]);
-      } else if (c === -1) {
-        lx.push(binX[i]);
-        ly.push(yClip);
-        lt.push(binHover[i]);
-      } else {
-        nx.push(binX[i]);
-        ny.push(yClip);
-        nt.push(binHover[i]);
-      }
+      const b = binBuckets[classify(binR[i], binZ[i], zT, rT)] || binBuckets[0];
+      b.x.push(binX[i]);
+      b.y.push(clampY(binR[i]));
+      b.t.push(binHover[i]);
     }
 
-    const snx = [], sny = [], snt = [];
-    const sgx = [], sgy = [], sgt = [];
-    const slx = [], sly = [], slt = [];
-    const sdx = [], sdy = [], sdt = [];
+    const segBuckets = {
+      neutral: { x: [], y: [], t: [] },
+      gain: { x: [], y: [], t: [] },
+      loss: { x: [], y: [], t: [] },
+      disc: { x: [], y: [], t: [] }
+    };
+    const pushSeg = (b, x0, x1, y, h) => {
+      b.x.push(x0, x1, null);
+      b.y.push(y, y, null);
+      b.t.push(h, h, "");
+    };
+
     for (const seg of D.segments) {
       const ci = seg[0];
       const s = seg[1];
@@ -387,38 +382,30 @@
         h += `<br>Discordant: ${discReason || "YES"}`;
         if (expR !== null && expR !== undefined) h += ` | Expected: ${Number(expR).toFixed(3)}`;
         if (impliedFF !== null && impliedFF !== undefined) h += ` | Implied FF: ${(Number(impliedFF) * 100).toFixed(1)}%`;
-        sdx.push(x0, x1, null);
-        sdy.push(yClip, yClip, null);
-        sdt.push(h, h, "");
+        pushSeg(segBuckets.disc, x0, x1, yClip, h);
       } else if (c === 1) {
-        sgx.push(x0, x1, null);
-        sgy.push(yClip, yClip, null);
-        sgt.push(h, h, "");
+        pushSeg(segBuckets.gain, x0, x1, yClip, h);
       } else if (c === -1) {
-        slx.push(x0, x1, null);
-        sly.push(yClip, yClip, null);
-        slt.push(h, h, "");
+        pushSeg(segBuckets.loss, x0, x1, yClip, h);
       } else {
-        snx.push(x0, x1, null);
-        sny.push(yClip, yClip, null);
-        snt.push(h, h, "");
+        pushSeg(segBuckets.neutral, x0, x1, yClip, h);
       }
     }
 
     const traces = [
-      mkScatter("Bins (Neutral)", nx, ny, nt, "#94a3b8", 3.5, 0.7),
-      mkScatter("Bins (Gain)", gx, gy, gt, "#e11d48", 4.5, 0.85),
-      mkScatter("Bins (Loss)", lx, ly, lt, "#16a34a", 4.5, 0.85),
-      mkLines("Segments (Neutral)", snx, sny, snt, "#1e293b", 2.2),
-      mkLines("Segments (Gain)", sgx, sgy, sgt, "#c43c39", 3),
-      mkLines("Segments (Loss)", slx, sly, slt, "#3c8c5a", 3),
+      mkScatter("Bins (Neutral)", binBuckets[0].x, binBuckets[0].y, binBuckets[0].t, "#94a3b8", 3.5, 0.7),
+      mkScatter("Bins (Gain)", binBuckets[1].x, binBuckets[1].y, binBuckets[1].t, "#e11d48", 4.5, 0.85),
+      mkScatter("Bins (Loss)", binBuckets[-1].x, binBuckets[-1].y, binBuckets[-1].t, "#16a34a", 4.5, 0.85),
+      mkLines("Segments (Neutral)", segBuckets.neutral.x, segBuckets.neutral.y, segBuckets.neutral.t, "#1e293b", 2.2),
+      mkLines("Segments (Gain)", segBuckets.gain.x, segBuckets.gain.y, segBuckets.gain.t, "#c43c39", 3),
+      mkLines("Segments (Loss)", segBuckets.loss.x, segBuckets.loss.y, segBuckets.loss.t, "#3c8c5a", 3),
       {
         type: "scatter",
         mode: "lines+markers",
         name: "Segments (Discordant)",
-        x: sdx,
-        y: sdy,
-        text: sdt,
+        x: segBuckets.disc.x,
+        y: segBuckets.disc.y,
+        text: segBuckets.disc.t,
         hoverinfo: "text",
         line: { color: "#9333ea", width: 6.0 },
         marker: { symbol: "diamond", size: 7, color: "#9333ea" },

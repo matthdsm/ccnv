@@ -12,11 +12,9 @@ from ccnv.reference_qc import (
     CHRY_MIN_USABLE_PCT_FAIL,
     CHRY_MIN_USABLE_PCT_WARN,
     ReferenceQCError,
-    compute_per_bin_stats,
     compute_signal_contig_metrics,
     evaluate_autosomal_or_female_verdict,
     evaluate_male_verdict,
-    evaluate_reference_qc,
     run_reference_qc,
     run_reference_qc_on_table,
 )
@@ -28,19 +26,6 @@ from ccnv.schemas import (
 
 
 class TestReferenceQC(unittest.TestCase):
-    def test_compute_per_bin_stats(self) -> None:
-        distances = [[1.0, 3.0], [4.0], []]
-        mean_d, n_refs = compute_per_bin_stats(distances)
-
-        self.assertAlmostEqual(float(mean_d[0]), 2.0)
-        self.assertEqual(int(n_refs[0]), 2)
-
-        self.assertAlmostEqual(float(mean_d[1]), 4.0)
-        self.assertEqual(int(n_refs[1]), 1)
-
-        self.assertTrue(np.isnan(mean_d[2]))
-        self.assertEqual(int(n_refs[2]), 0)
-
     def test_compute_signal_contig_metrics_missing(self) -> None:
         contigs = ["chr1", "chr2"]
         mean_d = np.array([1.0, 2.0], dtype=np.float64)
@@ -374,7 +359,7 @@ class TestReferenceQC(unittest.TestCase):
                 schema=REFERENCE_SCHEMA.with_metadata(metadata),
             )
 
-            outputs = evaluate_reference_qc(
+            outputs = run_reference_qc_on_table(
                 table,
                 prefix=tmp_path / "prenatal_qc_ref",
                 write_json=True,

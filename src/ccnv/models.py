@@ -130,10 +130,14 @@ class ReferenceConfig:
     min_mappability: float = DEFAULT_MIN_MAPPABILITY
     samplesheet_path: Path | None = None
     entries: tuple[SamplesheetEntry, ...] = ()
-    input_paths: tuple[Path, ...] = ()
     mode: AnalysisMode = "germline"
     prenatal_bin_size: int = 100000
     seed: int = 42
+
+    @property
+    def input_paths(self) -> tuple[Path, ...]:
+        """Backward-compatible alias for samples."""
+        return self.samples
 
     def __post_init__(self) -> None:
         if isinstance(self.samples, (Path, str)):
@@ -149,12 +153,6 @@ class ReferenceConfig:
                 f"mode must be 'germline' or 'prenatal', got {self.mode!r}"
             )
 
-        # Keep samples, input_paths, and entries synchronized for backward compatibility
-        if not self.samples and self.input_paths:
-            object.__setattr__(self, "samples", self.input_paths)
-        elif not self.input_paths and self.samples:
-            object.__setattr__(self, "input_paths", self.samples)
-
         if not self.entries and self.samples:
             object.__setattr__(
                 self,
@@ -164,7 +162,6 @@ class ReferenceConfig:
         elif not self.samples and self.entries:
             paths = tuple(entry.filepath for entry in self.entries)
             object.__setattr__(self, "samples", paths)
-            object.__setattr__(self, "input_paths", paths)
 
 
 @dataclass(frozen=True, slots=True)

@@ -109,105 +109,36 @@ class PrenatalModelMetadata:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PrenatalModelMetadata:
-        ffy = data.get("ffy") if isinstance(data.get("ffy"), Mapping) else {}
-        preface = (
-            data.get("preface") if isinstance(data.get("preface"), Mapping) else {}
+        raw_bin_size = data["prenatal_bin_size"]
+        if isinstance(raw_bin_size, bool):
+            raise ValueError(
+                f"prenatal_bin_size must be a positive integer, got {raw_bin_size!r}"
+            )
+        raw_b2 = data["mlp_b2"]
+        mlp_b2 = (
+            [float(x) for x in raw_b2]
+            if isinstance(raw_b2, (list, tuple))
+            else [float(raw_b2)]
         )
-        ffx = data.get("ffx") if isinstance(data.get("ffx"), Mapping) else {}
-
-        prenatal_bin_size = data.get("prenatal_bin_size")
-        if prenatal_bin_size is None:
-            prenatal_bin_size = preface.get("binsize", 100_000)
-
-        yfrac_threshold = data.get("yfrac_threshold")
-        if yfrac_threshold is None:
-            yfrac_threshold = ffy.get("yfrac_threshold", 0.0)
-
-        ffy_intercept = data.get("ffy_intercept")
-        if ffy_intercept is None:
-            ffy_intercept = ffy.get("intercept", 0.0)
-
-        ffy_slope = data.get("ffy_slope")
-        if ffy_slope is None:
-            ffy_slope = ffy.get("slope", 1.0)
-
-        mlp_w1 = data.get("mlp_w1")
-        if mlp_w1 is None:
-            mlp_w1 = preface.get("w1", [])
-
-        mlp_b1 = data.get("mlp_b1")
-        if mlp_b1 is None:
-            mlp_b1 = preface.get("b1", [])
-
-        mlp_w2 = data.get("mlp_w2")
-        if mlp_w2 is None:
-            mlp_w2 = preface.get("w2", [])
-
-        mlp_b2 = data.get("mlp_b2")
-        if mlp_b2 is None:
-            mlp_b2 = preface.get("b2", [0.0])
-        if not isinstance(mlp_b2, (list, tuple)):
-            mlp_b2 = [mlp_b2]
-
-        mlp_skew_intercept = data.get("mlp_skew_intercept")
-        if mlp_skew_intercept is None:
-            mlp_skew_intercept = preface.get("skew_intercept", 0.0)
-
-        mlp_skew_slope = data.get("mlp_skew_slope")
-        if mlp_skew_slope is None:
-            mlp_skew_slope = preface.get("skew_slope", 1.0)
-
-        olm_weights = data.get("olm_weights")
-        if olm_weights is None:
-            olm_weights = preface.get("olm_weights", [])
-
-        olm_bias = data.get("olm_bias")
-        if olm_bias is None:
-            olm_bias = preface.get("olm_bias", 0.0)
-
-        olm_skew_intercept = data.get("olm_skew_intercept")
-        if olm_skew_intercept is None:
-            olm_skew_intercept = preface.get("olm_skew_intercept", 0.0)
-
-        olm_skew_slope = data.get("olm_skew_slope")
-        if olm_skew_slope is None:
-            olm_skew_slope = preface.get("olm_skew_slope", 1.0)
-
-        ffx_intercept = data.get("ffx_intercept")
-        if ffx_intercept is None:
-            ffx_intercept = ffx.get("intercept_x", 0.0)
-
-        ffx_slope = data.get("ffx_slope")
-        if ffx_slope is None:
-            ffx_slope = ffx.get("slope_x", 1.0)
-
-        female_chrx_ratio_mean = data.get("female_chrx_ratio_mean")
-        if female_chrx_ratio_mean is None:
-            female_chrx_ratio_mean = ffx.get("female_chrx_ratio_mean", 1.0)
-
-        female_chrx_ratio_std = data.get("female_chrx_ratio_std")
-        if female_chrx_ratio_std is None:
-            female_chrx_ratio_std = ffx.get("female_chrx_ratio_std", 0.0)
-
         return cls(
-            prenatal_bin_size=int(prenatal_bin_size),
-            yfrac_threshold=float(yfrac_threshold),
-            ffy_intercept=float(ffy_intercept),
-            ffy_slope=float(ffy_slope),
-            mlp_w1=[[float(x) for x in row] for row in mlp_w1],
-            mlp_b1=[float(x) for x in mlp_b1],
-            mlp_w2=[[float(x) for x in row] for row in mlp_w2],
-            mlp_b2=[float(x) for x in mlp_b2],
-            mlp_skew_intercept=float(mlp_skew_intercept),
-            mlp_skew_slope=float(mlp_skew_slope),
-            olm_weights=[float(x) for x in olm_weights],
-            olm_bias=float(olm_bias),
-            olm_skew_intercept=float(olm_skew_intercept),
-            olm_skew_slope=float(olm_skew_slope),
-            ffx_intercept=float(ffx_intercept),
-            ffx_slope=float(ffx_slope),
-            female_chrx_ratio_mean=float(female_chrx_ratio_mean),
-            female_chrx_ratio_std=float(female_chrx_ratio_std),
+            prenatal_bin_size=int(raw_bin_size),
+            yfrac_threshold=float(data["yfrac_threshold"]),
+            ffy_intercept=float(data["ffy_intercept"]),
+            ffy_slope=float(data["ffy_slope"]),
+            mlp_w1=[[float(x) for x in row] for row in data["mlp_w1"]],
+            mlp_b1=[float(x) for x in data["mlp_b1"]],
+            mlp_w2=[[float(x) for x in row] for row in data["mlp_w2"]],
+            mlp_b2=mlp_b2,
+            mlp_skew_intercept=float(data["mlp_skew_intercept"]),
+            mlp_skew_slope=float(data["mlp_skew_slope"]),
+            olm_weights=[float(x) for x in data["olm_weights"]],
+            olm_bias=float(data["olm_bias"]),
+            olm_skew_intercept=float(data["olm_skew_intercept"]),
+            olm_skew_slope=float(data["olm_skew_slope"]),
+            ffx_intercept=float(data["ffx_intercept"]),
+            ffx_slope=float(data["ffx_slope"]),
+            female_chrx_ratio_mean=float(data["female_chrx_ratio_mean"]),
+            female_chrx_ratio_std=float(data["female_chrx_ratio_std"]),
         )
 
     def encode(self) -> bytes:
@@ -259,7 +190,7 @@ class ReferenceMetadata:
     nearest_bins: int = 300
     mode: AnalysisMode = "germline"
     prenatal_bin_size: int | None = None
-    sample_identities: tuple[str, ...] = ()
+    sample_identities: tuple[object, ...] = ()
     sex_signal_contig: str | None = None
     sex_cutoff: float | None = None
     sex_source: str | None = None
@@ -348,8 +279,8 @@ class ReferenceMetadata:
             else {}
         )
         sample_ids_obj = data.get("sample_identities", ())
-        sample_identities = (
-            tuple(str(x) for x in sample_ids_obj)
+        sample_identities: tuple[object, ...] = (
+            tuple(dict(x) if isinstance(x, Mapping) else str(x) for x in sample_ids_obj)
             if isinstance(sample_ids_obj, (list, tuple))
             else ()
         )
@@ -379,6 +310,11 @@ class ReferenceMetadata:
         if "prenatal" in data and isinstance(data["prenatal"], Mapping):
             prenatal_meta = PrenatalModelMetadata.from_dict(data["prenatal"])
 
+        raw_mode = str(model.get("mode", "germline"))
+        if raw_mode not in ("germline", "prenatal"):
+            raise ValueError(f"mode must be 'germline' or 'prenatal', got {raw_mode!r}")
+        mode: AnalysisMode = "prenatal" if raw_mode == "prenatal" else "germline"
+
         return cls(
             bin_size=int(model.get("bin_size", DEFAULT_BIN_SIZE)),
             contig_lengths=contig_lengths,
@@ -387,7 +323,7 @@ class ReferenceMetadata:
             sex_contigs=sex_contigs,
             pca_components=int(model.get("pca_components", 5)),
             nearest_bins=int(model.get("nearest_bins", 300)),
-            mode=str(model.get("mode", "germline")),  # type: ignore[arg-type]
+            mode=mode,
             prenatal_bin_size=(
                 int(model["prenatal_bin_size"])
                 if model.get("prenatal_bin_size") is not None

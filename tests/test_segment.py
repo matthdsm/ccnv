@@ -7,7 +7,6 @@ import numpy as np
 
 from ccnv.segment import (
     WeightedL2Cost,
-    benchmark_algorithms,
     segment_contig,
     segment_genome,
 )
@@ -198,21 +197,6 @@ class TestBenchmarkConcordance(unittest.TestCase):
                 if result[0].mean > 0.2:
                     observed_calls.append("gain")
             self.assertEqual(observed_calls, ["gain"])
-
-    def test_benchmark_runs_both_algorithms(self) -> None:
-        results = benchmark_algorithms(
-            contig="21",
-            starts=np.arange(12) * 100_000,
-            ends=np.arange(1, 13) * 100_000,
-            ratios=[0.0] * 6 + [0.1] * 6,
-            weights=np.ones(12),
-            contig_length=1_200_000,
-            penalty=0.01,
-        )
-
-        self.assertEqual([item.algorithm for item in results], ["pelt", "binseg"])
-        self.assertTrue(all(item.elapsed_seconds >= 0 for item in results))
-        self.assertTrue(all(len(item.segments) == 2 for item in results))
 
     def test_selected_algorithm_matches_real_fixture_segments_and_call(self) -> None:
         bins: dict[str, list[list[float | int]]] = {}

@@ -8,7 +8,7 @@ from pathlib import Path
 import pysam
 
 from ccnv.convert import run as convert
-from ccnv.models import ConvertConfig, parquet_path
+from ccnv.models import ConvertConfig
 
 CONVERT_FIXTURES = Path(__file__).parent / "fixtures" / "convert"
 _DATASETS = "https://raw.githubusercontent.com/nf-cmgg/test-datasets/wisecondorx/"
@@ -61,9 +61,13 @@ def ensure_published_fasta() -> Path:
 
 
 def convert_published_samples(root: Path) -> tuple[Path, Path]:
-    """Convert both published CRAMs into sample Parquet under ``root``."""
+    """Convert published CRAMs into sample Parquet under ``root``, reusing cache."""
+
+    import shutil
 
     fasta = ensure_published_fasta()
+    cache_dir = CONVERT_FIXTURES / ".cache_converted"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for index, (cached, url) in enumerate(
         (
@@ -73,7 +77,19 @@ def convert_published_samples(root: Path) -> tuple[Path, Path]:
         start=1,
     ):
         cram = ensure_published_file(cached, url)
-        prefix = root / f"sample{index}"
-        convert(ConvertConfig(cram, prefix, PUBLISHED_BIN_SIZE, fasta=fasta))
-        paths.append(parquet_path(prefix))
+        cached_sample = cache_dir / f"sample{index}.ccnv"
+        if not cached_sample.is_file() or cached_sample.stat().st_size == 0:
+            convert(
+                ConvertConfig(
+                    cram,
+                    cache_dir / f"sample{index}",
+                    PUBLISHED_BIN_SIZE,
+                    fasta=fasta,
+                )
+            )
+        dest = root / f"sample{index}.ccnv"
+        if not dest.is_file() or dest.resolve() != cached_sample.resolve():
+            root.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(cached_sample, dest)
+        paths.append(dest)
     return paths[0], paths[1]

@@ -331,12 +331,17 @@ class TestRLMHuber(unittest.TestCase):
         self.assertAlmostEqual(h_slope, o_slope, places=5)
 
     def test_rlm_huber_matches_sklearn_huber_on_clean_and_outlier_data(self) -> None:
+        from sklearn.linear_model import HuberRegressor
+
         x = np.linspace(0.0, 10.0, 50)
         y = 1.5 - 0.5 * x
         y[0] = 50.0
+        huber = HuberRegressor(alpha=0.0, epsilon=1.345, max_iter=100).fit(
+            x.reshape(-1, 1), y
+        )
         intercept, slope = rlm_huber(x, y)
-        self.assertAlmostEqual(intercept, 1.5, delta=0.1)
-        self.assertAlmostEqual(slope, -0.5, delta=0.05)
+        self.assertAlmostEqual(intercept, float(huber.intercept_), places=6)
+        self.assertAlmostEqual(slope, float(huber.coef_[0]), places=6)
 
     def test_rlm_huber_fallback_on_value_error(self) -> None:
         x = np.array([1.0, 2.0, 3.0, 4.0])

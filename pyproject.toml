@@ -87,7 +87,7 @@ format = "ruff check --fix . && ruff format ."
 lint = "ruff check ."
 test = "pytest"
 hooks = "prek run --all-files"
-docker-build = "docker build --platform linux/amd64 -t quay.io/matthdsm/ccnv:dev ."
+docker-build = "docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/matthdsm/copynumber-cnv:dev ."
 
 [tool.pytest.ini_options]
 addopts = "-ra"

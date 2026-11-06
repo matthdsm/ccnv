@@ -728,6 +728,84 @@ class TestPredictPublishedCrams(unittest.TestCase):
 
             self.assertGreater(plot_html.stat().st_size, 0)
 
+    def test_normalize_branch_zero_null_std_mad_fallback(self) -> None:
+        model = BranchModel(
+            branch=BRANCH_AUTOSOMAL,
+            contigs=("chr1", "chr1", "chr2", "chr2"),
+            starts=np.array([0, 100, 0, 100], dtype=np.int64),
+            ends=np.array([100, 200, 100, 200], dtype=np.int64),
+            counts=np.array([20.0, 30.0, 40.0, 50.0]),
+            masked=np.zeros(4, dtype=np.bool_),
+            pca_mean=np.full(4, 0.25),
+            pca_loadings=np.zeros((1, 4)),
+            nearest_indices=(
+                np.array([2, 3]),
+                np.array([2, 3]),
+                np.array([0, 1]),
+                np.array([0, 1]),
+            ),
+            mean_distance=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            null_mean=np.zeros(4, dtype=np.float64),
+            null_std=np.zeros(4, dtype=np.float64),
+        )
+        config = PredictConfig(
+            Path("sample"),
+            Path("reference"),
+            Path("output"),
+            min_reference_bins=2,
+        )
+        result = normalize_branch(model, config)
+        self.assertEqual(result.ratios.shape, (4,))
+        self.assertTrue(np.all(np.isfinite(result.zscores)))
+
+    def test_resolve_sample_sex_inferences_and_validations(self) -> None:
+        from ccnv.predict import _resolve_sample_sex
+
+        sample = pa.table(
+            {
+                "contig": ["chr1", "chrY"],
+                "start": [0, 0],
+                "end": [100, 100],
+                "count": [90.0, 10.0],
+            }
+        )
+        self.assertEqual(_resolve_sample_sex("female", sample, {}, set()), "female")
+        self.assertEqual(_resolve_sample_sex("male", sample, {}, set()), "male")
+        self.assertIsNone(_resolve_sample_sex("autosomal", sample, {}, {"autosomal"}))
+
+        with self.assertRaises(PredictError):
+            _resolve_sample_sex(
+                "autosomal", sample, {}, {"autosomal", "female_sex", "male_sex"}
+            )
+
+        meta = {
+            "model": {
+                "sex_signal_contig": "chrY",
+                "sex_inference": {"cutoff": 0.05},
+            }
+        }
+        self.assertEqual(
+            _resolve_sample_sex(
+                "autosomal", sample, meta, {"autosomal", "female_sex", "male_sex"}
+            ),
+            "male",
+        )
+        meta_high_cut = {
+            "model": {
+                "sex_signal_contig": "chrY",
+                "sex_inference": {"cutoff": 0.15},
+            }
+        }
+        self.assertEqual(
+            _resolve_sample_sex(
+                "autosomal",
+                sample,
+                meta_high_cut,
+                {"autosomal", "female_sex", "male_sex"},
+            ),
+            "female",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

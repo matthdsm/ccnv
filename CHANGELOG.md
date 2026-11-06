@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Refactored codebase architecture to conform to thermonuclear code quality standards, eliminating code bloat, deduplicating logic, and ensuring all source and test modules remain strictly below 1,000 lines.
+- Extracted modular test suites and test helpers into `tests/test_cohort.py`, `tests/test_reference_compute.py`, and `tests/helpers.py`, decomposing `tests/test_reference.py` from 1,065 to 763 lines.
+- Replaced module-level mutable state in `src/ccnv/reference_compute.py` with immutable context dataclasses (`_NearestContext`, `_NullContext`).
+- Streamlined `src/ccnv/reference.py` and `src/ccnv/prenatal.py` to ingest in-memory `Cohort` objects directly without redundant disk reads or table re-parsing.
+- Optimized coordinate evidence slicing per-contig in `src/ccnv/predict.py` and hoisted invariant nearest-bin neighbor filters.
 - Bumped Arrow Parquet storage schema to version `2.0.0` (`SCHEMA_VERSION = "2.0.0"`), introducing native multi-resolution reference branches (`prenatal_autosomal` at 100 kb, `prenatal_ffy` at 5 kb `chrY`) alongside 5 kb CNV branches (`autosomal`, `female_sex`, `male_sex`) and persisting scalar prenatal hyperparameters in `ccnv.prenatal` metadata.
 - Replaced positional cohort sample arguments in `ccnv reference` with `--samplesheet / -s` for cohort references and `--fasta` for flat uniform-depth references.
 - Added `--mode germline | prenatal` flag to `ccnv reference` and `ccnv predict` (defaulting to `germline`) with strict reference mode validation.

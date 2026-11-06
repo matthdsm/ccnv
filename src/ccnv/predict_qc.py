@@ -92,7 +92,7 @@ def build_predict_qc_payload(
     total_segments = len(segments)
     gain_calls = sum(1 for s in segments if s.call == "gain")
     loss_calls = sum(1 for s in segments if s.call == "loss")
-    discordant_segments = sum(1 for s in segments if getattr(s, "discordant", False))
+    discordant_segments = sum(1 for s in segments if s.discordant)
 
     cnv_summary: dict[str, object] = {
         "total_segments": total_segments,
@@ -107,22 +107,14 @@ def build_predict_qc_payload(
             "fetal_sex": prenatal_result.fetal_sex,
             "active_ff": float(prenatal_result.active_ff),
             "active_ff_source": prenatal_result.active_ff_source,
-            "active_method": prenatal_result.active_ff_source,
             "ffy": (
                 float(prenatal_result.ffy) if prenatal_result.ffy is not None else None
             ),
-            "ffx": (
-                float(prenatal_result.ffx) if prenatal_result.ffx is not None else None
-            ),
-            "preface": (
-                float(prenatal_result.preface)
-                if prenatal_result.preface is not None
-                else None
-            ),
+            "ffx": float(prenatal_result.ffx),
+            "preface": float(prenatal_result.preface),
             "chrx_ratio": float(prenatal_result.chrx_ratio),
             "chry_score": float(prenatal_result.chry_score),
             "yfrac_threshold": float(prenatal_result.yfrac_threshold),
-            "discordant_segments_count": discordant_segments,
             "sca": {
                 "call": prenatal_result.sca.call,
                 "is_aneuploid": bool(prenatal_result.sca.is_aneuploid),

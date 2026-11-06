@@ -16,7 +16,17 @@ from numpy.typing import NDArray
 
 from ccnv.models import ReferenceQCConfig
 from ccnv.results import ReferenceQCOutputs
-from ccnv.schemas import ArtifactKind, SchemaError, decode_metadata, validate_table
+from ccnv.schemas import (
+    BRANCH_AUTOSOMAL,
+    BRANCH_FEMALE_SEX,
+    BRANCH_MALE_SEX,
+    BRANCH_PRENATAL_AUTOSOMAL,
+    BRANCH_PRENATAL_FFY,
+    ArtifactKind,
+    SchemaError,
+    decode_metadata,
+    validate_table,
+)
 
 DEFAULT_MIN_REF_BINS: Final[int] = 150
 OUTLIER_N_SIGMA: Final[float] = 3.0
@@ -49,26 +59,6 @@ def _escalate(current: tuple[str, str], candidate: tuple[str, str]) -> tuple[str
     if VERDICT_SEVERITY.get(candidate[0], 0) > VERDICT_SEVERITY.get(current[0], 0):
         return candidate
     return current
-
-
-def compute_per_bin_stats(
-    distances: list[list[float]],
-) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
-    """Compute mean distance and reference bin count per unmasked bin."""
-
-    n = len(distances)
-    mean_d = np.zeros(n, dtype=np.float64)
-    n_refs = np.zeros(n, dtype=np.int64)
-
-    for i, dist in enumerate(distances):
-        if not dist:
-            mean_d[i] = np.nan
-            n_refs[i] = 0
-        else:
-            mean_d[i] = float(np.mean(dist))
-            n_refs[i] = len(dist)
-
-    return mean_d, n_refs
 
 
 def compute_signal_contig_metrics(
@@ -285,7 +275,7 @@ def compute_branch_qc(
     n_low_refs = int(np.sum(n_refs < min_ref_bins))
 
     sig_metrics = None
-    if branch_name == "male_sex" and signal_contig:
+    if branch_name == BRANCH_MALE_SEX and signal_contig:
         sig_metrics = compute_signal_contig_metrics(
             contigs, signal_contig, mean_d, n_refs, cutoff_outlier, min_ref_bins
         )
@@ -303,7 +293,7 @@ def compute_branch_qc(
         "signal_contig_metrics": sig_metrics,
     }
 
-    if branch_name == "male_sex":
+    if branch_name == BRANCH_MALE_SEX:
         verdict, message = evaluate_male_verdict(metrics, min_ref_bins)
     else:
         verdict, message = evaluate_autosomal_or_female_verdict(metrics, min_ref_bins)
@@ -344,7 +334,7 @@ def run_reference_qc_on_table(
     cnv_branch_names = tuple(
         b
         for b in dict.fromkeys(table.column("branch").to_pylist())
-        if b in ("autosomal", "female_sex", "male_sex")
+        if b in (BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX)
     )
     logger.debug(
         "evaluating reference QC (branches=%s, flat=%s, %d rows)",
@@ -399,14 +389,14 @@ def run_reference_qc_on_table(
         if not isinstance(prenatal_meta_dict, dict):
             prenatal_meta_dict = {}
 
-        auto_rows = table.filter(pc.equal(table["branch"], "prenatal_autosomal"))
+        auto_rows = table.filter(pc.equal(table["branch"], BRANCH_PRENATAL_AUTOSOMAL))
         usable_auto = (
             int(pc.sum(pc.invert(auto_rows["masked"])).as_py() or 0)
             if auto_rows.num_rows > 0
             else 0
         )
 
-        ffy_rows = table.filter(pc.equal(table["branch"], "prenatal_ffy"))
+        ffy_rows = table.filter(pc.equal(table["branch"], BRANCH_PRENATAL_FFY))
         informative_ffy = (
             int(pc.sum(pc.invert(ffy_rows["masked"])).as_py() or 0)
             if ffy_rows.num_rows > 0
@@ -512,6 +502,3 @@ def run_reference_qc(config: ReferenceQCConfig) -> ReferenceQCOutputs:
         write_json=True,
         emit_stderr=True,
     )
-
-
-evaluate_reference_qc = run_reference_qc_on_table

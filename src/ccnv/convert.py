@@ -1,7 +1,7 @@
 """Stream BAM/CRAM alignments into canonical sample Parquet bins."""
 
 import logging
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -155,6 +155,29 @@ def normalize_chr(name: str) -> str:
     return bare.upper() if bare.upper() in {"X", "Y"} else bare
 
 
+def is_autosome_name(name: str) -> bool:
+    """Return True if contig is a canonical numbered autosome (1..22)."""
+
+    stripped = normalize_chr(name)
+    return stripped.isdigit() and 1 <= int(stripped) <= 22
+
+
+def resolve_contig_name(contig: str, available: Iterable[str]) -> str | None:
+    """Resolve contig name against available keys with chr-prefix and case fallback."""
+
+    avail_set = set(available)
+    if contig in avail_set:
+        return contig
+    stripped = normalize_chr(contig)
+    if stripped in avail_set:
+        return stripped
+    prefixed = f"chr{stripped}"
+    if prefixed in avail_set:
+        return prefixed
+    lower_map = {normalize_chr(k).lower(): k for k in available}
+    return lower_map.get(stripped.lower())
+
+
 def is_canonical_contig(name: str) -> bool:
     """Report whether a contig is a canonical autosome or sex chromosome.
 
@@ -163,8 +186,7 @@ def is_canonical_contig(name: str) -> bool:
     are not canonical.
     """
 
-    norm = normalize_chr(name)
-    return (norm.isdigit() and 1 <= int(norm) <= 22) or norm in {"X", "Y"}
+    return is_autosome_name(name) or normalize_chr(name) in {"X", "Y"}
 
 
 def bin_intervals(length: int, bin_size: int) -> tuple[np.ndarray, np.ndarray]:
@@ -338,28 +360,23 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
     )
 
 
-def rejection_reason(read: object, filters: ReadFilters) -> str | None:
+def rejection_reason(read: pysam.AlignedSegment, filters: ReadFilters) -> str | None:
     """Return the first matching QC counter name, or ``None`` if kept."""
 
-    if filters.exclude_unmapped and bool(getattr(read, "is_unmapped", False)):
+    if filters.exclude_unmapped and read.is_unmapped:
         return "filter_unmapped"
-    start = getattr(read, "reference_start", None)
+    start = read.reference_start
     if start is None or int(start) < 0:
         return "filter_no_start"
-    if filters.exclude_secondary and bool(getattr(read, "is_secondary", False)):
+    if filters.exclude_secondary and read.is_secondary:
         return "filter_secondary"
-    if filters.exclude_supplementary and bool(getattr(read, "is_supplementary", False)):
+    if filters.exclude_supplementary and read.is_supplementary:
         return "filter_supplementary"
-    if filters.exclude_duplicates and bool(getattr(read, "is_duplicate", False)):
+    if filters.exclude_duplicates and read.is_duplicate:
         return "filter_duplicate"
-    if (
-        filters.require_proper_pair
-        and bool(getattr(read, "is_paired", False))
-        and not bool(getattr(read, "is_proper_pair", False))
-    ):
+    if filters.require_proper_pair and read.is_paired and not read.is_proper_pair:
         return "filter_improper_pair"
-    mapping_quality = int(getattr(read, "mapping_quality", 0))
-    if mapping_quality < filters.min_mapping_quality:
+    if int(read.mapping_quality) < filters.min_mapping_quality:
         return "filter_mapq"
     return None
 

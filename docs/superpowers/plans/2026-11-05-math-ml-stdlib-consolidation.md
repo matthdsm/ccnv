@@ -75,20 +75,21 @@
 - [ ] **Step 1: Add edge-case unit tests in `tests/test_prenatal_math.py`**
 
 ```python
-    def test_fit_lasso_fista_all_zero_target_no_warning(self) -> None:
-        rng = np.random.default_rng(42)
-        X = rng.uniform(0.0, 1.0, size=(20, 10))
-        y = np.zeros(20, dtype=np.float64)
-        w = fit_lasso_fista(X, y, alpha=1e-4)
-        np.testing.assert_allclose(w, 0.0, atol=1e-12)
+def test_fit_lasso_fista_all_zero_target_no_warning(self) -> None:
+    rng = np.random.default_rng(42)
+    X = rng.uniform(0.0, 1.0, size=(20, 10))
+    y = np.zeros(20, dtype=np.float64)
+    w = fit_lasso_fista(X, y, alpha=1e-4)
+    np.testing.assert_allclose(w, 0.0, atol=1e-12)
 
-    def test_rlm_huber_matches_sklearn_huber_on_clean_and_outlier_data(self) -> None:
-        x = np.linspace(0.0, 10.0, 50)
-        y = 1.5 - 0.5 * x
-        y[0] = 50.0
-        intercept, slope = rlm_huber(x, y)
-        self.assertAlmostEqual(intercept, 1.5, delta=0.1)
-        self.assertAlmostEqual(slope, -0.5, delta=0.05)
+
+def test_rlm_huber_matches_sklearn_huber_on_clean_and_outlier_data(self) -> None:
+    x = np.linspace(0.0, 10.0, 50)
+    y = 1.5 - 0.5 * x
+    y[0] = 50.0
+    intercept, slope = rlm_huber(x, y)
+    self.assertAlmostEqual(intercept, 1.5, delta=0.1)
+    self.assertAlmostEqual(slope, -0.5, delta=0.05)
 ```
 
 - [ ] **Step 2: Run tests to verify baseline**

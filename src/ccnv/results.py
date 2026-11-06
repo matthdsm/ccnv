@@ -69,8 +69,8 @@ class FetalFractionResult:
     active_ff: float
     active_ff_source: ActiveFFSource
     ffy: float | None
-    ffx: float | None
-    preface: float | None
+    ffx: float
+    preface: float
     chrx_ratio: float
     chry_score: float
     yfrac_threshold: float
@@ -105,10 +105,6 @@ class PredictionOutputs:
     segments: tuple[SegmentResult, ...]
     qc_json_path: Path | None = None
     prenatal_result: FetalFractionResult | None = None
-
-
-PredictResult = PredictionOutputs
-PredictOutputPaths = PredictionOutputs
 
 
 @dataclass(frozen=True, slots=True)

@@ -281,39 +281,21 @@ class TestSchemaContracts(unittest.TestCase):
         from_dict_meta = PrenatalModelMetadata.from_dict(as_dict)
         self.assertEqual(from_dict_meta, meta)
 
-    def test_prenatal_model_metadata_nested_dict_parsing(self) -> None:
-        nested = {
-            "ffy": {
-                "binsize": 5000,
-                "intercept": 0.0012,
-                "slope": 0.985,
-                "yfrac_threshold": 0.0041,
-            },
-            "preface": {
-                "binsize": 100_000,
-                "w1": [[0.1, 0.2] for _ in range(50)],
-                "b1": [0.12, -0.34],
-                "w2": [[0.85], [-0.61]],
-                "b2": 0.04,  # scalar float coerced to [0.04]
-                "skew_intercept": -0.002,
-                "skew_slope": 1.018,
-                "olm_weights": [0.02 for _ in range(50)],
-                "olm_bias": 0.005,
-                "olm_skew_intercept": -0.001,
-                "olm_skew_slope": 1.01,
-            },
-            "ffx": {
-                "intercept_x": 1.0004,
-                "slope_x": -0.498,
-                "female_chrx_ratio_mean": 1.0003,
-                "female_chrx_ratio_std": 0.0112,
-            },
-        }
-        parsed = PrenatalModelMetadata.from_dict(nested)
-        self.assertEqual(parsed.prenatal_bin_size, 100_000)
-        self.assertEqual(parsed.yfrac_threshold, 0.0041)
-        self.assertEqual(parsed.mlp_b2, [0.04])
-        self.assertEqual(parsed.female_chrx_ratio_std, 0.0112)
+    def test_prenatal_model_metadata_rejects_missing_keys_or_empty_dict(self) -> None:
+        with self.assertRaises(KeyError):
+            PrenatalModelMetadata.from_dict({})
+
+        with self.assertRaises(SchemaError):
+            metadata_for(
+                ArtifactKind.REFERENCE,
+                contig_lengths={"chr1": 200},
+                values={
+                    "schema_version": "2.0.0",
+                    "sample_identities": [],
+                    "model": {"branches": ["autosomal"]},
+                    "prenatal": {},
+                },
+            )
 
     def test_prenatal_model_metadata_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "positive integer"):

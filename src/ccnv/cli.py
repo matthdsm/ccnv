@@ -76,8 +76,6 @@ class AnalysisMode(StrEnum):
 
     germline = "germline"
     prenatal = "prenatal"
-    GERMLINE = "germline"
-    PRENATAL = "prenatal"
 
 
 def configure_logging(level: LogLevel) -> None:
@@ -106,6 +104,52 @@ LogLevelOption = Annotated[
         "--loglevel",
         case_sensitive=False,
         help="Logging verbosity for pipeline steps",
+    ),
+]
+
+ModeOption = Annotated[
+    AnalysisMode,
+    typer.Option(
+        "--mode",
+        case_sensitive=False,
+        help="Analysis mode: germline constitutional CNV or prenatal NIPS cfDNA",
+    ),
+]
+
+MappabilityOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--mappability",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help=(
+            "Mappability BigWig (.bw/.bigWig) track for covariate normalization "
+            "(k-mer length should roughly match average sequencing read length)"
+        ),
+    ),
+]
+
+GcOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--gc",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="GC content track (.bw/.bigWig, .bed/.bed.gz, or .fa/.fasta/.fna)",
+    ),
+]
+
+MinMappabilityOption = Annotated[
+    float,
+    typer.Option(
+        "--min-mappability",
+        min=0.0,
+        max=1.0,
+        help="Minimum bin mappability in [0, 1] required to stay unmasked",
     ),
 ]
 
@@ -293,14 +337,7 @@ def reference(
             help="Reference FASTA for flat reference building",
         ),
     ] = None,
-    mode: Annotated[
-        AnalysisMode,
-        typer.Option(
-            "--mode",
-            case_sensitive=False,
-            help="Analysis mode: germline constitutional CNV or prenatal NIPS cfDNA",
-        ),
-    ] = AnalysisMode.germline,
+    mode: ModeOption = AnalysisMode.germline,
     prenatal_binsize: Annotated[
         int,
         typer.Option(
@@ -374,40 +411,9 @@ def reference(
             help="Generate reference quality control report",
         ),
     ] = True,
-    mappability: Annotated[
-        Path | None,
-        typer.Option(
-            "--mappability",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            help=(
-                "Mappability BigWig (.bw/.bigWig) track for covariate normalization "
-                "(k-mer length should roughly match average sequencing read length)"
-            ),
-        ),
-    ] = None,
-    gc: Annotated[
-        Path | None,
-        typer.Option(
-            "--gc",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            help="GC content track (.bw/.bigWig, .bed/.bed.gz, or .fa/.fasta/.fna)",
-        ),
-    ] = None,
-    min_mappability: Annotated[
-        float,
-        typer.Option(
-            "--min-mappability",
-            min=0.0,
-            max=1.0,
-            help="Minimum bin mappability in [0, 1] required to stay unmasked",
-        ),
-    ] = DEFAULT_MIN_MAPPABILITY,
+    mappability: MappabilityOption = None,
+    gc: GcOption = None,
+    min_mappability: MinMappabilityOption = DEFAULT_MIN_MAPPABILITY,
     threads: Annotated[
         int,
         typer.Option(
@@ -625,48 +631,10 @@ def predict(
             "--vcf/--no-vcf", help="Write VCFv4.2 outputs for bins and segments"
         ),
     ] = True,
-    mappability: Annotated[
-        Path | None,
-        typer.Option(
-            "--mappability",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            help=(
-                "Mappability BigWig (.bw/.bigWig) override track for normalization "
-                "(k-mer length should roughly match average sequencing read length)"
-            ),
-        ),
-    ] = None,
-    gc: Annotated[
-        Path | None,
-        typer.Option(
-            "--gc",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            help="GC content override track (.bw/.bigWig, .bed/.bed.gz, or .fa/.fasta)",
-        ),
-    ] = None,
-    min_mappability: Annotated[
-        float,
-        typer.Option(
-            "--min-mappability",
-            min=0.0,
-            max=1.0,
-            help="Minimum bin mappability in [0, 1] required to stay unmasked",
-        ),
-    ] = DEFAULT_MIN_MAPPABILITY,
-    mode: Annotated[
-        AnalysisMode,
-        typer.Option(
-            "--mode",
-            case_sensitive=False,
-            help="Analysis mode: germline constitutional CNV or prenatal NIPS cfDNA",
-        ),
-    ] = AnalysisMode.germline,
+    mappability: MappabilityOption = None,
+    gc: GcOption = None,
+    min_mappability: MinMappabilityOption = DEFAULT_MIN_MAPPABILITY,
+    mode: ModeOption = AnalysisMode.germline,
     loglevel: LogLevelOption = LogLevel.warning,
 ) -> None:
     """Predict copy-number events for one sample."""

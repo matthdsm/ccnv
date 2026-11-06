@@ -12,7 +12,6 @@ import scipy.stats
 from numpy.typing import NDArray
 from sklearn.decomposition import PCA
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.impute import SimpleImputer
 from sklearn.linear_model import HuberRegressor, Lasso, LinearRegression
 from sklearn.mixture import GaussianMixture
 from sklearn.utils.extmath import svd_flip
@@ -154,10 +153,14 @@ def pca_irlba_numpy(
             np.zeros((n_features, n_components), dtype=np.float64),
         )
 
-    imputer = SimpleImputer(strategy="mean", keep_empty_features=True)
-    x_imputed = imputer.fit_transform(np.where(np.isfinite(x_arr), x_arr, np.nan))
-    center = np.nan_to_num(imputer.statistics_, nan=0.0)
-    x_centered = x_imputed - center
+    nan_mask = ~np.isfinite(x_arr)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        center = np.nan_to_num(
+            np.nanmean(np.where(nan_mask, np.nan, x_arr), axis=0),
+            nan=0.0,
+        )
+    x_centered = np.where(nan_mask, 0.0, x_arr - center)
 
     if k == 0 or np.allclose(x_centered, 0.0):
         return (

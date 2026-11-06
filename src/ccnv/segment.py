@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 Algorithm = Literal["pelt", "binseg"]
 DEFAULT_MAX_BLACKLIST_GAP = 2_000_000
-PENALTY_SEMANTICS = "absolute weighted-SSE cost per breakpoint"
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,15 +33,6 @@ class Segment:
     mean: float
     weight: float
     bin_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class AlgorithmBenchmark:
-    """One segmentation algorithm's result and elapsed wall-clock time."""
-
-    algorithm: Algorithm
-    elapsed_seconds: float
-    segments: tuple[Segment, ...]
 
 
 class WeightedL2Cost(BaseCost):
@@ -230,47 +220,6 @@ def segment_genome(
         elapsed,
     )
     return tuple(all_segments)
-
-
-def benchmark_algorithms(
-    *,
-    contig: str,
-    starts: ArrayLike,
-    ends: ArrayLike,
-    ratios: ArrayLike,
-    weights: ArrayLike,
-    contig_length: int,
-    penalty: float,
-    min_size: int = 2,
-    jump: int = 1,
-    max_blacklist_gap: int = DEFAULT_MAX_BLACKLIST_GAP,
-) -> tuple[AlgorithmBenchmark, AlgorithmBenchmark]:
-    """Run PELT and Binseg against identical inputs for fixture evaluation."""
-
-    results: list[AlgorithmBenchmark] = []
-    for algorithm in ("pelt", "binseg"):
-        started = perf_counter()
-        segments = segment_contig(
-            contig=contig,
-            starts=starts,
-            ends=ends,
-            ratios=ratios,
-            weights=weights,
-            contig_length=contig_length,
-            penalty=penalty,
-            algorithm=algorithm,
-            min_size=min_size,
-            jump=jump,
-            max_blacklist_gap=max_blacklist_gap,
-        )
-        results.append(
-            AlgorithmBenchmark(
-                algorithm=algorithm,
-                elapsed_seconds=perf_counter() - started,
-                segments=segments,
-            )
-        )
-    return results[0], results[1]
 
 
 def _cumulative(values: NDArray[np.float64]) -> NDArray[np.float64]:

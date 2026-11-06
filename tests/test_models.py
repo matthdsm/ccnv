@@ -12,8 +12,6 @@ from ccnv.models import (
 from ccnv.results import (
     FetalFractionResult,
     PredictionOutputs,
-    PredictOutputPaths,
-    PredictResult,
     SCACall,
     SCAResult,
     SegmentResult,
@@ -97,13 +95,6 @@ class TestReferenceConfig(unittest.TestCase):
             config.entries,
             (SamplesheetEntry(filepath=p1), SamplesheetEntry(filepath=p2)),
         )
-
-    def test_reference_config_input_paths_synchronization(self) -> None:
-        p1 = Path("s1.ccnv")
-        config = ReferenceConfig(prefix=Path("ref"), input_paths=(p1,))
-        self.assertEqual(config.input_paths, (p1,))
-        self.assertEqual(config.samples, (p1,))
-        self.assertEqual(config.entries, (SamplesheetEntry(filepath=p1),))
 
     def test_reference_config_entries_synchronization(self) -> None:
         e1 = SamplesheetEntry(filepath=Path("s1.ccnv"), sex="M", ff=0.10)
@@ -374,7 +365,7 @@ class TestFetalFractionResult(unittest.TestCase):
             active_ff=0.08,
             active_ff_source="PREFACE",
             ffy=None,
-            ffx=None,
+            ffx=0.08,
             preface=0.08,
             chrx_ratio=1.0,
             chry_score=0.0,
@@ -386,10 +377,6 @@ class TestFetalFractionResult(unittest.TestCase):
 
 
 class TestPredictionOutputsAliasesAndFields(unittest.TestCase):
-    def test_prediction_outputs_aliases(self) -> None:
-        self.assertIs(PredictResult, PredictionOutputs)
-        self.assertIs(PredictOutputPaths, PredictionOutputs)
-
     def test_prediction_outputs_optional_qc_and_prenatal(self) -> None:
         outputs = PredictionOutputs(
             bins_bed=Path("bins.bed.gz"),

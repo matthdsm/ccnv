@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 
 _MAX_N_FRACTION: Final[float] = 0.5
 _MIN_VARIANCE_STD: Final[float] = 1e-6
-_MIN_TREND_FLOOR: Final[float] = 0.05
 _IRLS_ITERATIONS: Final[int] = 3
 _OUTLIER_SIGMA_CUTOFF: Final[float] = 2.5
 
@@ -197,41 +196,17 @@ def _load_bigwig_intervals(
             c_starts = starts[mask]
             c_ends = ends[mask]
             chrom_len = int(bw_chroms[bw_contig])
-            c_vals = np.full(
-                c_starts.size,
-                0.0 if full_bin_denominator else np.nan,
-                dtype=np.float64,
-            )
-            for idx in range(c_starts.size):
-                s = int(c_starts[idx])
-                e = int(c_ends[idx])
-                clamped_s = max(0, min(s, chrom_len))
-                clamped_e = max(clamped_s, min(e, chrom_len))
-                if clamped_e <= clamped_s:
-                    continue
-                mean_res = bw.stats(
-                    bw_contig, clamped_s, clamped_e, type="mean", exact=True
+            raw_intervals = bw.intervals(bw_contig, 0, chrom_len)
+            if raw_intervals:
+                iv_arr = np.array(raw_intervals, dtype=np.float64)
+                out[mask] = _bin_weighted_mean(
+                    c_starts,
+                    c_ends,
+                    iv_arr[:, 0].astype(np.int64),
+                    iv_arr[:, 1].astype(np.int64),
+                    iv_arr[:, 2],
+                    full_bin_denominator=full_bin_denominator,
                 )
-                if not mean_res or mean_res[0] is None:
-                    continue
-                val = float(mean_res[0])
-                if full_bin_denominator:
-                    cov_res = bw.stats(
-                        bw_contig,
-                        clamped_s,
-                        clamped_e,
-                        type="coverage",
-                        exact=True,
-                    )
-                    cov = (
-                        float(cov_res[0])
-                        if (cov_res and cov_res[0] is not None)
-                        else 0.0
-                    )
-                    covered_bases = (clamped_e - clamped_s) * cov
-                    val *= covered_bases / max(e - s, 1)
-                c_vals[idx] = val
-            out[mask] = c_vals
     finally:
         bw.close()
 
@@ -584,23 +559,16 @@ def _apply_1d_correction(
     if design is None:
         return sub
     out = sub.copy()
-    if out.ndim == 1:
-        orig_sum = float(np.sum(out))
-        trend = _fit_sample_trend(design, out)
-        corrected = out / trend
+    arr2d = out[:, np.newaxis] if out.ndim == 1 else out
+    for s_idx in range(arr2d.shape[1]):
+        col = arr2d[:, s_idx]
+        orig_sum = float(np.sum(col))
+        trend = _fit_sample_trend(design, col)
+        corrected = col / trend
         new_sum = float(np.sum(corrected))
         if orig_sum > 0 and new_sum > 0:
             corrected *= orig_sum / new_sum
-        return corrected
-
-    for s_idx in range(out.shape[1]):
-        orig_sum = float(np.sum(out[:, s_idx]))
-        trend = _fit_sample_trend(design, out[:, s_idx])
-        corrected = out[:, s_idx] / trend
-        new_sum = float(np.sum(corrected))
-        if orig_sum > 0 and new_sum > 0:
-            corrected *= orig_sum / new_sum
-        out[:, s_idx] = corrected
+        arr2d[:, s_idx] = corrected
     return out
 
 
