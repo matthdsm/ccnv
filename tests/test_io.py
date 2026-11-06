@@ -38,7 +38,7 @@ from ccnv.models import (
     ReferenceError,
     metadata_for,
 )
-from ccnv.schemas import (
+from ccnv.models.schemas import (
     REFERENCE_SCHEMA,
     SAMPLE_SCHEMA,
 )

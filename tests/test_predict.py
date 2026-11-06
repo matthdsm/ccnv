@@ -14,6 +14,18 @@ from typer.testing import CliRunner
 
 from ccnv.cli import app
 from ccnv.models import PredictConfig, ReadFilters, ReferenceConfig, parquet_path
+from ccnv.models.results import BinResult, SegmentResult
+from ccnv.models.schemas import (
+    BRANCH_PRENATAL_AUTOSOMAL,
+    BRANCH_PRENATAL_FFY,
+    PRENATAL_METADATA_KEY,
+    REFERENCE_SCHEMA,
+    SAMPLE_SCHEMA,
+    ArtifactKind,
+    PrenatalModelMetadata,
+    decode_metadata,
+    metadata_for,
+)
 from ccnv.predict import (
     BranchModel,
     PredictError,
@@ -34,18 +46,6 @@ from ccnv.report import (
     CALLS_BED_HEADER,
     SEGMENTS_BED_HEADER,
     write_outputs,
-)
-from ccnv.results import BinResult, SegmentResult
-from ccnv.schemas import (
-    BRANCH_PRENATAL_AUTOSOMAL,
-    BRANCH_PRENATAL_FFY,
-    PRENATAL_METADATA_KEY,
-    REFERENCE_SCHEMA,
-    SAMPLE_SCHEMA,
-    ArtifactKind,
-    PrenatalModelMetadata,
-    decode_metadata,
-    metadata_for,
 )
 
 

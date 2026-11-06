@@ -5,7 +5,7 @@ from dataclasses import asdict
 import pyarrow as pa
 
 from ccnv.models import ReadFilters
-from ccnv.schemas import (
+from ccnv.models.schemas import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,

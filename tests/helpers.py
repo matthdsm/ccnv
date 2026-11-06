@@ -9,9 +9,9 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 
-from ccnv.convert import write_sample_parquet
+from ccnv.io.parquet import write_sample_parquet
 from ccnv.models import ReadFilters
-from ccnv.schemas import (
+from ccnv.models.schemas import (
     SAMPLE_SCHEMA,
     ArtifactKind,
     metadata_for,

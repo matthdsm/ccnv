@@ -1,10 +1,9 @@
 """Interactive Plotly HTML generator and cytoband ideogram renderers."""
 
 import base64
-import gzip
 import json
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from importlib.resources import files
 from pathlib import Path
 from typing import Final
@@ -30,7 +29,6 @@ _JINJA_ENV: Final[jinja2.Environment] = jinja2.Environment(
 
 __all__ = [
     "PLOTLY_CDN_URL",
-    "_load_cytobands_path",
     "encode_b64",
     "render_genome_plot",
     "write_genome_plot",
@@ -46,74 +44,9 @@ _encode_b64 = encode_b64
 
 
 def _load_template_source() -> str:
-    """Load the genome plot Jinja2 template with transitional fallback."""
-    try:
-        res = files("ccnv.report.templates").joinpath("genome_plot.html.j2")
-        if res.is_file():
-            return res.read_text(encoding="utf-8")
-    except (
-        ModuleNotFoundError,
-        TypeError,
-        FileNotFoundError,
-    ):
-        pass
-    res = files("ccnv.templates").joinpath("genome_plot.html.j2")
+    """Load the genome plot Jinja2 template."""
+    res = files("ccnv.report.templates").joinpath("genome_plot.html.j2")
     return res.read_text(encoding="utf-8")
-
-
-def _load_cytobands_path(
-    path: Path, contig_lengths: Mapping[str, int]
-) -> tuple[Cytoband, ...]:
-    """Parse a UCSC cytoband BED/TSV file (.txt, .bed, or .gz) aligned to contigs."""
-    contig_lookup: dict[str, str] = {}
-    for c in contig_lengths:
-        contig_lookup[c.casefold()] = c
-        stripped = c[3:] if c.lower().startswith("chr") else c
-        contig_lookup[stripped.casefold()] = c
-
-    open_fn = gzip.open if path.suffix.lower() == ".gz" else open
-    bands: list[Cytoband] = []
-    with open_fn(path, "rt", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or line.startswith("track"):
-                continue
-            fields = line.split("\t") if "\t" in line else line.split()
-            if len(fields) < 4:
-                continue
-            raw_contig = fields[0]
-            stripped_raw = (
-                raw_contig[3:] if raw_contig.lower().startswith("chr") else raw_contig
-            )
-            canonical = contig_lookup.get(raw_contig.casefold()) or contig_lookup.get(
-                stripped_raw.casefold()
-            )
-            if canonical is None:
-                continue
-            try:
-                start = int(fields[1])
-                end = int(fields[2])
-            except ValueError:
-                continue
-            max_len = contig_lengths[canonical]
-            start = max(0, min(start, max_len))
-            end = max(0, min(end, max_len))
-            if end <= start:
-                continue
-            name = fields[3]
-            stain = fields[4] if len(fields) >= 5 else "gneg"
-            bands.append(
-                Cytoband(
-                    contig=canonical,
-                    start=start,
-                    end=end,
-                    name=name,
-                    stain=stain,
-                )
-            )
-    return tuple(
-        sorted(bands, key=lambda b: (natural_sort_key(b.contig), b.start, b.end))
-    )
 
 
 def render_genome_plot(
@@ -122,18 +55,16 @@ def render_genome_plot(
     segments: tuple[SegmentResult, ...],
     contig_lengths: dict[str, int],
     *,
-    cytobands: Path | Sequence[Cytoband] | None = None,
+    cytobands: Sequence[Cytoband] | None = None,
     z_threshold: float = 3.0,
     ratio_threshold: float | None = None,
     sample_name: str | None = None,
     prenatal_result: FetalFractionResult | None = None,
 ) -> None:
     """Write an interactive Plotly HTML viewer with binary-packed bins and segments."""
-    parsed_bands: tuple[Cytoband, ...] = ()
-    if isinstance(cytobands, Path):
-        parsed_bands = _load_cytobands_path(cytobands, contig_lengths)
-    elif cytobands is not None:
-        parsed_bands = tuple(cytobands)
+    parsed_bands: tuple[Cytoband, ...] = (
+        tuple(cytobands) if cytobands is not None else ()
+    )
 
     raw_contigs = dict.fromkeys(
         [contig for result in bins for contig in result.contigs]

@@ -7,10 +7,15 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ccnv.cohort import ReferenceError
+from ccnv.io.samplesheet import load_samplesheet
 from ccnv.models import ReadFilters, SamplesheetEntry
-from ccnv.samplesheet import load_samplesheet
-from ccnv.schemas import REFERENCE_SCHEMA, SAMPLE_SCHEMA, ArtifactKind, metadata_for
+from ccnv.models.exceptions import ReferenceError
+from ccnv.models.schemas import (
+    REFERENCE_SCHEMA,
+    SAMPLE_SCHEMA,
+    ArtifactKind,
+    metadata_for,
+)
 
 
 def _write_sample(path: Path) -> Path:

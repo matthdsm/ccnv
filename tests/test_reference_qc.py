@@ -7,7 +7,12 @@ import numpy as np
 import pyarrow as pa
 
 from ccnv.models import ReferenceQCConfig
-from ccnv.reference_qc import (
+from ccnv.models.schemas import (
+    REFERENCE_SCHEMA,
+    ArtifactKind,
+    metadata_for,
+)
+from ccnv.qc.reference import (
     CHRY_MEAN_DIST_FAIL,
     CHRY_MIN_USABLE_PCT_FAIL,
     CHRY_MIN_USABLE_PCT_WARN,
@@ -17,11 +22,6 @@ from ccnv.reference_qc import (
     evaluate_male_verdict,
     run_reference_qc,
     run_reference_qc_on_table,
-)
-from ccnv.schemas import (
-    REFERENCE_SCHEMA,
-    ArtifactKind,
-    metadata_for,
 )
 
 

@@ -28,20 +28,9 @@ __all__ = [
 
 @functools.cache
 def _get_samplesheet_schema() -> dict[str, Any]:
-    try:
-        schema_ref = importlib.resources.files("ccnv.io").joinpath(
-            "samplesheet.schema.json"
-        )
-        if schema_ref.is_file():
-            with schema_ref.open("r", encoding="utf-8") as f:
-                return json.load(f)
-    except (
-        ModuleNotFoundError,
-        TypeError,
-        FileNotFoundError,
-    ):
-        pass
-    schema_ref = importlib.resources.files("ccnv").joinpath("samplesheet.schema.json")
+    schema_ref = importlib.resources.files("ccnv.io").joinpath(
+        "samplesheet.schema.json"
+    )
     with schema_ref.open("r", encoding="utf-8") as f:
         return json.load(f)
 

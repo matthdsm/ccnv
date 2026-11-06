@@ -9,7 +9,7 @@ from ccnv.models import (
     ReferenceConfig,
     SamplesheetEntry,
 )
-from ccnv.results import (
+from ccnv.models.results import (
     FetalFractionResult,
     PredictionOutputs,
     SCACall,

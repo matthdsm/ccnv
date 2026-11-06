@@ -32,23 +32,16 @@ A fixed human chromosome layout is intentionally absent; the tool is organism-ag
 ### Module Structure
 
 - `src/ccnv/cli.py`: The `ccnv` Typer entry point and subcommands (`convert`, `reference`, `ref-qc`, `predict`).
-- `src/ccnv/convert.py`: Functional logic for the convert stage and effective read statistics collection.
-- `src/ccnv/cohort.py`: Cohort sample discovery, validation, and parallel rebinning.
-- `src/ccnv/samplesheet.py`: Root-list YAML/JSON cohort samplesheet loading and schema validation (`samplesheet.schema.json`).
-- `src/ccnv/covariates.py`: Mappability BigWig and GC content (FASTA, BigWig, BED/TSV) loading, bin masking, and robust Huber IRLS polynomial bias normalization.
-- `src/ccnv/prenatal_math.py`: NumPy, SciPy, and scikit-learn mathematical kernels for prenatal models (1D 2-component GMM, non-negative Lasso, centered unscaled PCA, L-BFGS-B Sigmoid MLP, OLM, OLS skew correction, Huber RLM).
-- `src/ccnv/prenatal.py`: Prenatal reference training, multi-resolution coarsening, single-sample inference (`FFY`, `FFX`, `PREFACE`), SCA classification, active fetal fraction selection, and segment discordance annotation.
-- `src/ccnv/reference.py`: Functional logic for creating cohort and flat FASTA reference files across germline and prenatal modes.
-- `src/ccnv/reference_compute.py`: PCA, batched off-contig nearest-bin search, and null distribution kernels.
-- `src/ccnv/reference_qc.py`: Reference quality control metrics and usability verdicts.
-- `src/ccnv/predict.py`: Functional logic for the predict stage across germline and prenatal modes.
-- `src/ccnv/predict_qc.py`: Prediction QC payload assembly and `<prefix>_qc.json` writer for germline and prenatal runs.
-- `src/ccnv/segment.py`: Weighted L2 cost and Ruptures Binseg segmentation.
-- `src/ccnv/report.py`: BED, VCF, and interactive Plotly HTML writers for prediction artifacts.
-- `src/ccnv/templates/genome_plot.html.j2`: Jinja2 HTML template for the interactive Plotly genome viewer.
-- `src/ccnv/results.py`: Typed bin/segment/output objects shared across stages.
-- `src/ccnv/schemas.py`: Versioned Arrow schemas (`2.0.0`) and metadata validation.
-- `src/ccnv/models.py`: Typed configurations and genomic domain objects.
+- `src/ccnv/convert.py`: Root orchestrator for the convert stage, multi-process contig streaming, and effective read statistics collection.
+- `src/ccnv/reference.py`: Root orchestrator for creating cohort and flat FASTA reference files across germline and prenatal modes.
+- `src/ccnv/ref_qc.py`: Root orchestrator for auditing reference Parquet files and emitting usability verdicts.
+- `src/ccnv/predict.py`: Root orchestrator for single-sample prediction, within-sample normalization, Ruptures segmentation, calling, and reporting.
+- `src/ccnv/models/`: Pure domain types, dataclasses, schemas, configuration containers, and exceptions (`domain`, `config`, `results`, `schemas`, `exceptions`).
+- `src/ccnv/io/`: Pure I/O ingestion and persistence routines for alignments, external tracks (GC, mappability, cytobands), samplesheet schemas, and versioned Parquet tables (`alignments`, `tracks`, `samplesheet`, `parquet`).
+- `src/ccnv/stats/`: Pure stateless mathematical and machine learning kernels for PCA, batched off-contig nearest-bin search, weighted segmentation costs, regression, and prenatal mathematical estimators (`pca`, `neighbors`, `segmentation`, `regression`, `prenatal_math`).
+- `src/ccnv/features/`: In-memory feature transforms, binning, cohort alignment/rebinning, Huber IRLS covariate bias correction, and prenatal reference/inference workflows (`binning`, `cohort`, `covariates`, `prenatal`).
+- `src/ccnv/qc/`: Quality control metrics calculation, verification, and JSON serialization for samples, references, and predictions (`sample`, `reference`, `predict`).
+- `src/ccnv/report/`: Genomic deliverable generators for bgzipped/tabix BED, VCFv4.2, and interactive Plotly HTML viewer (`bed`, `vcf`, `html`, `templates/genome_plot.html.j2`).
 
 ### Storage and Coordinate Contracts
 

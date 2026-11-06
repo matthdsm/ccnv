@@ -13,20 +13,32 @@ import pysam
 from typer.testing import CliRunner
 
 from ccnv.cli import app
-from ccnv.covariates import (
-    CovariateError,
-    _bin_weighted_mean,
+from ccnv.features.covariates import (
     correct_covariate_bias,
     covariate_features,
-    load_gc_track,
-    load_mappability_track,
     mask_covariates,
     validate_min_mappability,
 )
-from ccnv.models import PredictConfig, ReadFilters, ReferenceConfig, parquet_path
+from ccnv.io.tracks import (
+    _bin_weighted_mean,
+    load_gc_track,
+    load_mappability_track,
+)
+from ccnv.models import (
+    CovariateError,
+    PredictConfig,
+    ReadFilters,
+    ReferenceConfig,
+    parquet_path,
+)
+from ccnv.models.schemas import (
+    SAMPLE_SCHEMA,
+    ArtifactKind,
+    decode_metadata,
+    metadata_for,
+)
 from ccnv.predict import run as run_predict
 from ccnv.reference import run as run_reference
-from ccnv.schemas import SAMPLE_SCHEMA, ArtifactKind, decode_metadata, metadata_for
 
 
 def _write_bigwig(

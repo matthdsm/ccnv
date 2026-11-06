@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from ccnv.predict import call_segment
-from ccnv.segment import segment_contig
+from ccnv.stats.segmentation import segment_contig
 
 FIXTURES = Path(__file__).parent / "fixtures" / "benchmark"
 BIN_SIZE = 100_000

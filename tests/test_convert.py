@@ -26,7 +26,6 @@ from ccnv.convert import (
     empty_qc,
     is_canonical_contig,
     normalize_chr,
-    read_sample_parquet,
     rebin_counts,
     rebin_sample_table,
     rejection_reason,
@@ -34,8 +33,9 @@ from ccnv.convert import (
     select_layout,
     split_thread_budget,
 )
+from ccnv.io.parquet import read_sample_parquet
 from ccnv.models import Contig, ConvertConfig, GenomeProfile, ReadFilters, parquet_path
-from ccnv.schemas import (
+from ccnv.models.schemas import (
     COORDINATE_SYSTEM,
     SAMPLE_SCHEMA,
     SCHEMA_VERSION,

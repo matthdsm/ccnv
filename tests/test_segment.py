@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ccnv.segment import (
+from ccnv.stats.segmentation import (
     WeightedL2Cost,
     segment_contig,
     segment_genome,

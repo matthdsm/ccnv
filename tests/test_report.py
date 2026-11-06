@@ -9,6 +9,13 @@ from pathlib import Path
 import numpy as np
 import pysam
 
+from ccnv.io.tracks import load_cytobands_track
+from ccnv.models.results import (
+    BinResult,
+    FetalFractionResult,
+    SCAResult,
+    SegmentResult,
+)
 from ccnv.report import (
     BINS_BED_HEADER,
     CALLS_BED_HEADER,
@@ -17,15 +24,8 @@ from ccnv.report import (
     PRENATAL_SEGMENTS_BED_HEADER,
     SEGMENTS_BED_HEADER,
     natural_sort_key,
-    read_cytobands,
     write_genome_plot,
     write_outputs,
-)
-from ccnv.results import (
-    BinResult,
-    FetalFractionResult,
-    SCAResult,
-    SegmentResult,
 )
 
 
@@ -145,7 +145,7 @@ class TestReport(unittest.TestCase):
             with gzip.open(cyto_gz, "wt", encoding="utf-8") as handle:
                 handle.write(cyto_lines)
 
-            parsed = read_cytobands(cyto_gz, contig_lengths)
+            parsed = load_cytobands_track(cyto_gz, contig_lengths)
             self.assertEqual(len(parsed), 3)
             self.assertEqual(parsed[0].contig, "1")
             self.assertEqual((parsed[0].start, parsed[0].end), (0, 40_000))
@@ -161,7 +161,7 @@ class TestReport(unittest.TestCase):
                 bins,
                 (),
                 contig_lengths,
-                cytobands=cyto_gz,
+                cytobands=parsed,
             )
             payload = _extract_payload(html_path.read_text(encoding="utf-8"))
 

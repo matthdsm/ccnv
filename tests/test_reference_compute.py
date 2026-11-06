@@ -6,7 +6,7 @@ import numpy as np
 from sklearn.neighbors import NearestNeighbors
 
 from ccnv.models import ReferenceConfig
-from ccnv.reference_compute import compute_null_models, select_nearest_bins
+from ccnv.stats.neighbors import compute_null_models, select_nearest_bins
 
 
 class TestNearestBinSelection(unittest.TestCase):

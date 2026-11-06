@@ -29,7 +29,6 @@ from ccnv.report.bed import (
 )
 from ccnv.report.html import (
     PLOTLY_CDN_URL,
-    _load_cytobands_path,
     encode_b64,
     render_genome_plot,
     write_genome_plot,
@@ -53,7 +52,6 @@ __all__ = [
     "build_vcf_header",
     "encode_b64",
     "natural_sort_key",
-    "read_cytobands",
     "render_genome_plot",
     "sort_bin_result",
     "sort_bin_results",
@@ -66,11 +64,6 @@ __all__ = [
 ]
 
 
-def read_cytobands(path: Path, contig_lengths: dict[str, int]) -> tuple[Cytoband, ...]:
-    """Transitional compatibility wrapper reading cytobands."""
-    return _load_cytobands_path(path, contig_lengths)
-
-
 def write_outputs(
     prefix: Path,
     bins: tuple[BinResult, ...],
@@ -79,7 +72,7 @@ def write_outputs(
     plot: bool,
     vcf: bool = True,
     *,
-    cytobands: Path | Sequence[Cytoband] | None = None,
+    cytobands: Sequence[Cytoband] | None = None,
     z_threshold: float = 3.0,
     ratio_threshold: float | None = None,
     prenatal_result: FetalFractionResult | None = None,

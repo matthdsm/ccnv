@@ -8,7 +8,8 @@ import numpy as np
 import pyarrow.parquet as pq
 from helpers import make_sample_table
 
-from ccnv.cohort import ReferenceError, load_cohort, validate_cohort
+from ccnv.features.cohort import load_cohort, validate_cohort
+from ccnv.models.exceptions import ReferenceError
 
 
 class TestCohortCompatibility(unittest.TestCase):

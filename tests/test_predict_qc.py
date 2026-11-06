@@ -11,9 +11,9 @@ from pathlib import Path
 import pyarrow as pa
 
 from ccnv.models import ReadFilters
-from ccnv.predict_qc import build_predict_qc_payload, write_predict_qc_json
-from ccnv.results import FetalFractionResult, SCAResult, SegmentResult
-from ccnv.schemas import SAMPLE_SCHEMA, ArtifactKind, metadata_for
+from ccnv.models.results import FetalFractionResult, SCAResult, SegmentResult
+from ccnv.models.schemas import SAMPLE_SCHEMA, ArtifactKind, metadata_for
+from ccnv.qc.predict import build_predict_qc_payload, write_predict_qc_json
 
 
 def _make_sample_table() -> pa.Table:

@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Consolidated codebase into six cohesive domain subpackages (`ccnv.models`, `ccnv.stats`, `ccnv.io`, `ccnv.features`, `ccnv.qc`, `ccnv.report`) governed by a strict 7-layer unidirectional DAG, slimming root orchestrators (`convert.py`, `reference.py`, `ref_qc.py`, `predict.py`, `cli.py`) down to composition roots.
+- Removed deprecated transitional root modules (`cohort.py`, `covariates.py`, `predict_qc.py`, `prenatal.py`, `prenatal_math.py`, `reference_compute.py`, `reference_qc.py`, `results.py`, `samplesheet.py`, `schemas.py`, `segment.py`, and `templates/`) and updated entire test suite imports to canonical subpackage paths.
+- Enforced typed `Sequence[Cytoband] | None` contract for `ccnv.report.write_outputs` and `ccnv.report.html.render_genome_plot`, isolating file I/O strictly inside `ccnv.io.tracks`.
 - Refactored codebase architecture to conform to thermonuclear code quality standards, eliminating code bloat, deduplicating logic, and ensuring all source and test modules remain strictly below 1,000 lines.
 - Extracted modular test suites and test helpers into `tests/test_cohort.py`, `tests/test_reference_compute.py`, and `tests/helpers.py`, decomposing `tests/test_reference.py` from 1,065 to 763 lines.
 - Replaced module-level mutable state in `src/ccnv/reference_compute.py` with immutable context dataclasses (`_NearestContext`, `_NullContext`).

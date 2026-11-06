@@ -14,6 +14,7 @@ from ccnv.models import (
     ReferenceConfig,
     parquet_path,
 )
+from ccnv.models.schemas import decode_metadata
 from ccnv.predict import run as predict
 from ccnv.reference import run as reference
 from ccnv.report import (
@@ -21,7 +22,6 @@ from ccnv.report import (
     CALLS_BED_HEADER,
     SEGMENTS_BED_HEADER,
 )
-from ccnv.schemas import decode_metadata
 
 CONTIGS = (
     ("chr2", 1_200),

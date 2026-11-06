@@ -17,7 +17,13 @@ import pysam
 import yaml
 
 from ccnv.cli import AnalysisMode
-from ccnv.convert import bin_intervals
+from ccnv.features.binning import bin_intervals
+from ccnv.features.prenatal import (
+    annotate_prenatal_segments,
+    classify_sca,
+    fit_prenatal_models,
+    predict_prenatal,
+)
 from ccnv.models import (
     PredictConfig,
     ReadFilters,
@@ -25,30 +31,15 @@ from ccnv.models import (
     SamplesheetEntry,
     parquet_path,
 )
-from ccnv.predict import run as run_predict
-from ccnv.prenatal import (
-    annotate_prenatal_segments,
-    classify_sca,
-    fit_prenatal_models,
-    predict_prenatal,
-)
-from ccnv.reference import (
-    BRANCH_AUTOSOMAL,
-    BRANCH_FEMALE_SEX,
-    BRANCH_MALE_SEX,
-)
-from ccnv.reference import (
-    run as run_reference,
-)
-from ccnv.report import (
-    PRENATAL_SEGMENTS_BED_HEADER,
-)
-from ccnv.results import (
+from ccnv.models.results import (
     FetalFractionResult,
     SCAResult,
     SegmentResult,
 )
-from ccnv.schemas import (
+from ccnv.models.schemas import (
+    BRANCH_AUTOSOMAL,
+    BRANCH_FEMALE_SEX,
+    BRANCH_MALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
     REFERENCE_SCHEMA,
@@ -56,6 +47,11 @@ from ccnv.schemas import (
     ArtifactKind,
     PrenatalModelMetadata,
     metadata_for,
+)
+from ccnv.predict import run as run_predict
+from ccnv.reference import run as run_reference
+from ccnv.report import (
+    PRENATAL_SEGMENTS_BED_HEADER,
 )
 
 

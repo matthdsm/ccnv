@@ -63,21 +63,21 @@ In `--mode prenatal`, `ccnv` integrates non-invasive prenatal analysis directly 
 
 ## Subdirectories & Key Modules
 
-- `src/ccnv/convert.py`: BAM/CRAM read ingestion, canonical contig binning, and effective target-contig read QC.
-- `src/ccnv/samplesheet.py`: Root-list YAML/JSON cohort samplesheet parsing and validation against `samplesheet.schema.json`.
-- `src/ccnv/reference.py`: Reference Parquet synthesis and cohort rebinning across germline and prenatal modes.
-- `src/ccnv/reference_compute.py`: Deterministic PCA, batched nearest-neighbor Euclidean distance search, and empirical null kernels.
-- `src/ccnv/reference_qc.py`: Reference model quality auditing emitting `<prefix>_qc.json`.
-- `src/ccnv/prenatal_math.py`: Pure NumPy and SciPy algorithms for 1D 2-GMM, FISTA non-negative Lasso (`FFY`), centered unscaled PCA, full-batch Rprop Sigmoid MLP / OLM (`PREFACE`), and Huber RLM (`FFX`).
-- `src/ccnv/prenatal.py`: Prenatal reference fitting, multi-resolution coarsening, single-sample prenatal inference, sex chromosome aneuploidy classification, and segment discordance annotation.
-- `src/ccnv/predict.py`: Sample projection, within-sample normalization, Ruptures segmentation, and event calling across germline and prenatal modes.
-- `src/ccnv/predict_qc.py`: Prediction QC payload assembly and `<prefix>_qc.json` generation.
-- `src/ccnv/report.py`: Bgzipped/tabix-indexed BED, VCFv4.2, and interactive Plotly HTML report generation (`_plot.html`).
-- `src/ccnv/schemas.py`: Versioned Arrow schemas (`2.0.0`) and coordinate validation.
+- `src/ccnv/cli.py`: The `ccnv` Typer entry point and subcommands (`convert`, `reference`, `ref-qc`, `predict`).
+- `src/ccnv/convert.py`: Root orchestrator for BAM/CRAM read ingestion, canonical contig binning, and effective target-contig read QC.
+- `src/ccnv/reference.py`: Root orchestrator for reference Parquet synthesis and cohort rebinning across germline and prenatal modes.
+- `src/ccnv/ref_qc.py`: Root orchestrator for reference model quality auditing and usability verdicts.
+- `src/ccnv/predict.py`: Root orchestrator for sample projection, within-sample normalization, Ruptures segmentation, and event calling across germline and prenatal modes.
+- `src/ccnv/models/`: Layer 0 domain objects, configurations, results, versioned Arrow schemas (`2.0.0`), and exceptions.
+- `src/ccnv/stats/`: Layer 1 pure mathematical, nearest-neighbor, PCA, regression, and prenatal kernels.
+- `src/ccnv/io/`: Layer 2 file format readers (BAM/CRAM, BigWig, FASTA, cytoband BED/TSV), samplesheet parsing, and Parquet storage.
+- `src/ccnv/features/`: Layer 3 feature transformations, dynamic rebinning, covariate bias correction, and prenatal inference models.
+- `src/ccnv/qc/`: Layer 4 quality control auditors and structured JSON report builders.
+- `src/ccnv/report/`: Layer 5 deliverable writers for bgzipped/tabix BED, VCFv4.2, and interactive Plotly HTML viewer (`templates/genome_plot.html.j2`).
 
 ## Global Invariants
 
-- Schema Version: All serialized `.ccnv` Parquet files strictly conform to Arrow schema version `2.0.0` and validate against `ccnv.schemas:validate_table`.
+- Schema Version: All serialized `.ccnv` Parquet files strictly conform to Arrow schema version `2.0.0` and validate against `ccnv.models.schemas:validate_table`.
 - Coordinate System: All intervals across memory representations, Parquet tables, and output BED/VCF files are 0-based half-open `[start, end)`.
 - Contig Authority: Contig names, order, and lengths from alignment headers or reference FASTA files are authoritative; arbitrary 24-chromosome layouts are forbidden.
 - Off-Contig Neighbor Separation: Reference bin neighbors must never be drawn from the same contig as the target bin ($d_{\text{intra-contig}} = \infty$).

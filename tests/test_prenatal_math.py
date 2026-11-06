@@ -6,7 +6,7 @@ import unittest.mock
 import numpy as np
 import scipy.special
 
-from ccnv.prenatal_math import (
+from ccnv.stats.prenatal_math import (
     fit_lasso_fista,
     fit_rprop_mlp,
     infer_sex_gmm_1d,
@@ -347,7 +347,7 @@ class TestRLMHuber(unittest.TestCase):
         x = np.array([1.0, 2.0, 3.0, 4.0])
         y = np.array([2.0, 4.0, 6.0, 8.0])
         with unittest.mock.patch(
-            "ccnv.prenatal_math.HuberRegressor.fit",
+            "ccnv.stats.prenatal_math.HuberRegressor.fit",
             side_effect=ValueError("convergence failed"),
         ):
             intercept, slope = rlm_huber(x, y)

@@ -7,26 +7,26 @@ The `ccnv` package implements an organism-agnostic, pure-Python bioinformatics f
 ```mermaid
 flowchart TD
     subgraph Ingestion["Alignment & Layout Ingestion"]
-        A["BAM / CRAM Alignment"] --> B["ccnv.convert: bin_contig_with_handle"]
-        B --> C["ccnv.schemas: SAMPLE_SCHEMA Parquet (.ccnv)"]
+        A["BAM / CRAM Alignment"] --> B["ccnv.convert: bin_contig"]
+        B --> C["ccnv.models.schemas: SAMPLE_SCHEMA Parquet (.ccnv)"]
     end
     subgraph ReferenceModeling["Cohort & Reference Modeling"]
-        C --> D["ccnv.cohort: load_cohort / rebin_sample_table"]
-        D --> E["ccnv.covariates: Huber IRLS Polynomial Bias Correction"]
-        E --> F["ccnv.reference: fit_pca"]
-        F --> G["ccnv.reference_compute: select_nearest_bins (Off-Contig Search)"]
-        G --> H["ccnv.reference_compute: compute_null_models"]
-        H --> I["ccnv.schemas: REFERENCE_SCHEMA Parquet (.ccnv)"]
+        C --> D["ccnv.features.cohort: load_cohort"]
+        D --> E["ccnv.features.covariates: Huber IRLS Polynomial Bias Correction"]
+        E --> F["ccnv.stats.pca: fit_pca"]
+        F --> G["ccnv.stats.neighbors: select_nearest_bins (Off-Contig Search)"]
+        G --> H["ccnv.stats.neighbors: compute_null_models"]
+        H --> I["ccnv.models.schemas: REFERENCE_SCHEMA Parquet (.ccnv)"]
     end
     subgraph Inference["Sample Inference & Segmentation"]
         I --> J["ccnv.predict: project_coverage & normalize_branch"]
         C --> J
-        J --> K["ccnv.segment: WeightedL2Cost Ruptures Binseg"]
+        J --> K["ccnv.stats.segmentation: WeightedL2Cost Ruptures Binseg"]
         K --> L["ccnv.predict: call_segment"]
     end
     subgraph Reporting["Artifact Generation"]
-        L --> M["ccnv.report: write_outputs (BED.gz / VCF.gz / Tabix)"]
-        L --> N["ccnv.report: write_genome_plot (.html)"]
+        L --> M["ccnv.report.bed: write_compressed_bed (BED.gz / Tabix)"]
+        L --> N["ccnv.report.html: render_genome_plot (.html)"]
     end
 ```
 
@@ -63,48 +63,47 @@ Contiguous tracts of unmapped or masked bins exceeding $\Delta_{\text{max}}$ bas
 
 - `[src/ccnv/cli.py:app]`: Primary Typer CLI application hosting `convert`, `reference`, `ref-qc`, and `predict` entry points.
 - `[src/ccnv/convert.py:run]`: Ingests BAM/CRAM files, filters reads, performs multi-process binned counting, and writes sample Parquet.
-- `[src/ccnv/convert.py:rebin_sample_table]`: Dynamically rebins sample tables in memory across compatible contig coordinate layouts.
-- `[src/ccnv/cohort.py:load_cohort]`: Discovers, validates, and rebins multiple control sample Parquet files into a synchronized `Cohort`.
-- `[src/ccnv/cohort.py:cohort_from_fasta]`: Synthesizes an artificial flat uniform-depth cohort from FASTA sequence lengths.
-- `[src/ccnv/covariates.py:load_gc_track]`: Extracts and validates GC content proportions from FASTA, BigWig, or BED/TSV files.
-- `[src/ccnv/covariates.py:load_mappability_track]`: Loads per-bin mappability scores from BigWig tracks.
-- `[src/ccnv/covariates.py:correct_covariate_bias]`: Normalizes GC and mappability biases using 3-iteration Huber IRLS polynomial regression.
+- `[src/ccnv/features/binning.py:rebin_sample_table]`: Dynamically rebins sample tables in memory across compatible contig coordinate layouts.
+- `[src/ccnv/features/cohort.py:load_cohort]`: Discovers, validates, and rebins multiple control sample Parquet files into a synchronized `Cohort`.
+- `[src/ccnv/features/cohort.py:cohort_from_fasta]`: Synthesizes an artificial flat uniform-depth cohort from FASTA sequence lengths.
+- `[src/ccnv/io/tracks.py:load_gc_track]`: Extracts and validates GC content proportions from FASTA, BigWig, or BED/TSV files.
+- `[src/ccnv/io/tracks.py:load_mappability_track]`: Loads per-bin mappability scores from BigWig tracks.
+- `[src/ccnv/features/covariates.py:correct_covariate_bias]`: Normalizes GC and mappability biases using 3-iteration Huber IRLS polynomial regression.
 - `[src/ccnv/reference.py:run]`: Coordinates cohort loading, depth normalization, PCA decomposition, nearest-bin pairing, and reference Parquet creation.
-- `[src/ccnv/reference_compute.py:select_nearest_bins]`: Parallel batched off-contig nearest-neighbor search in PCA/covariate space.
-- `[src/ccnv/reference_compute.py:compute_null_models]`: Calculates per-bin null log2 ratio means and standard deviations across cohort controls.
-- `[src/ccnv/reference_qc.py:run_reference_qc]`: Evaluates reference quality metrics and issues usability verdicts (`PASS`, `WARN`, `FAIL`).
+- `[src/ccnv/stats/neighbors.py:select_nearest_bins]`: Parallel batched off-contig nearest-neighbor search in PCA/covariate space.
+- `[src/ccnv/stats/neighbors.py:compute_null_models]`: Calculates per-bin null log2 ratio means and standard deviations across cohort controls.
+- `[src/ccnv/qc/reference.py:run_reference_qc]`: Evaluates reference quality metrics and issues usability verdicts (`PASS`, `WARN`, `FAIL`).
 - `[src/ccnv/predict.py:run]`: Coordinates single-sample normalization, PCA projection, Ruptures segmentation, calling, and reporting.
-- `[src/ccnv/segment.py:WeightedL2Cost]`: Custom Ruptures `BaseCost` computing weighted SSE for change-point detection.
-- `[src/ccnv/segment.py:segment_contig]`: Segments an individual contig across blacklisted gap boundaries.
-- `[src/ccnv/report.py:write_outputs]`: Serializes tabix-indexed bgzipped BED and VCF tables for bins, segments, and calls.
-- `[src/ccnv/report.py:write_genome_plot]`: Compiles interactive self-contained Plotly HTML visualizations using Jinja2 templates.
-- `[src/ccnv/schemas.py:validate_table]`: Validates Arrow schemas and metadata against versioned contracts.
-- `[src/ccnv/models.py:ConvertConfig]`, `[src/ccnv/models.py:ReferenceConfig]`, `[src/ccnv/models.py:PredictConfig]`: Strongly-typed configuration containers.
-- `[src/ccnv/results.py:BinResult]`, `[src/ccnv/results.py:SegmentResult]`, `[src/ccnv/results.py:PredictionOutputs]`: Common result dataclasses.
-- Child Subdirectory: [ccnv.templates](./templates/README.md) - Jinja2 interactive Plotly HTML viewer templates.
+- `[src/ccnv/stats/segmentation.py:WeightedL2Cost]`: Custom Ruptures `BaseCost` computing weighted SSE for change-point detection.
+- `[src/ccnv/stats/segmentation.py:segment_contig]`: Segments an individual contig across blacklisted gap boundaries.
+- `[src/ccnv/report/__init__.py:write_outputs]`: Serializes tabix-indexed bgzipped BED and VCF tables for bins, segments, and calls.
+- `[src/ccnv/report/html.py:render_genome_plot]`: Compiles interactive self-contained Plotly HTML visualizations using Jinja2 templates.
+- `[src/ccnv/models/schemas.py:validate_table]`: Validates Arrow schemas and metadata against versioned contracts.
+- `[src/ccnv/models/config.py:ConvertConfig]`, `[src/ccnv/models/config.py:ReferenceConfig]`, `[src/ccnv/models/config.py:PredictConfig]`: Strongly-typed configuration containers.
+- `[src/ccnv/models/results.py:BinResult]`, `[src/ccnv/models/results.py:SegmentResult]`, `[src/ccnv/models/results.py:PredictionOutputs]`: Common result dataclasses.
 
 ## Invariants
 
-- `[src/ccnv/schemas.py:validate_table]`: All tables must strictly conform to `SAMPLE_SCHEMA` or `REFERENCE_SCHEMA` under Arrow schema version `1.0.0` with `0-based-half-open` intervals.
-- `[src/ccnv/schemas.py:validate_metadata]`: Metadata requires non-empty `contig_lengths` mapping identifiers to positive integers; row coordinates must satisfy $0 \le \text{start} < \text{end} \le \text{length}$.
-- `[src/ccnv/cohort.py:load_cohort]`: Input cohort samples must share identical contig layouts, identical contig lengths, and matching bin coordinates.
-- `[src/ccnv/covariates.py:validate_min_mappability]`: Minimum mappability must be a finite floating-point value in $[0.0, 1.0]$.
-- `[src/ccnv/reference_compute.py:select_nearest_bins]`: Nearest-bin search explicitly enforces infinite distance ($d_{ii} = \infty$) for all bins on the same contig to guarantee off-contig selection.
-- `[src/ccnv/reference_compute.py:compute_null_models]`: Null distribution sampling is bounded to at most 100 cohort samples; non-finite standard deviations are coerced to 0.0.
-- `[src/ccnv/segment.py:WeightedL2Cost.fit]`: Signal values and weights must have identical lengths; non-finite values or negative weights are zeroed.
-- `[src/ccnv/segment.py:_validate_inputs]`: Bins must be sorted, non-overlapping ($\text{start}_{i+1} \ge \text{end}_i$), with finite positive penalty and $\text{jump} \ge 1$.
+- `[src/ccnv/models/schemas.py:validate_table]`: All tables must strictly conform to `SAMPLE_SCHEMA` or `REFERENCE_SCHEMA` under Arrow schema version `2.0.0` with `0-based-half-open` intervals.
+- `[src/ccnv/models/schemas.py:validate_metadata]`: Metadata requires non-empty `contig_lengths` mapping identifiers to positive integers; row coordinates must satisfy $0 \le \text{start} < \text{end} \le \text{length}$.
+- `[src/ccnv/features/cohort.py:load_cohort]`: Input cohort samples must share identical contig layouts, identical contig lengths, and matching bin coordinates.
+- `[src/ccnv/features/covariates.py:validate_min_mappability]`: Minimum mappability must be a finite floating-point value in $[0.0, 1.0]$.
+- `[src/ccnv/stats/neighbors.py:select_nearest_bins]`: Nearest-bin search explicitly enforces infinite distance ($d_{ii} = \infty$) for all bins on the same contig to guarantee off-contig selection.
+- `[src/ccnv/stats/neighbors.py:compute_null_models]`: Null distribution sampling is bounded to at most 100 cohort samples; non-finite standard deviations are coerced to 0.0.
+- `[src/ccnv/stats/segmentation.py:WeightedL2Cost.fit]`: Signal values and weights must have identical lengths; non-finite values or negative weights are zeroed.
+- `[src/ccnv/stats/segmentation.py:_validate_inputs]`: Bins must be sorted, non-overlapping ($\text{start}_{i+1} \ge \text{end}_i$), with finite positive penalty and $\text{jump} \ge 1$.
 - `[src/ccnv/predict.py:normalize_branch]`: Retains only bins satisfying $|Z_i| < 2.326347874$; masks bins possessing fewer than $\tau_{\text{ref}}$ valid reference bins.
 
 ## Side Effects
 
 - `[src/ccnv/convert.py:_worker_handle]`: Opens BAM/CRAM handles using `pysam.AlignmentFile` and maintains a per-worker handle cache.
-- `[src/ccnv/convert.py:_ensure_index]`: Generates BAM (`.bai`) or CRAM (`.crai`) index files on disk via `pysam.index` when missing.
-- `[src/ccnv/convert.py:write_sample_parquet]`: Creates target directory hierarchies and writes zstd-compressed Parquet files to disk.
-- `[src/ccnv/cohort.py:_fasta_contigs]`: Generates FASTA index files (`.fai`) on disk via `pysam.faidx` when absent.
-- `[src/ccnv/reference_compute.py:select_nearest_bins]`: Allocates process worker pools via `concurrent.futures.ProcessPoolExecutor` when bin count $> 2\,000$ and threads $> 1$.
+- `[src/ccnv/io/alignments.py:_ensure_index]`: Generates BAM (`.bai`) or CRAM (`.crai`) index files on disk via `pysam.index` when missing.
+- `[src/ccnv/io/parquet.py:write_sample_parquet]`: Creates target directory hierarchies and writes zstd-compressed Parquet files to disk.
+- `[src/ccnv/features/cohort.py:_fasta_contigs]`: Generates FASTA index files (`.fai`) on disk via `pysam.faidx` when absent.
+- `[src/ccnv/stats/neighbors.py:select_nearest_bins]`: Allocates process worker pools via `concurrent.futures.ProcessPoolExecutor` when bin count $> 2\,000$ and threads $> 1$.
 - `[src/ccnv/reference.py:run]`: Writes `<prefix>.ccnv` reference Parquet and optionally writes `<prefix>_qc.json` while emitting formatted QC metrics to `sys.stderr`.
-- `[src/ccnv/report.py:write_outputs]`: Writes bgzipped files (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`, optional VCFs) and creates tabix indices (`.tbi`) via `pysam`.
-- `[src/ccnv/report.py:write_genome_plot]`: Writes standalone HTML visualization `<prefix>_plot.html` to disk.
+- `[src/ccnv/report/__init__.py:write_outputs]`: Writes bgzipped files (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`, optional VCFs) and creates tabix indices (`.tbi`) via `pysam`.
+- `[src/ccnv/report/html.py:render_genome_plot]`: Writes standalone HTML visualization `<prefix>_plot.html` to disk.
 
 ## Verification
 

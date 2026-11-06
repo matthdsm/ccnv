@@ -43,7 +43,6 @@ ccnv = "ccnv.cli:app"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"ccnv" = ["*.json"]
 "ccnv.io" = ["*.schema.json"]
 "ccnv.report.templates" = ["*.html.j2"]
 
