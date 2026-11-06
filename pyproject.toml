@@ -45,7 +45,6 @@ where = ["src"]
 [tool.setuptools.package-data]
 "ccnv" = ["*.json"]
 "ccnv.io" = ["*.schema.json"]
-"ccnv.templates" = ["*.html.j2"]
 "ccnv.report.templates" = ["*.html.j2"]
 
 [tool.pixi.workspace]

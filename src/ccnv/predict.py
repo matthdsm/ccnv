@@ -23,6 +23,7 @@ from ccnv.covariates import (
     validate_min_mappability,
 )
 from ccnv.io.parquet import read_reference_parquet, read_sample_parquet
+from ccnv.io.tracks import load_cytobands_track
 from ccnv.models import (
     DEFAULT_MIN_MAPPABILITY,
     AnalysisMode,
@@ -44,13 +45,16 @@ from ccnv.schemas import (
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
     PrenatalModelMetadata,
-    SchemaError,
     bin_coordinates,
     decode_metadata,
 )
 from ccnv.segment import segment_genome
 
-__all__ = (
+Sex = Literal["female", "male"]
+_MASK_Z_THRESHOLD: Final[float] = 2.326347874
+logger = logging.getLogger(__name__)
+
+__all__ = [
     "BranchModel",
     "PredictError",
     "PredictionInput",
@@ -58,20 +62,15 @@ __all__ = (
     "call_segment",
     "load_inputs",
     "normalize_branch",
+    "project_coverage",
     "run",
+    "run_predict",
     "segment_and_call",
-)
-
-logger = logging.getLogger(__name__)
-
-Sex = Literal["female", "male"]
-_MASK_Z_THRESHOLD: Final[float] = 2.326347874
+]
 
 
 @dataclass(frozen=True, slots=True)
 class PredictionInput:
-    """Validated sample and reference artifacts."""
-
     sample: pa.Table
     reference: pa.Table
     contig_lengths: dict[str, int]
@@ -81,8 +80,6 @@ class PredictionInput:
 
 @dataclass(frozen=True, slots=True)
 class BranchModel:
-    """Dense arrays for one selected reference branch."""
-
     branch: str
     contigs: tuple[str, ...]
     starts: NDArray[np.int64]
@@ -101,8 +98,6 @@ class BranchModel:
 
 @dataclass(frozen=True, slots=True)
 class ProjectedCoverage:
-    """Coverage after depth normalization, masking, and PCA projection."""
-
     normalized: NDArray[np.float64]
     corrected: NDArray[np.float64]
     usable: NDArray[np.bool_]
@@ -110,7 +105,6 @@ class ProjectedCoverage:
 
 def run(config: PredictConfig) -> PredictionOutputs:
     """Run prediction and write bin, segment, call, and optional plot artifacts."""
-
     _validate_config(config)
     if config.cytobands is not None and not config.plot:
         logger.warning("--cytobands is ignored when --no-plot is set")
@@ -118,15 +112,8 @@ def run(config: PredictConfig) -> PredictionOutputs:
     inputs = load_inputs(
         config.sample, config.reference, sex=config.sex, mode=config.mode
     )
-    logger.debug("using branches %s (sex=%s)", inputs.branches, inputs.sex)
     bin_results = tuple(
-        normalize_branch(build_branch_model(inputs, branch), config)
-        for branch in inputs.branches
-    )
-    logger.debug(
-        "segmenting %d branch result(s) with penalty=%s",
-        len(bin_results),
-        config.penalty,
+        normalize_branch(build_branch_model(inputs, b), config) for b in inputs.branches
     )
     segments = segment_and_call(
         bin_results,
@@ -136,35 +123,37 @@ def run(config: PredictConfig) -> PredictionOutputs:
         ratio_threshold=config.ratio_threshold,
         max_blacklist_gap=config.max_blacklist_gap,
     )
-
     prenatal_result: FetalFractionResult | None = None
     if config.mode == "prenatal":
-        prenatal_meta = PrenatalModelMetadata.from_table(inputs.reference)
-        if prenatal_meta is None:
+        meta = PrenatalModelMetadata.from_table(inputs.reference)
+        if meta is None:
             raise PredictError("reference is missing prenatal metadata (ccnv.prenatal)")
         prenatal_result = predict_prenatal(
             inputs.sample,
             inputs.reference,
-            prenatal_meta,
+            meta,
             min_ff_warning=config.min_fetal_fraction_warning,
         )
         segments = tuple(
             annotate_prenatal_segments(
-                segments,
-                prenatal_result,
-                z_threshold=config.z_threshold,
+                segments, prenatal_result, z_threshold=config.z_threshold
             )
         )
-
     qc_json_path = Path(f"{config.prefix}_qc.json")
-    qc_payload = build_predict_qc_payload(
-        mode=config.mode,
-        sample_table=inputs.sample,
-        segments=segments,
-        prenatal_result=prenatal_result,
+    write_predict_qc_json(
+        qc_json_path,
+        build_predict_qc_payload(
+            mode=config.mode,
+            sample_table=inputs.sample,
+            segments=segments,
+            prenatal_result=prenatal_result,
+        ),
     )
-    write_predict_qc_json(qc_json_path, qc_payload)
-
+    cytobands_track = (
+        load_cytobands_track(config.cytobands, inputs.contig_lengths)
+        if (config.plot and config.cytobands is not None)
+        else None
+    )
     return write_outputs(
         config.prefix,
         bin_results,
@@ -172,7 +161,7 @@ def run(config: PredictConfig) -> PredictionOutputs:
         inputs.contig_lengths,
         config.plot,
         config.vcf,
-        cytobands=config.cytobands if config.plot else None,
+        cytobands=cytobands_track,
         z_threshold=config.z_threshold,
         ratio_threshold=config.ratio_threshold,
         prenatal_result=prenatal_result,
@@ -189,109 +178,85 @@ def load_inputs(
     mode: AnalysisMode = "germline",
 ) -> PredictionInput:
     """Read artifacts through their contracts and select model branches."""
-
     try:
-        sample = read_sample_parquet(sample_path)
-    except (FileNotFoundError, OSError, pa.ArrowInvalid, SchemaError) as error:
-        raise PredictError(
-            f"{sample_path}: cannot read sample Parquet ({error})"
-        ) from error
-    try:
-        reference = read_reference_parquet(reference_path)
-    except (FileNotFoundError, OSError, pa.ArrowInvalid, SchemaError) as error:
-        raise PredictError(
-            f"{reference_path}: cannot read reference Parquet ({error})"
-        ) from error
-
-    sample_meta = decode_metadata(sample.schema.metadata)
-    reference_meta = decode_metadata(reference.schema.metadata)
-    ref_model = reference_meta.get("model")
+        sample, reference = (
+            read_sample_parquet(sample_path),
+            read_reference_parquet(reference_path),
+        )
+    except Exception as err:
+        raise PredictError(f"cannot read Parquet artifacts: {err}") from err
+    sample_meta, ref_meta = (
+        decode_metadata(sample.schema.metadata),
+        decode_metadata(reference.schema.metadata),
+    )
+    ref_model = ref_meta.get("model", {})
     ref_mode = (
         ref_model.get("mode", "germline")
         if isinstance(ref_model, Mapping)
         else "germline"
     )
-
     if mode == "prenatal" and ref_mode != "prenatal":
-        raise PredictError(
+        msg = (
             "reference was built in germline mode and lacks prenatal models; "
             "rebuild reference with --mode prenatal or run predict with --mode germline"
         )
+        raise PredictError(msg)
     if mode == "germline" and ref_mode == "prenatal":
         logger.warning(
             "reference was built in prenatal mode; "
             "prenatal models are ignored in germline mode"
         )
-
-    sample_lengths = _contig_lengths(sample_meta)
-    reference_lengths = _contig_lengths(reference_meta)
-    branch_values = set(reference.column("branch").unique().to_pylist())
-    if BRANCH_AUTOSOMAL not in branch_values:
+    sample_lens, ref_lens = _contig_lengths(sample_meta), _contig_lengths(ref_meta)
+    branch_vals = set(reference.column("branch").unique().to_pylist())
+    if BRANCH_AUTOSOMAL not in branch_vals:
         raise PredictError("reference has no autosomal branch")
-
     if mode == "prenatal":
-        branches = [BRANCH_AUTOSOMAL]
-        if BRANCH_FEMALE_SEX in branch_values:
-            branches.append(BRANCH_FEMALE_SEX)
-        chosen_sex = "female" if BRANCH_FEMALE_SEX in branch_values else None
+        branches, chosen_sex = (
+            [BRANCH_AUTOSOMAL]
+            + ([BRANCH_FEMALE_SEX] if BRANCH_FEMALE_SEX in branch_vals else []),
+            ("female" if BRANCH_FEMALE_SEX in branch_vals else None),
+        )
     else:
-        chosen_sex = _resolve_sample_sex(sex, sample, reference_meta, branch_values)
+        chosen_sex = _resolve_sample_sex(sex, sample, ref_meta, branch_vals)
         branches = [BRANCH_AUTOSOMAL]
         if chosen_sex is not None:
-            sex_branch = (
-                BRANCH_FEMALE_SEX if chosen_sex == "female" else BRANCH_MALE_SEX
-            )
-            if sex_branch not in branch_values:
-                if sex != "autosomal":
-                    raise PredictError(f"reference has no {sex_branch!r} branch")
-            else:
-                branches.append(sex_branch)
-
-    ref_model = reference_meta.get("model")
-    ref_bin_size = ref_model.get("bin_size") if isinstance(ref_model, dict) else None
-    sample_bin_size = sample_meta.get("bin_size")
-    if (
-        isinstance(ref_bin_size, int)
-        and isinstance(sample_bin_size, int)
-        and sample_bin_size != ref_bin_size
-    ):
+            sb = BRANCH_FEMALE_SEX if chosen_sex == "female" else BRANCH_MALE_SEX
+            if sb not in branch_vals and sex != "autosomal":
+                raise PredictError(f"reference has no {sb!r} branch")
+            if sb in branch_vals:
+                branches.append(sb)
+    ref_bs, sample_bs = (
+        (ref_model.get("bin_size") if isinstance(ref_model, dict) else None),
+        sample_meta.get("bin_size"),
+    )
+    if isinstance(ref_bs, int) and isinstance(sample_bs, int) and sample_bs != ref_bs:
         logger.debug(
-            "rebinning sample from %d bp to reference bin size %d bp",
-            sample_bin_size,
-            ref_bin_size,
+            "rebinning sample from %d bp to reference bin size %d bp", sample_bs, ref_bs
         )
-        sample = rebin_sample_table(sample, ref_bin_size)
-
-    ref_branch_arr = np.asarray(
-        reference.column("branch").to_numpy(zero_copy_only=False)
+        sample = rebin_sample_table(sample, ref_bs)
+    active_ref = reference.filter(
+        pa.compute.is_in(reference.column("branch"), pa.array(branches))
     )
-    branch_mask = np.isin(ref_branch_arr, branches)
-    active_ref = reference.filter(pa.array(branch_mask))
-
-    ref_active_contigs = set(active_ref.column("contig").unique().to_pylist())
-    for contig in ref_active_contigs:
-        if sample_lengths.get(contig) != reference_lengths.get(contig):
-            raise PredictError(f"contig length mismatch for {contig!r}")
-
-    sample_contig_arr = np.asarray(
-        sample.column("contig").to_numpy(zero_copy_only=False)
+    for c in set(active_ref.column("contig").unique().to_pylist()):
+        if sample_lens.get(c) != ref_lens.get(c):
+            raise PredictError(f"contig length mismatch for {c!r}")
+    sample_active = sample.filter(
+        pa.compute.is_in(
+            sample.column("contig"),
+            pa.array(list(set(active_ref.column("contig").unique().to_pylist()))),
+        )
     )
-    sample_active_mask = np.isin(sample_contig_arr, list(ref_active_contigs))
-    sample_active = sample.filter(pa.array(sample_active_mask))
-    if sample_active.num_rows != active_ref.num_rows:
-        sample_bins = set(bin_coordinates(sample))
-        required = set(bin_coordinates(active_ref))
-        missing = sorted(required - sample_bins)
-        if missing:
-            contigs = ", ".join(dict.fromkeys(item[0] for item in missing))
-            raise PredictError(
-                f"sample is missing reference bins on contig(s): {contigs}"
-            )
-
+    if sample_active.num_rows != active_ref.num_rows and (
+        missing := sorted(
+            set(bin_coordinates(active_ref)) - set(bin_coordinates(sample))
+        )
+    ):
+        contigs = ", ".join(dict.fromkeys(item[0] for item in missing))
+        raise PredictError(f"sample is missing reference bins on contig(s): {contigs}")
     return PredictionInput(
         sample=sample,
         reference=reference,
-        contig_lengths=reference_lengths,
+        contig_lengths=ref_lens,
         sex=chosen_sex,
         branches=tuple(branches),
     )
@@ -299,121 +264,84 @@ def load_inputs(
 
 def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
     """Align sample counts to a branch and materialize its nested model arrays."""
-
-    branch_col = inputs.reference.column("branch")
-    branch_arr = np.asarray(branch_col.to_numpy(zero_copy_only=False))
-    row_indexes = np.flatnonzero(branch_arr == branch)
-    if row_indexes.size == 0:
-        raise PredictError(f"reference branch {branch!r} is empty")
-
-    start_row = int(row_indexes[0])
-    num_rows = int(row_indexes.size)
-    if int(row_indexes[-1]) == start_row + num_rows - 1:
-        branch_table = inputs.reference.slice(start_row, num_rows)
-    else:
-        branch_table = inputs.reference.take(pa.array(row_indexes))
-
-    branch_contigs = tuple(branch_table.column("contig").to_pylist())
-    branch_starts = branch_table.column("start").to_numpy(zero_copy_only=False)
-    branch_ends = branch_table.column("end").to_numpy(zero_copy_only=False)
-
-    sample_contig_arr = np.asarray(
-        inputs.sample.column("contig").to_numpy(zero_copy_only=False)
+    rows = np.flatnonzero(
+        np.asarray(inputs.reference.column("branch").to_numpy(zero_copy_only=False))
+        == branch
     )
-    branch_contig_set = set(branch_contigs)
-    sample_branch_mask = np.isin(sample_contig_arr, list(branch_contig_set))
-    sample_branch_table = inputs.sample.filter(pa.array(sample_branch_mask))
+    if rows.size == 0:
+        raise PredictError(f"reference branch {branch!r} is empty")
+    s_row, n_rows = int(rows[0]), int(rows.size)
+    b_tbl = (
+        inputs.reference.slice(s_row, n_rows)
+        if int(rows[-1]) == s_row + n_rows - 1
+        else inputs.reference.take(pa.array(rows))
+    )
+    b_contigs = tuple(b_tbl.column("contig").to_pylist())
+    s_branch = inputs.sample.filter(
+        pa.compute.is_in(inputs.sample.column("contig"), pa.array(list(set(b_contigs))))
+    )
     if (
-        sample_branch_table.num_rows == branch_table.num_rows
-        and sample_branch_table.column("start").equals(branch_table.column("start"))
-        and sample_branch_table.column("end").equals(branch_table.column("end"))
-        and sample_branch_table.column("contig").equals(branch_table.column("contig"))
+        s_branch.num_rows == b_tbl.num_rows
+        and s_branch.column("start").equals(b_tbl.column("start"))
+        and s_branch.column("end").equals(b_tbl.column("end"))
+        and s_branch.column("contig").equals(b_tbl.column("contig"))
     ):
         counts = (
-            sample_branch_table.column("count")
-            .to_numpy(zero_copy_only=False)
-            .astype(np.float64)
+            s_branch.column("count").to_numpy(zero_copy_only=False).astype(np.float64)
         )
     else:
-        sample_counts = {
-            coordinate: float(count)
-            for coordinate, count in zip(
+        s_counts = {
+            c: float(cnt)
+            for c, cnt in zip(
                 bin_coordinates(inputs.sample),
                 inputs.sample.column("count").to_pylist(),
                 strict=True,
             )
         }
-        coordinates = bin_coordinates(branch_table)
         counts = np.asarray(
-            [sample_counts[item] for item in coordinates], dtype=np.float64
+            [s_counts[c] for c in bin_coordinates(b_tbl)], dtype=np.float64
         )
-
-    masked = (
-        branch_table.column("masked").to_numpy(zero_copy_only=False).astype(np.bool_)
-    )
-    unmasked_rows = np.flatnonzero(~masked)
-    unmasked_count = int(unmasked_rows.size)
-
-    pca_mean_col = branch_table.column("pca_mean").to_numpy(zero_copy_only=False)
-    pca_mean = np.nan_to_num(pca_mean_col[unmasked_rows], nan=0.0).astype(np.float64)
-
-    loading_chunk = branch_table.column("pca_loadings").combine_chunks()
-    loading_offsets = loading_chunk.offsets.to_numpy()
-    comp_sizes = loading_offsets[unmasked_rows + 1] - loading_offsets[unmasked_rows]
-    unique_comp_sizes = np.unique(comp_sizes)
-    if len(unique_comp_sizes) != 1:
+    masked = b_tbl.column("masked").to_numpy(zero_copy_only=False).astype(np.bool_)
+    unmasked = np.flatnonzero(~masked)
+    pca_mean = np.nan_to_num(
+        b_tbl.column("pca_mean").to_numpy(zero_copy_only=False)[unmasked], nan=0.0
+    ).astype(np.float64)
+    l_chunk = b_tbl.column("pca_loadings").combine_chunks()
+    l_offs, l_flat = l_chunk.offsets.to_numpy(), l_chunk.values.to_numpy()
+    if len(np.unique(l_offs[unmasked + 1] - l_offs[unmasked])) != 1:
         raise PredictError(f"branch {branch!r} has inconsistent PCA loading shapes")
-    n_components = int(unique_comp_sizes[0])
-    loadings_flat = loading_chunk.values.to_numpy()
-    if unmasked_count == branch_table.num_rows:
-        loadings = loadings_flat.reshape(unmasked_count, n_components).T.astype(
-            np.float64
-        )
-    else:
-        loadings = np.empty((n_components, unmasked_count), dtype=np.float64)
-        for i, row in enumerate(unmasked_rows):
-            start = loading_offsets[row]
-            loadings[:, i] = loadings_flat[start : start + n_components]
-
-    nearest_chunk = branch_table.column("nearest_ref_indices").combine_chunks()
-    nearest_offsets = nearest_chunk.offsets.to_numpy()
-    nearest_flat = nearest_chunk.values.to_numpy()
-    nearest = tuple(
-        nearest_flat[nearest_offsets[row] : nearest_offsets[row + 1]].astype(np.int64)
-        for row in unmasked_rows
+    n_comp = int((l_offs[unmasked + 1] - l_offs[unmasked])[0])
+    loadings = (
+        l_flat.reshape(unmasked.size, n_comp).T.astype(np.float64)
+        if unmasked.size == b_tbl.num_rows
+        else np.column_stack(
+            [l_flat[l_offs[r] : l_offs[r] + n_comp] for r in unmasked]
+        ).astype(np.float64)
     )
-
-    mean_distance = branch_table.column("mean_distance").to_numpy(zero_copy_only=False)[
-        unmasked_rows
-    ]
-    null_mean = branch_table.column("null_mean").to_numpy(zero_copy_only=False)[
-        unmasked_rows
-    ]
-    null_std = branch_table.column("null_std").to_numpy(zero_copy_only=False)[
-        unmasked_rows
-    ]
-    for indexes in nearest:
-        if np.any(indexes < 0) or np.any(indexes >= unmasked_count):
-            raise PredictError(f"branch {branch!r} has invalid nearest references")
-
-    gc = _extract_covariate_col(branch_table, "gc")
-    mappability = _extract_covariate_col(branch_table, "mappability")
-
+    n_chunk = b_tbl.column("nearest_ref_indices").combine_chunks()
+    n_offs, n_flat = n_chunk.offsets.to_numpy(), n_chunk.values.to_numpy()
+    nearest = tuple(
+        n_flat[n_offs[r] : n_offs[r + 1]].astype(np.int64) for r in unmasked
+    )
+    if any(np.any(idxs < 0) or np.any(idxs >= unmasked.size) for idxs in nearest):
+        raise PredictError(f"branch {branch!r} has invalid nearest references")
     return BranchModel(
         branch=branch,
-        contigs=branch_contigs,
-        starts=branch_starts,
-        ends=branch_ends,
+        contigs=b_contigs,
+        starts=b_tbl.column("start").to_numpy(zero_copy_only=False),
+        ends=b_tbl.column("end").to_numpy(zero_copy_only=False),
         counts=counts,
         masked=masked,
         pca_mean=pca_mean,
         pca_loadings=loadings,
         nearest_indices=nearest,
-        mean_distance=mean_distance,
-        null_mean=null_mean,
-        null_std=null_std,
-        gc=gc,
-        mappability=mappability,
+        mean_distance=b_tbl.column("mean_distance").to_numpy(zero_copy_only=False)[
+            unmasked
+        ],
+        null_mean=b_tbl.column("null_mean").to_numpy(zero_copy_only=False)[unmasked],
+        null_std=b_tbl.column("null_std").to_numpy(zero_copy_only=False)[unmasked],
+        gc=_extract_covariate_col(b_tbl, "gc"),
+        mappability=_extract_covariate_col(b_tbl, "mappability"),
     )
 
 
@@ -434,22 +362,27 @@ def project_coverage(
     min_mappability: float = DEFAULT_MIN_MAPPABILITY,
 ) -> ProjectedCoverage:
     """Normalize branch depth, remove covariate bias, and subtract PCA trend."""
-
     if model.counts.ndim != 1 or model.counts.size != model.masked.size:
         raise PredictError("counts and mask must be aligned one-dimensional arrays")
-    if np.any(~np.isfinite(model.counts)) or np.any(model.counts < 0):
-        raise PredictError("sample counts must be finite and non-negative")
-    if float(np.sum(model.counts)) <= 0:
-        raise PredictError(f"branch {model.branch!r} has zero sample coverage")
-    ref_unmasked = ~model.masked
-    gc = gc_override if gc_override is not None else model.gc
-    mappability = (
-        mappability_override if mappability_override is not None else model.mappability
+    if (
+        np.any(~np.isfinite(model.counts))
+        or np.any(model.counts < 0)
+        or float(np.sum(model.counts)) <= 0
+    ):
+        raise PredictError("sample counts must be finite, non-negative, and non-zero")
+    ref_unm = ~model.masked
+    gc, map_ = (
+        (gc_override if gc_override is not None else model.gc),
+        (
+            mappability_override
+            if mappability_override is not None
+            else model.mappability
+        ),
     )
     cov_usable = mask_covariates(
-        ref_unmasked,
+        ref_unm,
         gc=gc,
-        mappability=mappability,
+        mappability=map_,
         n_mask=n_mask_override,
         min_mappability=min_mappability,
     )
@@ -458,113 +391,96 @@ def project_coverage(
         raise PredictError(
             f"branch {model.branch!r} has zero sample coverage on usable bins"
         )
-    normalized = model.counts / usable_total
     normalized = correct_covariate_bias(
-        normalized, cov_usable, gc=gc, mappability=mappability
+        model.counts / usable_total, cov_usable, gc=gc, mappability=map_
     )
-    selected = normalized[ref_unmasked]
+    selected = normalized[ref_unm]
     if selected.shape != model.pca_mean.shape:
         raise PredictError("PCA mean does not align with unmasked sample bins")
-    active_sub = cov_usable[ref_unmasked] & np.isfinite(selected)
+    active_sub = cov_usable[ref_unm] & np.isfinite(selected)
     reconstruction = model.pca_mean.copy()
-    n_active = int(np.count_nonzero(active_sub))
-    if n_active > 0:
-        sub_loadings = model.pca_loadings[:, active_sub]
-        if n_active > int(np.linalg.matrix_rank(sub_loadings.T)):
-            sub_centered = selected[active_sub] - model.pca_mean[active_sub]
-            coeffs, *_ = np.linalg.lstsq(sub_loadings.T, sub_centered, rcond=None)
-            reconstruction = (coeffs @ model.pca_loadings) + model.pca_mean
+    if np.count_nonzero(active_sub) > int(
+        np.linalg.matrix_rank(model.pca_loadings[:, active_sub].T)
+    ):
+        sub_c = selected[active_sub] - model.pca_mean[active_sub]
+        coeffs, *_ = np.linalg.lstsq(
+            model.pca_loadings[:, active_sub].T, sub_c, rcond=None
+        )
+        reconstruction = (coeffs @ model.pca_loadings) + model.pca_mean
     corrected = np.full(normalized.shape, np.nan, dtype=np.float64)
     valid = active_sub & np.isfinite(reconstruction) & (reconstruction > 0)
     corrected_values = np.full(selected.shape, np.nan, dtype=np.float64)
     corrected_values[valid] = selected[valid] / reconstruction[valid]
-    corrected[ref_unmasked] = corrected_values
-    usable = cov_usable & np.isfinite(corrected) & (corrected > 0)
-    return ProjectedCoverage(normalized, corrected, usable)
+    corrected[ref_unm] = corrected_values
+    return ProjectedCoverage(
+        normalized, corrected, cov_usable & np.isfinite(corrected) & (corrected > 0)
+    )
 
 
 def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
     """Calculate within-sample log2 ratios, null z-scores, and segment weights."""
-
     logger.debug("normalizing branch %s (%d bins)", model.branch, model.counts.size)
-    gc_override: NDArray[np.float64] | None = None
-    n_mask_override: NDArray[np.bool_] | None = None
-    map_override: NDArray[np.float64] | None = None
     try:
-        if config.gc is not None:
-            gc_override, n_mask_override = load_gc_track(
-                config.gc, model.contigs, model.starts, model.ends
-            )
-        if config.mappability is not None:
-            map_override = load_mappability_track(
+        gc_ov, n_ov = (
+            load_gc_track(config.gc, model.contigs, model.starts, model.ends)
+            if config.gc
+            else (None, None)
+        )
+        map_ov = (
+            load_mappability_track(
                 config.mappability, model.contigs, model.starts, model.ends
             )
-    except CovariateError as error:
-        raise PredictError(str(error)) from error
-
-    projected = project_coverage(
+            if config.mappability
+            else None
+        )
+    except CovariateError as err:
+        raise PredictError(str(err)) from err
+    proj = project_coverage(
         model,
-        gc_override=gc_override,
-        mappability_override=map_override,
-        n_mask_override=n_mask_override,
+        gc_override=gc_ov,
+        mappability_override=map_ov,
+        n_mask_override=n_ov,
         min_mappability=config.min_mappability,
     )
-    unmasked_positions = np.flatnonzero(~model.masked)
-    corrected = projected.corrected[unmasked_positions]
-    n_unmasked = unmasked_positions.size
-
-    ratios = np.full(model.counts.shape, np.nan, dtype=np.float64)
-    zscores = np.full(model.counts.shape, np.nan, dtype=np.float64)
-    weights = np.zeros(model.counts.shape, dtype=np.float64)
-    reference_sizes = np.zeros(model.counts.shape, dtype=np.int64)
-
-    eligible = np.isfinite(corrected) & (corrected > 0)
-    local_ratios = np.full(corrected.shape, np.nan, dtype=np.float64)
-    local_zscores = np.full(corrected.shape, np.nan, dtype=np.float64)
-
-    filtered_neighbors = tuple(
-        nbrs[nbrs != i] for i, nbrs in enumerate(model.nearest_indices)
+    unm = np.flatnonzero(~model.masked)
+    corrected = proj.corrected[unm]
+    ratios, zscores, weights = (
+        np.full(model.counts.shape, np.nan),
+        np.full(model.counts.shape, np.nan),
+        np.zeros(model.counts.shape),
     )
-    null_mean = model.null_mean
-    null_std = model.null_std
-
-    min_ref_bins = config.min_reference_bins
-
+    ref_sizes = np.zeros(model.counts.shape, dtype=np.int64)
+    eligible = np.isfinite(corrected) & (corrected > 0)
+    loc_r, loc_z = np.full(corrected.shape, np.nan), np.full(corrected.shape, np.nan)
+    flt_nbrs = tuple(nbrs[nbrs != i] for i, nbrs in enumerate(model.nearest_indices))
     for iteration in range(config.mask_repeats):
-        for index in range(n_unmasked):
-            val = corrected[index]
-            neighbors = filtered_neighbors[index]
-            mask = eligible[neighbors]
-            selected = neighbors[mask]
-            n_sel = int(selected.size)
-            reference_sizes[unmasked_positions[index]] = n_sel
-            if not np.isfinite(val) or val <= 0 or n_sel < min_ref_bins:
-                local_ratios[index] = np.nan
-                local_zscores[index] = np.nan
+        for idx in range(unm.size):
+            val, nbrs = corrected[idx], flt_nbrs[idx]
+            sel = nbrs[eligible[nbrs]]
+            ref_sizes[unm[idx]] = sel.size
+            if not np.isfinite(val) or val <= 0 or sel.size < config.min_reference_bins:
+                loc_r[idx], loc_z[idx] = np.nan, np.nan
                 continue
-            baseline = float(np.median(corrected[selected]))
-            if not np.isfinite(baseline) or baseline <= 0:
+            base = float(np.median(corrected[sel]))
+            if not np.isfinite(base) or base <= 0:
                 continue
-            ratio = float(np.log2(val / baseline))
-            local_ratios[index] = ratio
-            s = null_std[index]
-            local_zscores[index] = (ratio - null_mean[index]) / s if s > 0 else np.nan
-
-        missing_z = np.isfinite(local_ratios) & ~np.isfinite(local_zscores)
-        if np.any(missing_z):
-            finite_r = local_ratios[np.isfinite(local_ratios)]
-            med_r = float(np.median(finite_r))
-            mad_r = float(scipy.stats.median_abs_deviation(finite_r, scale=1.0))
-            emp_std = 1.4826 * mad_r
-            if emp_std > 1e-12:
-                local_zscores[missing_z] = (local_ratios[missing_z] - med_r) / emp_std
-            else:
-                local_zscores[missing_z] = 0.0
-
+            r = float(np.log2(val / base))
+            loc_r[idx], s = r, model.null_std[idx]
+            loc_z[idx] = (r - model.null_mean[idx]) / s if s > 0 else np.nan
+        miss_z = np.isfinite(loc_r) & ~np.isfinite(loc_z)
+        if np.any(miss_z):
+            fin_r = loc_r[np.isfinite(loc_r)]
+            med_r, emp_std = (
+                float(np.median(fin_r)),
+                1.4826 * float(scipy.stats.median_abs_deviation(fin_r, scale=1.0)),
+            )
+            loc_z[miss_z] = (
+                (loc_r[miss_z] - med_r) / emp_std if emp_std > 1e-12 else 0.0
+            )
         eligible = (
             np.isfinite(corrected)
-            & np.isfinite(local_zscores)
-            & (np.abs(local_zscores) < _MASK_Z_THRESHOLD)
+            & np.isfinite(loc_z)
+            & (np.abs(loc_z) < _MASK_Z_THRESHOLD)
         )
         logger.debug(
             "branch %s within-sample iteration %d/%d: %d eligible bins",
@@ -573,38 +489,32 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
             config.mask_repeats,
             int(np.count_nonzero(eligible)),
         )
-
-    finite_ratios = np.isfinite(local_ratios)
+    finite_ratios = np.isfinite(loc_r)
     median_shift = 0.0
     if np.any(finite_ratios):
-        median_shift = float(np.median(local_ratios[finite_ratios]))
-        local_ratios[finite_ratios] -= median_shift
+        median_shift = float(np.median(loc_r[finite_ratios]))
+        loc_r[finite_ratios] -= median_shift
     logger.debug(
         "branch %s: %d finite ratios, median shift=%.4f (mean=%.4f, std=%.4f)",
         model.branch,
         int(np.count_nonzero(finite_ratios)),
         median_shift,
-        float(np.mean(local_ratios[finite_ratios])) if np.any(finite_ratios) else 0.0,
-        float(np.std(local_ratios[finite_ratios])) if np.any(finite_ratios) else 0.0,
+        float(np.mean(loc_r[finite_ratios])) if np.any(finite_ratios) else 0.0,
+        float(np.std(loc_r[finite_ratios])) if np.any(finite_ratios) else 0.0,
     )
-    ratios[unmasked_positions] = local_ratios
-    zscores[unmasked_positions] = local_zscores
-
-    valid_dist = (model.mean_distance > 0) & np.isfinite(model.mean_distance)
-    unmasked_weights = np.zeros(n_unmasked, dtype=np.float64)
-    unmasked_weights[valid_dist] = 1.0 / model.mean_distance[valid_dist]
-    unmasked_weights[~valid_dist] = 1.0
-    weights[unmasked_positions] = unmasked_weights
+    ratios[unm], zscores[unm] = loc_r, loc_z
+    valid_d = (model.mean_distance > 0) & np.isfinite(model.mean_distance)
+    weights[unm] = np.where(
+        valid_d, 1.0 / np.where(valid_d, model.mean_distance, 1.0), 1.0
+    )
     valid = (
-        projected.usable
+        proj.usable
         & np.isfinite(ratios)
         & np.isfinite(zscores)
-        & (reference_sizes >= config.min_reference_bins)
+        & (ref_sizes >= config.min_reference_bins)
     )
-    ratios[~valid] = np.nan
-    zscores[~valid] = np.nan
-    weights[~valid] = 0.0
-    _require_aligned(model.counts.size, ratios, zscores, weights, reference_sizes)
+    ratios[~valid], zscores[~valid], weights[~valid] = np.nan, np.nan, 0.0
+    _require_aligned(model.counts.size, ratios, zscores, weights, ref_sizes)
     return BinResult(
         branch=model.branch,
         contigs=model.contigs,
@@ -613,7 +523,7 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
         ratios=ratios,
         zscores=zscores,
         weights=weights,
-        reference_sizes=reference_sizes,
+        reference_sizes=ref_sizes,
         masked=~valid,
     )
 
@@ -623,17 +533,19 @@ def call_segment(
     zscore: float,
     *,
     z_threshold: float,
-    ratio_threshold: float | None,
+    ratio_threshold: float | None = None,
 ) -> CallType | None:
     """Classify a segment using a symmetric ratio or z-score threshold."""
-
-    value = ratio if ratio_threshold is not None else zscore
-    threshold = ratio_threshold if ratio_threshold is not None else z_threshold
-    if not np.isfinite(value):
+    val, thresh = (
+        (ratio, ratio_threshold)
+        if ratio_threshold is not None
+        else (zscore, z_threshold)
+    )
+    if not np.isfinite(val):
         return None
-    if value > threshold:
+    if val > thresh:
         return "gain"
-    if value < -threshold:
+    if val < -thresh:
         return "loss"
     return None
 
@@ -644,82 +556,41 @@ def segment_and_call(
     *,
     penalty: float,
     z_threshold: float,
-    ratio_threshold: float | None,
-    max_blacklist_gap: int,
+    ratio_threshold: float | None = None,
+    max_blacklist_gap: int = 2_000_000,
 ) -> tuple[SegmentResult, ...]:
     """Segment all selected branches and classify their weighted means."""
-
-    by_contig: dict[
-        str,
-        tuple[
-            NDArray[np.int64],
-            NDArray[np.int64],
-            NDArray[np.float64],
-            NDArray[np.float64],
-            int,
-        ],
-    ] = {}
-    evidence: dict[
-        str,
-        tuple[
-            NDArray[np.int64],
-            NDArray[np.int64],
-            NDArray[np.float64],
-            NDArray[np.float64],
-        ],
-    ] = {}
-    for result in bins:
-        contig_array = np.asarray(result.contigs, dtype=object)
-        for contig in dict.fromkeys(result.contigs):
-            selected = contig_array == contig
-            c_starts = result.starts[selected]
-            c_ends = result.ends[selected]
-            c_weights = result.weights[selected]
-            by_contig[contig] = (
-                c_starts,
-                c_ends,
-                result.ratios[selected],
-                c_weights,
-                contig_lengths[contig],
-            )
-            evidence[contig] = (
-                c_starts,
-                c_ends,
-                result.zscores[selected],
-                c_weights,
-            )
-    raw_segments = segment_genome(
+    by_contig, evidence = {}, {}
+    for res in bins:
+        c_arr = np.asarray(res.contigs, dtype=object)
+        for c in dict.fromkeys(res.contigs):
+            sel = c_arr == c
+            c_s, c_e, c_w = res.starts[sel], res.ends[sel], res.weights[sel]
+            by_contig[c] = (c_s, c_e, res.ratios[sel], c_w, contig_lengths[c])
+            evidence[c] = (c_s, c_e, res.zscores[sel], c_w)
+    raw = segment_genome(
         by_contig,
         penalty=penalty,
         algorithm="binseg",
         max_blacklist_gap=max_blacklist_gap,
     )
     output: list[SegmentResult] = []
-    for segment in raw_segments:
-        c_starts, c_ends, c_zscores, c_weights = evidence[segment.contig]
-        overlap = (
-            (c_starts < segment.end)
-            & (c_ends > segment.start)
-            & np.isfinite(c_zscores)
-            & (c_weights > 0)
-        )
-        segment_z = (
-            float(np.average(c_zscores[overlap], weights=c_weights[overlap]))
-            if np.any(overlap)
-            else np.nan
-        )
+    for seg in raw:
+        c_s, c_e, c_z, c_w = evidence[seg.contig]
+        ov = (c_s < seg.end) & (c_e > seg.start) & np.isfinite(c_z) & (c_w > 0)
+        seg_z = float(np.average(c_z[ov], weights=c_w[ov])) if np.any(ov) else np.nan
         output.append(
             SegmentResult(
-                contig=segment.contig,
-                start=segment.start,
-                end=min(segment.end, contig_lengths[segment.contig]),
-                ratio=segment.mean,
-                zscore=segment_z,
-                weight=segment.weight,
-                bin_count=segment.bin_count,
+                contig=seg.contig,
+                start=seg.start,
+                end=min(seg.end, contig_lengths[seg.contig]),
+                ratio=seg.mean,
+                zscore=seg_z,
+                weight=seg.weight,
+                bin_count=seg.bin_count,
                 call=call_segment(
-                    segment.mean,
-                    segment_z,
+                    seg.mean,
+                    seg_z,
                     z_threshold=z_threshold,
                     ratio_threshold=ratio_threshold,
                 ),
@@ -735,18 +606,6 @@ def segment_and_call(
         losses,
         neutral,
     )
-    for s in output:
-        if s.call is not None:
-            logger.debug(
-                "call %s: %s:%d-%d (%d bins, ratio=%.3f, z=%.2f)",
-                s.call.upper(),
-                s.contig,
-                s.start,
-                s.end,
-                s.bin_count,
-                s.ratio,
-                s.zscore,
-            )
     return tuple(output)
 
 
@@ -758,24 +617,26 @@ def _resolve_sample_sex(
 ) -> Sex | None:
     if requested != "autosomal":
         return requested
-    sex_branches = {BRANCH_FEMALE_SEX, BRANCH_MALE_SEX} & branches
-    if not sex_branches:
+    if not ({BRANCH_FEMALE_SEX, BRANCH_MALE_SEX} & branches):
         return None
     model = metadata.get("model")
-    if not isinstance(model, dict):
+    if (
+        not isinstance(model, dict)
+        or not isinstance(model.get("sex_inference"), dict)
+        or not isinstance(model.get("sex_signal_contig"), str)
+    ):
         raise PredictError("cannot infer sample sex; pass --sex female or --sex male")
-    inference = model.get("sex_inference")
-    signal = model.get("sex_signal_contig")
-    if not isinstance(inference, dict) or not isinstance(signal, str):
-        raise PredictError("cannot infer sample sex; pass --sex female or --sex male")
-    cutoff = inference.get("cutoff")
+    cutoff = model["sex_inference"].get("cutoff")
     if not isinstance(cutoff, int | float):
         raise PredictError("cannot infer sample sex; pass --sex female or --sex male")
-    contigs = np.asarray(sample.column("contig").to_pylist(), dtype=object)
-    counts = np.asarray(sample.column("count").to_pylist(), dtype=np.float64)
+    contigs, counts = (
+        np.asarray(sample.column("contig").to_pylist(), dtype=object),
+        np.asarray(sample.column("count").to_pylist(), dtype=np.float64),
+    )
     total = float(np.sum(counts))
     if total <= 0:
         raise PredictError("sample has zero total coverage")
+    signal = str(model["sex_signal_contig"])
     fraction = float(np.sum(counts[contigs == signal]) / total)
     sex = "male" if fraction > float(cutoff) else "female"
     logger.debug(
@@ -789,35 +650,45 @@ def _resolve_sample_sex(
 
 
 def _contig_lengths(metadata: dict[str, object]) -> dict[str, int]:
-    values = metadata.get("contig_lengths")
-    if not isinstance(values, dict):
+    val = metadata.get("contig_lengths")
+    if not isinstance(val, dict):
         raise PredictError("artifact metadata has no contig lengths")
-    return {str(contig): int(length) for contig, length in values.items()}
+    return {str(c): int(length) for c, length in val.items()}
 
 
 def _validate_config(config: PredictConfig) -> None:
-    if not np.isfinite(config.penalty) or config.penalty <= 0:
-        raise PredictError("penalty must be finite and positive")
-    if not np.isfinite(config.z_threshold) or config.z_threshold <= 0:
-        raise PredictError("z_threshold must be finite and positive")
+    if (
+        not np.isfinite(config.penalty)
+        or config.penalty <= 0
+        or not np.isfinite(config.z_threshold)
+        or config.z_threshold <= 0
+    ):
+        raise PredictError("penalty and z_threshold must be finite and positive")
     if config.ratio_threshold is not None and (
         not np.isfinite(config.ratio_threshold) or config.ratio_threshold <= 0
     ):
         raise PredictError("ratio_threshold must be finite and positive")
-    if config.min_reference_bins < 1:
-        raise PredictError("min_reference_bins must be positive")
-    if config.mask_repeats < 1:
-        raise PredictError("mask_repeats must be positive")
-    if config.max_blacklist_gap < 0:
-        raise PredictError("max_blacklist_gap must be non-negative")
+    if (
+        config.min_reference_bins < 1
+        or config.mask_repeats < 1
+        or config.max_blacklist_gap < 0
+    ):
+        msg = (
+            "min_reference_bins and mask_repeats must be positive, "
+            "max_blacklist_gap non-negative"
+        )
+        raise PredictError(msg)
     try:
         validate_min_mappability(config.min_mappability)
-    except CovariateError as error:
-        raise PredictError(str(error)) from error
+    except CovariateError as err:
+        raise PredictError(str(err)) from err
 
 
 def _require_aligned(length: int, *arrays: ArrayLike) -> None:
-    if any(np.asarray(array).shape != (length,) for array in arrays):
+    if any(np.asarray(a).shape != (length,) for a in arrays):
         raise PredictError(
             "prediction result arrays must be aligned and one-dimensional"
         )
+
+
+run_predict: Final = run

@@ -29,6 +29,10 @@ from ccnv.models import (
 )
 from ccnv.predict import PredictError
 from ccnv.predict import run as run_predict
+from ccnv.ref_qc import (
+    ReferenceQCError,
+    run_reference_qc,
+)
 from ccnv.reference import (
     DEFAULT_SEX_CONTIGS,
     DEFAULT_SEX_SIGNAL_CONTIGS,
@@ -36,10 +40,6 @@ from ccnv.reference import (
 )
 from ccnv.reference import (
     run as run_reference,
-)
-from ccnv.reference_qc import (
-    ReferenceQCError,
-    run_reference_qc,
 )
 from ccnv.schemas import ArtifactKind, SchemaError, decode_metadata
 

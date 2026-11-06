@@ -17,10 +17,10 @@ from ccnv.qc.reference import (
     compute_signal_contig_metrics,
     evaluate_autosomal_or_female_verdict,
     evaluate_male_verdict,
-    run_reference_qc,
     run_reference_qc_on_table,
     write_reference_qc_json,
 )
+from ccnv.ref_qc import run_reference_qc
 
 __all__ = [
     "CHRY_MEAN_DIST_FAIL",
