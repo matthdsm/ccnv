@@ -13,29 +13,28 @@ import numpy as np
 import pyarrow as pa
 from numpy.typing import NDArray
 
-from ccnv.cohort import Cohort, cohort_from_fasta, load_cohort, validate_cohort
-from ccnv.covariates import (
-    CovariateError,
+from ccnv.features.cohort import (
+    Cohort,
+    SexInference,
+    SexLabel,
+    cohort_from_fasta,
+    infer_sample_sexes,
+    load_cohort,
+    mask_low_coverage,
+    normalize_depth,
+    validate_cohort,
+)
+from ccnv.features.covariates import (
     correct_covariate_bias,
     covariate_features,
-    load_gc_track,
-    load_mappability_track,
     mask_covariates,
     validate_min_mappability,
 )
-from ccnv.features.cohort import (
-    SexInference,
-    SexLabel,
-    infer_sample_sexes,
-    mask_low_coverage,
-    normalize_depth,
-)
+from ccnv.features.prenatal import fit_prenatal_models
 from ccnv.io.parquet import write_reference_parquet
 from ccnv.io.samplesheet import load_samplesheet
-from ccnv.models import ReferenceConfig, ReferenceError, SamplesheetEntry, parquet_path
-from ccnv.prenatal import fit_prenatal_models
-from ccnv.qc.reference import run_reference_qc_on_table
-from ccnv.schemas import (
+from ccnv.io.tracks import load_gc_track, load_mappability_track
+from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
@@ -43,8 +42,14 @@ from ccnv.schemas import (
     BRANCH_PRENATAL_FFY,
     REFERENCE_SCHEMA,
     ArtifactKind,
+    CovariateError,
+    ReferenceConfig,
+    ReferenceError,
+    SamplesheetEntry,
     metadata_for,
+    parquet_path,
 )
+from ccnv.qc.reference import run_reference_qc_on_table
 from ccnv.stats.neighbors import (
     compute_null_models,
     distance_cutoff,
@@ -189,42 +194,46 @@ def build_reference_table(
             cohort, config, sex_contigs
         )
 
-    def _add_b(b: str, idx: NDArray[np.integer], names: tuple[str, ...]) -> None:
+    def _add_branch(
+        branch_name: str,
+        sample_indices: NDArray[np.integer],
+        contig_names: tuple[str, ...],
+    ) -> None:
         branch_tables.append(
             _build_branch_table(
-                branch=b,
+                branch=branch_name,
                 cohort=cohort,
-                sample_index=idx,
-                contig_names=names,
+                sample_index=sample_indices,
+                contig_names=contig_names,
                 config=config,
                 cohort_gc=cohort_gc,
                 cohort_mappability=cohort_map,
                 cohort_n_mask=cohort_n_mask,
             )
         )
-        built_branches.append(b)
+        built_branches.append(branch_name)
 
     branch_tables, built_branches = [], []
-    _add_b(BRANCH_AUTOSOMAL, np.arange(cohort.counts.shape[1]), autosomes)
+    _add_branch(BRANCH_AUTOSOMAL, np.arange(cohort.counts.shape[1]), autosomes)
     if sex_contigs and sexes is not None:
         labels = np.asarray(sexes)
         if (
-            f_idx := np.flatnonzero(labels == "female")
+            female_indices := np.flatnonzero(labels == "female")
         ).size >= config.min_sex_group_size:
-            _add_b(BRANCH_FEMALE_SEX, f_idx, sex_contigs)
+            _add_branch(BRANCH_FEMALE_SEX, female_indices, sex_contigs)
         if (
-            m_idx := np.flatnonzero(labels == "male")
+            male_indices := np.flatnonzero(labels == "male")
         ).size >= config.min_sex_group_size:
-            _add_b(BRANCH_MALE_SEX, m_idx, sex_contigs)
+            _add_branch(BRANCH_MALE_SEX, male_indices, sex_contigs)
     if config.mode == "prenatal":
         assert prenatal_auto is not None and prenatal_ffy is not None
-        for b_name, b_tbl in [
+        for branch_name, branch_table in [
             (BRANCH_PRENATAL_AUTOSOMAL, prenatal_auto),
             (BRANCH_PRENATAL_FFY, prenatal_ffy),
         ]:
-            if b_tbl.num_rows > 0:
-                built_branches.append(b_name)
-                branch_tables.append(b_tbl)
+            if branch_table.num_rows > 0:
+                built_branches.append(branch_name)
+                branch_tables.append(branch_table)
     model_metadata = {
         "bin_size": cohort.bin_size,
         "branches": built_branches,
@@ -416,14 +425,16 @@ def _build_branch_table(
     if not np.any(selected):
         raise ReferenceError(f"branch {branch!r} has no bins")
     counts = cohort.counts[np.ix_(selected, sample_index)]
-    b_gc = cohort_gc[selected] if cohort_gc is not None else None
-    b_map = cohort_mappability[selected] if cohort_mappability is not None else None
-    b_n = cohort_n_mask[selected] if cohort_n_mask is not None else None
+    branch_gc = cohort_gc[selected] if cohort_gc is not None else None
+    branch_map = (
+        cohort_mappability[selected] if cohort_mappability is not None else None
+    )
+    branch_n = cohort_n_mask[selected] if cohort_n_mask is not None else None
     usable = mask_covariates(
         mask_low_coverage(normalize_depth(counts)),
-        gc=b_gc,
-        mappability=b_map,
-        n_mask=b_n,
+        gc=branch_gc,
+        mappability=branch_map,
+        n_mask=branch_n,
         min_mappability=config.min_mappability,
     )
     if not np.any(usable):
@@ -436,7 +447,10 @@ def _build_branch_table(
         np.count_nonzero(usable) / usable.size * 100 if usable.size else 0.0,
     )
     normalized = correct_covariate_bias(
-        normalize_depth(counts, mask=usable), usable, gc=b_gc, mappability=b_map
+        normalize_depth(counts, mask=usable),
+        usable,
+        gc=branch_gc,
+        mappability=branch_map,
     )
     corrected, pca_mean, pca_loadings = fit_pca(
         normalized[usable], config.pca_components
@@ -449,7 +463,11 @@ def _build_branch_table(
         cov_mat
         if (
             config.fasta is not None
-            and (cov_mat := covariate_features(usable, gc=b_gc, mappability=b_map))
+            and (
+                cov_mat := covariate_features(
+                    usable, gc=branch_gc, mappability=branch_map
+                )
+            )
             is not None
         )
         else corrected
@@ -476,49 +494,52 @@ def _build_branch_table(
         np.count_nonzero(usable),
     )
     cutoff = distance_cutoff(nearest_dist, repeats=3)
-    filt_nearest, mean_dists = [], []
-    for d_list, idx_list in zip(nearest_dist, nearest_idx, strict=True):
-        d_arr, i_arr = (
-            np.asarray(d_list, dtype=np.float64),
-            np.asarray(idx_list, dtype=np.int32),
-        )
-        valid = (d_arr <= cutoff) & np.isfinite(d_arr)
-        mean_dists.append(
-            float(np.mean(np.sqrt(np.maximum(d_arr[valid], 0.0))))
+    filtered_nearest, mean_distances = [], []
+    for distance_list, index_list in zip(nearest_dist, nearest_idx, strict=True):
+        distance_array = np.asarray(distance_list, dtype=np.float64)
+        index_array = np.asarray(index_list, dtype=np.int32)
+        valid = (distance_array <= cutoff) & np.isfinite(distance_array)
+        mean_distances.append(
+            float(np.mean(np.sqrt(np.maximum(distance_array[valid], 0.0))))
             if np.any(valid)
             else 0.0
         )
-        filt_nearest.append(np.sort(i_arr[valid]).tolist() if np.any(valid) else [])
+        filtered_nearest.append(
+            np.sort(index_array[valid]).tolist() if np.any(valid) else []
+        )
     n_bins = int(np.count_nonzero(selected))
-    out_gc = (
-        np.where(np.isfinite(b_gc), b_gc, -1.0).astype(np.float32)
-        if b_gc is not None
+    output_gc = (
+        np.where(np.isfinite(branch_gc), branch_gc, -1.0).astype(np.float32)
+        if branch_gc is not None
         else np.full(n_bins, -1.0, dtype=np.float32)
     )
-    out_map = (
-        np.where(np.isfinite(b_map), b_map, -1.0).astype(np.float32)
-        if b_map is not None
+    output_map = (
+        np.where(np.isfinite(branch_map), branch_map, -1.0).astype(np.float32)
+        if branch_map is not None
         else np.full(n_bins, -1.0, dtype=np.float32)
     )
-    branch_pca, branch_dist, branch_nm, branch_ns = (
-        np.zeros(n_bins),
-        np.zeros(n_bins, dtype=np.float32),
-        np.zeros(n_bins),
-        np.zeros(n_bins),
-    )
-    branch_pca[usable], branch_dist[usable], branch_nm[usable], branch_ns[usable] = (
+    branch_pca_mean = np.zeros(n_bins, dtype=np.float64)
+    branch_mean_dist = np.zeros(n_bins, dtype=np.float32)
+    branch_null_mean = np.zeros(n_bins, dtype=np.float64)
+    branch_null_std = np.zeros(n_bins, dtype=np.float64)
+    (
+        branch_pca_mean[usable],
+        branch_mean_dist[usable],
+        branch_null_mean[usable],
+        branch_null_std[usable],
+    ) = (
         pca_mean,
-        mean_dists,
+        mean_distances,
         null_mean,
         null_std,
     )
-    full_loadings = [
-        pca_loadings[:, u].tolist() if usable[i] else []
-        for i, u in zip(range(n_bins), np.cumsum(usable) - 1, strict=True)
+    full_pca_loadings = [
+        pca_loadings[:, u_idx].tolist() if usable[bin_idx] else []
+        for bin_idx, u_idx in zip(range(n_bins), np.cumsum(usable) - 1, strict=True)
     ]
-    full_nearest = [
-        filt_nearest[u] if usable[i] else []
-        for i, u in zip(range(n_bins), np.cumsum(usable) - 1, strict=True)
+    full_nearest_indices = [
+        filtered_nearest[u_idx] if usable[bin_idx] else []
+        for bin_idx, u_idx in zip(range(n_bins), np.cumsum(usable) - 1, strict=True)
     ]
     return pa.table(
         {
@@ -527,14 +548,16 @@ def _build_branch_table(
             "start": pa.array(cohort.starts[selected], type=pa.int64()),
             "end": pa.array(cohort.ends[selected], type=pa.int64()),
             "masked": pa.array(~usable, type=pa.bool_()),
-            "gc": pa.array(out_gc, type=pa.float32()),
-            "mappability": pa.array(out_map, type=pa.float32()),
-            "pca_mean": pa.array(branch_pca, type=pa.float64()),
-            "pca_loadings": pa.array(full_loadings, type=pa.list_(pa.float64())),
-            "nearest_ref_indices": pa.array(full_nearest, type=pa.list_(pa.int32())),
-            "mean_distance": pa.array(branch_dist, type=pa.float32()),
-            "null_mean": pa.array(branch_nm, type=pa.float64()),
-            "null_std": pa.array(branch_ns, type=pa.float64()),
+            "gc": pa.array(output_gc, type=pa.float32()),
+            "mappability": pa.array(output_map, type=pa.float32()),
+            "pca_mean": pa.array(branch_pca_mean, type=pa.float64()),
+            "pca_loadings": pa.array(full_pca_loadings, type=pa.list_(pa.float64())),
+            "nearest_ref_indices": pa.array(
+                full_nearest_indices, type=pa.list_(pa.int32())
+            ),
+            "mean_distance": pa.array(branch_mean_dist, type=pa.float32()),
+            "null_mean": pa.array(branch_null_mean, type=pa.float64()),
+            "null_std": pa.array(branch_null_std, type=pa.float64()),
         },
         schema=REFERENCE_SCHEMA,
     )

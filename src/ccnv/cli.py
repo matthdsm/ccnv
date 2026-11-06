@@ -18,11 +18,14 @@ from ccnv.convert import run as run_convert
 from ccnv.models import (
     DEFAULT_BIN_SIZE,
     DEFAULT_MIN_MAPPABILITY,
+    ArtifactKind,
     ConvertConfig,
     PredictConfig,
     ReadFilters,
     ReferenceConfig,
     ReferenceQCConfig,
+    SchemaError,
+    decode_metadata,
 )
 from ccnv.models import (
     AnalysisMode as AnalysisModeLiteral,
@@ -41,7 +44,6 @@ from ccnv.reference import (
 from ccnv.reference import (
     run as run_reference,
 )
-from ccnv.schemas import ArtifactKind, SchemaError, decode_metadata
 
 app = typer.Typer(
     name="ccnv",
