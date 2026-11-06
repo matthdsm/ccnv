@@ -14,7 +14,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import scipy.stats
 from numpy.typing import NDArray
-from sklearn.decomposition import PCA
 
 from ccnv.cohort import (
     Cohort as Cohort,
@@ -61,6 +60,8 @@ from ccnv.schemas import (
     metadata_for,
     validate_table,
 )
+from ccnv.stats.neighbors import distance_cutoff as distance_cutoff
+from ccnv.stats.pca import fit_pca as fit_pca
 
 DEFAULT_SEX_CONTIGS: Final[tuple[str, ...]] = ("X", "Y", "chrX", "chrY")
 DEFAULT_SEX_SIGNAL_CONTIGS: Final[tuple[str, ...]] = ("chrY", "Y")
@@ -193,50 +194,6 @@ def mask_low_coverage(normalized: NDArray[np.floating]) -> NDArray[np.bool_]:
         return np.zeros(per_bin.shape, dtype=np.bool_)
     threshold = _MASK_FRACTION * float(np.median(positive))
     return per_bin > threshold
-
-
-def fit_pca(
-    masked_normalized: NDArray[np.floating],
-    n_components: int,
-) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-    """Fit a deterministic PCA model on samples-by-bins and correct coverage."""
-
-    data = np.asarray(masked_normalized, dtype=np.float64)
-    if data.ndim != 2 or data.size == 0:
-        raise ReferenceError("PCA requires a non-empty bins-by-samples matrix")
-    samples = data.T
-    n_components = min(n_components, samples.shape[0], samples.shape[1])
-    if n_components < 1:
-        raise ReferenceError("PCA requires at least one sample and one unmasked bin")
-    mean = np.mean(samples, axis=0)
-    if np.allclose(samples, mean):
-        return (
-            np.ones(data.shape, dtype=np.float64),
-            mean.astype(np.float64, copy=False),
-            np.zeros((n_components, samples.shape[1]), dtype=np.float64),
-        )
-    pca = PCA(n_components=n_components, svd_solver="full")
-    pca.fit(samples)
-    if (
-        hasattr(pca, "explained_variance_ratio_")
-        and pca.explained_variance_ratio_ is not None
-    ):
-        finite_vars = np.nan_to_num(pca.explained_variance_ratio_ * 100.0)
-        logger.debug(
-            "PCA fitted %d components: explained variance [%s] (total=%.2f%%)",
-            n_components,
-            ", ".join(f"{v:.2f}%" for v in finite_vars),
-            float(np.sum(finite_vars)),
-        )
-    reconstructed = pca.inverse_transform(pca.transform(samples))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        corrected = samples / reconstructed
-    corrected = np.nan_to_num(corrected, nan=1.0, posinf=1.0, neginf=1.0)
-    return (
-        corrected.T.astype(np.float64, copy=False),
-        pca.mean_.astype(np.float64, copy=False),
-        pca.components_.astype(np.float64, copy=False),
-    )
 
 
 def infer_sample_sexes(
@@ -679,39 +636,6 @@ def _contig_fractions(cohort: Cohort, contig: str) -> NDArray[np.float64]:
         raise ReferenceError("every sample must have a positive total count")
     mask = np.array([name == contig for name in cohort.contigs], dtype=np.bool_)
     return cohort.counts[mask].sum(axis=0) / totals
-
-
-def distance_cutoff(
-    distances: (
-        tuple[NDArray[np.float64], ...]
-        | NDArray[np.floating]
-        | Sequence[Sequence[float]]
-    ),
-    repeats: int = 3,
-) -> float:
-    """Return an iterative three-sigma cutoff for nearest-bin distances."""
-
-    if isinstance(distances, np.ndarray):
-        values = distances.ravel()
-    elif (
-        isinstance(distances, tuple)
-        and distances
-        and isinstance(distances[0], np.ndarray)
-    ):
-        values = np.concatenate(distances)
-    else:
-        values = np.asarray([d for sub in distances for d in sub], dtype=np.float64)
-
-    values = values[np.isfinite(values) & (values >= 0)]
-    if values.size == 0:
-        return float("inf")
-    cutoff = float("inf")
-    for _ in range(repeats):
-        selected = values[values < cutoff]
-        if selected.size == 0:
-            break
-        cutoff = float(np.mean(selected) + 3.0 * np.std(selected))
-    return cutoff
 
 
 def _build_branch_table(
