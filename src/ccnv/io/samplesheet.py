@@ -35,7 +35,11 @@ def _get_samplesheet_schema() -> dict[str, Any]:
         if schema_ref.is_file():
             with schema_ref.open("r", encoding="utf-8") as f:
                 return json.load(f)
-    except ModuleNotFoundError, TypeError, FileNotFoundError:
+    except (
+        ModuleNotFoundError,
+        TypeError,
+        FileNotFoundError,
+    ):
         pass
     schema_ref = importlib.resources.files("ccnv").joinpath("samplesheet.schema.json")
     with schema_ref.open("r", encoding="utf-8") as f:

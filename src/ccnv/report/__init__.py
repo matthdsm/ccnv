@@ -29,6 +29,7 @@ from ccnv.report.bed import (
 )
 from ccnv.report.html import (
     PLOTLY_CDN_URL,
+    _load_cytobands_path,
     encode_b64,
     render_genome_plot,
     write_genome_plot,
@@ -67,9 +68,7 @@ __all__ = [
 
 def read_cytobands(path: Path, contig_lengths: dict[str, int]) -> tuple[Cytoband, ...]:
     """Transitional compatibility wrapper reading cytobands."""
-    from ccnv.io.tracks import load_cytobands_track
-
-    return load_cytobands_track(path, contig_lengths)
+    return _load_cytobands_path(path, contig_lengths)
 
 
 def write_outputs(
