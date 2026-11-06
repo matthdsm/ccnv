@@ -5,8 +5,15 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import pyarrow as pa
+
 from ccnv.io.parquet import read_reference_parquet
-from ccnv.models import ReferenceQCConfig, ReferenceQCError, ReferenceQCOutputs
+from ccnv.models import (
+    ReferenceQCConfig,
+    ReferenceQCError,
+    ReferenceQCOutputs,
+    SchemaError,
+)
 from ccnv.qc.reference import run_reference_qc_on_table
 
 logger = logging.getLogger(__name__)
@@ -35,7 +42,7 @@ def run_reference_qc(
 
     try:
         table = read_reference_parquet(ref_path)
-    except Exception as error:
+    except (OSError, pa.ArrowInvalid, SchemaError) as error:
         raise ReferenceQCError(f"failed to read {ref_path}: {error}") from error
 
     return run_reference_qc_on_table(

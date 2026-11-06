@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Sequence
-from concurrent.futures import ProcessPoolExecutor
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 from numpy.typing import NDArray
 
 from ccnv.features.binning import bin_intervals, rebin_counts
@@ -22,7 +20,6 @@ from ccnv.models import (
     SchemaError,
     decode_metadata,
     metadata_for,
-    select_layout,
     validate_table,
 )
 
@@ -302,13 +299,6 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
     )
 
 
-def _read_sample(path: Path) -> pa.Table:
-    try:
-        return pq.read_table(path)
-    except (FileNotFoundError, OSError, pa.ArrowInvalid) as error:
-        raise ReferenceError(f"{path}: cannot read sample Parquet ({error})") from error
-
-
 def _parse_sample_table(
     table: pa.Table,
     label: str,
@@ -407,13 +397,8 @@ def _assemble_cohort(
     )
 
 
-def _load_sample_worker(args: tuple[Path, int | None]) -> _ParsedSample:
-    path, target_bin_size = args
-    return _parse_sample_table(_read_sample(path), str(path), target_bin_size)
-
-
 def load_cohort(
-    paths: tuple[Path, ...],
+    paths: Sequence[Path | str],
     target_bin_size: int | None = None,
     threads: int = 1,
 ) -> Cohort:
@@ -421,27 +406,27 @@ def load_cohort(
     if not paths:
         raise ReferenceError("at least one sample Parquet path is required")
 
-    args = [(path, target_bin_size) for path in paths]
-    if threads > 1 and len(paths) > 1:
-        max_workers = min(threads, len(paths))
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            results = list(executor.map(_load_sample_worker, args))
-    else:
-        results = [_load_sample_worker(arg) for arg in args]
+    from ccnv.io.parquet import read_sample_tables
 
-    return _assemble_cohort(results, paths, target_bin_size)
+    resolved_paths = tuple(Path(p) for p in paths)
+    tables = read_sample_tables(resolved_paths, threads=threads)
+    return validate_cohort(
+        tables, paths=resolved_paths, target_bin_size=target_bin_size
+    )
 
 
 def validate_cohort(
-    tables: tuple[pa.Table, ...],
-    paths: tuple[Path, ...] | None = None,
+    tables: Sequence[pa.Table],
+    paths: Sequence[Path] | None = None,
     target_bin_size: int | None = None,
 ) -> Cohort:
     """Require matching contig lengths across samples, rebinning counts if set."""
     if len(tables) < 1:
         raise ReferenceError("cohort must contain at least one sample")
-    resolved_paths = paths or tuple(
-        Path(f"sample_{index}") for index in range(len(tables))
+    resolved_paths = (
+        tuple(paths)
+        if paths is not None
+        else tuple(Path(f"sample_{index}") for index in range(len(tables)))
     )
     if len(resolved_paths) != len(tables):
         raise ReferenceError("paths must align with sample tables")
@@ -454,16 +439,28 @@ def validate_cohort(
 
 
 def cohort_from_fasta(
-    fasta: Path,
+    fasta: Path | str | Mapping[str, int],
     bin_size: int,
     *,
     n_samples: int,
     all_contigs: bool = False,
+    fasta_path: Path | None = None,
 ) -> Cohort:
     """Build identical uniform-depth samples from FASTA contig lengths."""
     if n_samples < 1:
         raise ReferenceError("n_samples must be a positive integer")
-    names, lengths = _fasta_contigs(fasta, all_contigs=all_contigs)
+    if isinstance(fasta, Mapping):
+        names = list(fasta.keys())
+        lengths = [int(v) for v in fasta.values()]
+        source_path = fasta_path or Path("flat_fasta")
+    else:
+        from ccnv.io.tracks import read_fasta_contigs
+
+        source_path = Path(fasta).expanduser().resolve()
+        contig_dict = read_fasta_contigs(source_path, all_contigs=all_contigs)
+        names = list(contig_dict.keys())
+        lengths = list(contig_dict.values())
+
     contigs: list[str] = []
     starts: list[int] = []
     ends: list[int] = []
@@ -476,7 +473,7 @@ def cohort_from_fasta(
     end_array = np.asarray(ends, dtype=np.int64)
     expected = np.maximum(end_array - start_array, 1).astype(np.float64)
     counts = np.broadcast_to(expected[:, np.newaxis], (expected.size, n_samples)).copy()
-    resolved = fasta.expanduser().resolve()
+    resolved = source_path.expanduser().resolve()
     identities = tuple(
         {
             "path": str(resolved),
@@ -495,32 +492,3 @@ def cohort_from_fasta(
         identities=identities,
         paths=tuple(Path(f"{resolved}#flat-{index}") for index in range(n_samples)),
     )
-
-
-def _fasta_contigs(path: Path, *, all_contigs: bool) -> tuple[list[str], list[int]]:
-    import pysam
-
-    fasta = path.expanduser()
-    if not fasta.is_file():
-        raise ReferenceError(f"FASTA not found: {fasta}")
-    if not Path(f"{fasta}.fai").is_file():
-        logger.debug("creating FASTA index for %s", fasta)
-        try:
-            pysam.faidx(str(fasta))
-        except Exception as error:
-            raise ReferenceError(f"failed to index FASTA {fasta}: {error}") from error
-    handle = pysam.FastaFile(str(fasta))
-    try:
-        header_names = list(handle.references)
-        header_lengths = [int(length) for length in handle.lengths]
-    finally:
-        handle.close()
-    if any(length <= 0 for length in header_lengths):
-        raise ReferenceError(f"{fasta} contains non-positive contig lengths")
-    layout = select_layout(header_names, header_lengths, all_contigs=all_contigs)
-    if not layout:
-        raise ReferenceError(
-            f"{fasta} declares no canonical chromosomes; "
-            "pass --all-contigs to include every contig"
-        )
-    return [contig.name for contig in layout], [contig.length for contig in layout]

@@ -19,7 +19,6 @@ from ccnv.features.cohort import (
     SexLabel,
     cohort_from_fasta,
     infer_sample_sexes,
-    load_cohort,
     mask_low_coverage,
     normalize_depth,
     validate_cohort,
@@ -31,9 +30,9 @@ from ccnv.features.covariates import (
     validate_min_mappability,
 )
 from ccnv.features.prenatal import fit_prenatal_models
-from ccnv.io.parquet import write_reference_parquet
+from ccnv.io.parquet import read_sample_tables, write_reference_parquet
 from ccnv.io.samplesheet import load_samplesheet
-from ccnv.io.tracks import load_gc_track, load_mappability_track
+from ccnv.io.tracks import load_gc_track, load_mappability_track, read_fasta_contigs
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
@@ -63,22 +62,12 @@ DEFAULT_SEX_SIGNAL_CONTIGS: Final[tuple[str, ...]] = ("chrY", "Y")
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "BRANCH_AUTOSOMAL",
-    "BRANCH_FEMALE_SEX",
-    "BRANCH_MALE_SEX",
     "DEFAULT_SEX_CONTIGS",
     "DEFAULT_SEX_SIGNAL_CONTIGS",
     "ReferenceError",
     "build_reference_table",
-    "cohort_from_fasta",
-    "fit_pca",
-    "infer_sample_sexes",
-    "load_cohort",
-    "mask_low_coverage",
-    "normalize_depth",
     "run",
     "run_reference",
-    "validate_cohort",
 ]
 
 
@@ -98,11 +87,12 @@ def run(config: ReferenceConfig) -> None:
         )
     if config.fasta is not None:
         assert config.bin_size is not None
+        contigs = read_fasta_contigs(config.fasta, all_contigs=config.all_contigs)
         cohort = cohort_from_fasta(
-            config.fasta,
+            contigs,
             config.bin_size,
             n_samples=max(config.min_cohort_size, 2),
-            all_contigs=config.all_contigs,
+            fasta_path=config.fasta,
         )
         config = (
             replace(config, sex_contigs=())
@@ -110,8 +100,11 @@ def run(config: ReferenceConfig) -> None:
             else config
         )
     else:
-        cohort = load_cohort(
-            config.samples, target_bin_size=config.bin_size, threads=config.threads
+        sample_tables = read_sample_tables(config.samples, threads=config.threads)
+        cohort = validate_cohort(
+            sample_tables,
+            paths=config.samples,
+            target_bin_size=config.bin_size,
         )
     table, path = build_reference_table(cohort, config), parquet_path(config.prefix)
     logger.debug("writing reference parquet %s (%d rows)", path, table.num_rows)

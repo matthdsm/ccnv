@@ -19,22 +19,28 @@ from typer.testing import CliRunner
 
 from ccnv.cli import app
 from ccnv.convert import (
-    QC_COUNTERS,
-    ConvertError,
-    bin_counts,
-    bin_intervals,
-    empty_qc,
-    is_canonical_contig,
-    normalize_chr,
-    rebin_counts,
-    rebin_sample_table,
-    rejection_reason,
     run,
-    select_layout,
     split_thread_budget,
 )
+from ccnv.features.binning import (
+    bin_counts,
+    bin_intervals,
+    rebin_counts,
+)
+from ccnv.features.cohort import rebin_sample_table
+from ccnv.io.alignments import rejection_reason
 from ccnv.io.parquet import read_sample_parquet
-from ccnv.models import Contig, ConvertConfig, GenomeProfile, ReadFilters, parquet_path
+from ccnv.models import (
+    Contig,
+    ConvertConfig,
+    ConvertError,
+    GenomeProfile,
+    ReadFilters,
+    is_canonical_contig,
+    normalize_chr,
+    parquet_path,
+    select_layout,
+)
 from ccnv.models.schemas import (
     COORDINATE_SYSTEM,
     SAMPLE_SCHEMA,
@@ -43,6 +49,7 @@ from ccnv.models.schemas import (
     decode_metadata,
     metadata_for,
 )
+from ccnv.qc.sample import QC_COUNTERS, empty_qc
 
 
 class FakeRead:

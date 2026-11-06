@@ -12,7 +12,6 @@ from typing import Final
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
 from numpy.typing import NDArray
 
 from ccnv.models import (
@@ -21,13 +20,10 @@ from ccnv.models import (
     BRANCH_MALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
-    ArtifactKind,
     ReferenceQCConfig,
     ReferenceQCError,
     ReferenceQCOutputs,
-    SchemaError,
     decode_metadata,
-    validate_table,
 )
 
 DEFAULT_MIN_REF_BINS: Final[int] = 150
@@ -65,7 +61,6 @@ __all__ = [
     "compute_signal_contig_metrics",
     "evaluate_autosomal_or_female_verdict",
     "evaluate_male_verdict",
-    "run_reference_qc",
     "run_reference_qc_on_table",
     "write_reference_qc_json",
 ]
@@ -492,31 +487,4 @@ def run_reference_qc_on_table(
         overall_verdict=overall_verdict,
         worst_severity=worst,
         data=qc_data,
-    )
-
-
-def run_reference_qc(config: ReferenceQCConfig) -> ReferenceQCOutputs:
-    """Validate and run reference QC against a reference Parquet file."""
-    ref_path = config.reference.expanduser().resolve()
-    if not ref_path.is_file():
-        raise ReferenceQCError(f"reference file not found: {ref_path}")
-
-    try:
-        table = pq.read_table(ref_path)
-    except Exception as error:
-        raise ReferenceQCError(f"failed to read {ref_path}: {error}") from error
-
-    try:
-        validate_table(table, ArtifactKind.REFERENCE)
-    except SchemaError as error:
-        raise ReferenceQCError(f"{ref_path}: {error}") from error
-
-    prefix = config.prefix if config.prefix is not None else ref_path.with_suffix("")
-
-    return run_reference_qc_on_table(
-        table,
-        prefix=prefix,
-        reference_path=ref_path,
-        write_json=True,
-        emit_stderr=True,
     )

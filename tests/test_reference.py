@@ -20,8 +20,25 @@ from published_fixtures import (
 from typer.testing import CliRunner
 
 from ccnv.cli import app
+from ccnv.features.cohort import (
+    cohort_from_fasta,
+    infer_sample_sexes,
+    load_cohort,
+    mask_low_coverage,
+    normalize_depth,
+    validate_cohort,
+)
 from ccnv.io.parquet import read_sample_parquet
-from ccnv.models import PredictConfig, ReadFilters, ReferenceConfig, parquet_path
+from ccnv.models import (
+    BRANCH_AUTOSOMAL,
+    BRANCH_FEMALE_SEX,
+    BRANCH_MALE_SEX,
+    PredictConfig,
+    ReadFilters,
+    ReferenceConfig,
+    ReferenceError,
+    parquet_path,
+)
 from ccnv.models.schemas import (
     REFERENCE_SCHEMA,
     SAMPLE_SCHEMA,
@@ -33,21 +50,11 @@ from ccnv.models.schemas import (
 )
 from ccnv.predict import run as predict
 from ccnv.reference import (
-    BRANCH_AUTOSOMAL,
-    BRANCH_FEMALE_SEX,
-    BRANCH_MALE_SEX,
     DEFAULT_SEX_CONTIGS,
-    ReferenceError,
     build_reference_table,
-    cohort_from_fasta,
-    fit_pca,
-    infer_sample_sexes,
-    load_cohort,
-    mask_low_coverage,
-    normalize_depth,
     run,
-    validate_cohort,
 )
+from ccnv.stats.pca import fit_pca
 
 
 def _sample_table(

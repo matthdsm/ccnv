@@ -1,16 +1,20 @@
 """Arrow Parquet table reading, writing, and contract validation for ccnv."""
 
+from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import overload
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ccnv.models import ArtifactKind, validate_table
+from ccnv.models import ArtifactKind, ReferenceError, SchemaError, validate_table
 
 __all__ = [
+    "load_cohort",
     "read_reference_parquet",
     "read_sample_parquet",
+    "read_sample_tables",
     "write_reference_parquet",
     "write_sample_parquet",
 ]
@@ -115,3 +119,37 @@ def write_reference_parquet(
         },
     )
     return path
+
+
+def _read_sample_for_cohort(path: Path | str) -> pa.Table:
+    p = Path(path)
+    try:
+        table = pq.read_table(p)
+    except (FileNotFoundError, OSError, pa.ArrowInvalid) as error:
+        raise ReferenceError(f"{p}: cannot read sample Parquet ({error})") from error
+    try:
+        validate_table(table, ArtifactKind.SAMPLE)
+    except SchemaError as error:
+        raise ReferenceError(f"{p}: {error}") from error
+    return table
+
+
+def read_sample_tables(
+    paths: Sequence[Path | str],
+    *,
+    threads: int = 1,
+) -> tuple[pa.Table, ...]:
+    """Read and validate multiple sample Parquet files into memory."""
+    if not paths:
+        raise ReferenceError("at least one sample Parquet path is required")
+    resolved = tuple(Path(p) for p in paths)
+    if threads > 1 and len(resolved) > 1:
+        max_workers = min(threads, len(resolved))
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            tables = list(executor.map(_read_sample_for_cohort, resolved))
+    else:
+        tables = [_read_sample_for_cohort(p) for p in resolved]
+    return tuple(tables)
+
+
+load_cohort = read_sample_tables

@@ -14,16 +14,14 @@ import numpy as np
 import pyarrow as pa
 import pysam
 
-from ccnv.features.binning import bin_counts, bin_intervals, rebin_counts
-from ccnv.features.cohort import rebin_sample_table
+from ccnv.features.binning import bin_counts, bin_intervals
 from ccnv.io.alignments import (
     alignment_format,
     ensure_index,
     open_alignment,
-    rejection_reason,
     stream_contig_reads,
 )
-from ccnv.io.parquet import read_sample_parquet, write_sample_parquet
+from ccnv.io.parquet import write_sample_parquet
 from ccnv.models import (
     SAMPLE_SCHEMA,
     ArtifactKind,
@@ -31,13 +29,12 @@ from ccnv.models import (
     ConvertError,
     GenomeProfile,
     ReadFilters,
-    is_canonical_contig,
     metadata_for,
     normalize_chr,
     parquet_path,
     select_layout,
 )
-from ccnv.qc.sample import QC_COUNTERS, build_sample_qc, empty_qc
+from ccnv.qc.sample import build_sample_qc, empty_qc
 
 logger = logging.getLogger(__name__)
 
@@ -45,15 +42,13 @@ _alignment_format = alignment_format
 _ensure_index = ensure_index
 _open_alignment = open_alignment
 
-# fmt: off
 __all__ = [
-    "QC_COUNTERS", "ConvertError", "bin_contig_with_handle", "bin_counts",
-    "bin_intervals", "empty_qc", "is_canonical_contig", "normalize_chr",
-    "read_sample_parquet", "rebin_counts", "rebin_sample_table",
-    "rejection_reason", "run", "run_convert", "select_layout",
-    "split_thread_budget", "write_sample_parquet",
+    "ConvertError",
+    "bin_contig_with_handle",
+    "run",
+    "run_convert",
+    "split_thread_budget",
 ]
-# fmt: on
 
 
 @dataclass(frozen=True, slots=True)

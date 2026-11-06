@@ -16,6 +16,8 @@ from ccnv.cli import app
 from ccnv.models import PredictConfig, ReadFilters, ReferenceConfig, parquet_path
 from ccnv.models.results import BinResult, SegmentResult
 from ccnv.models.schemas import (
+    BRANCH_AUTOSOMAL,
+    BRANCH_FEMALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
     PRENATAL_METADATA_KEY,
@@ -36,10 +38,6 @@ from ccnv.predict import (
     segment_and_call,
 )
 from ccnv.predict import run as run_predict
-from ccnv.reference import (
-    BRANCH_AUTOSOMAL,
-    BRANCH_FEMALE_SEX,
-)
 from ccnv.reference import run as build_reference
 from ccnv.report import (
     BINS_BED_HEADER,

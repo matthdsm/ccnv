@@ -19,7 +19,6 @@ from ccnv.qc.reference import (
     compute_signal_contig_metrics,
     evaluate_autosomal_or_female_verdict,
     evaluate_male_verdict,
-    run_reference_qc,
     run_reference_qc_on_table,
     write_reference_qc_json,
 )
@@ -48,7 +47,6 @@ __all__ = [
     "empty_qc",
     "evaluate_autosomal_or_female_verdict",
     "evaluate_male_verdict",
-    "run_reference_qc",
     "run_reference_qc_on_table",
     "write_predict_qc_json",
     "write_reference_qc_json",

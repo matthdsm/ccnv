@@ -13,7 +13,14 @@ import pyBigWig
 import pysam
 from numpy.typing import NDArray
 
-from ccnv.models import CovariateError, Cytoband, natural_sort_key, resolve_contig_name
+from ccnv.models import (
+    CovariateError,
+    Cytoband,
+    ReferenceError,
+    natural_sort_key,
+    resolve_contig_name,
+    select_layout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +28,7 @@ __all__ = [
     "load_cytobands_track",
     "load_gc_track",
     "load_mappability_track",
+    "read_fasta_contigs",
 ]
 
 _MAX_N_FRACTION: Final[float] = 0.5
@@ -462,3 +470,38 @@ def load_cytobands_track(
     return tuple(
         sorted(bands, key=lambda b: (natural_sort_key(b.contig), b.start, b.end))
     )
+
+
+def read_fasta_contigs(
+    fasta_path: Path | str,
+    *,
+    all_contigs: bool = False,
+) -> dict[str, int]:
+    """Read contig names and lengths from a FASTA file and select canonical layout."""
+    fasta = Path(fasta_path).expanduser().resolve()
+    if not fasta.is_file():
+        raise ReferenceError(f"FASTA not found: {fasta}")
+    if not Path(f"{fasta}.fai").is_file():
+        logger.debug("creating FASTA index for %s", fasta)
+        try:
+            pysam.faidx(str(fasta))
+        except Exception as error:
+            raise ReferenceError(f"failed to index FASTA {fasta}: {error}") from error
+    try:
+        handle = pysam.FastaFile(str(fasta))
+    except Exception as error:
+        raise ReferenceError(f"failed to open FASTA {fasta}: {error}") from error
+    try:
+        header_names = list(handle.references)
+        header_lengths = [int(length) for length in handle.lengths]
+    finally:
+        handle.close()
+    if any(length <= 0 for length in header_lengths):
+        raise ReferenceError(f"{fasta} contains non-positive contig lengths")
+    layout = select_layout(header_names, header_lengths, all_contigs=all_contigs)
+    if not layout:
+        raise ReferenceError(
+            f"{fasta} declares no canonical chromosomes; "
+            "pass --all-contigs to include every contig"
+        )
+    return {contig.name: contig.length for contig in layout}
