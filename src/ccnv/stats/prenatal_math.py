@@ -14,14 +14,11 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import HuberRegressor, Lasso, LinearRegression
 from sklearn.mixture import GaussianMixture
 
-from ccnv.stats.pca import pca_irlba_numpy
-
 __all__ = [
     "fit_lasso_fista",
     "fit_rprop_mlp",
     "infer_sex_gmm_1d",
     "ols_fit",
-    "pca_irlba_numpy",
     "rlm_huber",
     "train_olm",
 ]

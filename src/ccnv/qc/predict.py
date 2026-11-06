@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -18,6 +17,7 @@ from ccnv.models import (
     SegmentResult,
     decode_metadata,
 )
+from ccnv.qc.sample import sanitize_qc_payload
 
 __all__ = [
     "build_predict_qc_payload",
@@ -143,32 +143,11 @@ def build_predict_qc_payload(
     }
 
 
-def _sanitize(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {str(k): _sanitize(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_sanitize(v) for v in value]
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            return None
-        return round(value, 6)
-    if isinstance(value, (np.floating,)):
-        f = float(value)
-        return round(f, 6) if math.isfinite(f) else None
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.bool_,)):
-        return bool(value)
-    if isinstance(value, Path):
-        return str(value)
-    return value
-
-
 def write_predict_qc_json(path: Path | str, payload: Mapping[str, object]) -> Path:
     """Write formatted predict QC metrics to a JSON file."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    sanitized = _sanitize(dict(payload))
+    sanitized = sanitize_qc_payload(dict(payload))
     with open(target, "w", encoding="utf-8") as handle:
         json.dump(sanitized, handle, indent=2)
     return target

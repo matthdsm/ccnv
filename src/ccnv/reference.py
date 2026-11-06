@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Final
@@ -128,9 +127,9 @@ def run(config: ReferenceConfig) -> None:
 def build_reference_table(
     cohort: Cohort,
     config: ReferenceConfig,
-    sample_tables: Sequence[pa.Table] | None = None,
 ) -> pa.Table:
     """Fit autosomal and optional sex-contig branches into one reference table."""
+
     if cohort.counts.shape[1] < config.min_cohort_size:
         raise ReferenceError(
             f"provide at least {config.min_cohort_size} samples to build a reference"
@@ -167,12 +166,13 @@ def build_reference_table(
             for i in range(cohort.counts.shape[1])
         )
         prenatal_auto, prenatal_ffy, prenatal_meta, is_m = fit_prenatal_models(
-            sample_tables if sample_tables is not None else cohort,
+            cohort,
             entries,
             bin_size=eff_bs,
             prenatal_bin_size=config.prenatal_bin_size,
-            seed=getattr(config, "seed", 42),
+            seed=config.seed,
         )
+
         sexes = tuple("male" if m else "female" for m in np.array(is_m, dtype=np.bool_))
         sex_source, signal = "prenatal_model", _resolve_sex_signal(cohort, config)
         inference = SexInference(
@@ -281,12 +281,7 @@ def _validate_config(config: ReferenceConfig) -> None:
             "--mode prenatal requires a cohort --samplesheet."
         )
     has_samples, has_fasta = (
-        bool(
-            config.samples
-            or config.entries
-            or config.input_paths
-            or config.samplesheet_path
-        ),
+        bool(config.samples or config.entries or config.samplesheet_path),
         config.fasta is not None,
     )
     if not has_samples and not has_fasta:

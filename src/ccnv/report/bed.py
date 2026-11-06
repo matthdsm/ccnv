@@ -1,6 +1,6 @@
 """Formatted BED generation with bgzip compression and tabix indexing."""
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Final
 
@@ -92,9 +92,6 @@ def format_bed_float(value: float) -> str:
     return f"{value:.8g}"
 
 
-_format_bed_float = format_bed_float
-
-
 def sort_bin_result(result: BinResult) -> BinResult:
     """Sort BinResult bins in natural chromosome order, preserving coords."""
     if len(result.contigs) <= 1:
@@ -153,29 +150,25 @@ def sort_segments(segments: Iterable[SegmentResult]) -> tuple[SegmentResult, ...
     )
 
 
-def bin_bed_rows(results: tuple[BinResult, ...]) -> tuple[tuple[object, ...], ...]:
+def bin_bed_rows(results: tuple[BinResult, ...]) -> Iterator[tuple[object, ...]]:
     """Format bin records into BED tuples."""
-    rows: list[tuple[object, ...]] = []
     for result in results:
         for index in range(len(result.contigs)):
             contig = result.contigs[index]
             start = int(result.starts[index])
             end = int(result.ends[index])
-            rows.append(
-                (
-                    contig,
-                    start,
-                    end,
-                    f"{contig}:{start}-{end}",
-                    format_bed_float(float(result.ratios[index])),
-                    format_bed_float(float(result.zscores[index])),
-                    format_bed_float(float(result.weights[index])),
-                    int(result.reference_sizes[index]),
-                    "true" if bool(result.masked[index]) else "false",
-                    result.branch,
-                )
+            yield (
+                contig,
+                start,
+                end,
+                f"{contig}:{start}-{end}",
+                format_bed_float(float(result.ratios[index])),
+                format_bed_float(float(result.zscores[index])),
+                format_bed_float(float(result.weights[index])),
+                int(result.reference_sizes[index]),
+                "true" if bool(result.masked[index]) else "false",
+                result.branch,
             )
-    return tuple(rows)
 
 
 def prenatal_bed_fields(item: SegmentResult) -> tuple[object, ...]:

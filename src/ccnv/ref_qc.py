@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import pyarrow as pa
 
@@ -21,21 +20,12 @@ logger = logging.getLogger(__name__)
 __all__ = ["ReferenceQCError", "run_reference_qc"]
 
 
-def run_reference_qc(
-    config_or_path: ReferenceQCConfig | Path,
-    prefix: Path | None = None,
-) -> ReferenceQCOutputs:
+def run_reference_qc(config: ReferenceQCConfig) -> ReferenceQCOutputs:
     """Validate and run reference QC against a reference Parquet file."""
-    if isinstance(config_or_path, ReferenceQCConfig):
-        ref_path = config_or_path.reference.expanduser().resolve()
-        out_prefix = (
-            config_or_path.prefix
-            if config_or_path.prefix is not None
-            else ref_path.with_suffix("")
-        )
-    else:
-        ref_path = Path(config_or_path).expanduser().resolve()
-        out_prefix = prefix if prefix is not None else ref_path.with_suffix("")
+    ref_path = config.reference.expanduser().resolve()
+    out_prefix = (
+        config.prefix if config.prefix is not None else ref_path.with_suffix("")
+    )
 
     if not ref_path.is_file():
         raise ReferenceQCError(f"reference file not found: {ref_path}")

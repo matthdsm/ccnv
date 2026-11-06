@@ -6,12 +6,12 @@ import unittest.mock
 import numpy as np
 import scipy.special
 
+from ccnv.stats.pca import pca_irlba_numpy
 from ccnv.stats.prenatal_math import (
     fit_lasso_fista,
     fit_rprop_mlp,
     infer_sex_gmm_1d,
     ols_fit,
-    pca_irlba_numpy,
     rlm_huber,
     train_olm,
 )

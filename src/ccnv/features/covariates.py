@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import math
 from typing import Final
 
@@ -14,14 +13,7 @@ from ccnv.models import (
     DEFAULT_MIN_MAPPABILITY,
     CovariateError,
 )
-from ccnv.stats.regression import (
-    apply_1d_correction as _apply_1d_correction,
-)
-from ccnv.stats.regression import (
-    build_1d_basis as _build_1d_basis,
-)
-
-logger = logging.getLogger(__name__)
+from ccnv.stats.regression import apply_1d_correction, build_1d_basis
 
 __all__ = [
     "DEFAULT_MIN_MAPPABILITY",
@@ -85,12 +77,12 @@ def correct_covariate_bias(
         return data.copy()
 
     gc_design = (
-        _build_1d_basis(np.asarray(gc, dtype=np.float64)[mask], degree=3)
+        build_1d_basis(np.asarray(gc, dtype=np.float64)[mask], degree=3)
         if gc is not None and np.any(np.isfinite(np.asarray(gc)[mask]))
         else None
     )
     map_design = (
-        _build_1d_basis(np.asarray(mappability, dtype=np.float64)[mask], degree=2)
+        build_1d_basis(np.asarray(mappability, dtype=np.float64)[mask], degree=2)
         if (
             mappability is not None
             and np.any(np.isfinite(np.asarray(mappability)[mask]))
@@ -102,8 +94,8 @@ def correct_covariate_bias(
 
     out = data.copy()
     sub = out[mask]
-    sub = _apply_1d_correction(sub, gc_design)
-    sub = _apply_1d_correction(sub, map_design)
+    sub = apply_1d_correction(sub, gc_design)
+    sub = apply_1d_correction(sub, map_design)
     out[mask] = sub
     return out
 

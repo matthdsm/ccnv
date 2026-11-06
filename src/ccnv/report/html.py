@@ -40,9 +40,6 @@ def encode_b64(array: np.ndarray) -> str:
     return base64.b64encode(np.ascontiguousarray(array).tobytes()).decode("ascii")
 
 
-_encode_b64 = encode_b64
-
-
 def _load_template_source() -> str:
     """Load the genome plot Jinja2 template."""
     res = files("ccnv.report.templates").joinpath("genome_plot.html.j2")

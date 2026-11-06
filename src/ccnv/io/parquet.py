@@ -3,14 +3,20 @@
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import overload
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ccnv.models import ArtifactKind, ReferenceError, SchemaError, validate_table
+from ccnv.models import (
+    ArtifactKind,
+    ReferenceError,
+    SchemaError,
+    decode_metadata,
+    validate_table,
+)
 
 __all__ = [
+    "is_sample_parquet",
     "load_cohort",
     "read_reference_parquet",
     "read_sample_parquet",
@@ -18,6 +24,16 @@ __all__ = [
     "write_reference_parquet",
     "write_sample_parquet",
 ]
+
+
+def is_sample_parquet(path: Path | str) -> bool:
+    """Return True if path is a readable Parquet file with sample artifact metadata."""
+    try:
+        p = Path(path)
+        metadata = decode_metadata(pq.read_schema(p).metadata)
+    except OSError, TypeError, ValueError, SchemaError, pa.ArrowException:
+        return False
+    return metadata.get("artifact_kind") == ArtifactKind.SAMPLE.value
 
 
 def read_sample_parquet(path: Path | str) -> pa.Table:
@@ -28,35 +44,13 @@ def read_sample_parquet(path: Path | str) -> pa.Table:
     return table
 
 
-@overload
-def write_sample_parquet(table: pa.Table, path: Path | str) -> Path: ...
-
-
-@overload
-def write_sample_parquet(path: Path | str, table: pa.Table) -> Path: ...
-
-
-def write_sample_parquet(
-    arg1: pa.Table | Path | str,
-    arg2: Path | str | pa.Table,
-) -> Path:
-    """Validate sample table contract and persist as a zstd-compressed Parquet table.
-
-    Supports both (table, path) and legacy (path, table) calling conventions.
-    """
-    if isinstance(arg1, pa.Table):
-        table = arg1
-        path = Path(arg2)
-    elif isinstance(arg2, pa.Table):
-        table = arg2
-        path = Path(arg1)
-    else:
-        raise TypeError("write_sample_parquet requires a pa.Table and a Path")
-
+def write_sample_parquet(table: pa.Table, path: Path | str) -> Path:
+    """Validate sample table contract and persist as a zstd-compressed Parquet table."""
     validate_table(table, ArtifactKind.SAMPLE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, path, compression="zstd")
-    return path
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, out_path, compression="zstd")
+    return out_path
 
 
 def read_reference_parquet(path: Path | str) -> pa.Table:
@@ -67,48 +61,19 @@ def read_reference_parquet(path: Path | str) -> pa.Table:
     return table
 
 
-@overload
 def write_reference_parquet(
     table: pa.Table,
     path: Path | str,
-    *,
-    compression_level: int = 3,
-) -> Path: ...
-
-
-@overload
-def write_reference_parquet(
-    path: Path | str,
-    table: pa.Table,
-    *,
-    compression_level: int = 3,
-) -> Path: ...
-
-
-def write_reference_parquet(
-    arg1: pa.Table | Path | str,
-    arg2: Path | str | pa.Table,
     *,
     compression_level: int = 3,
 ) -> Path:
-    """Validate reference table contract and persist with dictionary and delta encoding.
-
-    Supports both (table, path) and legacy (path, table) calling conventions.
-    """
-    if isinstance(arg1, pa.Table):
-        table = arg1
-        path = Path(arg2)
-    elif isinstance(arg2, pa.Table):
-        table = arg2
-        path = Path(arg1)
-    else:
-        raise TypeError("write_reference_parquet requires a pa.Table and a Path")
-
+    """Validate reference table contract and persist with encodings."""
     validate_table(table, ArtifactKind.REFERENCE)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(
         table,
-        path,
+        out_path,
         compression="zstd",
         compression_level=compression_level,
         use_dictionary=["branch", "contig"],
@@ -118,7 +83,7 @@ def write_reference_parquet(
             "nearest_ref_indices.list.element": "DELTA_BINARY_PACKED",
         },
     )
-    return path
+    return out_path
 
 
 def _read_sample_for_cohort(path: Path | str) -> pa.Table:

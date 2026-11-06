@@ -397,21 +397,70 @@ def _assemble_cohort(
     )
 
 
-def load_cohort(
-    paths: Sequence[Path | str],
-    target_bin_size: int | None = None,
-    threads: int = 1,
-) -> Cohort:
-    """Load sample Parquet files and reject incompatible cohorts."""
-    if not paths:
-        raise ReferenceError("at least one sample Parquet path is required")
+def rebin_cohort(cohort: Cohort, target_bin_size: int) -> Cohort:
+    """Rescale 2D cohort count matrix to target_bin_size."""
+    if target_bin_size <= 0:
+        raise ValueError("target_bin_size must be a positive integer")
+    if cohort.bin_size == target_bin_size:
+        return cohort
 
-    from ccnv.io.parquet import read_sample_tables
+    contig_arr = np.asarray(cohort.contigs)
+    n_samples = cohort.counts.shape[1]
+    if len(contig_arr) == 0:
+        contig_slices: dict[str, tuple[int, int]] = {}
+    else:
+        changes = np.flatnonzero(contig_arr[1:] != contig_arr[:-1]) + 1
+        starts_idx = np.concatenate(([0], changes))
+        ends_idx = np.concatenate((changes, [len(contig_arr)]))
+        contig_slices = {
+            str(contig_arr[s]): (int(s), int(e))
+            for s, e in zip(starts_idx, ends_idx, strict=True)
+        }
 
-    resolved_paths = tuple(Path(p) for p in paths)
-    tables = read_sample_tables(resolved_paths, threads=threads)
-    return validate_cohort(
-        tables, paths=resolved_paths, target_bin_size=target_bin_size
+    new_c: list[str] = []
+    new_s: list[np.ndarray] = []
+    new_e: list[np.ndarray] = []
+    new_counts: list[np.ndarray] = []
+
+    for c_name, c_len in cohort.contig_lengths.items():
+        t_starts, t_ends = bin_intervals(int(c_len), target_bin_size)
+        span = contig_slices.get(c_name)
+        if span is None:
+            t_counts = np.zeros((t_starts.size, n_samples), dtype=np.float64)
+        else:
+            s_i, e_i = span
+            src_s = cohort.starts[s_i:e_i]
+            src_e = cohort.ends[s_i:e_i]
+            t_counts = np.column_stack(
+                [
+                    rebin_counts(
+                        src_s,
+                        src_e,
+                        cohort.counts[s_i:e_i, j],
+                        t_starts,
+                        t_ends,
+                    )
+                    for j in range(n_samples)
+                ]
+            )
+        new_c.extend([c_name] * t_starts.size)
+        new_s.append(t_starts)
+        new_e.append(t_ends)
+        new_counts.append(t_counts)
+
+    return Cohort(
+        contigs=tuple(new_c),
+        starts=np.concatenate(new_s) if new_s else np.empty(0, dtype=np.int64),
+        ends=np.concatenate(new_e) if new_e else np.empty(0, dtype=np.int64),
+        counts=(
+            np.vstack(new_counts)
+            if new_counts
+            else np.empty((0, n_samples), dtype=np.float64)
+        ),
+        contig_lengths=cohort.contig_lengths,
+        identities=cohort.identities,
+        bin_size=target_bin_size,
+        paths=cohort.paths,
     )
 
 
@@ -439,27 +488,18 @@ def validate_cohort(
 
 
 def cohort_from_fasta(
-    fasta: Path | str | Mapping[str, int],
+    contigs_dict: Mapping[str, int],
     bin_size: int,
     *,
     n_samples: int,
-    all_contigs: bool = False,
     fasta_path: Path | None = None,
 ) -> Cohort:
     """Build identical uniform-depth samples from FASTA contig lengths."""
     if n_samples < 1:
         raise ReferenceError("n_samples must be a positive integer")
-    if isinstance(fasta, Mapping):
-        names = list(fasta.keys())
-        lengths = [int(v) for v in fasta.values()]
-        source_path = fasta_path or Path("flat_fasta")
-    else:
-        from ccnv.io.tracks import read_fasta_contigs
-
-        source_path = Path(fasta).expanduser().resolve()
-        contig_dict = read_fasta_contigs(source_path, all_contigs=all_contigs)
-        names = list(contig_dict.keys())
-        lengths = list(contig_dict.values())
+    names = list(contigs_dict.keys())
+    lengths = [int(v) for v in contigs_dict.values()]
+    source_path = fasta_path or Path("flat_fasta")
 
     contigs: list[str] = []
     starts: list[int] = []

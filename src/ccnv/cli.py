@@ -9,23 +9,19 @@ from pathlib import Path
 from time import perf_counter
 from typing import Annotated, NoReturn, cast
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 import typer
 
 from ccnv.convert import ConvertError
 from ccnv.convert import run as run_convert
+from ccnv.io.parquet import is_sample_parquet
 from ccnv.models import (
     DEFAULT_BIN_SIZE,
     DEFAULT_MIN_MAPPABILITY,
-    ArtifactKind,
     ConvertConfig,
     PredictConfig,
     ReadFilters,
     ReferenceConfig,
     ReferenceQCConfig,
-    SchemaError,
-    decode_metadata,
 )
 from ccnv.models import (
     AnalysisMode as AnalysisModeLiteral,
@@ -171,7 +167,7 @@ def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
             matches = [
                 candidate.resolve()
                 for candidate in sorted(resolved.rglob("*.ccnv"))
-                if _is_sample_parquet(candidate)
+                if is_sample_parquet(candidate)
             ]
             if not matches:
                 raise SampleInputError(f"{path} contains no sample CCNV files")
@@ -184,20 +180,6 @@ def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
             seen.add(resolved)
             samples.append(resolved)
     return tuple(samples)
-
-
-def _is_sample_parquet(path: Path) -> bool:
-    try:
-        metadata = decode_metadata(pq.read_schema(path).metadata)
-    except (
-        OSError,
-        TypeError,
-        ValueError,
-        SchemaError,
-        pa.ArrowException,
-    ):
-        return False
-    return metadata.get("artifact_kind") == ArtifactKind.SAMPLE.value
 
 
 @app.command()

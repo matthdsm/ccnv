@@ -414,9 +414,19 @@ class TestReport(unittest.TestCase):
                 recs = list(vf.fetch("chr1"))
                 self.assertEqual(len(recs), 2)
                 self.assertNotIn("DISCORDANT", recs[0].info)
-                self.assertNotIn("EXP_LOG2R", recs[0].samples["prenatal_sample"])
+                self.assertAlmostEqual(
+                    recs[0].samples["prenatal_sample"]["EXP_LOG2R"],
+                    0.084,
+                    places=3,
+                )
+                self.assertAlmostEqual(
+                    recs[0].samples["prenatal_sample"]["IMPLIED_FF"],
+                    0.115,
+                    places=3,
+                )
 
                 self.assertTrue(recs[1].info["DISCORDANT"])
+
                 self.assertEqual(recs[1].info["DISC_REASON"], "SUB_FETAL_RATIO")
                 self.assertAlmostEqual(
                     recs[1].samples["prenatal_sample"]["EXP_LOG2R"],

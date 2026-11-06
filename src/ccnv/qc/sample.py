@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Final
+
+import numpy as np
 
 QC_COUNTERS: Final[tuple[str, ...]] = (
     "header_mapped",
@@ -28,7 +32,30 @@ __all__ = [
     "QC_COUNTERS",
     "build_sample_qc",
     "empty_qc",
+    "sanitize_qc_payload",
 ]
+
+
+def sanitize_qc_payload(value: object) -> object:
+    """Recursively convert NumPy scalars and special floats to JSON-safe types."""
+    if isinstance(value, Mapping):
+        return {str(k): sanitize_qc_payload(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [sanitize_qc_payload(v) for v in value]
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return round(value, 6)
+    if isinstance(value, (np.floating,)):
+        f = float(value)
+        return round(f, 6) if math.isfinite(f) else None
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
 def empty_qc() -> dict[str, int]:

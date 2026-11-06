@@ -67,12 +67,14 @@ def ensure_index(
     """Verify an alignment index exists, generating one on-the-fly if missing."""
     if fmt is None:
         fmt = alignment_format(path)
-    if handle is not None and handle.has_index():
+    if handle is None:
+        handle = open_alignment(path, fmt, fasta, threads=threads)
+    if handle.has_index():
         logger.debug("%s already has an index", path)
         return handle
-    if handle is not None:
-        handle.close()
+    handle.close()
     kind = "CRAM" if fmt == "cram" else "BAM"
+
     logger.debug("creating %s index for %s", kind, path)
     try:
         pysam.index(str(path))

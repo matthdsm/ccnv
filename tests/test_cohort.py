@@ -8,7 +8,8 @@ import numpy as np
 import pyarrow.parquet as pq
 from helpers import make_sample_table
 
-from ccnv.features.cohort import load_cohort, validate_cohort
+from ccnv.features.cohort import rebin_cohort, validate_cohort
+from ccnv.io.parquet import read_sample_tables
 from ccnv.models.exceptions import ReferenceError
 
 
@@ -84,8 +85,8 @@ class TestCohortLoading(unittest.TestCase):
                 pq.write_table(t, p)
                 paths.append(p)
 
-            cohort_seq = load_cohort(tuple(paths), threads=1)
-            cohort_par = load_cohort(tuple(paths), threads=2)
+            cohort_seq = validate_cohort(read_sample_tables(tuple(paths), threads=1))
+            cohort_par = validate_cohort(read_sample_tables(tuple(paths), threads=2))
 
             np.testing.assert_array_equal(cohort_seq.counts, cohort_par.counts)
             self.assertEqual(cohort_seq.contigs, cohort_par.contigs)
@@ -93,6 +94,10 @@ class TestCohortLoading(unittest.TestCase):
             np.testing.assert_array_equal(cohort_seq.ends, cohort_par.ends)
             self.assertEqual(cohort_seq.contig_lengths, cohort_par.contig_lengths)
             self.assertEqual(cohort_seq.bin_size, cohort_par.bin_size)
+
+            rebinned = rebin_cohort(cohort_seq, 2000)
+            self.assertEqual(rebinned.bin_size, 2000)
+            self.assertEqual(rebinned.counts.shape, (2, 4))
 
 
 if __name__ == "__main__":

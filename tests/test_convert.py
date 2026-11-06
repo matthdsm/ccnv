@@ -241,7 +241,7 @@ class TestConvertAlignment(unittest.TestCase):
             bam_path.touch()
             alignment = FakeAlignment()
             with (
-                patch("ccnv.convert._open_alignment", return_value=alignment),
+                patch("ccnv.convert.open_alignment", return_value=alignment),
                 self.assertRaises(ConvertError),
             ):
                 run(ConvertConfig(bam_path, Path(tmpdir) / "out", bin_size=100))
@@ -561,10 +561,10 @@ class TestParallelBinning(unittest.TestCase):
                 self.assertLessEqual(workers * decode, budget)
 
     def test_open_alignment_forwards_htslib_threads(self) -> None:
-        with patch("ccnv.convert.pysam.AlignmentFile") as alignment_file:
-            from ccnv.convert import _open_alignment
+        with patch("ccnv.io.alignments.pysam.AlignmentFile") as alignment_file:
+            from ccnv.io.alignments import open_alignment
 
-            _open_alignment(Path("sample.bam"), "bam", None, threads=4)
+            open_alignment(Path("sample.bam"), "bam", None, threads=4)
             alignment_file.assert_called_once()
             self.assertEqual(alignment_file.call_args.kwargs["threads"], 4)
 

@@ -23,12 +23,13 @@ from ccnv.cli import app
 from ccnv.features.cohort import (
     cohort_from_fasta,
     infer_sample_sexes,
-    load_cohort,
     mask_low_coverage,
     normalize_depth,
     validate_cohort,
 )
 from ccnv.io.parquet import read_sample_parquet
+from ccnv.io.parquet import read_sample_tables as load_cohort
+from ccnv.io.tracks import read_fasta_contigs
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
@@ -610,7 +611,9 @@ class TestFlatFastaReference(unittest.TestCase):
                 Path(tmpdir) / "genome.fa",
                 (("chr1", 250), ("chr2", 150), ("chrX", 100)),
             )
-            cohort = cohort_from_fasta(fasta, 100, n_samples=2)
+            contigs_dict = read_fasta_contigs(fasta)
+            cohort = cohort_from_fasta(contigs_dict, 100, n_samples=2, fasta_path=fasta)
+
             self.assertEqual(cohort.bin_size, 100)
             self.assertEqual(
                 cohort.contigs, ("chr1", "chr1", "chr1", "chr2", "chr2", "chrX")

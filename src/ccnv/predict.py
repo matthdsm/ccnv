@@ -295,18 +295,30 @@ def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
         raise PredictError(f"branch {branch!r} bin count mismatch")
 
     c_vals = ref_b.column("contig").to_pylist()
-    starts = np.asarray(ref_b.column("start").to_pylist(), dtype=np.int64)
-    ends = np.asarray(ref_b.column("end").to_pylist(), dtype=np.int64)
-    counts = np.asarray(sample_branch.column("count").to_pylist(), dtype=np.float64)
-    masked = np.asarray(ref_b.column("masked").to_pylist(), dtype=np.bool_)
-    gc_col, map_col = (
-        np.asarray(ref_b.column("gc").to_pylist(), dtype=np.float32),
-        np.asarray(ref_b.column("mappability").to_pylist(), dtype=np.float32),
+    starts = np.asarray(
+        ref_b.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
+    )
+    ends = np.asarray(
+        ref_b.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
+    )
+    counts = np.asarray(
+        sample_branch.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
+    )
+    masked = np.asarray(
+        ref_b.column("masked").to_numpy(zero_copy_only=False), dtype=np.bool_
+    )
+    gc_col = np.asarray(
+        ref_b.column("gc").to_numpy(zero_copy_only=False), dtype=np.float32
+    )
+    map_col = np.asarray(
+        ref_b.column("mappability").to_numpy(zero_copy_only=False), dtype=np.float32
     )
     gc = gc_col if np.any(gc_col >= 0) else None
     map_ = map_col if np.any(map_col >= 0) else None
     unmasked = ~masked
-    pca_m = np.asarray(ref_b.column("pca_mean").to_pylist(), dtype=np.float64)[unmasked]
+    pca_m = np.asarray(
+        ref_b.column("pca_mean").to_numpy(zero_copy_only=False), dtype=np.float64
+    )[unmasked]
     raw_ld = [
         item
         for item, keep in zip(
@@ -327,19 +339,19 @@ def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
         if keep
     ]
     nearest_idx = tuple(np.asarray(nbrs, dtype=np.int32) for nbrs in raw_nbrs)
-    mean_dist = np.asarray(ref_b.column("mean_distance").to_pylist(), dtype=np.float32)[
-        unmasked
-    ]
+    mean_dist = np.asarray(
+        ref_b.column("mean_distance").to_numpy(zero_copy_only=False), dtype=np.float32
+    )[unmasked]
     nearest_dst = tuple(
         np.full(nbrs.shape, dist, dtype=np.float32)
         for nbrs, dist in zip(nearest_idx, mean_dist, strict=True)
     )
-    null_m = np.asarray(ref_b.column("null_mean").to_pylist(), dtype=np.float64)[
-        unmasked
-    ]
-    null_s = np.asarray(ref_b.column("null_std").to_pylist(), dtype=np.float64)[
-        unmasked
-    ]
+    null_m = np.asarray(
+        ref_b.column("null_mean").to_numpy(zero_copy_only=False), dtype=np.float64
+    )[unmasked]
+    null_s = np.asarray(
+        ref_b.column("null_std").to_numpy(zero_copy_only=False), dtype=np.float64
+    )[unmasked]
     return BranchModel(
         branch=branch,
         contigs=tuple(c_vals),
@@ -688,7 +700,9 @@ def _resolve_sample_sex(
         raise PredictError("cannot infer sample sex; pass --sex female or --sex male")
     contigs, counts = (
         np.asarray(sample.column("contig").to_pylist(), dtype=object),
-        np.asarray(sample.column("count").to_pylist(), dtype=np.float64),
+        np.asarray(
+            sample.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
+        ),
     )
     total = float(np.sum(counts))
     if total <= 0:

@@ -115,9 +115,3 @@ def apply_1d_correction(
             corrected *= orig_sum / new_sum
         arr2d[:, s_idx] = corrected
     return out
-
-
-# Private aliases for backward compatibility with covariates.py
-_build_1d_basis = build_1d_basis
-_fit_sample_trend = fit_sample_trend
-_apply_1d_correction = apply_1d_correction

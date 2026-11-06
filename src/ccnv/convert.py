@@ -38,10 +38,6 @@ from ccnv.qc.sample import build_sample_qc, empty_qc
 
 logger = logging.getLogger(__name__)
 
-_alignment_format = alignment_format
-_ensure_index = ensure_index
-_open_alignment = open_alignment
-
 __all__ = [
     "ConvertError",
     "bin_contig_with_handle",
@@ -84,7 +80,7 @@ def _worker_handle(task: _ContigTask) -> pysam.AlignmentFile:
         task.decode_threads,
     )
     if key not in _WORKER_HANDLES:
-        _WORKER_HANDLES[key] = _open_alignment(
+        _WORKER_HANDLES[key] = open_alignment(
             task.path, task.fmt, task.fasta, threads=task.decode_threads
         )
     return _WORKER_HANDLES[key]
@@ -127,7 +123,8 @@ def run(config: ConvertConfig) -> None:
 
     fmt = alignment_format(alignment)
     logger.debug("opening alignment %s as %s", alignment, fmt)
-    bam = _open_alignment(alignment, fmt, config.fasta)
+    bam = open_alignment(alignment, fmt, config.fasta)
+
     try:
         if bam.has_index():
             logger.debug("%s already has an index", alignment)
@@ -149,7 +146,7 @@ def run(config: ConvertConfig) -> None:
         workers, decode_threads = split_thread_budget(config.threads, len(layout))
         if workers <= 1 and decode_threads > 1:
             bam.close()
-            bam = _open_alignment(alignment, fmt, config.fasta, threads=decode_threads)
+            bam = open_alignment(alignment, fmt, config.fasta, threads=decode_threads)
 
         qc = empty_qc()
         qc["header_mapped"], qc["header_unmapped"], qc["header_no_coordinate"] = (
@@ -264,7 +261,7 @@ def run(config: ConvertConfig) -> None:
     table = pa.table(columns, schema=SAMPLE_SCHEMA.with_metadata(metadata))
     output = parquet_path(config.prefix)
     logger.debug("writing sample parquet %s (%d bins)", output, table.num_rows)
-    write_sample_parquet(output, table)
+    write_sample_parquet(table, output)
     logger.debug(
         "wrote sample parquet %s (%.1f KB)",
         output,

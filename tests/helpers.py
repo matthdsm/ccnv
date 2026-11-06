@@ -87,7 +87,7 @@ def write_synthetic_sample(
 ) -> Path:
     table = make_sample_table(counts, **kwargs)
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_sample_parquet(path, table)
+    write_sample_parquet(table, path)
     return path
 
 

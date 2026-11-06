@@ -27,9 +27,6 @@ def vcf_float(value: float) -> float | None:
     return float(value) if np.isfinite(value) else None
 
 
-_vcf_float = vcf_float
-
-
 def build_vcf_header(
     contig_lengths: dict[str, int],
     sample_name: str,
@@ -204,11 +201,12 @@ def write_segments_vcf(
             sample["ZSCORE"] = vcf_float(item.zscore)
             sample["WEIGHT"] = vcf_float(item.weight)
             sample["BINS"] = int(item.bin_count)
-            if is_prenatal and item.discordant:
+            if is_prenatal:
                 if item.expected_ratio is not None:
                     sample["EXP_LOG2R"] = vcf_float(item.expected_ratio)
                 if item.implied_ff is not None:
                     sample["IMPLIED_FF"] = vcf_float(item.implied_ff)
             vf.write(rec)
+
     pysam.tabix_index(str(gz_path), preset="vcf", force=True)
     return gz_path

@@ -20,11 +20,11 @@ from ccnv.models import (
     BRANCH_MALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
-    ReferenceQCConfig,
     ReferenceQCError,
     ReferenceQCOutputs,
     decode_metadata,
 )
+from ccnv.qc.sample import sanitize_qc_payload
 
 DEFAULT_MIN_REF_BINS: Final[int] = 150
 OUTLIER_N_SIGMA: Final[float] = 3.0
@@ -55,7 +55,6 @@ __all__ = [
     "OUTLIER_N_SIGMA",
     "SEVERITY_TO_VERDICT",
     "VERDICT_SEVERITY",
-    "ReferenceQCConfig",
     "ReferenceQCError",
     "compute_branch_qc",
     "compute_signal_contig_metrics",
@@ -315,8 +314,9 @@ def write_reference_qc_json(path: Path | str, data: Mapping[str, object]) -> Pat
     """Serialize reference quality metrics to a JSON file."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    sanitized = sanitize_qc_payload(dict(data))
     with open(target, "w", encoding="utf-8") as handle:
-        json.dump(dict(data), handle, indent=2)
+        json.dump(sanitized, handle, indent=2)
     logger.debug("wrote reference QC report to %s", target)
     return target
 

@@ -9,6 +9,7 @@ from ccnv.io.alignments import (
     stream_contig_reads,
 )
 from ccnv.io.parquet import (
+    is_sample_parquet,
     load_cohort,
     read_reference_parquet,
     read_sample_parquet,
@@ -29,6 +30,7 @@ from ccnv.io.tracks import (
 __all__ = [
     "alignment_format",
     "ensure_index",
+    "is_sample_parquet",
     "load_cohort",
     "load_cytobands_track",
     "load_gc_track",

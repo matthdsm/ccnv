@@ -15,6 +15,7 @@ from ccnv.io.alignments import (
     stream_contig_reads,
 )
 from ccnv.io.parquet import (
+    is_sample_parquet,
     read_reference_parquet,
     read_sample_parquet,
     write_reference_parquet,
@@ -210,13 +211,7 @@ class TestParquetIO(unittest.TestCase):
             loaded = read_sample_parquet(path)
             self.assertEqual(loaded.num_rows, 2)
             self.assertEqual(loaded.column("start").to_pylist(), [0, 100])
-
-            # Write (path, table) legacy signature
-            path2 = Path(tmpdir) / "sample2.parquet"
-            out2 = write_sample_parquet(path2, table)
-            self.assertEqual(out2, path2)
-            loaded2 = read_sample_parquet(path2)
-            self.assertEqual(loaded2.num_rows, 2)
+            self.assertTrue(is_sample_parquet(path))
 
     def test_reference_parquet_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

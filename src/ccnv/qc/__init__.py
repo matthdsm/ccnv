@@ -13,7 +13,6 @@ from ccnv.qc.reference import (
     OUTLIER_N_SIGMA,
     SEVERITY_TO_VERDICT,
     VERDICT_SEVERITY,
-    ReferenceQCConfig,
     ReferenceQCError,
     compute_branch_qc,
     compute_signal_contig_metrics,
@@ -26,6 +25,7 @@ from ccnv.qc.sample import (
     QC_COUNTERS,
     build_sample_qc,
     empty_qc,
+    sanitize_qc_payload,
 )
 
 __all__ = [
@@ -38,7 +38,6 @@ __all__ = [
     "QC_COUNTERS",
     "SEVERITY_TO_VERDICT",
     "VERDICT_SEVERITY",
-    "ReferenceQCConfig",
     "ReferenceQCError",
     "build_predict_qc_payload",
     "build_sample_qc",
@@ -48,6 +47,7 @@ __all__ = [
     "evaluate_autosomal_or_female_verdict",
     "evaluate_male_verdict",
     "run_reference_qc_on_table",
+    "sanitize_qc_payload",
     "write_predict_qc_json",
     "write_reference_qc_json",
 ]
