@@ -10,6 +10,7 @@ from typing import Final, Literal
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import scipy.stats
 from numpy.typing import ArrayLike, NDArray
 
@@ -240,13 +241,13 @@ def load_inputs(
         )
         sample = rebin_sample_table(sample, reference_bin_size)
     active_ref = reference.filter(
-        pa.compute.is_in(reference.column("branch"), pa.array(branches))
+        pc.is_in(reference.column("branch"), pa.array(branches))
     )
     for contig_name in set(active_ref.column("contig").unique().to_pylist()):
         if sample_lens.get(contig_name) != ref_lens.get(contig_name):
             raise PredictError(f"contig length mismatch for {contig_name!r}")
     sample_active = sample.filter(
-        pa.compute.is_in(
+        pc.is_in(
             sample.column("contig"),
             pa.array(list(set(active_ref.column("contig").unique().to_pylist()))),
         )
@@ -269,14 +270,12 @@ def load_inputs(
 
 def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
     """Build dense NumPy arrays for one reference branch."""
-    ref_b = inputs.reference.filter(
-        pa.compute.equal(inputs.reference.column("branch"), branch)
-    )
+    ref_b = inputs.reference.filter(pc.equal(inputs.reference.column("branch"), branch))
     if ref_b.num_rows == 0:
         raise PredictError(f"branch {branch!r} has no reference rows")
     ref_coords = set(bin_coordinates(ref_b))
     sm_b = inputs.sample.filter(
-        pa.compute.is_in(
+        pc.is_in(
             inputs.sample.column("contig"),
             pa.array(list(set(ref_b.column("contig").unique().to_pylist()))),
         )
