@@ -55,7 +55,7 @@ from ccnv.stats.neighbors import (
 )
 from ccnv.stats.pca import fit_pca
 
-DEFAULT_SEX_CONTIGS: Final[tuple[str, ...]] = ("X", "Y", "chrX", "chrY")
+DEFAULT_SEX_CONTIGS: Final[list[str]] = ["X", "Y", "chrX", "chrY"]
 DEFAULT_SEX_SIGNAL_CONTIGS: Final[tuple[str, ...]] = ("chrY", "Y")
 
 logger = logging.getLogger(__name__)

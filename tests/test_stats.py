@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-import ccnv.stats as stats
+from ccnv import stats
 from ccnv.models.exceptions import ReferenceError
 from ccnv.stats.neighbors import (
     compute_null_models,

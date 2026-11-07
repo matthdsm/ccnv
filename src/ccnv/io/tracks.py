@@ -307,12 +307,7 @@ def _load_bed_gc(
         with opener(resolved, "rt", encoding="utf-8") as handle:
             for line_num, raw in enumerate(handle, start=1):
                 line = raw.strip()
-                if (
-                    not line
-                    or line.startswith("#")
-                    or line.startswith("track")
-                    or line.startswith("browser")
-                ):
+                if not line or line.startswith(("#", "track", "browser")):
                     continue
                 parts = line.split()
                 if len(parts) < 4:
@@ -432,7 +427,7 @@ def load_cytobands_track(
     with open_fn(path, "rt", encoding="utf-8") as handle:
         for raw_line in handle:
             line = raw_line.strip()
-            if not line or line.startswith("#") or line.startswith("track"):
+            if not line or line.startswith(("#", "track")):
                 continue
             fields = line.split("\t") if "\t" in line else line.split()
             if len(fields) < 4:

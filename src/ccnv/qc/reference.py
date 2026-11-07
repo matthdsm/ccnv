@@ -188,7 +188,7 @@ def evaluate_male_verdict(
                     result,
                     (
                         "FAIL",
-                        f"usable {sig_name} bins = {usable_pct:.1f}% (<{CHRY_MIN_USABLE_PCT_FAIL:.0f}%)",  # noqa: E501
+                        f"usable {sig_name} bins = {usable_pct:.1f}% (<{CHRY_MIN_USABLE_PCT_FAIL:.0f}%)",
                     ),
                 )
             elif usable_pct < CHRY_MIN_USABLE_PCT_WARN:
@@ -196,7 +196,7 @@ def evaluate_male_verdict(
                     result,
                     (
                         "WARN",
-                        f"usable {sig_name} bins = {usable_pct:.1f}% (<{CHRY_MIN_USABLE_PCT_WARN:.0f}%)",  # noqa: E501
+                        f"usable {sig_name} bins = {usable_pct:.1f}% (<{CHRY_MIN_USABLE_PCT_WARN:.0f}%)",
                     ),
                 )
         ym = cy.get("mean_of_means")
@@ -206,7 +206,7 @@ def evaluate_male_verdict(
                     result,
                     (
                         "FAIL",
-                        f"{sig_name} mean distance = {float(ym):.1f} (very poor {sig_name})",  # noqa: E501
+                        f"{sig_name} mean distance = {float(ym):.1f} (very poor {sig_name})",
                     ),
                 )
             elif float(ym) > CHRY_MEAN_DIST_WARN:
@@ -329,7 +329,7 @@ def run_reference_qc_on_table(
     write_json: bool = True,
     emit_stderr: bool = True,
 ) -> ReferenceQCOutputs:
-    """Analyze an in-memory or loaded reference table, evaluate verdict, and write JSON."""  # noqa: E501
+    """Analyze an in-memory or loaded reference table, evaluate verdict, and write JSON."""
     metadata = decode_metadata(table.schema.metadata)
     model = metadata.get("model", {})
     if not isinstance(model, dict):

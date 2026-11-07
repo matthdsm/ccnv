@@ -109,7 +109,7 @@ class PrenatalModelMetadata:
     def from_dict(cls, data: Mapping[str, Any]) -> PrenatalModelMetadata:
         raw_bin_size = data["prenatal_bin_size"]
         if isinstance(raw_bin_size, bool):
-            raise ValueError(
+            raise TypeError(
                 f"prenatal_bin_size must be a positive integer, got {raw_bin_size!r}"
             )
         raw_b2 = data["mlp_b2"]

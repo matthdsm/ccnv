@@ -529,7 +529,7 @@ class TestDomainModels(unittest.TestCase):
 
 class TestModelReExports(unittest.TestCase):
     def test_reexports_from_root_models(self) -> None:
-        import ccnv.models as models
+        from ccnv import models
 
         expected_symbols = [
             "ConvertConfig",
