@@ -9,7 +9,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pysam
-from published_fixtures import CHR21_LENGTH, convert_published_samples
+from published_fixtures import CHR21_LENGTH, extract_published_samples
 from typer.testing import CliRunner
 
 from ccnv.cli import app
@@ -641,7 +641,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            sample_a, sample_b = convert_published_samples(root)
+            sample_a, sample_b = extract_published_samples(root)
             reference_prefix = root / "reference"
             build_reference(
                 ReferenceConfig(

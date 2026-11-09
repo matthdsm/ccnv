@@ -6,7 +6,7 @@ The `ccnv.models` package defines pure domain models, configuration containers, 
 
 ## Interface
 
-- `[src/ccnv/models/config.py:ConvertConfig]`, `[src/ccnv/models/config.py:ReferenceConfig]`, `[src/ccnv/models/config.py:PredictConfig]`, `[src/ccnv/models/config.py:ReferenceQCConfig]`: Strongly-typed configuration containers for CLI orchestrators.
+- `[src/ccnv/models/config.py:ExtractConfig]`, `[src/ccnv/models/config.py:ReferenceConfig]`, `[src/ccnv/models/config.py:PredictConfig]`, `[src/ccnv/models/config.py:ReferenceQCConfig]`: Strongly-typed configuration containers for CLI orchestrators.
 - `[src/ccnv/models/config.py:ReadFilters]`: Dataclass governing BAM/CRAM read filtering criteria (MAPQ, duplicates, secondary, supplementary).
 - `[src/ccnv/models/config.py:parquet_path]`: Resolves the canonical `.ccnv` artifact path from a prefix.
 - `[src/ccnv/models/domain.py:Contig]`: Structural contig representation holding name, length, and index.
@@ -14,7 +14,7 @@ The `ccnv.models` package defines pure domain models, configuration containers, 
 - `[src/ccnv/models/domain.py:SamplesheetEntry]`: Structured record for cohort samplesheet rows.
 - `[src/ccnv/models/domain.py:natural_sort_key]`: Deterministic natural sorting comparator for human and organism contig naming schemes.
 - `[src/ccnv/models/domain.py:select_layout]`: Resolves and validates target contigs and header ordering.
-- `[src/ccnv/models/exceptions.py:CcnvError]`: Root exception for all toolkit errors, subclassed by stage-specific exceptions (`ConvertError`, `ReferenceError`, `PredictError`, `SchemaError`).
+- `[src/ccnv/models/exceptions.py:CcnvError]`: Root exception for all toolkit errors, subclassed by stage-specific exceptions (`ExtractError`, `ReferenceError`, `PredictError`, `SchemaError`).
 - `[src/ccnv/models/results.py:BinResult]`: Per-contig binned observed depth, expected baseline, normalized ratios, and Z-scores.
 - `[src/ccnv/models/results.py:SegmentResult]`: Segment change-point interval with weighted mean ratio, mean Z-score, gain/loss call, and prenatal annotations.
 - `[src/ccnv/models/results.py:PredictionOutputs]`: Comprehensive container of output paths and result data structures.

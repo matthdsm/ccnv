@@ -544,7 +544,7 @@ class TestReferencePublishedCrams(unittest.TestCase):
                 result = runner.invoke(
                     app,
                     [
-                        "convert",
+                        "extract",
                         str(cram),
                         "--fasta",
                         str(fasta),

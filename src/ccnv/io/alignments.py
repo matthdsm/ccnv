@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pysam
 
-from ccnv.models import ConvertError, ReadFilters
+from ccnv.models import ExtractError, ReadFilters
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ def alignment_format(path: Path) -> str:
         return "bam"
     if suffix == ".cram":
         return "cram"
-    raise ConvertError(f"{path} must be BAM or CRAM (found suffix {path.suffix!r})")
+    raise ExtractError(f"{path} must be BAM or CRAM (found suffix {path.suffix!r})")
 
 
 def open_alignment(
@@ -42,12 +42,12 @@ def open_alignment(
     decode_threads = max(1, threads)
     if fmt == "cram":
         if fasta is None:
-            raise ConvertError(
+            raise ExtractError(
                 f"{path} is CRAM and requires a reference FASTA. "
                 "Pass --fasta /path/to/reference.fa (indexed with samtools faidx)."
             )
         if not fasta.is_file():
-            raise ConvertError(f"CRAM reference FASTA not found: {fasta}")
+            raise ExtractError(f"CRAM reference FASTA not found: {fasta}")
         return pysam.AlignmentFile(
             str(path),
             "rc",
@@ -79,14 +79,14 @@ def ensure_index(
     try:
         pysam.index(str(path))
     except Exception as error:
-        raise ConvertError(
+        raise ExtractError(
             f"failed to create {kind} index for {path}: {error}"
         ) from error
     new_handle = open_alignment(path, fmt, fasta, threads=threads)
     if new_handle.has_index():
         return new_handle
     new_handle.close()
-    raise ConvertError(f"failed to create {kind} index for {path}")
+    raise ExtractError(f"failed to create {kind} index for {path}")
 
 
 def read_alignment_header(

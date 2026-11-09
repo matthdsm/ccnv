@@ -1,15 +1,15 @@
 # CLI Reference
 
-`ccnv` provides four subcommands: `convert`, `reference`, `ref-qc`, and `predict`. Commands accept `--prefix` and append canonical suffixes automatically; do not include file extensions in `--prefix`.
+`ccnv` provides four subcommands: `extract`, `reference`, `ref-qc`, and `predict`. Commands accept `--prefix` and append canonical suffixes automatically; do not include file extensions in `--prefix`.
 
 Every command accepts `-h`/`--help` and `--loglevel` (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`; default `WARNING`). See [Pipeline Architecture](pipeline.md) for algorithmic details.
 
-## `convert`
+## `extract`
 
 Stream a BAM or CRAM alignment into binned counts (`<prefix>.ccnv`). Missing `.bai`/`.crai` indexes are created automatically with `pysam`.
 
 ```console
-ccnv convert ALIGNMENT [--prefix PREFIX] [options]
+ccnv extract ALIGNMENT [--prefix PREFIX] [options]
 ```
 
 | Flag / Argument | Default | Description |
@@ -107,7 +107,7 @@ ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
 
 | Flag / Argument | Default | Description |
 | --- | --- | --- |
-| `SAMPLE` | required | Sample `.ccnv` file from `convert`. |
+| `SAMPLE` | required | Sample `.ccnv` file from `extract`. |
 | `REFERENCE` | required | Reference `.ccnv` file from `reference`. |
 | `--mode` | `germline` | Prediction mode: `germline` (standard diploid CNV analysis) or `prenatal` (joint CNV, fetal fraction, SCA, and discordance analysis). |
 | `--prefix` | sample stem | Output path prefix. |

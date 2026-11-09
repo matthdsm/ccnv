@@ -31,21 +31,21 @@ def _cli_text(output: str) -> str:
 
 
 class TestCliPathChecks(unittest.TestCase):
-    def test_convert_rejects_missing_alignment(self) -> None:
+    def test_extract_rejects_missing_alignment(self) -> None:
         result = CliRunner().invoke(
-            app, ["convert", "/does/not/exist.bam", "--prefix", "out"]
+            app, ["extract", "/does/not/exist.bam", "--prefix", "out"]
         )
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("does not exist", _cli_text(result.output))
 
-    def test_convert_rejects_missing_fasta(self) -> None:
+    def test_extract_rejects_missing_fasta(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "sample.bam"
             bam_path.write_bytes(b"BAM")
             result = CliRunner().invoke(
                 app,
                 [
-                    "convert",
+                    "extract",
                     str(bam_path),
                     "--fasta",
                     str(Path(tmpdir) / "missing.fa"),
@@ -157,7 +157,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
     def test_short_help_flag_works_on_app_and_subcommands(self) -> None:
         for args in (
             ["-h"],
-            ["convert", "-h"],
+            ["extract", "-h"],
             ["reference", "-h"],
             ["ref-qc", "-h"],
             ["predict", "-h"],
@@ -181,7 +181,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
         self.assertIn("[default: germline]", _cli_text(result.output))
 
     def test_loglevel_flag_is_on_every_command(self) -> None:
-        for command in ("convert", "reference", "ref-qc", "predict"):
+        for command in ("extract", "reference", "ref-qc", "predict"):
             with self.subTest(command=command):
                 result = CliRunner().invoke(app, [command, "--help"])
                 self.assertEqual(result.exit_code, 0, result.output)
@@ -189,7 +189,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 self.assertIn("[default: WARNING]", _cli_text(result.output))
 
     def test_invalid_loglevel_is_rejected(self) -> None:
-        result = CliRunner().invoke(app, ["convert", "--loglevel", "verbose"])
+        result = CliRunner().invoke(app, ["extract", "--loglevel", "verbose"])
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("verbose", _cli_text(result.output))
 

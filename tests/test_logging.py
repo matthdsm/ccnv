@@ -40,7 +40,7 @@ def _build_test_cohort(tmpdir: Path, n_samples: int = 4) -> tuple[list[Path], Pa
         prefix = tmpdir / f"sample_{s}"
         result = CliRunner().invoke(
             app,
-            ["convert", str(bam), "--prefix", str(prefix), "--bin-size", str(BIN_SIZE)],
+            ["extract", str(bam), "--prefix", str(prefix), "--bin-size", str(BIN_SIZE)],
         )
         assert result.exit_code == 0, result.output
         sample_paths.append(parquet_path(prefix))
@@ -64,7 +64,7 @@ def _build_test_cohort(tmpdir: Path, n_samples: int = 4) -> tuple[list[Path], Pa
 
 
 class TestLoggingVerbosity(unittest.TestCase):
-    def test_convert_debug_vs_default_logging(self) -> None:
+    def test_extract_debug_vs_default_logging(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             bam = root / "sample.bam"
@@ -75,7 +75,7 @@ class TestLoggingVerbosity(unittest.TestCase):
             res_default = CliRunner().invoke(
                 app,
                 [
-                    "convert",
+                    "extract",
                     str(bam),
                     "--prefix",
                     str(prefix),
@@ -84,16 +84,16 @@ class TestLoggingVerbosity(unittest.TestCase):
                 ],
             )
             self.assertEqual(res_default.exit_code, 0, res_default.output)
-            self.assertNotIn("starting convert:", res_default.output)
+            self.assertNotIn("starting extract:", res_default.output)
             self.assertNotIn("filter drops:", res_default.output)
-            self.assertNotIn("convert QC summary:", res_default.output)
+            self.assertNotIn("extract QC summary:", res_default.output)
 
             # Run with DEBUG loglevel
             prefix_debug = root / "sample_debug"
             res_debug = CliRunner().invoke(
                 app,
                 [
-                    "convert",
+                    "extract",
                     str(bam),
                     "--prefix",
                     str(prefix_debug),
@@ -104,15 +104,15 @@ class TestLoggingVerbosity(unittest.TestCase):
                 ],
             )
             self.assertEqual(res_debug.exit_code, 0, res_debug.output)
-            self.assertIn("starting convert:", res_debug.output)
+            self.assertIn("starting extract:", res_debug.output)
             self.assertIn("read filters:", res_debug.output)
             self.assertIn("opening alignment", res_debug.output)
             self.assertIn("binned contig chr1", res_debug.output)
             self.assertIn("filter drops:", res_debug.output)
-            self.assertIn("convert QC summary:", res_debug.output)
+            self.assertIn("extract QC summary:", res_debug.output)
             self.assertIn("writing sample parquet", res_debug.output)
             self.assertIn("wrote sample parquet", res_debug.output)
-            self.assertIn("convert completed in", res_debug.output)
+            self.assertIn("extract completed in", res_debug.output)
 
     def test_reference_and_qc_debug_logging(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

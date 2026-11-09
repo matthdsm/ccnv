@@ -7,7 +7,7 @@ The `ccnv` package implements an organism-agnostic, pure-Python bioinformatics f
 ```mermaid
 flowchart TD
     subgraph Ingestion["Alignment & Layout Ingestion"]
-        A["BAM / CRAM Alignment"] --> B["ccnv.convert: bin_contig"]
+        A["BAM / CRAM Alignment"] --> B["ccnv.extract: bin_contig"]
         B --> C["ccnv.models.schemas: SAMPLE_SCHEMA Parquet (.ccnv)"]
     end
     subgraph ReferenceModeling["Cohort & Reference Modeling"]
@@ -72,8 +72,8 @@ Contiguous tracts of unmapped or masked bins exceeding $\Delta_{\text{max}}$ bas
 
 ### Package Symbols
 
-- `[src/ccnv/cli.py:app]`: Primary Typer CLI application hosting `convert`, `reference`, `ref-qc`, and `predict` entry points.
-- `[src/ccnv/convert.py:run]`: Ingests BAM/CRAM files, filters reads, performs multi-process binned counting, and writes sample Parquet.
+- `[src/ccnv/cli.py:app]`: Primary Typer CLI application hosting `extract`, `reference`, `ref-qc`, and `predict` entry points.
+- `[src/ccnv/extract.py:run]`: Ingests BAM/CRAM files, filters reads, performs multi-process binned counting, and writes sample Parquet.
 - `[src/ccnv/features/cohort.py:rebin_sample_table]`: Dynamically rebins sample tables in memory across compatible contig coordinate layouts.
 - `[src/ccnv/io/parquet.py:load_cohort]`: Discovers, validates, and loads multiple control sample Parquet files.
 - `[src/ccnv/features/cohort.py:cohort_from_fasta]`: Synthesizes an artificial flat uniform-depth cohort from FASTA sequence lengths.
@@ -91,7 +91,7 @@ Contiguous tracts of unmapped or masked bins exceeding $\Delta_{\text{max}}$ bas
 - `[src/ccnv/report/__init__.py:write_outputs]`: Serializes tabix-indexed bgzipped BED and VCF tables for bins, segments, and calls.
 - `[src/ccnv/report/html.py:render_genome_plot]`: Compiles interactive self-contained Plotly HTML visualizations using Jinja2 templates.
 - `[src/ccnv/models/schemas.py:validate_table]`: Validates Arrow schemas and metadata against versioned contracts.
-- `[src/ccnv/models/config.py:ConvertConfig]`, `[src/ccnv/models/config.py:ReferenceConfig]`, `[src/ccnv/models/config.py:PredictConfig]`: Strongly-typed configuration containers.
+- `[src/ccnv/models/config.py:ExtractConfig]`, `[src/ccnv/models/config.py:ReferenceConfig]`, `[src/ccnv/models/config.py:PredictConfig]`: Strongly-typed configuration containers.
 - `[src/ccnv/models/results.py:BinResult]`, `[src/ccnv/models/results.py:SegmentResult]`, `[src/ccnv/models/results.py:PredictionOutputs]`: Common result dataclasses.
 
 ## Invariants
@@ -108,7 +108,7 @@ Contiguous tracts of unmapped or masked bins exceeding $\Delta_{\text{max}}$ bas
 
 ## Side Effects
 
-- `[src/ccnv/convert.py:_worker_handle]`: Opens BAM/CRAM handles using `pysam.AlignmentFile` and maintains a per-worker handle cache.
+- `[src/ccnv/extract.py:_worker_handle]`: Opens BAM/CRAM handles using `pysam.AlignmentFile` and maintains a per-worker handle cache.
 - `[src/ccnv/io/alignments.py:ensure_index]`: Generates BAM (`.bai`) or CRAM (`.crai`) index files on disk via `pysam.index` when missing.
 - `[src/ccnv/io/parquet.py:write_sample_parquet]`: Creates target directory hierarchies and writes zstd-compressed Parquet files to disk.
 - `[src/ccnv/io/tracks.py:read_fasta_contigs]`: Generates FASTA index files (`.fai`) on disk via `pysam.faidx` when absent.

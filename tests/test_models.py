@@ -427,8 +427,8 @@ class TestExceptions(unittest.TestCase):
     def test_exception_hierarchy(self) -> None:
         from ccnv.models.exceptions import (
             CcnvError,
-            ConvertError,
             CovariateError,
+            ExtractError,
             PredictError,
             ReferenceError,
             ReferenceQCError,
@@ -436,8 +436,8 @@ class TestExceptions(unittest.TestCase):
         )
 
         for err_cls in (
-            ConvertError,
             CovariateError,
+            ExtractError,
             PredictError,
             ReferenceError,
             ReferenceQCError,
@@ -532,7 +532,7 @@ class TestModelReExports(unittest.TestCase):
         from ccnv import models
 
         expected_symbols = [
-            "ConvertConfig",
+            "ExtractConfig",
             "ReferenceConfig",
             "PredictConfig",
             "ReferenceQCConfig",
@@ -589,7 +589,7 @@ class TestModelReExports(unittest.TestCase):
             "CovariateError",
             "PredictError",
             "SchemaError",
-            "ConvertError",
+            "ExtractError",
             "ReferenceQCError",
         ]
         for sym in expected_symbols:

@@ -18,7 +18,7 @@ from published_fixtures import (
 from typer.testing import CliRunner
 
 from ccnv.cli import app
-from ccnv.convert import (
+from ccnv.extract import (
     run,
     split_thread_budget,
 )
@@ -32,8 +32,8 @@ from ccnv.io.alignments import rejection_reason
 from ccnv.io.parquet import read_sample_parquet
 from ccnv.models import (
     Contig,
-    ConvertConfig,
-    ConvertError,
+    ExtractConfig,
+    ExtractError,
     GenomeProfile,
     ReadFilters,
     is_canonical_contig,
@@ -224,7 +224,7 @@ class TestReadFilters(unittest.TestCase):
         self.assertIsNone(rejection_reason(FakeRead(mapping_quality=20), filters))
 
 
-class TestConvertAlignment(unittest.TestCase):
+class TestExtractAlignment(unittest.TestCase):
     def test_alignment_handle_closes_when_validation_fails(self) -> None:
         class FakeAlignment:
             closed = False
@@ -241,10 +241,10 @@ class TestConvertAlignment(unittest.TestCase):
             bam_path.touch()
             alignment = FakeAlignment()
             with (
-                patch("ccnv.convert.open_alignment", return_value=alignment),
-                self.assertRaises(ConvertError),
+                patch("ccnv.extract.open_alignment", return_value=alignment),
+                self.assertRaises(ExtractError),
             ):
-                run(ConvertConfig(bam_path, Path(tmpdir) / "out", bin_size=100))
+                run(ExtractConfig(bam_path, Path(tmpdir) / "out", bin_size=100))
             self.assertTrue(alignment.closed)
 
     def test_missing_bam_index_is_created(self) -> None:
@@ -253,7 +253,7 @@ class TestConvertAlignment(unittest.TestCase):
             prefix = Path(tmpdir) / "sample"
             _write_bam(bam_path, [_read("r1", 0, 0, 10)], index=False)
             self.assertFalse(_has_alignment_index(bam_path))
-            run(ConvertConfig(bam_path, prefix, bin_size=100))
+            run(ExtractConfig(bam_path, prefix, bin_size=100))
             self.assertTrue(_has_alignment_index(bam_path))
             table = read_sample_parquet(parquet_path(prefix))
             self.assertEqual(table.column("count").to_pylist(), [1, 0, 0])
@@ -262,8 +262,8 @@ class TestConvertAlignment(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             cram_path = Path(tmpdir) / "sample.cram"
             cram_path.touch()
-            with self.assertRaisesRegex(ConvertError, r"CRAM.*--fasta"):
-                run(ConvertConfig(cram_path, Path(tmpdir) / "out", bin_size=100))
+            with self.assertRaisesRegex(ExtractError, r"CRAM.*--fasta"):
+                run(ExtractConfig(cram_path, Path(tmpdir) / "out", bin_size=100))
 
     def test_missing_cram_index_is_created(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -287,7 +287,7 @@ class TestConvertAlignment(unittest.TestCase):
             self.assertFalse(_has_alignment_index(cram_path))
             prefix = Path(tmpdir) / "sample"
             run(
-                ConvertConfig(
+                ExtractConfig(
                     cram_path,
                     prefix,
                     bin_size=100,
@@ -322,7 +322,7 @@ class TestConvertAlignment(unittest.TestCase):
                 ],
             }
             _write_bam(bam_path, reads, header=header, index=True)
-            run(ConvertConfig(bam_path, prefix, bin_size=100, all_contigs=True))
+            run(ExtractConfig(bam_path, prefix, bin_size=100, all_contigs=True))
 
             table = read_sample_parquet(out_path)
             metadata = decode_metadata(table.schema.metadata)
@@ -358,7 +358,7 @@ class TestConvertAlignment(unittest.TestCase):
             self.assertEqual(rows["end"], [100, 200, 250, 99, 50])
             self.assertEqual(rows["count"], [2, 1, 1, 1, 1])
 
-    def test_convert_applies_configured_min_mapping_quality(self) -> None:
+    def test_extract_applies_configured_min_mapping_quality(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "sample.bam"
             prefix = Path(tmpdir) / "sample"
@@ -371,7 +371,7 @@ class TestConvertAlignment(unittest.TestCase):
                 index=True,
             )
             run(
-                ConvertConfig(
+                ExtractConfig(
                     bam_path,
                     prefix,
                     bin_size=100,
@@ -400,7 +400,7 @@ class TestConvertAlignment(unittest.TestCase):
             result = CliRunner().invoke(
                 app,
                 [
-                    "convert",
+                    "extract",
                     str(bam_path),
                     "--prefix",
                     str(prefix),
@@ -416,7 +416,7 @@ class TestConvertAlignment(unittest.TestCase):
             self.assertEqual(metadata["filters"]["min_mapping_quality"], 30)
             self.assertEqual(table.column("count").to_pylist(), [1, 0, 0])
 
-    def test_cli_convert_round_trip(self) -> None:
+    def test_cli_extract_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "sample.bam"
             prefix = Path(tmpdir) / "sample"
@@ -425,7 +425,7 @@ class TestConvertAlignment(unittest.TestCase):
             result = CliRunner().invoke(
                 app,
                 [
-                    "convert",
+                    "extract",
                     str(bam_path),
                     "--prefix",
                     str(prefix),
@@ -437,7 +437,7 @@ class TestConvertAlignment(unittest.TestCase):
             table = read_sample_parquet(out_path)
             self.assertEqual(table.column("count").to_pylist(), [1, 0, 0])
 
-    def test_cli_debug_loglevel_prints_convert_steps(self) -> None:
+    def test_cli_debug_loglevel_prints_extract_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "sample.bam"
             prefix = Path(tmpdir) / "sample"
@@ -445,7 +445,7 @@ class TestConvertAlignment(unittest.TestCase):
             result = CliRunner().invoke(
                 app,
                 [
-                    "convert",
+                    "extract",
                     str(bam_path),
                     "--prefix",
                     str(prefix),
@@ -460,14 +460,14 @@ class TestConvertAlignment(unittest.TestCase):
             self.assertIn("binned contig chr1", result.output)
             self.assertIn("writing sample parquet", result.output)
 
-    def test_convert_debug_logs_each_step(self) -> None:
+    def test_extract_debug_logs_each_step(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "sample.bam"
             prefix = Path(tmpdir) / "sample"
             _write_bam(bam_path, [_read("r1", 0, 0, 60)], index=True)
-            with self.assertLogs("ccnv.convert", level="DEBUG") as captured:
+            with self.assertLogs("ccnv.extract", level="DEBUG") as captured:
                 run(
-                    ConvertConfig(
+                    ExtractConfig(
                         bam_path,
                         prefix,
                         bin_size=100,
@@ -508,8 +508,8 @@ class TestParallelBinning(unittest.TestCase):
 
             serial_prefix = root / "serial"
             parallel_prefix = root / "parallel"
-            run(ConvertConfig(bam_path, serial_prefix, bin_size=100, threads=1))
-            run(ConvertConfig(bam_path, parallel_prefix, bin_size=100, threads=3))
+            run(ExtractConfig(bam_path, serial_prefix, bin_size=100, threads=1))
+            run(ExtractConfig(bam_path, parallel_prefix, bin_size=100, threads=3))
 
             serial = read_sample_parquet(parquet_path(serial_prefix))
             parallel = read_sample_parquet(parquet_path(parallel_prefix))
@@ -525,7 +525,7 @@ class TestParallelBinning(unittest.TestCase):
             bam_path = root / "sample.bam"
             self._multi_contig_bam(bam_path)
             prefix = root / "sample"
-            run(ConvertConfig(bam_path, prefix, bin_size=100, threads=3))
+            run(ExtractConfig(bam_path, prefix, bin_size=100, threads=3))
 
             table = read_sample_parquet(parquet_path(prefix))
             metadata = decode_metadata(table.schema.metadata)
@@ -541,7 +541,7 @@ class TestParallelBinning(unittest.TestCase):
 
     def test_threads_must_be_positive(self) -> None:
         with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
-            ConvertConfig(Path("a.bam"), Path("out"), bin_size=100, threads=0)
+            ExtractConfig(Path("a.bam"), Path("out"), bin_size=100, threads=0)
 
     def test_thread_budget_splits_workers_and_decode_threads(self) -> None:
         cases = (
@@ -636,7 +636,7 @@ class TestCanonicalContigs(unittest.TestCase):
                 _read("mito", 5, 0, 60),
             ]
             _write_bam(bam_path, reads, header=header, index=True)
-            run(ConvertConfig(bam_path, prefix, bin_size=100))
+            run(ExtractConfig(bam_path, prefix, bin_size=100))
 
             table = read_sample_parquet(parquet_path(prefix))
             metadata = decode_metadata(table.schema.metadata)
@@ -668,7 +668,7 @@ class TestCanonicalContigs(unittest.TestCase):
                 _read("scaf", 2, 0, 60),
             ]
             _write_bam(bam_path, reads, header=header, index=True)
-            run(ConvertConfig(bam_path, prefix, bin_size=100, all_contigs=True))
+            run(ExtractConfig(bam_path, prefix, bin_size=100, all_contigs=True))
 
             table = read_sample_parquet(parquet_path(prefix))
             metadata = decode_metadata(table.schema.metadata)
@@ -689,8 +689,8 @@ class TestCanonicalContigs(unittest.TestCase):
                 ],
             }
             _write_bam(bam_path, [], header=header, index=True)
-            with self.assertRaisesRegex(ConvertError, "no canonical chromosomes"):
-                run(ConvertConfig(bam_path, Path(tmpdir) / "sample", bin_size=100))
+            with self.assertRaisesRegex(ExtractError, "no canonical chromosomes"):
+                run(ExtractConfig(bam_path, Path(tmpdir) / "sample", bin_size=100))
 
 
 class TestEffectiveReadMetrics(unittest.TestCase):
@@ -753,7 +753,7 @@ class TestEffectiveReadMetrics(unittest.TestCase):
                 _read("cm_k1", 4, 0, 60),
             ]
             _write_bam(bam_path, reads, header=header, index=True)
-            run(ConvertConfig(bam_path, prefix, bin_size=100))
+            run(ExtractConfig(bam_path, prefix, bin_size=100))
 
             table = read_sample_parquet(parquet_path(prefix))
             metadata = decode_metadata(table.schema.metadata)
@@ -787,7 +787,7 @@ class TestEffectiveReadMetrics(unittest.TestCase):
                 _read("cm_k1", 2, 0, 60),
             ]
             _write_bam(bam_path, reads, header=header, index=True)
-            run(ConvertConfig(bam_path, prefix, bin_size=100, all_contigs=True))
+            run(ExtractConfig(bam_path, prefix, bin_size=100, all_contigs=True))
 
             table = read_sample_parquet(parquet_path(prefix))
             metadata = decode_metadata(table.schema.metadata)
@@ -802,8 +802,8 @@ class TestEffectiveReadMetrics(unittest.TestCase):
             self.assertEqual(set(qc), set(QC_COUNTERS))
 
 
-class TestConvertPublishedCram(unittest.TestCase):
-    def test_cli_converts_published_chr21_cram(self) -> None:
+class TestExtractPublishedCram(unittest.TestCase):
+    def test_cli_extracts_published_chr21_cram(self) -> None:
         cram = ensure_published_file(PUBLISHED_CRAM, PUBLISHED_CRAM_URL)
         fasta = ensure_published_fasta()
 
@@ -812,7 +812,7 @@ class TestConvertPublishedCram(unittest.TestCase):
             result = CliRunner().invoke(
                 app,
                 [
-                    "convert",
+                    "extract",
                     str(cram),
                     "--fasta",
                     str(fasta),

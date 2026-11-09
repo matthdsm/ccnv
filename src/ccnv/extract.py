@@ -25,8 +25,8 @@ from ccnv.io.parquet import write_sample_parquet
 from ccnv.models import (
     SAMPLE_SCHEMA,
     ArtifactKind,
-    ConvertConfig,
-    ConvertError,
+    ExtractConfig,
+    ExtractError,
     GenomeProfile,
     ReadFilters,
     metadata_for,
@@ -39,10 +39,10 @@ from ccnv.qc.sample import build_sample_qc, empty_qc
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "ConvertError",
+    "ExtractError",
     "bin_contig_with_handle",
     "run",
-    "run_convert",
+    "run_extract",
     "split_thread_budget",
 ]
 
@@ -115,11 +115,11 @@ def _binned_contigs(
             yield pool.map(_bin_contig, tasks)
 
 
-def run(config: ConvertConfig) -> None:
-    """Convert one BAM/CRAM into canonical sample Parquet."""
+def run(config: ExtractConfig) -> None:
+    """Extract binned counts from one BAM/CRAM into canonical sample Parquet."""
     alignment = config.alignment.expanduser()
     if not alignment.is_file():
-        raise ConvertError(f"alignment not found: {alignment}")
+        raise ExtractError(f"alignment not found: {alignment}")
 
     fmt = alignment_format(alignment)
     logger.debug("opening alignment %s as %s", alignment, fmt)
@@ -132,7 +132,7 @@ def run(config: ConvertConfig) -> None:
         header_names = list(bam.references)
         header_lengths = [int(length) for length in bam.lengths]
         if not header_names or any(length <= 0 for length in header_lengths):
-            raise ConvertError(f"{alignment} header declares invalid contigs")
+            raise ExtractError(f"{alignment} header declares invalid contigs")
         layout = select_layout(
             header_names, header_lengths, all_contigs=config.all_contigs
         )
@@ -141,7 +141,7 @@ def run(config: ConvertConfig) -> None:
                 f"{alignment} header declares no canonical chromosomes; "
                 "pass --all-contigs to bin every contig"
             )
-            raise ConvertError(msg)
+            raise ExtractError(msg)
         profile = GenomeProfile(layout)
         workers, decode_threads = split_thread_budget(config.threads, len(layout))
         if workers <= 1 and decode_threads > 1:
@@ -218,7 +218,7 @@ def run(config: ConvertConfig) -> None:
 
     qc = build_sample_qc(qc)
     logger.debug(
-        "convert QC summary: %d reads examined, %d kept (%.1f%%), %d duplicate, "
+        "extract QC summary: %d reads examined, %d kept (%.1f%%), %d duplicate, "
         "%d low_mapq, %d unmapped",
         qc["reads_seen"],
         qc["reads_kept"],
@@ -269,4 +269,4 @@ def run(config: ConvertConfig) -> None:
     )
 
 
-run_convert: Final = run
+run_extract: Final = run

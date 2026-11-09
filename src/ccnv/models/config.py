@@ -19,7 +19,7 @@ def parquet_path(prefix: Path) -> Path:
 
 @dataclass(frozen=True, slots=True)
 class ReadFilters:
-    """Explicit per-read inclusion rules applied during convert."""
+    """Explicit per-read inclusion rules applied during extract."""
 
     min_mapping_quality: int = 1
     exclude_unmapped: bool = True
@@ -34,7 +34,7 @@ class ReadFilters:
 
 
 @dataclass(frozen=True, slots=True)
-class ConvertConfig:
+class ExtractConfig:
     alignment: Path
     prefix: Path
     bin_size: int = DEFAULT_BIN_SIZE
@@ -147,7 +147,7 @@ __all__ = [
     "DEFAULT_BIN_SIZE",
     "DEFAULT_MIN_MAPPABILITY",
     "AnalysisMode",
-    "ConvertConfig",
+    "ExtractConfig",
     "PredictConfig",
     "ReadFilters",
     "ReferenceConfig",

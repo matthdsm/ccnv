@@ -33,8 +33,8 @@ from ccnv.models import (
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
     ArtifactKind,
-    ConvertError,
     Cytoband,
+    ExtractError,
     ReadFilters,
     ReferenceError,
     metadata_for,
@@ -92,15 +92,15 @@ class TestAlignmentsIO(unittest.TestCase):
         self.assertEqual(alignment_format(Path("sample.CRAM")), "cram")
 
     def test_alignment_format_invalid(self) -> None:
-        with self.assertRaises(ConvertError):
+        with self.assertRaises(ExtractError):
             alignment_format(Path("sample.sam"))
 
     def test_open_alignment_cram_missing_fasta(self) -> None:
-        with self.assertRaises(ConvertError):
+        with self.assertRaises(ExtractError):
             open_alignment(Path("sample.cram"), fmt="cram", fasta=None)
 
     def test_open_alignment_cram_nonexistent_fasta(self) -> None:
-        with self.assertRaises(ConvertError):
+        with self.assertRaises(ExtractError):
             open_alignment(
                 Path("sample.cram"),
                 fmt="cram",

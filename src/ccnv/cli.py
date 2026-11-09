@@ -11,13 +11,13 @@ from typing import Annotated, NoReturn, cast
 
 import typer
 
-from ccnv.convert import ConvertError
-from ccnv.convert import run as run_convert
+from ccnv.extract import ExtractError
+from ccnv.extract import run as run_extract
 from ccnv.io.parquet import is_sample_parquet
 from ccnv.models import (
     DEFAULT_BIN_SIZE,
     DEFAULT_MIN_MAPPABILITY,
-    ConvertConfig,
+    ExtractConfig,
     PredictConfig,
     ReadFilters,
     ReferenceConfig,
@@ -183,7 +183,7 @@ def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
 
 
 @app.command()
-def convert(
+def extract(
     alignment: Annotated[
         Path,
         typer.Argument(
@@ -253,17 +253,17 @@ def convert(
     ] = DEFAULT_THREADS,
     loglevel: LogLevelOption = LogLevel.warning,
 ) -> None:
-    """Convert one alignment into canonical binned counts."""
+    """Extract binned counts from one alignment into canonical sample Parquet."""
 
     configure_logging(loglevel)
     cli_logger.debug(
-        "starting convert: alignment=%s, bin_size=%d, threads=%d",
+        "starting extract: alignment=%s, bin_size=%d, threads=%d",
         alignment,
         bin_size,
         threads,
     )
     started = perf_counter()
-    config = ConvertConfig(
+    config = ExtractConfig(
         alignment,
         prefix if prefix is not None else alignment.with_suffix(""),
         bin_size,
@@ -279,9 +279,9 @@ def convert(
         all_contigs=all_contigs,
     )
     try:
-        run_convert(config)
-        cli_logger.debug("convert completed in %.3f s", perf_counter() - started)
-    except ConvertError as error:
+        run_extract(config)
+        cli_logger.debug("extract completed in %.3f s", perf_counter() - started)
+    except ExtractError as error:
         _fail(error, 1)
 
 
@@ -348,9 +348,9 @@ def reference(
         ),
     ] = None,
     sex_contig: Annotated[
-        list[str],
+        list[str] | None,
         typer.Option("--sex-contig", help="Sex contig name; repeat as needed"),
-    ] = DEFAULT_SEX_CONTIGS,
+    ] = None,
     sex_signal_contig: Annotated[
         str,
         typer.Option(help="Contig used for inferred sex; higher fraction is male"),
@@ -475,7 +475,9 @@ def reference(
                 qc_report=qc_report,
                 samples=sample_paths,
                 samplesheet_path=samplesheet,
-                sex_contigs=tuple(sex_contig),
+                sex_contigs=(
+                    tuple(sex_contig) if sex_contig is not None else DEFAULT_SEX_CONTIGS
+                ),
                 sex_cutoff=sex_cutoff,
                 sex_signal_contig=sex_signal_contig,
                 threads=threads,

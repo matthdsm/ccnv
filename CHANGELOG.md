@@ -8,7 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Consolidated codebase into six cohesive domain subpackages (`ccnv.models`, `ccnv.stats`, `ccnv.io`, `ccnv.features`, `ccnv.qc`, `ccnv.report`) governed by a strict 7-layer unidirectional DAG, slimming root orchestrators (`convert.py`, `reference.py`, `ref_qc.py`, `predict.py`, `cli.py`) down to composition roots.
+- Renamed the `convert` CLI subcommand and orchestrators to `extract` (`ExtractConfig`, `ExtractError`, `run_extract`), updating all module paths, test suites, test fixtures, and documentation with clean break semantics.
+- Consolidated codebase into six cohesive domain subpackages (`ccnv.models`, `ccnv.stats`, `ccnv.io`, `ccnv.features`, `ccnv.qc`, `ccnv.report`) governed by a strict 7-layer unidirectional DAG, slimming root orchestrators (`extract.py`, `reference.py`, `ref_qc.py`, `predict.py`, `cli.py`) down to composition roots.
 - Removed deprecated transitional root modules (`cohort.py`, `covariates.py`, `predict_qc.py`, `prenatal.py`, `prenatal_math.py`, `reference_compute.py`, `reference_qc.py`, `results.py`, `samplesheet.py`, `schemas.py`, `segment.py`, and `templates/`) and updated entire test suite imports to canonical subpackage paths.
 - Enforced typed `Sequence[Cytoband] | None` contract for `ccnv.report.write_outputs` and `ccnv.report.html.render_genome_plot`, isolating file I/O strictly inside `ccnv.io.tracks`.
 - Refactored codebase architecture to conform to thermonuclear code quality standards, eliminating code bloat, deduplicating logic, and ensuring all source and test modules remain strictly below 1,000 lines.
@@ -19,7 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Bumped Arrow Parquet storage schema to version `2.0.0` (`SCHEMA_VERSION = "2.0.0"`), introducing native multi-resolution reference branches (`prenatal_autosomal` at 100 kb, `prenatal_ffy` at 5 kb `chrY`) alongside 5 kb CNV branches (`autosomal`, `female_sex`, `male_sex`) and persisting scalar prenatal hyperparameters in `ccnv.prenatal` metadata.
 - Replaced positional cohort sample arguments in `ccnv reference` with `--samplesheet / -s` for cohort references and `--fasta` for flat uniform-depth references.
 - Added `--mode germline | prenatal` flag to `ccnv reference` and `ccnv predict` (defaulting to `germline`) with strict reference mode validation.
-- Updated `ccnv convert` sample metadata to track effective read counts examined, kept, and filtered strictly on target canonical contigs (`effective_reads_examined`, `effective_reads_kept`, `autosomal_reads_kept`, `sex_reads_kept`).
+- Updated `ccnv extract` sample metadata to track effective read counts examined, kept, and filtered strictly on target canonical contigs (`effective_reads_examined`, `effective_reads_kept`, `autosomal_reads_kept`, `sex_reads_kept`).
 - Extended prediction BED (`_segments.bed.gz`, `_calls.bed.gz`) and VCFv4.2 (`_segments.vcf.gz`, `_calls.vcf.gz`) outputs in `--mode prenatal` to include expected copy ratios (`EXP_LOG2R`), implied fetal fractions (`IMPLIED_FF`), and discordance annotations (`DISCORDANT`, `DISC_REASON`).
 - `ccnv ref-qc` and `ccnv reference` now evaluate and record prenatal quality metrics in `<prefix>_qc.json` when auditing or building prenatal references.
 - Replaced the static `_plot.svg` output in `ccnv predict` with a minimal, interactive Plotly HTML viewer (`_plot.html`) rendered from an external Jinja2 template (`src/ccnv/templates/genome_plot.html.j2`), featuring whole-genome pan/zoom, coordinate and cytoband search, configurable Z-score and $\log_2$ ratio threshold color-coding, base64-encoded binary typed arrays (`scattergl`), and an optional `--cytobands` ideogram track.

@@ -21,8 +21,8 @@ class SchemaError(CcnvError):
     """Raised when an artifact violates a storage contract."""
 
 
-class ConvertError(CcnvError):
-    """Raised when conversion cannot proceed with the given inputs."""
+class ExtractError(CcnvError):
+    """Raised when extraction cannot proceed with the given inputs."""
 
 
 class ReferenceQCError(CcnvError):
@@ -31,8 +31,8 @@ class ReferenceQCError(CcnvError):
 
 __all__ = [
     "CcnvError",
-    "ConvertError",
     "CovariateError",
+    "ExtractError",
     "PredictError",
     "ReferenceError",
     "ReferenceQCError",

@@ -1,11 +1,11 @@
 # Pipeline Architecture
 
-`ccnv` executes copy-number variation (CNV) analysis across four stages: [`convert`](#1-convert) (bins alignments into sample Parquet), [`reference`](#2-reference) (builds cohort or flat FASTA reference models), [`ref-qc`](#3-ref-qc) (audits reference quality), and [`predict`](#4-predict) (normalizes coverage, segments with weighted Binary Segmentation, and calls aberrations).
+`ccnv` executes copy-number variation (CNV) analysis across four stages: [`extract`](#1-extract) (bins alignments into sample Parquet), [`reference`](#2-reference) (builds cohort or flat FASTA reference models), [`ref-qc`](#3-ref-qc) (audits reference quality), and [`predict`](#4-predict) (normalizes coverage, segments with weighted Binary Segmentation, and calls aberrations).
 
 ```mermaid
 flowchart LR
-    A["BAM / CRAM Alignment"] -->|ccnv convert| B["Sample Parquet (<sample>.ccnv)"]
-    C["Control BAMs / CRAMs"] -->|ccnv convert| D["Control Parquets (<ctrl>.ccnv)"]
+    A["BAM / CRAM Alignment"] -->|ccnv extract| B["Sample Parquet (<sample>.ccnv)"]
+    C["Control BAMs / CRAMs"] -->|ccnv extract| D["Control Parquets (<ctrl>.ccnv)"]
     D -->|ccnv reference| E["Reference Parquet (<reference>.ccnv)"]
     D -->|ccnv reference| H["Reference QC (<reference>_qc.json)"]
     F["Reference FASTA"] -.->|ccnv reference (flat)| E
@@ -21,7 +21,7 @@ flowchart LR
 - **Canonical Filtering**: By default, canonical chromosomes (`1`–`22`, `X`, `Y`) are retained and mitochondrial, decoy, unplaced, and ALT contigs are skipped. Pass `--all-contigs` to include all header contigs.
 - **Schema `2.0.0` Parquet Artifacts**: Sample and reference `.ccnv` files are Zstandard-compressed Apache Arrow Parquet tables validated against schema version `2.0.0` before computation.
 
-## 1. `convert`
+## 1. `extract`
 
 Streams alignments per contig, filters reads in deterministic precedence order, bins read starts with `numpy.bincount`, and writes `<prefix>.ccnv`. Effective read counters (`effective_reads_examined`, `effective_reads_kept`, `autosomal_reads_kept`, `sex_reads_kept`) record metrics strictly across binned target contigs.
 
@@ -73,7 +73,7 @@ flowchart TD
     WriteRef --> WriteQC["Write <prefix>_qc.json (unless --no-qc-report)"]
 ```
 
-- **In-Memory Rebinning**: Control samples converted at a finer or coarser resolution are rebinned to `--bin-size` via mass-conserving geometric overlap when contig lengths match.
+- **In-Memory Rebinning**: Control samples extracted at a finer or coarser resolution are rebinned to `--bin-size` via mass-conserving geometric overlap when contig lengths match.
 - **Covariate Masking & Bias Removal**: Optional `--mappability` BigWig (where k-mer length should roughly match average sequencing read length) and `--gc` (FASTA, BigWig, or BED/TSV; derived automatically from the input FASTA in flat mode) tracks mask bins with mappability below `--min-mappability` (default `0.5`) or `>50%` `N` bases, and fit a per-sample Huber-weighted polynomial trend on unmasked bins to divide out multiplicative GC wave and mappability bias before PCA.
 - **Sex Inference & Branches**: Coverage on `--sex-signal-contig` (`chrY`/`Y`) separates female and male controls automatically (or via `--sex-cutoff` in germline mode, or via 1D 2-GMM and samplesheet labels in prenatal mode). The `autosomal` branch models autosomes across all controls; `female_sex` and `male_sex` model sex contigs for each group when at least `--min-sex-group-size` samples are present.
 - **Between- & Within-Sample Modeling**: PCA captures cohort-wide technical bias (such as residual GC wave and batch effects). Residual profiles (or standardized `(GC, mappability)` feature vectors in flat mode when covariates are present) are compared across contigs via batched BLAS matrix multiplication to select the `--nearest-bins` off-contig reference neighbors and estimate `null_mean` and `null_std` per bin.

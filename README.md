@@ -9,11 +9,11 @@
 
 ## System Overview
 
-The pipeline formalizes CNV identification across shallow whole-genome sequencing datasets into four discrete functional stages: read ingestion and binning (`convert`), cohort reference synthesis with covariate correction (`reference`), reference audit and quality verification (`ref-qc`), and single-sample projection and change-point segmentation (`predict`).
+The pipeline formalizes CNV identification across shallow whole-genome sequencing datasets into four discrete functional stages: read ingestion and binning (`extract`), cohort reference synthesis with covariate correction (`reference`), reference audit and quality verification (`ref-qc`), and single-sample projection and change-point segmentation (`predict`).
 
 ```mermaid
 flowchart LR
-    subgraph S1["1. Convert"]
+    subgraph S1["1. Extract"]
         BAM["BAM / CRAM Alignment"] --> C["Sample Parquet (.ccnv)"]
     end
     subgraph S2["2. Reference"]
@@ -64,7 +64,7 @@ In `--mode prenatal`, `ccnv` integrates non-invasive prenatal analysis directly 
 ## Subdirectories & System Boundaries
 
 - `src`: [src/README.md](./src/README.md) - Top-level Python source namespace and subsystem boundary.
-- `src/ccnv`: [src/ccnv/README.md](./src/ccnv/README.md) - Core bioinformatics pipeline implementation and CLI orchestrators (`convert`, `reference`, `ref-qc`, `predict`).
+- `src/ccnv`: [src/ccnv/README.md](./src/ccnv/README.md) - Core bioinformatics pipeline implementation and CLI orchestrators (`extract`, `reference`, `ref-qc`, `predict`).
 - `src/ccnv/models`: [src/ccnv/models/README.md](./src/ccnv/models/README.md) - Layer 0 domain objects, configurations, results, versioned Arrow schemas (`2.0.0`), and exceptions.
 - `src/ccnv/stats`: [src/ccnv/stats/README.md](./src/ccnv/stats/README.md) - Layer 1 pure numerical, nearest-neighbor, PCA, regression, and prenatal mathematical kernels.
 - `src/ccnv/io`: [src/ccnv/io/README.md](./src/ccnv/io/README.md) - Layer 2 file format readers (BAM/CRAM, BigWig, FASTA, cytoband BED/TSV), samplesheet parsing, and Parquet storage.
@@ -111,8 +111,8 @@ docker run --rm ghcr.io/matthdsm/copynumber-cnv:latest --help
 ## Quickstart
 
 ```console
-# 1. Convert BAM or CRAM alignments into binned sample Parquet (.ccnv)
-ccnv convert sample.bam --prefix sample --bin-size 5000
+# 1. Extract BAM or CRAM alignments into binned sample Parquet (.ccnv)
+ccnv extract sample.bam --prefix sample --bin-size 5000
 
 # 2a. Build a germline reference model from a cohort samplesheet (with optional GC & mappability tracks)
 ccnv reference -s cohort.yaml --prefix reference --bin-size 5000 --gc genome.fa --mappability mappability.bw
@@ -133,7 +133,7 @@ ccnv predict sample.ccnv reference.ccnv --prefix results/sample
 ccnv predict sample.ccnv prenatal_ref.ccnv --mode prenatal --prefix results/sample_prenatal
 ```
 
-- `convert` writes `<prefix>.ccnv` (automatically indexing BAM/CRAM files when needed; CRAM inputs also require `--fasta`). Metadata records effective read counts and filter drops on target contigs.
+- `extract` writes `<prefix>.ccnv` (automatically indexing BAM/CRAM files when needed; CRAM inputs also require `--fasta`). Metadata records effective read counts and filter drops on target contigs.
 - `reference` writes `<prefix>.ccnv` and `<prefix>_qc.json` from a cohort samplesheet (`-s/--samplesheet`) or flat FASTA (`--fasta`). In `--mode prenatal`, it fits multi-resolution `FFY`, `PREFACE`, and `FFX` models alongside 5 kb CNV branches.
 - `ref-qc` audits `<prefix>.ccnv` and outputs `<prefix>_qc.json` with a usability verdict (`PASS`, `WARN`, `FAIL`).
 - `predict` writes bgzipped and tabix-indexed BED and VCFv4.2 tables (`_bins`, `_segments`, `_calls`), an interactive genome viewer (`<prefix>_plot.html`), and a run quality metrics report (`<prefix>_qc.json`). In `--mode prenatal`, segments include prenatal scaling and discordance tags, the viewer highlights discordant calls in high contrast, and `_qc.json` details fetal fraction and aneuploidy calls.

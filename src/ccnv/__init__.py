@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from ccnv.convert import ConvertError, run_convert
+from ccnv.extract import ExtractError, run_extract
 from ccnv.models import (
-    ConvertConfig,
+    ExtractConfig,
     PredictConfig,
     ReadFilters,
     ReferenceConfig,
@@ -17,8 +17,8 @@ from ccnv.reference import ReferenceError, run_reference
 __version__ = "0.1.0dev"
 
 __all__ = [
-    "ConvertConfig",
-    "ConvertError",
+    "ExtractConfig",
+    "ExtractError",
     "PredictConfig",
     "PredictError",
     "ReadFilters",
@@ -27,7 +27,7 @@ __all__ = [
     "ReferenceQCConfig",
     "ReferenceQCError",
     "__version__",
-    "run_convert",
+    "run_extract",
     "run_predict",
     "run_reference",
     "run_reference_qc",

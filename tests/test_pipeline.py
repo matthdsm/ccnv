@@ -7,9 +7,9 @@ import numpy as np
 import pyarrow.parquet as pq
 import pysam
 
-from ccnv.convert import run as convert
+from ccnv.extract import run as extract
 from ccnv.models import (
-    ConvertConfig,
+    ExtractConfig,
     PredictConfig,
     ReferenceConfig,
     parquet_path,
@@ -49,8 +49,8 @@ class TestInstalledPipelineContract(unittest.TestCase):
                     alignment = root / "control-0.cram"
                     _bam_to_cram(bam, alignment, fasta)
                 prefix = root / f"control-{sample_index}"
-                convert(
-                    ConvertConfig(
+                extract(
+                    ExtractConfig(
                         alignment,
                         prefix,
                         BIN_SIZE,
@@ -69,8 +69,8 @@ class TestInstalledPipelineContract(unittest.TestCase):
             target_prefix = root / "target"
             target_sample = parquet_path(target_prefix)
             _write_alignment(target_bam, target_counts)
-            convert(
-                ConvertConfig(target_bam, target_prefix, BIN_SIZE, all_contigs=True)
+            extract(
+                ExtractConfig(target_bam, target_prefix, BIN_SIZE, all_contigs=True)
             )
 
             reference_prefix = root / "reference"
