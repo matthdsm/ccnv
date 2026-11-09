@@ -369,6 +369,35 @@ class TestNormalization(unittest.TestCase):
         # n_active=1 <= rank=1 -> reconstruction is pca_mean[3] = 0.25
         self.assertAlmostEqual(proj_one.corrected[3], 1.0 / 0.25)
 
+    def test_project_coverage_huber_resists_trisomy_outlier_chromosome(self) -> None:
+        from ccnv.predict import project_coverage
+
+        # 20 bins: 16 diploid bins follow loading, 4 trisomic bins have +50% jump
+        loadings = np.linspace(-1.0, 1.0, 20).reshape(1, 20)
+        pca_mean = np.full(20, 0.05)
+        true_c = 0.02
+        counts = (pca_mean + true_c * loadings.ravel()) * 1000.0
+        counts[16:] *= 1.8  # Trisomy / amplification on last 4 bins
+
+        model = BranchModel(
+            branch=BRANCH_AUTOSOMAL,
+            contigs=("chr1",) * 16 + ("chr21",) * 4,
+            starts=np.arange(20, dtype=np.int64) * 100,
+            ends=np.arange(1, 21, dtype=np.int64) * 100,
+            counts=counts,
+            masked=np.zeros(20, dtype=np.bool_),
+            pca_mean=pca_mean,
+            pca_loadings=loadings,
+            nearest_indices=tuple(np.arange(16, dtype=np.int32) for _ in range(20)),
+            mean_distance=np.ones(20, dtype=np.float32),
+            null_mean=np.zeros(20, dtype=np.float64),
+            null_std=np.full(20, 0.05, dtype=np.float64),
+        )
+        proj = project_coverage(model)
+        # Diploid bins (0..15) should have near-flat corrected ratios (~1.0), not tilted by chr21
+        self.assertLess(float(np.std(proj.corrected[:16])), 0.05)
+        self.assertGreater(float(np.mean(proj.corrected[16:])), 1.4)
+
 
 class TestCalling(unittest.TestCase):
     def test_calls_symmetric_z_and_ratio_thresholds(self) -> None:
@@ -382,6 +411,63 @@ class TestCalling(unittest.TestCase):
             call_segment(0.3, 0.0, z_threshold=3.0, ratio_threshold=0.2), "gain"
         )
         self.assertIsNone(call_segment(0.1, 2.0, z_threshold=3.0, ratio_threshold=None))
+
+    def test_segment_and_call_stouffer_zscore_accumulates_evidence_and_corrects_autocorr(
+        self,
+    ) -> None:
+        # 25 consecutive bins with Z_i = +1.8 (white noise / zero lag-1 autocorr via alternating jitter)
+        z = np.full(25, 1.8, dtype=np.float64) + np.tile([0.05, -0.05], 13)[:25]
+        bins = (
+            BinResult(
+                branch=BRANCH_AUTOSOMAL,
+                contigs=("chr1",) * 25,
+                starts=np.arange(25, dtype=np.int64) * 100,
+                ends=np.arange(1, 26, dtype=np.int64) * 100,
+                ratios=np.full(25, 0.35, dtype=np.float64),
+                zscores=z,
+                weights=np.ones(25, dtype=np.float64),
+                reference_sizes=np.full(25, 10, dtype=np.int64),
+                masked=np.zeros(25, dtype=np.bool_),
+            ),
+        )
+        segs = segment_and_call(
+            bins,
+            {"chr1": 2500},
+            penalty=5.0,
+            z_threshold=3.0,
+            ratio_threshold=None,
+        )
+        self.assertEqual(len(segs), 1)
+        # Mean Z would be ~1.8 (<3.0, missed); Stouffer Z is ~1.8 * sqrt(25) = 9.0 (>3.0, called gain)
+        self.assertGreater(segs[0].zscore, 8.0)
+        self.assertEqual(segs[0].call, "gain")
+
+    def test_segment_and_call_preserves_zero_usable_bins_segment(self) -> None:
+        bins = (
+            BinResult(
+                branch=BRANCH_AUTOSOMAL,
+                contigs=("chr1", "chr1", "chr1"),
+                starts=np.array([0, 100, 200], dtype=np.int64),
+                ends=np.array([100, 200, 300], dtype=np.int64),
+                ratios=np.array([0.5, 0.5, np.nan], dtype=np.float64),
+                zscores=np.array([3.5, 3.5, np.nan], dtype=np.float64),
+                weights=np.array([1.0, 1.0, 0.0], dtype=np.float64),
+                reference_sizes=np.array([10, 10, 0], dtype=np.int64),
+                masked=np.array([False, False, True], dtype=np.bool_),
+            ),
+        )
+        segs = segment_and_call(
+            bins,
+            {"chr1": 300},
+            penalty=0.001,
+            z_threshold=3.0,
+            ratio_threshold=None,
+        )
+        self.assertGreaterEqual(len(segs), 1)
+        for s in segs:
+            if s.start == 200 and s.end == 300:
+                self.assertEqual(s.zscore, 0.0)
+                self.assertIsNone(s.call)
 
 
 class TestCoordinatesAndOutputs(unittest.TestCase):
@@ -555,6 +641,41 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
 
             with self.assertRaisesRegex(PredictError, "contig length mismatch"):
                 load_inputs(sample_path, reference_path)
+
+    def test_build_branch_model_rejects_mismatched_sample_coordinates(self) -> None:
+        from ccnv.predict import build_branch_model
+
+        ref = _reference_table()
+        bad_sample = pa.table(
+            {
+                "contig": ["chr1"],
+                "start": pa.array([0], type=pa.int64()),
+                "end": pa.array([100], type=pa.int64()),
+                "count": pa.array([10], type=pa.uint64()),
+            },
+            schema=SAMPLE_SCHEMA.with_metadata(
+                metadata_for(
+                    ArtifactKind.SAMPLE,
+                    contig_lengths={"chr1": 100},
+                    values={
+                        "bin_size": 100,
+                        "source_identity": {"id": "test"},
+                        "reference_identity": {"id": "genome"},
+                        "qc": {},
+                        "filters": asdict(ReadFilters()),
+                    },
+                )
+            ),
+        )
+        inputs = PredictionInput(
+            bad_sample,
+            ref,
+            {"chr1": 100, "chr2": 80},
+            None,
+            (BRANCH_AUTOSOMAL,),
+        )
+        with self.assertRaises(PredictError):
+            build_branch_model(inputs, BRANCH_AUTOSOMAL)
 
 
 class TestModeGuardrails(unittest.TestCase):
