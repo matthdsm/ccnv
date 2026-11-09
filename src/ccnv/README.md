@@ -61,18 +61,30 @@ Contiguous tracts of unmapped or masked bins exceeding $\Delta_{\text{max}}$ bas
 
 ## Interface
 
+### Subpackages & Contracts
+
+- `features`: [features/README.md](./features/README.md) - Feature extraction, dynamic rebinning, cohort normalization, covariate bias correction, and prenatal inference models.
+- `io`: [io/README.md](./io/README.md) - External format ingestion (BAM/CRAM, BigWig, FASTA), samplesheet validation, and Parquet storage.
+- `models`: [models/README.md](./models/README.md) - Domain representations, configuration models, result structures, Arrow schemas (2.0.0), and exception types.
+- `qc`: [qc/README.md](./qc/README.md) - Quality control accounting, reference model auditing, usability verdicts, and JSON metrics reporting.
+- `report`: [report/README.md](./report/README.md) - Downstream bgzipped/tabix BED/VCF serialization and interactive Plotly HTML visualization.
+- `stats`: [stats/README.md](./stats/README.md) - Stateless numerical kernels, truncated PCA, off-contig nearest-neighbor search, and weighted change-point segmentation.
+
+### Package Symbols
+
 - `[src/ccnv/cli.py:app]`: Primary Typer CLI application hosting `convert`, `reference`, `ref-qc`, and `predict` entry points.
 - `[src/ccnv/convert.py:run]`: Ingests BAM/CRAM files, filters reads, performs multi-process binned counting, and writes sample Parquet.
-- `[src/ccnv/features/binning.py:rebin_sample_table]`: Dynamically rebins sample tables in memory across compatible contig coordinate layouts.
-- `[src/ccnv/features/cohort.py:load_cohort]`: Discovers, validates, and rebins multiple control sample Parquet files into a synchronized `Cohort`.
+- `[src/ccnv/features/cohort.py:rebin_sample_table]`: Dynamically rebins sample tables in memory across compatible contig coordinate layouts.
+- `[src/ccnv/io/parquet.py:load_cohort]`: Discovers, validates, and loads multiple control sample Parquet files.
 - `[src/ccnv/features/cohort.py:cohort_from_fasta]`: Synthesizes an artificial flat uniform-depth cohort from FASTA sequence lengths.
 - `[src/ccnv/io/tracks.py:load_gc_track]`: Extracts and validates GC content proportions from FASTA, BigWig, or BED/TSV files.
 - `[src/ccnv/io/tracks.py:load_mappability_track]`: Loads per-bin mappability scores from BigWig tracks.
 - `[src/ccnv/features/covariates.py:correct_covariate_bias]`: Normalizes GC and mappability biases using 3-iteration Huber IRLS polynomial regression.
 - `[src/ccnv/reference.py:run]`: Coordinates cohort loading, depth normalization, PCA decomposition, nearest-bin pairing, and reference Parquet creation.
+- `[src/ccnv/ref_qc.py:run]`: Audits reference model Parquet tables and emits quality verdicts (`PASS`, `WARN`, `FAIL`).
 - `[src/ccnv/stats/neighbors.py:select_nearest_bins]`: Parallel batched off-contig nearest-neighbor search in PCA/covariate space.
 - `[src/ccnv/stats/neighbors.py:compute_null_models]`: Calculates per-bin null log2 ratio means and standard deviations across cohort controls.
-- `[src/ccnv/qc/reference.py:run_reference_qc]`: Evaluates reference quality metrics and issues usability verdicts (`PASS`, `WARN`, `FAIL`).
+- `[src/ccnv/qc/reference.py:run_reference_qc_on_table]`: Evaluates reference quality metrics and issues usability verdicts (`PASS`, `WARN`, `FAIL`).
 - `[src/ccnv/predict.py:run]`: Coordinates single-sample normalization, PCA projection, Ruptures segmentation, calling, and reporting.
 - `[src/ccnv/stats/segmentation.py:WeightedL2Cost]`: Custom Ruptures `BaseCost` computing weighted SSE for change-point detection.
 - `[src/ccnv/stats/segmentation.py:segment_contig]`: Segments an individual contig across blacklisted gap boundaries.
@@ -86,7 +98,7 @@ Contiguous tracts of unmapped or masked bins exceeding $\Delta_{\text{max}}$ bas
 
 - `[src/ccnv/models/schemas.py:validate_table]`: All tables must strictly conform to `SAMPLE_SCHEMA` or `REFERENCE_SCHEMA` under Arrow schema version `2.0.0` with `0-based-half-open` intervals.
 - `[src/ccnv/models/schemas.py:validate_metadata]`: Metadata requires non-empty `contig_lengths` mapping identifiers to positive integers; row coordinates must satisfy $0 \le \text{start} < \text{end} \le \text{length}$.
-- `[src/ccnv/features/cohort.py:load_cohort]`: Input cohort samples must share identical contig layouts, identical contig lengths, and matching bin coordinates.
+- `[src/ccnv/features/cohort.py:validate_cohort]`: Input cohort samples must share identical contig layouts, identical contig lengths, and matching bin coordinates.
 - `[src/ccnv/features/covariates.py:validate_min_mappability]`: Minimum mappability must be a finite floating-point value in $[0.0, 1.0]$.
 - `[src/ccnv/stats/neighbors.py:select_nearest_bins]`: Nearest-bin search explicitly enforces infinite distance ($d_{ii} = \infty$) for all bins on the same contig to guarantee off-contig selection.
 - `[src/ccnv/stats/neighbors.py:compute_null_models]`: Null distribution sampling is bounded to at most 100 cohort samples; non-finite standard deviations are coerced to 0.0.
@@ -97,9 +109,9 @@ Contiguous tracts of unmapped or masked bins exceeding $\Delta_{\text{max}}$ bas
 ## Side Effects
 
 - `[src/ccnv/convert.py:_worker_handle]`: Opens BAM/CRAM handles using `pysam.AlignmentFile` and maintains a per-worker handle cache.
-- `[src/ccnv/io/alignments.py:_ensure_index]`: Generates BAM (`.bai`) or CRAM (`.crai`) index files on disk via `pysam.index` when missing.
+- `[src/ccnv/io/alignments.py:ensure_index]`: Generates BAM (`.bai`) or CRAM (`.crai`) index files on disk via `pysam.index` when missing.
 - `[src/ccnv/io/parquet.py:write_sample_parquet]`: Creates target directory hierarchies and writes zstd-compressed Parquet files to disk.
-- `[src/ccnv/features/cohort.py:_fasta_contigs]`: Generates FASTA index files (`.fai`) on disk via `pysam.faidx` when absent.
+- `[src/ccnv/io/tracks.py:read_fasta_contigs]`: Generates FASTA index files (`.fai`) on disk via `pysam.faidx` when absent.
 - `[src/ccnv/stats/neighbors.py:select_nearest_bins]`: Allocates process worker pools via `concurrent.futures.ProcessPoolExecutor` when bin count $> 2\,000$ and threads $> 1$.
 - `[src/ccnv/reference.py:run]`: Writes `<prefix>.ccnv` reference Parquet and optionally writes `<prefix>_qc.json` while emitting formatted QC metrics to `sys.stderr`.
 - `[src/ccnv/report/__init__.py:write_outputs]`: Writes bgzipped files (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`, optional VCFs) and creates tabix indices (`.tbi`) via `pysam`.

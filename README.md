@@ -61,19 +61,16 @@ where weights $w_i = \sigma_i^{-2}$, $y_i = \log_2(\text{depth}_i / \text{expect
 #### 5. Prenatal Fetal Fraction Estimation & Sex Chromosome Analysis
 In `--mode prenatal`, `ccnv` integrates non-invasive prenatal analysis directly into reference building and prediction without heavy machine learning dependencies. During `reference`, a 5 kb `chrY` non-negative Lasso regression (`FFY`) is calibrated alongside a 20x coarsened 100 kb autosomal PCA, full-batch Resilient Backpropagation Sigmoid neural network / Ordinary Linear Model (`PREFACE`), and robust Huber M-estimation on `chrX` (`FFX`). During `predict`, `chrX` is normalized against the diploid `XX` (`female_sex`) reference branch, fetal sex and sex chromosome aneuploidies (`XX`, `XY`, `XO`, `XXX`, `XXY`, `XYY`, `DISCORDANT_MIXED`) are classified, and active fetal fraction is selected. Predicted CNV segments are evaluated against expected prenatal copy ratios $\log_2(1 \pm 0.5 \cdot \text{active\_ff})$, flagging sub-fetal noise, super-fetal maternal changes, or gonosome shifts with dedicated discordance highlighting and structured `<prefix>_qc.json` reporting.
 
-## Subdirectories & Key Modules
+## Subdirectories & System Boundaries
 
-- `src/ccnv/cli.py`: The `ccnv` Typer entry point and subcommands (`convert`, `reference`, `ref-qc`, `predict`).
-- `src/ccnv/convert.py`: Root orchestrator for BAM/CRAM read ingestion, canonical contig binning, and effective target-contig read QC.
-- `src/ccnv/reference.py`: Root orchestrator for reference Parquet synthesis and cohort rebinning across germline and prenatal modes.
-- `src/ccnv/ref_qc.py`: Root orchestrator for reference model quality auditing and usability verdicts.
-- `src/ccnv/predict.py`: Root orchestrator for sample projection, within-sample normalization, Ruptures segmentation, and event calling across germline and prenatal modes.
-- `src/ccnv/models/`: Layer 0 domain objects, configurations, results, versioned Arrow schemas (`2.0.0`), and exceptions.
-- `src/ccnv/stats/`: Layer 1 pure mathematical, nearest-neighbor, PCA, regression, and prenatal kernels.
-- `src/ccnv/io/`: Layer 2 file format readers (BAM/CRAM, BigWig, FASTA, cytoband BED/TSV), samplesheet parsing, and Parquet storage.
-- `src/ccnv/features/`: Layer 3 feature transformations, dynamic rebinning, covariate bias correction, and prenatal inference models.
-- `src/ccnv/qc/`: Layer 4 quality control auditors and structured JSON report builders.
-- `src/ccnv/report/`: Layer 5 deliverable writers for bgzipped/tabix BED, VCFv4.2, and interactive Plotly HTML viewer (`templates/genome_plot.html.j2`).
+- `src`: [src/README.md](./src/README.md) - Top-level Python source namespace and subsystem boundary.
+- `src/ccnv`: [src/ccnv/README.md](./src/ccnv/README.md) - Core bioinformatics pipeline implementation and CLI orchestrators (`convert`, `reference`, `ref-qc`, `predict`).
+- `src/ccnv/models`: [src/ccnv/models/README.md](./src/ccnv/models/README.md) - Layer 0 domain objects, configurations, results, versioned Arrow schemas (`2.0.0`), and exceptions.
+- `src/ccnv/stats`: [src/ccnv/stats/README.md](./src/ccnv/stats/README.md) - Layer 1 pure numerical, nearest-neighbor, PCA, regression, and prenatal mathematical kernels.
+- `src/ccnv/io`: [src/ccnv/io/README.md](./src/ccnv/io/README.md) - Layer 2 file format readers (BAM/CRAM, BigWig, FASTA, cytoband BED/TSV), samplesheet parsing, and Parquet storage.
+- `src/ccnv/features`: [src/ccnv/features/README.md](./src/ccnv/features/README.md) - Layer 3 feature transformations, dynamic rebinning, covariate bias correction, and prenatal inference models.
+- `src/ccnv/qc`: [src/ccnv/qc/README.md](./src/ccnv/qc/README.md) - Layer 4 quality control auditors and structured JSON report builders.
+- `src/ccnv/report`: [src/ccnv/report/README.md](./src/ccnv/report/README.md) - Layer 5 deliverable writers for bgzipped/tabix BED, VCFv4.2, and interactive Plotly HTML viewer.
 
 ## Global Invariants
 
