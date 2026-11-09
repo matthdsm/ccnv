@@ -39,7 +39,7 @@ from ccnv.models import (
 from ccnv.stats.pca import pca_irlba_numpy
 from ccnv.stats.prenatal_math import (
     fit_elasticnet_ffy,
-    fit_preface_logit_ensemble,
+    fit_ffa_logit_ensemble,
     infer_sex_gmm_1d,
     rlm_huber,
 )
@@ -56,7 +56,7 @@ __all__ = [
 ]
 
 
-def _is_preface_autosome(norm_contig: str) -> bool:
+def _is_ffa_autosome(norm_contig: str) -> bool:
     """Return True if contig is a canonical autosome excluding 13, 18, 21."""
     return (
         is_autosome_name(norm_contig)
@@ -64,9 +64,12 @@ def _is_preface_autosome(norm_contig: str) -> bool:
     )
 
 
+_is_preface_autosome = _is_ffa_autosome
+
+
 def _resolve_autosome_mask(norm_contigs: Sequence[str]) -> NDArray[np.bool_]:
-    """Resolve boolean autosome mask for PREFACE, falling back to all autosomes."""
-    mask = np.array([_is_preface_autosome(c) for c in norm_contigs], dtype=np.bool_)
+    """Resolve boolean autosome mask for FFA, falling back to all autosomes."""
+    mask = np.array([_is_ffa_autosome(c) for c in norm_contigs], dtype=np.bool_)
     if not np.any(mask):
         mask = np.array([is_autosome_name(c) for c in norm_contigs], dtype=np.bool_)
     return mask
@@ -184,12 +187,18 @@ def classify_sca(
     fetal_sex: FetalSex,
     ffy: float | None,
     ffx: float,
-    preface: float,
-    chrx_ratio: float,
-    prenatal_meta: PrenatalModelMetadata,
+    ffa: float = 0.0,
+    chrx_ratio: float = 1.0,
+    prenatal_meta: PrenatalModelMetadata | None = None,
     z_cut: float = 3.0,
+    *,
+    preface: float | None = None,
 ) -> SCAResult:
     """Classify Sex Chromosome Aneuploidy (SCA) via 2D Stoichiometric Gaussian Bayes."""
+    if preface is not None:
+        ffa = preface
+    if prenatal_meta is None:
+        raise ValueError("prenatal_meta is required for classify_sca")
     mu_f = float(prenatal_meta.female_chrx_ratio_mean)
     std_f = max(float(prenatal_meta.female_chrx_ratio_std), 1e-4)
     chrx_zscore = float((chrx_ratio - mu_f) / std_f)
@@ -203,12 +212,12 @@ def classify_sca(
     cands: list[float] = []
     if fetal_sex == "M" and ffy is not None and ffy > 0.001:
         cands.append(float(ffy))
-    if preface > 0.001:
-        cands.append(float(preface))
+    if ffa > 0.001:
+        cands.append(float(ffa))
     if abs(ffx) > 0.001:
         cands.append(abs(float(ffx)))
     if not cands:
-        cands = [max(float(preface), 0.05)]
+        cands = [max(float(ffa), 0.05)]
     f0 = max(float(np.median(cands)), 0.01)
 
     means: dict[SCACall, tuple[float, float]] = {
@@ -291,7 +300,7 @@ def fit_prenatal_models(
     prenatal_bin_size: int,
     seed: int = 42,
 ) -> tuple[pa.Table, pa.Table, PrenatalModelMetadata, tuple[bool, ...]]:
-    """Fit FFY, PREFACE, and FFX models on cohort samples."""
+    """Fit FFY, FFA, and FFX models on cohort samples."""
     # 1. Extract 5 kb coordinates, chrY fractions, and sex classification
     if not isinstance(sample_tables, Sequence):
         cohort_5k = sample_tables
@@ -402,7 +411,7 @@ def fit_prenatal_models(
         ffy_intercept, ffy_slope = 0.0, 1.0
         final_ffy = np.zeros(n_samples, dtype=np.float64)
 
-    # 3. Rebin to prenatal_bin_size (100 kb) for PREFACE and FFX
+    # 3. Rebin to prenatal_bin_size (100 kb) for FFA and FFX
     cohort_100k = rebin_cohort(cohort_5k, prenatal_bin_size)
     c_100k = list(cohort_100k.contigs)
     s_100k = cohort_100k.starts
@@ -462,27 +471,25 @@ def fit_prenatal_models(
             X_autosomal, n_components=n_feat, seed=seed
         )
 
-    # 4. PREFACE Training targets (entry.ff if given, else FFY on male fetuses)
-    target_preface = np.full(n_samples, np.nan, dtype=np.float64)
+    # 4. FFA Training targets (entry.ff if given, else FFY on male fetuses)
+    target_ffa = np.full(n_samples, np.nan, dtype=np.float64)
     for i, entry in enumerate(entries):
         if entry.ff is not None:
-            target_preface[i] = entry.ff
+            target_ffa[i] = entry.ff
         elif is_male_arr[i]:
-            target_preface[i] = max(0.0, float(final_ffy[i]))
+            target_ffa[i] = max(0.0, float(final_ffy[i]))
 
-    labeled_mask = np.isfinite(target_preface)
+    labeled_mask = np.isfinite(target_ffa)
     if not np.any(labeled_mask):
         labeled_mask[:] = True
-        target_preface[:] = 0.05
+        target_ffa[:] = 0.05
 
     labeled_idx = np.flatnonzero(labeled_mask)
     X_labeled = scores[labeled_idx, :]
-    y_labeled = target_preface[labeled_idx]
+    y_labeled = target_ffa[labeled_idx]
 
     # Fit convex logit-link RidgeCV and ElasticNetCV ensemble
-    w_ens, b_ens, sigma_pref = fit_preface_logit_ensemble(
-        X_labeled, y_labeled, seed=seed
-    )
+    w_ens, b_ens, sigma_ffa = fit_ffa_logit_ensemble(X_labeled, y_labeled, seed=seed)
 
     # 5. chrX Diploid Female Baseline and FFX Huber Regression
     has_females = bool(np.any(~is_male_arr))
@@ -521,9 +528,9 @@ def fit_prenatal_models(
         female_chrx_ratio_mean=float(fem_chrx_mean),
         female_chrx_ratio_std=float(fem_chrx_std),
         ffy_std=0.01,
-        preface_std=float(sigma_pref),
+        ffa_std=float(sigma_ffa),
         ffx_std=0.025,
-        preface_logit_mode=True,
+        ffa_logit_mode=True,
     )
 
     # 7. Construct Arrow Reference Tables
@@ -563,7 +570,7 @@ def predict_prenatal(
     prenatal_meta: PrenatalModelMetadata,
     min_ff_warning: float = 0.04,
 ) -> FetalFractionResult:
-    """Predict fetal sex, FFY, PREFACE, FFX, SCA status, and active fetal fraction."""
+    """Predict fetal sex, FFY, FFA, FFX, SCA status, and active fetal fraction."""
     # 1. Extract reference branches
     ref_branches = reference_table.column("branch").to_pylist()
     if BRANCH_PRENATAL_FFY not in ref_branches:
@@ -643,7 +650,7 @@ def predict_prenatal(
     else:
         ffy = None
 
-    # 4. Rebin sample to 100 kb for PREFACE and FFX
+    # 4. Rebin sample to 100 kb for FFA and FFX
     sample_100k = rebin_sample_table(sample_table, prenatal_meta.prenatal_bin_size)
     c_100k = [str(x) for x in sample_100k.column("contig").to_pylist()]
     s_100k = np.asarray(
@@ -704,8 +711,8 @@ def predict_prenatal(
     centered = imputed - ref_pca_center
     features = centered @ ref_pca_rotation
 
-    # Evaluate PREFACE via convex logit ensemble or legacy MLP/OLM fallback
-    if prenatal_meta.preface_logit_mode:
+    # Evaluate FFA via convex logit ensemble or legacy MLP/OLM fallback
+    if prenatal_meta.ffa_logit_mode:
         features_flat = features.ravel() if features.ndim > 1 else features
         raw_logit = float(
             np.dot(
@@ -713,7 +720,7 @@ def predict_prenatal(
             )
             + prenatal_meta.olm_bias
         )
-        preface = float(scipy.special.expit(raw_logit))
+        ffa = float(scipy.special.expit(raw_logit))
     else:
         # Legacy MLP or fallback to OLM
         w1 = np.asarray(prenatal_meta.mlp_w1, dtype=np.float64)
@@ -725,7 +732,7 @@ def predict_prenatal(
         raw_mlp = float(scipy.special.expit(h @ w2 + b2)[0])
 
         if 0.01 <= raw_mlp <= 0.50:
-            preface = float(
+            ffa = float(
                 prenatal_meta.mlp_skew_intercept
                 + prenatal_meta.mlp_skew_slope * raw_mlp
             )
@@ -733,7 +740,7 @@ def predict_prenatal(
             olm_w = np.asarray(prenatal_meta.olm_weights, dtype=np.float64)
             olm_bias = float(prenatal_meta.olm_bias)
             raw_olm = float(features @ olm_w + olm_bias)
-            preface = float(
+            ffa = float(
                 prenatal_meta.olm_skew_intercept
                 + prenatal_meta.olm_skew_slope * raw_olm
             )
@@ -758,7 +765,7 @@ def predict_prenatal(
         fetal_sex=fetal_sex,
         ffy=ffy,
         ffx=ffx,
-        preface=preface,
+        ffa=ffa,
         chrx_ratio=chrx_ratio,
         prenatal_meta=prenatal_meta,
     )
@@ -767,14 +774,14 @@ def predict_prenatal(
     tolerance = 0.05
     if fetal_sex == "M" and sca_result.call in ("XY", "XXY"):
         if ffy is not None:
-            if abs(ffy - preface) <= tolerance:
+            if abs(ffy - ffa) <= tolerance:
                 # Precision fusion via inverse-variance weighting
                 var_ffy = max(float(prenatal_meta.ffy_std), 1e-4) ** 2
-                var_pref = max(float(prenatal_meta.preface_std), 1e-4) ** 2
+                var_ffa = max(float(prenatal_meta.ffa_std), 1e-4) ** 2
                 w_ffy = 1.0 / var_ffy
-                w_pref = 1.0 / var_pref
-                sum_w = w_ffy + w_pref
-                sum_prod = w_ffy * ffy + w_pref * preface
+                w_ffa = 1.0 / var_ffa
+                sum_w = w_ffy + w_ffa
+                sum_prod = w_ffy * ffy + w_ffa * ffa
                 if ffx > 0 and abs(ffx - ffy) <= tolerance:
                     var_ffx = max(float(prenatal_meta.ffx_std), 1e-4) ** 2
                     w_ffx = 1.0 / var_ffx
@@ -785,11 +792,11 @@ def predict_prenatal(
                 active_ff = float(max(0.0, ffy))
             active_ff_source: ActiveFFSource = "FFY"
         else:
-            active_ff = float(max(0.0, preface))
-            active_ff_source = "PREFACE"
+            active_ff = float(max(0.0, ffa))
+            active_ff_source = "FFA"
     else:
-        active_ff = float(max(0.0, preface))
-        active_ff_source = "PREFACE"
+        active_ff = float(max(0.0, ffa))
+        active_ff_source = "FFA"
 
     low_ff_warning = bool(active_ff < min_ff_warning)
     warnings: list[str] = []
@@ -806,7 +813,7 @@ def predict_prenatal(
         active_ff_source=active_ff_source,
         ffy=ffy,
         ffx=ffx,
-        preface=preface,
+        ffa=ffa,
         chrx_ratio=chrx_ratio,
         chry_score=chry_score,
         yfrac_threshold=prenatal_meta.yfrac_threshold,

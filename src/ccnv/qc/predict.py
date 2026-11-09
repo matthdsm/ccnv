@@ -114,7 +114,7 @@ def build_predict_qc_payload(
                 float(prenatal_result.ffy) if prenatal_result.ffy is not None else None
             ),
             "ffx": float(prenatal_result.ffx),
-            "preface": float(prenatal_result.preface),
+            "ffa": float(prenatal_result.ffa),
             "chrx_ratio": float(prenatal_result.chrx_ratio),
             "chry_score": float(prenatal_result.chry_score),
             "yfrac_threshold": float(prenatal_result.yfrac_threshold),

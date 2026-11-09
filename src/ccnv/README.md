@@ -78,7 +78,7 @@ Chromosomes are pre-split at masked gaps $>2\text{ Mb}$ into contiguous euchroma
 - `[src/ccnv/stats/neighbors.py:squeeze_var]`: Result-equivalent Smyth (2004) / Phipson et al. (2016) Empirical Bayes variance shrinkage under inverse-$\chi^2$ prior.
 - `[src/ccnv/stats/regression.py:build_joint_covariate_basis]`: Formulates joint natural cubic B-spline and interaction basis matrix for GC and mappability modeling.
 - `[src/ccnv/stats/prenatal_math.py:fit_elasticnet_ffy]`: Fits non-negative ElasticNetCV regression across euchromatic `chrY` bins for `FFY` estimation.
-- `[src/ccnv/stats/prenatal_math.py:fit_preface_logit_ensemble]`: Calibrates convex logit-link `RidgeCV` + `ElasticNetCV` ensemble for `PREFACE` fetal fraction prediction.
+- `[src/ccnv/stats/prenatal_math.py:fit_ffa_logit_ensemble]`: Calibrates convex logit-link `RidgeCV` + `ElasticNetCV` ensemble for `FFA` (fetal fraction autosomal) prediction.
 - `[src/ccnv/qc/reference.py:run_reference_qc_on_table]`: Evaluates reference quality metrics and issues usability verdicts (`PASS`, `WARN`, `FAIL`).
 - `[src/ccnv/predict.py:run]`: Coordinates single-sample normalization, PCA projection, Ruptures segmentation, calling, and reporting.
 - `[src/ccnv/stats/segmentation.py:WeightedL2Cost]`: Custom Ruptures `BaseCost` computing weighted SSE for change-point detection in $O(1)$ time.

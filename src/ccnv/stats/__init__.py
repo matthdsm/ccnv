@@ -16,6 +16,7 @@ from ccnv.stats.pca import (
 )
 from ccnv.stats.prenatal_math import (
     fit_elasticnet_ffy,
+    fit_ffa_logit_ensemble,
     fit_lasso_fista,
     fit_preface_logit_ensemble,
     fit_rprop_mlp,
@@ -51,6 +52,7 @@ __all__ = [
     "compute_null_models",
     "distance_cutoff",
     "fit_elasticnet_ffy",
+    "fit_ffa_logit_ensemble",
     "fit_lasso_fista",
     "fit_pca",
     "fit_preface_logit_ensemble",

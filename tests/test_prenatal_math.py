@@ -132,9 +132,12 @@ class TestFitElasticNetFFY(unittest.TestCase):
         self.assertEqual(b, 0.0)
 
 
-class TestFitPrefaceLogitEnsemble(unittest.TestCase):
+class TestFitFFALogitEnsemble(unittest.TestCase):
     def test_recovers_smooth_bounded_fetal_fraction(self) -> None:
-        from ccnv.stats.prenatal_math import fit_preface_logit_ensemble
+        from ccnv.stats.prenatal_math import (
+            fit_ffa_logit_ensemble,
+            fit_preface_logit_ensemble,
+        )
 
         rng = np.random.default_rng(42)
         n_samples = 30
@@ -146,7 +149,7 @@ class TestFitPrefaceLogitEnsemble(unittest.TestCase):
 
         true_ff = expit(true_logits)
 
-        weights, bias, sigma = fit_preface_logit_ensemble(X, true_ff, seed=42)
+        weights, bias, sigma = fit_ffa_logit_ensemble(X, true_ff, seed=42)
         self.assertEqual(weights.shape, (n_features,))
         self.assertTrue(math.isfinite(bias))
         self.assertGreater(sigma, 0.0)
@@ -155,6 +158,12 @@ class TestFitPrefaceLogitEnsemble(unittest.TestCase):
         preds = expit(X @ weights + bias)
         self.assertTrue(np.all((preds > 0.0) & (preds < 1.0)))
         np.testing.assert_allclose(preds, true_ff, atol=0.05)
+
+        # Test alias compatibility
+        w_pref, b_pref, s_pref = fit_preface_logit_ensemble(X, true_ff, seed=42)
+        np.testing.assert_array_equal(weights, w_pref)
+        self.assertEqual(bias, b_pref)
+        self.assertEqual(sigma, s_pref)
 
 
 class TestPCAIrlbaNumpy(unittest.TestCase):

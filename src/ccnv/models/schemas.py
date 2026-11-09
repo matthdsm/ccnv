@@ -70,9 +70,19 @@ class PrenatalModelMetadata:
     female_chrx_ratio_mean: float
     female_chrx_ratio_std: float
     ffy_std: float = 0.01
-    preface_std: float = 0.02
+    ffa_std: float = 0.02
     ffx_std: float = 0.025
-    preface_logit_mode: bool = False
+    ffa_logit_mode: bool = False
+
+    @property
+    def preface_std(self) -> float:
+        """Deprecated alias for ffa_std."""
+        return self.ffa_std
+
+    @property
+    def preface_logit_mode(self) -> bool:
+        """Deprecated alias for ffa_logit_mode."""
+        return self.ffa_logit_mode
 
     def __post_init__(self) -> None:
         if (
@@ -108,9 +118,11 @@ class PrenatalModelMetadata:
             "female_chrx_ratio_mean": float(self.female_chrx_ratio_mean),
             "female_chrx_ratio_std": float(self.female_chrx_ratio_std),
             "ffy_std": float(self.ffy_std),
-            "preface_std": float(self.preface_std),
+            "ffa_std": float(self.ffa_std),
             "ffx_std": float(self.ffx_std),
-            "preface_logit_mode": bool(self.preface_logit_mode),
+            "ffa_logit_mode": bool(self.ffa_logit_mode),
+            "preface_std": float(self.ffa_std),
+            "preface_logit_mode": bool(self.ffa_logit_mode),
         }
 
     @classmethod
@@ -125,6 +137,10 @@ class PrenatalModelMetadata:
             [float(x) for x in raw_b2]
             if isinstance(raw_b2, (list, tuple))
             else [float(raw_b2)]
+        )
+        ffa_std_val = float(data.get("ffa_std", data.get("preface_std", 0.02)))
+        ffa_logit_val = bool(
+            data.get("ffa_logit_mode", data.get("preface_logit_mode", False))
         )
         return cls(
             prenatal_bin_size=int(raw_bin_size),
@@ -146,9 +162,9 @@ class PrenatalModelMetadata:
             female_chrx_ratio_mean=float(data["female_chrx_ratio_mean"]),
             female_chrx_ratio_std=float(data["female_chrx_ratio_std"]),
             ffy_std=float(data.get("ffy_std", 0.01)),
-            preface_std=float(data.get("preface_std", 0.02)),
+            ffa_std=ffa_std_val,
             ffx_std=float(data.get("ffx_std", 0.025)),
-            preface_logit_mode=bool(data.get("preface_logit_mode", False)),
+            ffa_logit_mode=ffa_logit_val,
         )
 
     def encode(self) -> bytes:

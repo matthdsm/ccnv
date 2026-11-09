@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `ccnv.stats` package provides stateless numerical, statistical, and machine learning kernels for `ccnv`. It implements deterministic truncated Principal Component Analysis (PCA) with Gavish-Donoho Optimal Singular Value Hard Thresholding (SVHT), low-dimensional signal-subspace `KDTree` off-contig nearest-neighbor search, Smyth Empirical Bayes variance shrinkage (`squeeze_var`), joint natural cubic B-spline and Huber M-estimation regression, weighted change-point segmentation using custom Ruptures cost functions, non-negative Elastic Net (`FFY`), and convex logit-link regularized linear ensembles (`PREFACE`).
+The `ccnv.stats` package provides stateless numerical, statistical, and machine learning kernels for `ccnv`. It implements deterministic truncated Principal Component Analysis (PCA) with Gavish-Donoho Optimal Singular Value Hard Thresholding (SVHT), low-dimensional signal-subspace `KDTree` off-contig nearest-neighbor search, Smyth Empirical Bayes variance shrinkage (`squeeze_var`), joint natural cubic B-spline and Huber M-estimation regression, weighted change-point segmentation using custom Ruptures cost functions, non-negative Elastic Net (`FFY`), and convex logit-link regularized linear ensembles (`FFA`).
 
 ## Interface
 
@@ -23,8 +23,8 @@ The `ccnv.stats` package provides stateless numerical, statistical, and machine 
 - `[src/ccnv/stats/segmentation.py:segment_genome]`: Coordinates whole-genome change-point segmentation across all contigs.
 - `[src/ccnv/stats/prenatal_math.py:fit_elasticnet_ffy]`: Fits non-negative ElasticNetCV regression across euchromatic `chrY` bins for `FFY` estimation.
 - `[src/ccnv/stats/prenatal_math.py:fit_lasso_fista]`: Fits non-negative Lasso regression via coordinate descent for `FFY` estimation.
-- `[src/ccnv/stats/prenatal_math.py:fit_preface_logit_ensemble]`: Calibrates convex logit-link `RidgeCV` + `ElasticNetCV` ensemble for `PREFACE` fetal fraction prediction.
-- `[src/ccnv/stats/prenatal_math.py:fit_rprop_mlp]`: Trains a 2-unit Sigmoid multi-layer perceptron via quasi-Newton `L-BFGS-B` with Glorot initialization for `PREFACE`.
+- `[src/ccnv/stats/prenatal_math.py:fit_ffa_logit_ensemble]`: Calibrates convex logit-link `RidgeCV` + `ElasticNetCV` ensemble for `FFA` (fetal fraction autosomal) prediction.
+- `[src/ccnv/stats/prenatal_math.py:fit_rprop_mlp]`: Trains a 2-unit Sigmoid multi-layer perceptron via quasi-Newton `L-BFGS-B` with Glorot initialization for legacy autosomal models.
 - `[src/ccnv/stats/prenatal_math.py:infer_sex_gmm_1d]`: 1D two-component Gaussian Mixture Model with Brent's root-finding classifying sample fetal sex.
 - `[src/ccnv/stats/prenatal_math.py:ols_fit]`: Ordinary Least Squares linear regression kernel.
 - `[src/ccnv/stats/prenatal_math.py:rlm_huber]`: Robust Linear Model regression with Huber M-estimation ($\epsilon = 1.345$) for `FFX`.

@@ -50,7 +50,7 @@ flowchart TD
 
 ## 2. `reference`
 
-Constructs an autosomal and optional sex-chromosome background model from a cohort samplesheet (`--samplesheet`) or a flat uniform-depth reference from a FASTA file (`--fasta`). Supports `--mode germline | prenatal` (default `germline`). In prenatal mode, also fits non-negative `ElasticNetCV` `FFY` (5 kb chrY), coarsens in memory to 100 kb for convex logit-link `RidgeCV`/`ElasticNetCV` ensemble `PREFACE` and robust Huber `FFX`, and persists `prenatal_autosomal` and `prenatal_ffy` branches alongside `ccnv.prenatal` metadata.
+Constructs an autosomal and optional sex-chromosome background model from a cohort samplesheet (`--samplesheet`) or a flat uniform-depth reference from a FASTA file (`--fasta`). Supports `--mode germline | prenatal` (default `germline`). In prenatal mode, also fits non-negative `ElasticNetCV` `FFY` (5 kb chrY), coarsens in memory to 100 kb for convex logit-link `RidgeCV`/`ElasticNetCV` ensemble `FFA` and robust Huber `FFX`, and persists `prenatal_autosomal` and `prenatal_ffy` branches alongside `ccnv.prenatal` metadata.
 
 ```mermaid
 flowchart TD
@@ -67,7 +67,7 @@ flowchart TD
     FitPCA --> FitNearest["Select --nearest-bins off-contig neighbors via signal-subspace KDTree"]
     FitNearest --> FitNull["Compute Smyth Empirical Bayes squeeze_var null_mean and null_std"]
     FitNull --> PrenatalCheck{"--mode prenatal?"}
-    PrenatalCheck -- Yes --> FitPrenatal["Fit ElasticNetCV FFY, coarsened 100 kb logit RidgeCV/ElasticNetCV PREFACE & Huber FFX branches"]
+    PrenatalCheck -- Yes --> FitPrenatal["Fit ElasticNetCV FFY, coarsened 100 kb logit RidgeCV/ElasticNetCV FFA & Huber FFX branches"]
     PrenatalCheck -- No --> WriteRef["Write <prefix>.ccnv (REFERENCE_SCHEMA 2.0.0)"]
     FitPrenatal --> WriteRef
     WriteRef --> WriteQC["Write <prefix>_qc.json (unless --no-qc-report)"]
@@ -89,7 +89,7 @@ Evaluates reference usability from nearest-neighbor distance distributions, mask
 
 ## 4. `predict`
 
-Projects a sample onto the reference model, normalizes coverage against within-sample off-contig reference bins, segments per contig using pre-split euchromatic change-point detection, and calls `GAIN`/`LOSS` events. Supports `--mode germline | prenatal` (default `germline`). In prenatal mode, normalizes `chrX` against the diploid `XX` (`female_sex`) reference branch, computes `FFY`, `FFX`, and `PREFACE`, classifies sex chromosome aneuploidies (`XX`, `XY`, `XO`, `XXX`, `XXY`, `XYY`, `DISCORDANT_MIXED`), selects `active_ff`, annotates segments with expected ratios and discordance flags, and writes `<prefix>_qc.json`.
+Projects a sample onto the reference model, normalizes coverage against within-sample off-contig reference bins, segments per contig using pre-split euchromatic change-point detection, and calls `GAIN`/`LOSS` events. Supports `--mode germline | prenatal` (default `germline`). In prenatal mode, normalizes `chrX` against the diploid `XX` (`female_sex`) reference branch, computes `FFY`, `FFX`, and `FFA`, classifies sex chromosome aneuploidies (`XX`, `XY`, `XO`, `XXX`, `XXY`, `XYY`, `DISCORDANT_MIXED`), selects `active_ff`, annotates segments with expected ratios and discordance flags, and writes `<prefix>_qc.json`.
 
 ```mermaid
 flowchart TD

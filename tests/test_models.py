@@ -288,7 +288,7 @@ class TestFetalFractionResult(unittest.TestCase):
             active_ff_source="FFY",
             ffy=0.105,
             ffx=0.098,
-            preface=0.112,
+            ffa=0.112,
             chrx_ratio=0.95,
             chry_score=0.045,
             yfrac_threshold=0.015,
@@ -299,6 +299,7 @@ class TestFetalFractionResult(unittest.TestCase):
         self.assertEqual(ff_res.active_ff_source, "FFY")
         self.assertEqual(ff_res.ffy, 0.105)
         self.assertEqual(ff_res.ffx, 0.098)
+        self.assertEqual(ff_res.ffa, 0.112)
         self.assertEqual(ff_res.preface, 0.112)
         self.assertEqual(ff_res.sca, sca)
         self.assertFalse(ff_res.low_ff_warning)
@@ -309,10 +310,10 @@ class TestFetalFractionResult(unittest.TestCase):
         ff_res = FetalFractionResult(
             fetal_sex="F",
             active_ff=0.03,
-            active_ff_source="PREFACE",
+            active_ff_source="FFA",
             ffy=None,
             ffx=None,
-            preface=0.03,
+            ffa=0.03,
             chrx_ratio=1.0,
             chry_score=0.001,
             yfrac_threshold=0.015,
@@ -333,17 +334,17 @@ class TestFetalFractionResult(unittest.TestCase):
             FetalFractionResult(
                 fetal_sex="U",  # type: ignore[arg-type]
                 active_ff=0.1,
-                active_ff_source="PREFACE",
+                active_ff_source="FFA",
                 ffy=None,
                 ffx=None,
-                preface=0.1,
+                ffa=0.1,
                 chrx_ratio=1.0,
                 chry_score=0.0,
                 yfrac_threshold=0.01,
                 sca=sca,
             )
         with self.assertRaisesRegex(
-            ValueError, "active_ff_source must be 'FFY' or 'PREFACE'"
+            ValueError, "active_ff_source must be 'FFY' or 'FFA'"
         ):
             FetalFractionResult(
                 fetal_sex="F",
@@ -351,7 +352,7 @@ class TestFetalFractionResult(unittest.TestCase):
                 active_ff_source="OTHER",  # type: ignore[arg-type]
                 ffy=None,
                 ffx=None,
-                preface=0.1,
+                ffa=0.1,
                 chrx_ratio=1.0,
                 chry_score=0.0,
                 yfrac_threshold=0.01,
@@ -363,10 +364,10 @@ class TestFetalFractionResult(unittest.TestCase):
         ff_res = FetalFractionResult(
             fetal_sex="F",
             active_ff=0.08,
-            active_ff_source="PREFACE",
+            active_ff_source="FFA",
             ffy=None,
             ffx=0.08,
-            preface=0.08,
+            ffa=0.08,
             chrx_ratio=1.0,
             chry_score=0.0,
             yfrac_threshold=0.01,
@@ -400,7 +401,7 @@ class TestPredictionOutputsAliasesAndFields(unittest.TestCase):
             active_ff_source="FFY",
             ffy=0.10,
             ffx=0.09,
-            preface=0.11,
+            ffa=0.11,
             chrx_ratio=0.96,
             chry_score=0.05,
             yfrac_threshold=0.015,

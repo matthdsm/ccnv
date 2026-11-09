@@ -22,6 +22,7 @@ from sklearn.mixture import GaussianMixture
 
 __all__ = [
     "fit_elasticnet_ffy",
+    "fit_ffa_logit_ensemble",
     "fit_lasso_fista",
     "fit_preface_logit_ensemble",
     "fit_rprop_mlp",
@@ -181,12 +182,12 @@ def fit_elasticnet_ffy(
     return weights, intercept
 
 
-def fit_preface_logit_ensemble(
+def fit_ffa_logit_ensemble(
     X: NDArray[np.floating] | np.ndarray,
     y: NDArray[np.floating] | np.ndarray,
     seed: int = 42,
 ) -> tuple[NDArray[np.float64], float, float]:
-    """Fit convex logit-link RidgeCV and ElasticNetCV ensemble for PREFACE.
+    """Fit convex logit-link RidgeCV and ElasticNetCV ensemble for FFA (fetal fraction autosomal).
 
     Transforms fetal fraction targets to logit space u_i = logit(clip(y_i, 0.005, 0.85))
     and fits RidgeCV (alphas in 10^-2 to 10^4) and ElasticNetCV (l1_ratio in {0.1, 0.5}).
@@ -195,7 +196,7 @@ def fit_preface_logit_ensemble(
         b_ens = 0.5 * (b_ridge + b_enet)
     Predictions in (0, 1) are given by:
         y_hat = expit(x^T w_ens + b_ens)
-    Returns (w_ens, b_ens, sigma_pref) where sigma_pref is the RMSE of predictions.
+    Returns (w_ens, b_ens, sigma_ffa) where sigma_ffa is the RMSE of predictions.
     """
     x_arr = np.asarray(X, dtype=np.float64)
     y_arr = np.asarray(y, dtype=np.float64).ravel()
@@ -231,8 +232,12 @@ def fit_preface_logit_ensemble(
     b_ens = 0.5 * (float(ridge.intercept_) + float(enet.intercept_))
 
     y_pred = scipy.special.expit(x_arr @ w_ens + b_ens)
-    sigma_pref = max(float(np.sqrt(np.mean((y_pred - y_clip) ** 2))), 0.005)
-    return w_ens, b_ens, sigma_pref
+    sigma_ffa = max(float(np.sqrt(np.mean((y_pred - y_clip) ** 2))), 0.005)
+    return w_ens, b_ens, sigma_ffa
+
+
+# Backwards compatibility alias for PREFACE
+fit_preface_logit_ensemble = fit_ffa_logit_ensemble
 
 
 def fit_rprop_mlp(

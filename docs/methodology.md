@@ -19,7 +19,7 @@ flowchart TD
     S4 --> S5["5. Signal-Subspace KDTree Off-Contig Graph & Smyth Empirical Bayes squeeze_var Nulls"]
     S5 --> S6["6. Vectorized 2D Within-Sample Reference Masking & Empirical Bayes Precision Weighting"]
     S6 --> S7["7. Pre-Split Euchromatic PELT / KernelCPD Segmentation & Polars Stouffer AR(1) Z-Score Calling"]
-    S3 --> S8["8. Prenatal Reference: Non-Negative ElasticNetCV FFY, Coarsened Logit RidgeCV/ElasticNetCV PREFACE & Huber FFX"]
+    S3 --> S8["8. Prenatal Reference: Non-Negative ElasticNetCV FFY, Coarsened Logit RidgeCV/ElasticNetCV FFA & Huber FFX"]
     S8 --> S9["9. Prenatal Inference: Precision-Fused active_ff, 2D Stoichiometric Bayesian SCA & Fetal-Fraction LLR"]
     S7 --> S9
 ```
@@ -398,7 +398,7 @@ $$\operatorname{call} = \begin{cases} \texttt{"gain"} & \text{if } Z_{\text{seg}
 
 ---
 
-## 8. Prenatal Multi-Resolution Fetal Fraction Estimation (`FFY`, `PREFACE`, `FFX`)
+## 8. Prenatal Multi-Resolution Fetal Fraction Estimation (`FFY`, `FFA`, `FFX`)
 
 In `--mode prenatal`, `ccnv` calibrates and evaluates three complementary fetal fraction estimators from shallow maternal cfDNA sequencing.
 
@@ -422,19 +422,19 @@ $$\min_{\mathbf{w} \ge \mathbf{0}} \frac{1}{2S}\left\|\mathbf{y}_{\text{FF}} - \
 
 The $L_2$ penalty enforces the grouping effect, retaining all co-varying euchromatic `chrY` bins and eliminating out-of-sample overfit bias.
 
-### 8.3 Convex Logit-Link `RidgeCV` + `ElasticNetCV` Ensemble for `PREFACE`
+### 8.3 Convex Logit-Link `RidgeCV` + `ElasticNetCV` Ensemble for `FFA` (Fetal Fraction Autosomal)
 
 Autosomal counts are coarsened in memory to $100\text{ kb}$ (`prenatal_bin_size = 100000`). Truncated PCA extracts $D = \min(50, \max(1, S - 1))$ scores $\mathbf{X}_{\text{PCA}}$.
 
-`ccnv` implements a convex logit-space `SeqFF`-style ensemble (`src/ccnv/stats/prenatal_math.py:fit_preface_logit_ensemble`, Kim et al., 2015; Golub, Heath, & Wahba, 1979):
+`ccnv` implements a convex logit-space `SeqFF`/`PREFACE`-style ensemble (`src/ccnv/stats/prenatal_math.py:fit_ffa_logit_ensemble`, Kim et al., 2015; Raman et al., 2019b; Golub, Heath, & Wahba, 1979):
 
 $$u_s = \operatorname{logit}\!\left(\operatorname{clip}(y_s, 0.005, 0.85)\right) = \ln\!\left(\frac{\tilde{y}_s}{1 - \tilde{y}_s}\right)$$
 
 $$\mathbf{w}_{\text{ens}} = \frac{1}{2}\left(\hat{\mathbf{w}}_{\text{RidgeCV}} + \hat{\mathbf{w}}_{\text{ElasticNetCV}}\right), \quad b_{\text{ens}} = \frac{1}{2}\left(\hat{b}_{\text{RidgeCV}} + \hat{b}_{\text{ElasticNetCV}}\right)$$
 
-$$\hat{f}_{\text{PREFACE}}(\mathbf{z}) = \operatorname{expit}\!\left(\mathbf{z}^\top \mathbf{w}_{\text{ens}} + b_{\text{ens}}\right)$$
+$$\hat{f}_{\text{FFA}}(\mathbf{z}) = \operatorname{expit}\!\left(\mathbf{z}^\top \mathbf{w}_{\text{ens}} + b_{\text{ens}}\right)$$
 
-This convex formulation eliminates non-convex local minima and saturating tail artifacts of Sigmoid MLPs, guaranteeing monotonic predictions strictly within $(0, 1)$ with analytic LOOCV standard error $\sigma_{\text{pref}}$.
+This convex formulation eliminates non-convex local minima and saturating tail artifacts of Sigmoid MLPs, guaranteeing monotonic predictions strictly within $(0, 1)$ with analytic LOOCV standard error $\sigma_{\text{ffa}}$.
 
 ### 8.4 `FFX`: 100 kb `chrX` Robust Huber Regression
 
@@ -449,7 +449,7 @@ falling back to theoretical $(2.0, -2.0)$ when fewer than 2 male controls exist.
 - `_PAR1_START = 2_781_479`, `_YQ12_END = 28_800_000` (`src/ccnv/features/prenatal.py`): Euchromatic `chrY` bounds (**Tier 3 — Genomic Biology & Assembly Coordinates**).
 - `_EXCLUDED_PRENATAL_AUTOSOMES = {13, 18, 21}` (`src/ccnv/features/prenatal.py`): Autosomal exclusions (**Tier 2 — Published Literature & Reference Methodology** / **Tier 3 — Genomic Biology & Assembly Coordinates**).
 - `ElasticNetCV` `l1_ratio = [0.01, 0.05, 0.1]` for `FFY` (**Tier 2 — Published Literature & Reference Methodology**: Zou & Hastie, 2005; Kim et al., 2015).
-- `PREFACE` logit clip bounds `[0.005, 0.85]` and `RidgeCV` alpha grid $10^{-2} \dots 10^4$ (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**: Kim et al., 2015; Golub et al., 1979).
+- `FFA` logit clip bounds `[0.005, 0.85]` and `RidgeCV` alpha grid $10^{-2} \dots 10^4$ (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**: Kim et al., 2015; Golub et al., 1979).
 
 ---
 
@@ -475,9 +475,9 @@ Samples exceeding the 2D Mahalanobis outlier gate $d_M^2(\mathbf{x}, \boldsymbol
 
 In concordant `XY` pregnancies, independent estimators are combined via optimal Bates-Granger (1969) precision pooling (`src/ccnv/features/prenatal.py:predict_prenatal`):
 
-$$f_{\text{active}} = \frac{\sum_{m \in \{\text{FFY}, \text{PREFACE}, \text{FFX}\}} \sigma_m^{-2} \hat{f}_m}{\sum_{m \in \{\text{FFY}, \text{PREFACE}, \text{FFX}\}} \sigma_m^{-2}}, \qquad \sigma_{\text{active}}^2 = \left(\sum_{m} \sigma_m^{-2}\right)^{-1}$$
+$$f_{\text{active}} = \frac{\sum_{m \in \{\text{FFY}, \text{FFA}, \text{FFX}\}} \sigma_m^{-2} \hat{f}_m}{\sum_{m \in \{\text{FFY}, \text{FFA}, \text{FFX}\}} \sigma_m^{-2}}, \qquad \sigma_{\text{active}}^2 = \left(\sum_{m} \sigma_m^{-2}\right)^{-1}$$
 
-yielding an estimator with strictly lower variance than any individual component. For female fetuses (`XX`), `active_ff` routes to $\hat{f}_{\text{PREFACE}}$.
+yielding an estimator with strictly lower variance than any individual component. For female fetuses (`XX`), `active_ff` routes to $\hat{f}_{\text{FFA}}$.
 
 #### 9.1.3 Fetal-Fraction-Parameterized Log-Likelihood Ratio ($\operatorname{LLR}_{\text{fetal}}$) Segment Discordance
 
@@ -490,7 +490,7 @@ Discordance rules flag calls as `SCA_DISCORDANT`, `SUB_FETAL_RATIO` ($|r_{\text{
 ### 9.2 Constants & Hyperparameters
 
 - `SCA` Mahalanobis outlier threshold $\chi^2_{2, 0.999} = 13.8155$ (**Tier 2 — Published Literature & Reference Methodology**: Mazloom et al., 2013; Bianchi et al., 2015).
-- Default estimator standard errors `ffy_std = 0.01`, `preface_std = 0.02`, `ffx_std = 0.025` in `PrenatalModelMetadata` (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- Default estimator standard errors `ffy_std = 0.01`, `ffa_std = 0.02`, `ffx_std = 0.025` in `PrenatalModelMetadata` (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
 - `min_fetal_fraction_warning = 0.04` (`src/ccnv/models/config.py:PredictConfig`): $4\%$ clinical NIPT quantification lower limit (**Tier 2 — Published Literature & Reference Methodology** / **Tier 3 — Genomic Biology & Assembly Coordinates**).
 
 ---
@@ -529,7 +529,7 @@ Verdict escalation follows strict severity ordering $\texttt{PASS} (0) < \texttt
 | Constant / Parameter | Value | Source Location | Tier | Mathematical / Biological Rationale |
 | :--- | :--- | :--- | :--- | :--- |
 | `DEFAULT_BIN_SIZE` | `5000` bp | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Standard sWGS bin width balancing Poisson count noise vs. spatial resolution |
-| `prenatal_bin_size` | `100000` bp | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology | 20x coarsened resolution for `PREFACE` and `FFX` (SeqFF / PREFACE) |
+| `prenatal_bin_size` | `100000` bp | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology | 20x coarsened resolution for `FFA` and `FFX` (SeqFF / PREFACE) |
 | `min_mapping_quality` | `1` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology | Excludes multi-mapping reads ($\text{MAPQ}=0$) in BWA/Bowtie2 |
 | `DEFAULT_MIN_MAPPABILITY` | `0.5` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 3 — Genomic Biology & Assembly Coordinates | Requires $\ge 50\%$ uniquely mappable $k$-mers per bin |
 | `_MAX_N_FRACTION` | `0.5` | `src/ccnv/io/tracks.py` | Tier 3 — Genomic Biology & Assembly Coordinates / Tier 4 — Empirical Engineering & Numerical Guardrails | Masks bins with $>50\%$ ambiguous reference bases (`N`) |
@@ -558,11 +558,11 @@ Verdict escalation follows strict severity ordering $\texttt{PASS} (0) < \texttt
 | Contig AR(1) clamp | `[0.0, 0.95]` | `src/ccnv/predict.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Clamps contig lag-1 autocorrelation in Stouffer precision Z-score |
 | `z_threshold` | `3.0` | `src/ccnv/models/config.py` | Tier 1 — Statistical & Mathematical Theory / Tier 2 — Published Literature & Reference Methodology | Default segment calling threshold ($|Z| > 3.0$, two-sided $p \approx 0.0027$) |
 | `_PAR1_START` / `_YQ12_END` | `2,781,479` / `28,800,000` | `src/ccnv/features/prenatal.py` | Tier 3 — Genomic Biology & Assembly Coordinates | Human GRCh38 unique euchromatic `chrY` bounds (excludes PAR1 and `Yq12`) |
-| `_EXCLUDED_PRENATAL_AUTOSOMES` | `{13, 18, 21}` | `src/ccnv/features/prenatal.py` | Tier 2 — Published Literature & Reference Methodology / Tier 3 — Genomic Biology & Assembly Coordinates | Excludes common trisomy chromosomes from prenatal baseline and `PREFACE` |
+| `_EXCLUDED_PRENATAL_AUTOSOMES` | `{13, 18, 21}` | `src/ccnv/features/prenatal.py` | Tier 2 — Published Literature & Reference Methodology / Tier 3 — Genomic Biology & Assembly Coordinates | Excludes common trisomy chromosomes from prenatal baseline and `FFA` |
 | `ElasticNetCV` `l1_ratio` | `[0.01, 0.05, 0.1]` | `src/ccnv/stats/prenatal_math.py` | Tier 2 — Published Literature & Reference Methodology | Elastic Net grouping mixture for non-negative `FFY` estimation |
-| `PREFACE` logit bounds | `[0.005, 0.85]` | `src/ccnv/stats/prenatal_math.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Logit-link clipping bounds for convex `RidgeCV` + `ElasticNetCV` ensemble |
+| `FFA` logit bounds | `[0.005, 0.85]` | `src/ccnv/stats/prenatal_math.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Logit-link clipping bounds for convex `RidgeCV` + `ElasticNetCV` ensemble |
 | `SCA` Mahalanobis $\chi^2$ gate | `13.8155` | `src/ccnv/features/prenatal.py` | Tier 2 — Published Literature & Reference Methodology | $\chi^2_{2, 0.999}$ boundary identifying discordant mixed gonosome karyotypes |
-| Estimator SE defaults | `(0.01, 0.02, 0.025)` | `src/ccnv/models/results.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Default standard errors for `FFY`, `PREFACE`, and `FFX` in precision fusion |
+| Estimator SE defaults | `(0.01, 0.02, 0.025)` | `src/ccnv/models/results.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Default standard errors for `FFY`, `FFA`, and `FFX` in precision fusion |
 | `min_fetal_fraction_warning` | `0.04` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 3 — Genomic Biology & Assembly Coordinates | Clinical $4\%$ lower limit of fetal fraction warning threshold |
 | `DEFAULT_MIN_REF_BINS` | `150` | `src/ccnv/qc/reference.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Ref-QC warning threshold at $50\%$ of default $k=300$ neighbor pool |
 

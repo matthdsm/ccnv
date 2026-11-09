@@ -53,6 +53,7 @@ class TestStatsPackageExports(unittest.TestCase):
             "compute_null_models",
             "distance_cutoff",
             "fit_elasticnet_ffy",
+            "fit_ffa_logit_ensemble",
             "fit_lasso_fista",
             "fit_pca",
             "fit_preface_logit_ensemble",

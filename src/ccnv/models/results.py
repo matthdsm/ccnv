@@ -10,7 +10,7 @@ from numpy.typing import NDArray
 CallType = Literal["gain", "loss"]
 SCACall = Literal["XX", "XY", "XO", "XXX", "XXY", "XYY", "DISCORDANT_MIXED"]
 FetalSex = Literal["M", "F"]
-ActiveFFSource = Literal["FFY", "PREFACE"]
+ActiveFFSource = Literal["FFY", "FFA"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +70,7 @@ class FetalFractionResult:
     active_ff_source: ActiveFFSource
     ffy: float | None
     ffx: float
-    preface: float
+    ffa: float
     chrx_ratio: float
     chry_score: float
     yfrac_threshold: float
@@ -78,12 +78,17 @@ class FetalFractionResult:
     low_ff_warning: bool = False
     warnings: tuple[str, ...] = ()
 
+    @property
+    def preface(self) -> float:
+        """Alias for ffa (fetal fraction autosomal)."""
+        return self.ffa
+
     def __post_init__(self) -> None:
         if self.fetal_sex not in ("M", "F"):
             raise ValueError(f"fetal_sex must be 'M' or 'F', got {self.fetal_sex!r}")
-        if self.active_ff_source not in ("FFY", "PREFACE"):
+        if self.active_ff_source not in ("FFY", "FFA"):
             raise ValueError(
-                f"active_ff_source must be 'FFY' or 'PREFACE', "
+                f"active_ff_source must be 'FFY' or 'FFA', "
                 f"got {self.active_ff_source!r}"
             )
         if not isinstance(self.warnings, tuple):

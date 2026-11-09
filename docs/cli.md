@@ -52,8 +52,8 @@ ccnv reference --fasta GENOME.fa --prefix PREFIX [--bin-size N]
 | --- | --- | --- |
 | `-s`, `--samplesheet` | unset | Cohort samplesheet (`.yaml`, `.yml`, or `.json`) in root-list format listing sample Parquets with optional `sex` and `ff` overrides. Mutually exclusive with `--fasta`. |
 | `--fasta` | unset | Reference FASTA for building a flat uniform-depth reference model without a cohort (germline mode only). Mutually exclusive with `--samplesheet`. |
-| `--mode` | `germline` | Reference model mode: `germline` (standard CNV models) or `prenatal` (fits CNV branches plus 100 kb autosomal logit-ensemble PREFACE/Huber FFX and 5 kb chrY non-negative ElasticNetCV FFY models). |
-| `--prenatal-binsize` | `100000` | Target bin size in bases for coarsening autosomal counts in memory for prenatal PREFACE models. |
+| `--mode` | `germline` | Reference model mode: `germline` (standard CNV models) or `prenatal` (fits CNV branches plus 100 kb autosomal logit-ensemble FFA/Huber FFX and 5 kb chrY non-negative ElasticNetCV FFY models). |
+| `--prenatal-binsize` | `100000` | Target bin size in bases for coarsening autosomal counts in memory for prenatal FFA models. |
 | `--prefix` | required | Output prefix. Writes `<prefix>.ccnv` and `<prefix>_qc.json`. |
 | `--bin-size` | `5000` | Target bin size in bases. Cohort samples with different bin sizes are rebinned in memory if contig lengths match. |
 | `--all-contigs` | off | Include all FASTA contigs when building a flat reference. |
@@ -131,7 +131,7 @@ Prediction outputs:
 - `<prefix>_bins.bed.gz` (`.tbi`) and `<prefix>_bins.vcf.gz` (`.tbi`): Per-bin $\log_2$ ratio, z-score, precision weight, reference bin count, mask status, and branch.
 - `<prefix>_segments.bed.gz` (`.tbi`) and `<prefix>_segments.vcf.gz` (`.tbi`): Segmented intervals with weighted mean $\log_2$ ratio, z-score, weight, bin count, and call (plus prenatal `expected_ratio`, `implied_ff`, `discordant`, and `discordance_reason` columns in `prenatal` mode).
 - `<prefix>_calls.bed.gz` (`.tbi`) and `<prefix>_calls.vcf.gz` (`.tbi`): Called `GAIN` and `LOSS` segments only.
-- `<prefix>_qc.json`: Comprehensive prediction quality metrics covering effective target contig reads, CNV summary, and, in `prenatal` mode, `fetal_sex`, `active_ff`, `active_method`, `sca`, `ffy`, `preface`, `ffx`, and warning flags.
+- `<prefix>_qc.json`: Comprehensive prediction quality metrics covering effective target contig reads, CNV summary, and, in `prenatal` mode, `fetal_sex`, `active_ff`, `active_method`, `sca`, `ffy`, `ffa`, `ffx`, and warning flags.
 - `<prefix>_plot.html`: Interactive Plotly genome-wide copy-number profile with pan/zoom, coordinate/cytoband search, configurable Z-score and $\log_2$ ratio threshold color-coding, optional cytoband ideogram track, and, in `prenatal` mode, prenatal status banner, fetal fraction reference lines, and high-contrast purple `#9333ea` discordant segment overlays.
 
 ```mermaid

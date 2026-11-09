@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `ccnv.features` package provides feature extraction, dynamic genomic rebinning, cohort depth normalization, covariate bias correction, and non-invasive prenatal (NIPT) modeling workflows. It handles coordinate transformations between heterogeneous bin sizes, robust joint B-spline bias estimation against GC content and mappability, and multi-resolution fetal fraction calibration (`FFY`, `PREFACE`, `FFX`).
+The `ccnv.features` package provides feature extraction, dynamic genomic rebinning, cohort depth normalization, covariate bias correction, and non-invasive prenatal (NIPT) modeling workflows. It handles coordinate transformations between heterogeneous bin sizes, robust joint B-spline bias estimation against GC content and mappability, and multi-resolution fetal fraction calibration (`FFY`, `FFA`, `FFX`).
 
 ## Interface
 
@@ -21,7 +21,7 @@ The `ccnv.features` package provides feature extraction, dynamic genomic rebinni
 - `[src/ccnv/features/covariates.py:covariate_features]`: Formulates standardized polynomial basis matrices for GC and mappability tracks.
 - `[src/ccnv/features/covariates.py:mask_covariates]`: Masks bins failing valid base count, ambiguous base fraction, or mappability criteria.
 - `[src/ccnv/features/covariates.py:correct_covariate_bias]`: Normalizes GC and mappability biases using joint natural cubic B-spline and Huber M-estimation regression.
-- `[src/ccnv/features/prenatal.py:fit_prenatal_models]`: Calibrates multi-resolution prenatal reference models (`FFY`, `PREFACE`, `FFX`).
+- `[src/ccnv/features/prenatal.py:fit_prenatal_models]`: Calibrates multi-resolution prenatal reference models (`FFY`, `FFA`, `FFX`).
 - `[src/ccnv/features/prenatal.py:predict_prenatal]`: Evaluates active fetal fraction via Bates-Granger precision fusion, fetal sex, and sex chromosome aneuploidies.
 - `[src/ccnv/features/prenatal.py:classify_sca]`: Classifies sex chromosome aneuploidies (`XX`, `XY`, `XO`, `XXX`, `XXY`, `XYY`, `DISCORDANT_MIXED`) via a 2D stoichiometric Gaussian Bayes model with Mahalanobis $\chi^2$ gate.
 - `[src/ccnv/features/prenatal.py:annotate_prenatal_segments]`: Annotates CNV segments with expected prenatal ratios, implied fetal fractions, and LLR discordance flags.

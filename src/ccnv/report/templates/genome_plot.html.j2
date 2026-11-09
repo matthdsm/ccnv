@@ -200,11 +200,12 @@
     }
     const ffPct = (p.active_ff * 100).toFixed(1);
     const ffyStr = p.ffy !== null && p.ffy !== undefined ? `${(p.ffy * 100).toFixed(1)}%` : "N/A";
-    const prefStr = p.preface !== null && p.preface !== undefined ? `${(p.preface * 100).toFixed(1)}%` : "N/A";
+    const ffaVal = (p.ffa !== null && p.ffa !== undefined) ? p.ffa : p.preface;
+    const ffaStr = ffaVal !== null && ffaVal !== undefined ? `${(ffaVal * 100).toFixed(1)}%` : "N/A";
     const ffxStr = p.ffx !== null && p.ffx !== undefined ? `${(p.ffx * 100).toFixed(1)}%` : "N/A";
     badgeEl.innerHTML = `<span><strong>Fetal Sex:</strong> ${p.fetal_sex}</span>` +
       `<span>|</span><span><strong>Active FF:</strong> ${ffPct}% (${p.active_ff_source})</span>` +
-      `<span>|</span><span><strong>FF:</strong> ${ffyStr} / ${prefStr} / ${ffxStr}</span>` +
+      `<span>|</span><span><strong>FF (Y/A/X):</strong> ${ffyStr} / ${ffaStr} / ${ffxStr}</span>` +
       `<span>|</span><span><strong>SCA:</strong> ${p.sca_call}</span>`;
     badgeEl.style.display = "inline-flex";
     if (discLegend) discLegend.style.display = "inline";
