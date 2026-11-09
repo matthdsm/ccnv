@@ -52,7 +52,7 @@ ccnv reference --fasta GENOME.fa --prefix PREFIX [--bin-size N]
 | --- | --- | --- |
 | `-s`, `--samplesheet` | unset | Cohort samplesheet (`.yaml`, `.yml`, or `.json`) in root-list format listing sample Parquets with optional `sex` and `ff` overrides. Mutually exclusive with `--fasta`. |
 | `--fasta` | unset | Reference FASTA for building a flat uniform-depth reference model without a cohort (germline mode only). Mutually exclusive with `--samplesheet`. |
-| `--mode` | `germline` | Reference model mode: `germline` (standard CNV models) or `prenatal` (fits CNV branches plus 100 kb autosomal PREFACE/FFX and 5 kb chrY FFY models). |
+| `--mode` | `germline` | Reference model mode: `germline` (standard CNV models) or `prenatal` (fits CNV branches plus 100 kb autosomal logit-ensemble PREFACE/Huber FFX and 5 kb chrY non-negative ElasticNetCV FFY models). |
 | `--prenatal-binsize` | `100000` | Target bin size in bases for coarsening autosomal counts in memory for prenatal PREFACE models. |
 | `--prefix` | required | Output prefix. Writes `<prefix>.ccnv` and `<prefix>_qc.json`. |
 | `--bin-size` | `5000` | Target bin size in bases. Cohort samples with different bin sizes are rebinned in memory if contig lengths match. |
@@ -61,8 +61,8 @@ ccnv reference --fasta GENOME.fa --prefix PREFIX [--bin-size N]
 | `--sex-contig` | `X,Y,chrX,chrY` | Sex contig name (repeatable). Intersected with sample contigs by default. |
 | `--sex-signal-contig` | `chrY` | Contig coverage fraction used to infer male vs. female samples (falls back to `Y`). |
 | `--sex-cutoff` | inferred | Coverage fraction threshold on `--sex-signal-contig` above which samples are classified as male. |
-| `--pca-components` | `5` | Number of principal components per branch. |
-| `--nearest-bins` | `300` | Number of nearest off-contig reference bins per target bin. |
+| `--pca-components` | `5` | Maximum number of principal components per branch (optimal rank selected dynamically via Gavish-Donoho SVHT). |
+| `--nearest-bins` | `300` | Number of nearest off-contig reference bins per target bin (queried via signal-subspace KDTree). |
 | `--max-batch-memory-mb` | `256` | Memory cap (MiB) for batched pairwise distance calculation. |
 | `--min-cohort-size` | `10` | Minimum control samples required for the autosomal branch. |
 | `--min-sex-group-size` | `5` | Minimum samples per sex required to build a sex-specific branch. |
@@ -75,11 +75,11 @@ ccnv reference --fasta GENOME.fa --prefix PREFIX [--bin-size N]
 
 ```mermaid
 flowchart LR
-    A["Samplesheet (.yaml/.json) or FASTA"] --> B["Validation & Rebinning"]
-    B --> C["Depth & Covariate Normalization"]
+    A["Samplesheet (.yaml/.json) or FASTA"] --> B["Validation & Polars Rebinning"]
+    B --> C["DESeq2 Depth Scaling & B-Spline Covariate Normalization"]
     C --> D["Sex Inference & Branching"]
-    D --> E["PCA Decomposition"]
-    E --> F["Nearest Off-Contig Bin Search"]
+    D --> E["Gavish-Donoho SVHT PCA Decomposition"]
+    E --> F["Signal-Subspace KDTree Off-Contig Search & Smyth EB Nulls"]
     F --> G["<prefix>.ccnv & <prefix>_qc.json"]
 ```
 
@@ -99,7 +99,7 @@ ccnv ref-qc REFERENCE [--prefix PREFIX] [options]
 
 ## `predict`
 
-Normalize a sample against a reference model, segment with weighted Binary Segmentation, and call copy-number gains and losses.
+Normalize a sample against a reference model, segment with weighted change-point detection, and call copy-number gains and losses.
 
 ```console
 ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
@@ -109,11 +109,11 @@ ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
 | --- | --- | --- |
 | `SAMPLE` | required | Sample `.ccnv` file from `extract`. |
 | `REFERENCE` | required | Reference `.ccnv` file from `reference`. |
-| `--mode` | `germline` | Prediction mode: `germline` (standard diploid CNV analysis) or `prenatal` (joint CNV, fetal fraction, SCA, and discordance analysis). |
+| `--mode` | `germline` | Prediction mode: `germline` (standard diploid CNV analysis) or `prenatal` (joint CNV, Bates-Granger precision-fused fetal fraction, 2D stoichiometric Bayesian SCA, and LLR discordance analysis). |
 | `--prefix` | sample stem | Output path prefix. |
 | `--sex` | `autosomal` | Branch selection: `autosomal` (infers sex when sex branches exist), `female`, or `male`. (In `prenatal` mode, `chrX` is always normalized against the diploid `XX` female branch). |
-| `--penalty` | `1.0` | Weighted sum-of-squared-errors segmentation penalty per breakpoint. |
-| `--z-threshold` | `3.0` | Absolute segment z-score threshold for calling gains and losses. |
+| `--penalty` | `1.0` | Weighted sum-of-squared-errors segmentation penalty per breakpoint (evaluated across pre-split euchromatic arm blocks with C-compiled KernelCPD, Pelt, or Binseg). |
+| `--z-threshold` | `3.0` | Absolute autocorrelation-corrected Stouffer Z-score threshold for calling gains and losses. |
 | `--ratio-threshold` | unset | Absolute $\log_2$ ratio call threshold (overrides `--z-threshold` when set). |
 | `--min-reference-bins` | `3` | Minimum within-sample reference bins required to normalize a target bin. |
 | `--mask-repeats` | `3` | Outlier-masking iterations during within-sample normalization. |
@@ -137,10 +137,10 @@ Prediction outputs:
 ```mermaid
 flowchart LR
     A["Sample & Reference .ccnv"] --> B["In-Memory Rebinning"]
-    B --> C["Branch Selection & Covariate Scaling"]
-    C --> D["PCA Bias Subtraction"]
-    D --> E["Within-Sample Reference Normalization"]
-    E --> F["Weighted Ruptures Binseg"]
-    F --> G["Z-Score / Ratio Calling"]
+    B --> C["Branch Selection & B-Spline Scaling"]
+    C --> D["Robust HuberRegressor PCA Projection"]
+    D --> E["Vectorized Within-Sample Normalization & EB Precision Weights"]
+    E --> F["Pre-Split Euchromatic Segmentation (KernelCPD / Pelt / Binseg)"]
+    F --> G["Polars Autocorrelation-Corrected Stouffer Z-Score Calling"]
     G --> H["BED.gz, VCF.gz & HTML"]
 ```

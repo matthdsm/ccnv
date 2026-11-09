@@ -6,21 +6,21 @@ This document provides a complete specification of the mathematical formulations
 
 Every constant, threshold, and model hyperparameter in `ccnv` is classified into one of four provenance tiers:
 
-- **Tier 1 — Statistical & Mathematical Theory**: Derived analytically from probability distributions, asymptotic statistical efficiency, or numerical analysis (e.g., Gaussian quantile functions, Bessel's correction, Glorot weight initialization).
-- **Tier 2 — Published Literature & Reference Methodology**: Adopted from peer-reviewed bioinformatics algorithms, primarily WISECONDOR (Straver et al., 2014), WisecondorX (Raman et al., 2019a), SeqFF (Kim et al., 2015), PREFACE (Raman et al., 2019b), Huber M-estimation (Huber, 1964), and PELT/Binseg change-point detection (Killick et al., 2012).
+- **Tier 1 — Statistical & Mathematical Theory**: Derived analytically from probability distributions, asymptotic statistical efficiency, or numerical analysis (e.g., Gaussian quantile functions, Bessel's correction, Huber M-estimation efficiency, Bates-Granger forecast combination).
+- **Tier 2 — Published Literature & Reference Methodology**: Adopted from peer-reviewed bioinformatics algorithms, primarily WISECONDOR (Straver et al., 2014), WisecondorX (Raman et al., 2019a), DESeq2 median-of-ratios (Anders & Huber, 2010; Love et al., 2014), SeqFF (Kim et al., 2015), limma Empirical Bayes (Smyth, 2004; Phipson et al., 2016), Gavish-Donoho SVHT (Gavish & Donoho, 2014), Stouffer precision pooling (Stouffer et al., 1949; Whitlock, 2005), and PELT/Binseg change-point detection (Killick et al., 2012).
 - **Tier 3 — Genomic Biology & Assembly Coordinates**: Grounded in human cytogenetics, chromosome structure, or reference genome coordinates (e.g., pseudoautosomal boundaries, heterochromatic satellite blocks, centromeric gaps, and fetal-maternal cell-free DNA stoichiometry).
 - **Tier 4 — Empirical Engineering & Numerical Guardrails**: Tuned for floating-point stability, solver convergence, memory bounding, or outlier clamping in shallow whole-genome sequencing ($0.1\times\text{–}1.0\times$ coverage).
 
 ```mermaid
 flowchart TD
-    S1["1. Alignment Binning & Cumulative Knot Rebinning"] --> S2["2. Depth Normalization & Huber IRLS Covariate Regression"]
+    S1["1. Spatial Discretization & Mass-Conserving Rebinning"] --> S2["2. DESeq2 Median-of-Ratios Depth Scaling & Joint B-Spline HuberRegressor Covariate Correction"]
     S2 --> S3["3. Cohort Sex Inference (Gap-MAD & 1D 2-GMM)"]
-    S3 --> S4["4. Centered Unscaled PCA & Least-Squares Projection"]
-    S4 --> S5["5. Off-Contig Nearest-Neighbor Search & Null Modeling"]
-    S5 --> S6["6. Within-Sample Outlier Masking & Precision Weighting"]
-    S6 --> S7["7. Weighted Ruptures Segmentation & Event Calling"]
-    S3 --> S8["8. Prenatal Multi-Resolution FF Models (FFY, PREFACE, FFX)"]
-    S8 --> S9["9. Sex Chromosome Aneuploidy (SCA) & Discordance Calling"]
+    S3 --> S4["4. Gavish-Donoho SVHT PCA & Robust HuberRegressor Subspace Projection"]
+    S4 --> S5["5. Signal-Subspace KDTree Off-Contig Graph & Smyth Empirical Bayes squeeze_var Nulls"]
+    S5 --> S6["6. Vectorized 2D Within-Sample Reference Masking & Empirical Bayes Precision Weighting"]
+    S6 --> S7["7. Pre-Split Euchromatic PELT / KernelCPD Segmentation & Polars Stouffer AR(1) Z-Score Calling"]
+    S3 --> S8["8. Prenatal Reference: Non-Negative ElasticNetCV FFY, Coarsened Logit RidgeCV/ElasticNetCV PREFACE & Huber FFX"]
+    S8 --> S9["9. Prenatal Inference: Precision-Fused active_ff, 2D Stoichiometric Bayesian SCA & Fetal-Fraction LLR"]
     S7 --> S9
 ```
 
@@ -40,15 +40,12 @@ When reconciling a source partitioning $\{[s_i^{\text{src}}, e_i^{\text{src}})\}
 
 $$c_j^{\text{tgt}} = \sum_{i=0}^{N-1} w_{ij} c_i^{\text{src}}, \quad w_{ij} = \frac{\max\!\left(0, \min(e_i^{\text{src}}, e_j^{\text{tgt}}) - \max(s_i^{\text{src}}, s_j^{\text{tgt}})\right)}{e_i^{\text{src}} - s_i^{\text{src}}}$$
 
-Rather than materializing the $O(N \times M)$ overlap matrix $\mathbf{W}$, `src/ccnv/features/binning.py:rebin_counts` evaluates the exact transformation in $O(N + M)$ time and memory by constructing the piecewise-linear cumulative count function $F^{\text{src}}(x)$ at knots $\mathbf{x}^{\text{src}} = (s_0^{\text{src}}, e_0^{\text{src}}, \dots, e_{N-1}^{\text{src}})$:
+`ccnv` implements a dual-path rebinning architecture in `src/ccnv/features/cohort.py:rebin_sample_table`:
 
-$$F^{\text{src}}(x_k^{\text{src}}) = \sum_{i=0}^{k-1} c_i^{\text{src}}, \quad F^{\text{src}}(0) = 0$$
+1. **Exact Integer-Multiple Coarsening Fast Path ($w_{\text{target}} \equiv 0 \pmod{w_{\text{source}}}$, e.g., $5\text{ kb} \to 100\text{ kb}$)**: When target bin width is an exact integer multiple of source bin width and all interior source bins have uniform width $w_{\text{source}}$, rebinning executes directly via a Rust-parallelized Polars expression `pl.DataFrame.group_by(["contig", pl.col("start") // target_bin_size], maintain_order=True).agg(...)` summing counts across nested intervals in $O(B)$ time without intermediate Python allocations or array copies.
+2. **General Non-Nested Interval Rebinning**: For arbitrary non-nested bin grids over the same contig length, `src/ccnv/features/binning.py:rebin_counts` evaluates the transformation in $O(N + M)$ time and memory by constructing the piecewise-linear cumulative count function $F^{\text{src}}(x) = \sum_{j: e_j \le x} c_j + c_k \frac{x - s_k}{e_k - s_k}$ at knots $\mathbf{x}^{\text{src}} = (s_0^{\text{src}}, e_0^{\text{src}}, \dots, e_{N-1}^{\text{src}})$, interpolating $F^{\text{src}}$ at target knots $\mathbf{x}^{\text{tgt}}$ via `np.interp`, and taking non-negative first differences $c_j^{\text{tgt}} = \max(0, F^{\text{src}}(e_j^{\text{tgt}}) - F^{\text{src}}(s_j^{\text{tgt}}))$, guaranteeing exact conservation of total read mass ($\sum_m c_m^{\text{tgt}} = \sum_j c_j^{\text{src}}$).
 
-interpolating $F^{\text{src}}$ at target knots $\mathbf{x}^{\text{tgt}} = (s_0^{\text{tgt}}, e_0^{\text{tgt}}, \dots, e_{M-1}^{\text{tgt}})$ via `np.interp`, and taking first differences clamped to non-negative reals:
-
-$$c_j^{\text{tgt}} = \max\!\left(0, F^{\text{src}}(e_j^{\text{tgt}}) - F^{\text{src}}(s_j^{\text{tgt}})\right)$$
-
-When persisting rebinned sample tables (`src/ccnv/features/cohort.py:rebin_sample_table`), continuous target counts are rounded to nearest integers via round-half-to-even (`np.rint`) and cast to `uint64`.
+When persisting rebinned sample tables (`src/ccnv/features/cohort.py:rebin_sample_table`), target counts are preserved as `float64` to maintain fractional count conservation without integer rounding drift.
 
 ### 1.2 Statistical Assumptions & Failure Modes
 
@@ -59,12 +56,12 @@ When persisting rebinned sample tables (`src/ccnv/features/cohort.py:rebin_sampl
 ### 1.3 Model & Function Selection Rationale
 
 - **Cumulative Knot Interpolation vs. Dense Overlap Matrix**: At $5\text{ kb}$ resolution on human `chr1` ($N \approx 50,000$ bins), a dense matrix $\mathbf{W}$ requires $2.5 \times 10^9$ floats ($\approx 20\text{ GB}$ RAM). Cumulative knot interpolation (`np.cumsum` + `np.interp` + `np.diff`) computes identical values in $< 1\text{ MB}$ and $O(N + M)$ operations while strictly conserving total read mass ($\sum_j c_j^{\text{tgt}} = \sum_i c_i^{\text{src}}$).
-- **Round-Half-to-Even (`np.rint`)**: Prevents systematic upward or downward rounding drift across thousands of rebinned intervals compared to `np.floor` or standard half-up rounding.
+- **Float64 Conservation vs. Uint64 Truncation**: Persisting continuous `float64` counts preserves exact linear fractional totals across multiple rebinning stages, avoiding systematic truncation or bias across thousands of intervals.
 
 ### 1.4 Constants & Hyperparameters
 
-- `DEFAULT_BIN_SIZE = 5000` (`src/ccnv/models/config.py`): Default $5\text{ kb}$ bin width (**Tier 2 / Tier 4**). Balances Poisson counting noise at $0.1\times\text{–}0.5\times$ sWGS coverage ($\sim 150\text{–}750$ reads/bin) against spatial breakpoint resolution; coarsened in memory to $100\text{ kb}$ (`prenatal_bin_size = 100000`) for prenatal models.
-- `min_mapping_quality = 1` (`src/ccnv/models/config.py:ReadFilters`): Default minimum Phred-scaled MAPQ (**Tier 2**). Excludes multi-mapping reads ($\text{MAPQ} = 0$, which indicates $\ge 2$ equally likely alignments in BWA/Bowtie2) while retaining low-confidence unique alignments on repetitive contigs.
+- `DEFAULT_BIN_SIZE = 5000` (`src/ccnv/models/config.py`): Default $5\text{ kb}$ bin width (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**). Balances Poisson counting noise at $0.1\times\text{–}0.5\times$ sWGS coverage ($\sim 150\text{–}750$ reads/bin) against spatial breakpoint resolution; coarsened in memory to $100\text{ kb}$ (`prenatal_bin_size = 100000`) for prenatal models.
+- `min_mapping_quality = 1` (`src/ccnv/models/config.py:ReadFilters`): Default minimum Phred-scaled MAPQ (**Tier 2 — Published Literature & Reference Methodology**). Excludes multi-mapping reads ($\text{MAPQ} = 0$, which indicates $\ge 2$ equally likely alignments in BWA/Bowtie2) while retaining low-confidence unique alignments on repetitive contigs.
 
 ---
 
@@ -72,17 +69,26 @@ When persisting rebinned sample tables (`src/ccnv/features/cohort.py:rebin_sampl
 
 ### 2.1 Mathematical Formulation
 
-#### Depth Normalization and Low-Coverage Masking
+#### 2.1.1 DESeq2 Median-of-Ratios Compositional Depth Scaling
 
-Given a raw counts matrix $\mathbf{C} \in \mathbb{R}_{\ge 0}^{B \times S}$ across $B$ bins and $S$ cohort samples (`src/ccnv/features/cohort.py:normalize_depth`), each sample $s$ is normalized to unit total coverage over the active mask $\mathcal{U} \subseteq \{0, \dots, B-1\}$:
+Given a raw counts matrix $\mathbf{C} \in \mathbb{R}_{\ge 0}^{B \times S}$ across $B$ bins and $S$ cohort samples (`src/ccnv/features/cohort.py:estimate_size_factors`, `src/ccnv/features/cohort.py:normalize_depth`), naive total-sum division projects sample depths onto the simplex $\Delta^{B-1}$, giving it a $0\%$ breakdown point: any large whole-chromosome aneuploidy (such as Trisomy 21 or Monosomy X) or high-level focal amplification shifts the total sum denominator, distorting diploid bins before covariate and PCA correction (Aitchison, 1982; Robinson & Oshlack, 2010).
 
-$$y_{b, s} = \frac{C_{b, s}}{\sum_{i \in \mathcal{U}} C_{i, s}}$$
+`ccnv` implements the DESeq2 Median-of-Ratios normalization (Anders & Huber, 2010; Love et al., 2014) in pure NumPy/Polars with a $50\%$ outlier breakdown point. For the usable bin mask $\mathcal{U} \subseteq \{0, \dots, B-1\}$ and bins with positive counts in all samples $\mathcal{I}_{+} = \{i \in \mathcal{U} : \prod_{s=1}^S C_{i, s} > 0\}$:
 
-Cohort-level low-coverage masking (`src/ccnv/features/cohort.py:mask_low_coverage`) sums normalized coverage across samples $T_b = \sum_{s=1}^S y_{b, s}$ and retains bins exceeding a fraction $\alpha_{\text{cov}} = 0.05$ of the positive median bin sum:
+1. Compute the geometric mean pseudo-reference for each bin across all $S$ samples:
+   $$g_i = \exp\left(\frac{1}{S}\sum_{s=1}^S \ln C_{i, s}\right) \quad \forall i \in \mathcal{I}_{+}$$
+2. For each sample $s \in \{1, \dots, S\}$, calculate its raw size factor as the median ratio against the pseudo-reference:
+   $$\hat{s}_s = \operatorname{median}_{i \in \mathcal{I}_{+}}\left(\frac{C_{i, s}}{g_i}\right)$$
+3. Scale raw factors so that the median sample's total depth is preserved, aligning counts with standard sequencing depth:
+   $$s_s = \hat{s}_s \cdot \operatorname{median}_{s'}\left(\frac{\sum_{i \in \mathcal{U}} C_{i, s'}}{\hat{s}_{s'}}\right), \qquad \tilde{c}_{i, s} = \frac{C_{i, s}}{s_s}$$
+
+When $|\mathcal{I}_{+}| < 2$ or $S < 2$ (e.g., in single-sample prediction without a cohort), the normalization smoothly falls back to positive-median scaling or total-sum division over usable bins $\mathcal{U}$.
+
+Cohort-level low-coverage masking (`src/ccnv/features/cohort.py:mask_low_coverage`) sums normalized coverage across samples $T_b = \sum_{s=1}^S \tilde{c}_{b, s}$ and retains bins exceeding a fraction $\alpha_{\text{cov}} = 0.05$ of the positive median bin sum:
 
 $$\text{usable}_{\text{cov}}(b) \iff T_b > 0.05 \cdot \operatorname{median}_{i : T_i > 0}(T_i)$$
 
-#### Covariate Masking
+#### 2.1.2 Covariate Masking
 
 When GC content $\mathbf{g} \in [0, 1]^B$, ambiguous base indicator $\mathbf{n}_{\text{mask}} \in \{\text{true}, \text{false}\}^B$, and mappability $\mathbf{m} \in [0, 1]^B$ tracks are provided (`src/ccnv/io/tracks.py`, `src/ccnv/features/covariates.py:mask_covariates`), a bin $b$ is masked if:
 
@@ -91,57 +97,42 @@ When GC content $\mathbf{g} \in [0, 1]^B$, ambiguous base indicator $\mathbf{n}_
 2. Its mappability score falls below $\tau_{\text{map}}$ (`min_mappability`, default $0.5$): $m_b < \tau_{\text{map}}$.
 3. Its GC proportion is non-finite or outside $[0, 1]$.
 
-#### Sequential 1D Huber IRLS Polynomial Bias Correction
+#### 2.1.3 Joint Natural Cubic B-Spline & Huber M-Estimation Covariate Bias Correction
 
-For a covariate vector $\mathbf{x} \in \mathbb{R}^{B_{\text{usable}}}$ (either GC fraction with polynomial degree $d = 3$ or mappability with degree $d = 2$, `src/ccnv/features/covariates.py:correct_covariate_bias`), `src/ccnv/stats/regression.py:build_1d_basis` first checks that $\operatorname{std}(\mathbf{x}) > 10^{-6}$, standardizes $\mathbf{x}$ with population Z-scores ($\text{ddof} = 0$), and clamps extreme tails to $[-2.5, 2.5]$:
+`ccnv` models non-linear GC and mappability biases jointly (`src/ccnv/stats/regression.py:build_joint_covariate_basis`, `src/ccnv/stats/regression.py:fit_sample_trend`, `src/ccnv/features/covariates.py:correct_covariate_bias`). A joint basis matrix $\mathbf{X}_{\text{cov}} \in \mathbb{R}^{B_{\text{usable}} \times K}$ is constructed using quantile-placed natural cubic B-splines (`SplineTransformer(knots="quantile", extrapolation="linear")`) and an explicit interaction term:
 
-$$z_i = \operatorname{clip}\!\left(\frac{x_i - \bar{x}}{\sigma_x}, -2.5, 2.5\right)$$
+$$\mathbf{X}_{\text{cov}} = \left[\mathbf{1}, \; \mathcal{B}_{\text{GC}}^{(k=5, d=3)}(\mathbf{g}), \; \mathcal{B}_{\text{map}}^{(k=4, d=2)}(\mathbf{m}), \; z(\mathbf{g}) \odot z(\mathbf{m})\right]$$
 
-A 1D Vandermonde design matrix $\mathbf{X} \in \mathbb{R}^{B_{\text{usable}} \times (d+1)}$ is formed with entries $X_{i, k} = z_i^k$ for $k \in \{0, \dots, d\}$.
+where $\mathcal{B}_{\text{GC}}$ has 5 quantile knots with degree 3 cubic splines, $\mathcal{B}_{\text{map}}$ has 4 quantile knots with degree 2 quadratic splines, and $z(\cdot)$ denotes standardization.
 
-For each sample column $\mathbf{y} \in \mathbb{R}^{B_{\text{usable}}}$ (`src/ccnv/stats/regression.py:fit_sample_trend`), positive finite values $\mathcal{V} = \{i : y_i > 0 \land \text{finite}(y_i)\}$ are scaled by their median $\tilde{y}_i = y_i / \operatorname{median}(\mathbf{y}_{\mathcal{V}})$. An Iteratively Reweighted Least Squares (IRLS) loop runs for $T_{\text{IRLS}} = 3$ iterations starting from uniform weights $w_i^{(0)} = 1$:
+For each sample $s$, the log2 relative depth $\tilde{y}_{i, s} = \log_2(\tilde{c}_{i, s} / \operatorname{median}(\tilde{\mathbf{c}}_{\mathcal{V}_s, s}))$ over positive bins $\mathcal{V}_s$ is fitted via robust Huber M-estimation (`sklearn.linear_model.HuberRegressor(epsilon=1.35, alpha=1e-4)`):
 
-1. Solve weighted least squares via SVD (`np.linalg.lstsq`):
-   $$\boldsymbol{\beta}^{(t)} = \arg\min_{\boldsymbol{\beta}} \sum_{i \in \mathcal{V}} w_i^{(t-1)} \left(\tilde{y}_i - \mathbf{x}_i^\top \boldsymbol{\beta}\right)^2$$
-2. Compute residuals $r_i = \tilde{y}_i - \mathbf{x}_i^\top \boldsymbol{\beta}^{(t)}$, residual median $m_r = \operatorname{median}_{i \in \mathcal{V}}(r_i)$, and normal-consistent Median Absolute Deviation (MAD):
-   $$\sigma_{\text{MAD}} = \frac{\operatorname{median}_{i \in \mathcal{V}}\!\left(|r_i - m_r|\right)}{\Phi^{-1}(0.75)} \approx 1.4826 \cdot \operatorname{median}_{i \in \mathcal{V}}\!\left(|r_i - m_r|\right)$$
-3. Update Huber weights using tuning threshold $\delta = \max(2.5 \cdot \sigma_{\text{MAD}}, 0.08)$ and absolute centered deviations $a_i = |r_i - m_r|$:
-   $$w_i^{(t)} = \begin{cases} 1.0 & \text{if } a_i \le \delta \\ \max\!\left(0.05, \dfrac{\delta}{\max(a_i, 10^{-12})}\right) & \text{if } a_i > \delta \end{cases}$$
+$$\min_{\boldsymbol{\beta}, \sigma > 0} \sum_{i \in \mathcal{V}_s} \left(\sigma \cdot L_{\epsilon}\!\left(\frac{\tilde{y}_{i, s} - \mathbf{x}_i^\top \boldsymbol{\beta}}{\sigma}\right) + \sigma\right) + \alpha \|\boldsymbol{\beta}\|_2^2, \qquad \epsilon = 1.35, \; \alpha = 10^{-4}$$
 
-After 3 iterations, the raw trend $\hat{\mathbf{y}} = \mathbf{X} \boldsymbol{\beta}^{(3)}$ is normalized by the median of its positive predictions and clamped to $[0.20, 5.0]$:
+where $L_{\epsilon}(r) = \frac{1}{2}r^2$ if $|r| \le \epsilon$, and $\epsilon |r| - \frac{1}{2}\epsilon^2$ otherwise. The evaluated multiplicative trend $\hat{t}_i = 2^{\mathbf{x}_i^\top \boldsymbol{\beta}}$ is clamped to $[0.20, 5.0]$ and divided out:
 
-$$\hat{t}_i = \operatorname{clip}\!\left(\frac{\hat{y}_i}{\operatorname{median}_{j \in \mathcal{V}, \hat{y}_j > 0}(\hat{y}_j)}, 0.20, 5.0\right)$$
-
-Sample coverage is divided by $\hat{\mathbf{t}}$ and rescaled to preserve the sample's original total coverage sum over usable bins (`src/ccnv/stats/regression.py:apply_1d_correction`):
-
-$$y_i^{\text{corr}} = \frac{y_i}{\hat{t}_i} \cdot \frac{\sum_j y_j}{\sum_j (y_j / \hat{t}_j)}$$
-
-GC correction ($d = 3$) and mappability correction ($d = 2$) are applied sequentially in a two-stage cascade.
+$$y_i^{\text{corr}} = \frac{\tilde{c}_{i, s}}{\hat{t}_i} \cdot \frac{\sum_{j \in \mathcal{V}_s} \tilde{c}_{j, s}}{\sum_{j \in \mathcal{V}_s} (\tilde{c}_{j, s} / \hat{t}_j)}$$
 
 ### 2.2 Statistical Assumptions & Failure Modes
 
-- **Multiplicative Separability**: Assumes sequencing depth bias decomposes multiplicatively into a smooth function of GC content and a smooth function of mappability: $E[y_i] \propto f_{\text{GC}}(g_i) \cdot f_{\text{map}}(m_i)$.
-- **Majority Diploid / Copy-Neutral Genome**: Median scaling and MAD scale estimation have a $50\%$ breakdown point, assuming fewer than half of usable bins harbor extreme copy-number alterations.
-- **Boundary Polynomial Divergence**: High-degree polynomials oscillate wildly (Runge's phenomenon) at extreme covariate values; clamping standardized covariates to $z_i \in [-2.5, 2.5]$ and clamping the multiplicative trend to $[0.20, 5.0]$ prevent division by near-zero or negative polynomial extrapolations in GC-extreme pericentromeric or telomeric bins.
+- **50% Breakdown Bound**: DESeq2 median-of-ratios scaling and median relative depth assume that at least $50\%$ of unmasked bins are copy-neutral (diploid), allowing robust size factor estimation even under full-arm aneuploidies or high-fraction deletions (Anders & Huber, 2010; Robinson & Oshlack, 2010).
+- **Smoothness of Amplification Curves**: PCR GC bias curves are smooth, unimodal or sigmoidal functions of local GC composition (Benjamini & Speed, 2012). Natural cubic B-splines with linear boundary extrapolation eliminate Runge boundary oscillations at extreme GC tails ($<0.30$ or $>0.65$; de Boor, 1978; Wood, 2017).
+- **Joint Orthogonal Decomposition**: Fitting GC content, mappability, and their cross-product interaction in a single design matrix avoids Gauss-Seidel order-dependent attenuation inherent in sequential 1D regression (Hastie & Tibshirani, 1990).
 
 ### 2.3 Model & Function Selection Rationale
 
-- **3-Iteration Huber IRLS vs. LOESS or OLS**: Standard Ordinary Least Squares (OLS) is pulled toward large chromosomal trisomies or amplifications, causing the trend curve to absorb real CNVs. Non-parametric LOESS (used in original WISECONDOR) requires $O(B^2)$ or $k$-d tree evaluations per sample. A low-degree Vandermonde polynomial fitted via 3-iteration Huber IRLS runs in $O(B \cdot d^2)$ time via LAPACK `dgelsd` while downweighting CNV outliers.
-- **Cubic GC ($d=3$) and Quadratic Mappability ($d=2$)**: PCR amplification and Illumina cluster generation produce an asymmetric, unimodal or sigmoidal GC wave with inflection points requiring a cubic basis ($1, z, z^2, z^3$), whereas mappability bias is monotonic with mild saturation, well-captured by a quadratic basis ($1, z, z^2$).
-- **Weight Floor of `0.05` (`huber_w >= 0.05`)**: Unlike hard Tukey bisquare redescending weights that set $w_i = 0$ in the tails, flooring Huber weights at $0.05$ guarantees that the weighted Vandermonde matrix $\mathbf{W}^{1/2}\mathbf{X}$ retains full column rank even when an entire GC regime coincides with an aneuploid chromosome.
+- **DESeq2 Median-of-Ratios vs. Total Read Count Division**: Total-sum division introduces artificial baseline shifts when samples harbor whole-chromosome aneuploidies (e.g., Trisomy 21). Median-of-ratios provides exact invariance to copy-number alterations spanning up to $50\%$ of the genome.
+- **Natural Cubic B-Splines vs. Global Vandermonde Polynomials**: Monomial Vandermonde powers ($z, z^2, z^3$) suffer severe ill-conditioning and Runge oscillations at distribution extremes, requiring heuristic clamping. Quantile-knot B-splines with linear boundary extrapolation have local support, low condition number, and stable boundary behavior without ad-hoc tail truncation.
+- **HuberRegressor vs. Bespoke 3-Step IRLS**: `sklearn.linear_model.HuberRegressor` jointly optimizes location $\boldsymbol{\beta}$ and scale $\sigma$ via second-order L-BFGS-B, achieving $95\%$ asymptotic efficiency under Gaussian noise at $\epsilon = 1.35$ (Huber, 1964; Owen, 2007) while remaining robust against copy-number outliers.
 
 ### 2.4 Constants & Hyperparameters
 
-- `_MAX_N_FRACTION = 0.5` (`src/ccnv/io/tracks.py`): Maximum ambiguous base fraction (**Tier 3 / Tier 4**). Masks assembly gap bins where $>50\%$ of bases are unsequenced `N`s.
-- `DEFAULT_MIN_MAPPABILITY = 0.5` (`src/ccnv/models/config.py`): Default mappability threshold (**Tier 2 / Tier 3**). Requires at least $50\%$ of $k$-mers in a bin to map uniquely.
-- `_MASK_FRACTION = 0.05` (`src/ccnv/features/cohort.py`): Low-coverage bin cutoff at $5\%$ of positive median cohort depth (**Tier 2 / Tier 4**). Eliminates dead regions and unmappable heterochromatin before PCA.
-- `_MIN_VARIANCE_STD = 1e-6` (`src/ccnv/stats/regression.py`, `src/ccnv/features/covariates.py`): Minimum covariate standard deviation (**Tier 4**). Prevents division-by-zero when a track is constant (e.g., synthetic uniform tracks).
-- `z` clamp `[-2.5, 2.5]` (`src/ccnv/stats/regression.py:build_1d_basis`): Covariate Z-score tail winsorization (**Tier 1 / Tier 4**). Bounds polynomial basis evaluation to the central $98.76\%$ of a standard normal distribution, preventing cubic/quadratic runaway at extreme tails.
-- `degree = 3` (GC) and `degree = 2` (mappability) (`src/ccnv/features/covariates.py:correct_covariate_bias`): Polynomial degrees (**Tier 2 / Tier 3**). Matches physical curvature of PCR GC bias and aligner mappability saturation.
-- `_IRLS_ITERATIONS = 3` (`src/ccnv/stats/regression.py`): Fixed IRLS Gauss-Newton steps (**Tier 4**). Empirically converges within $< 10^{-3}$ relative parameter change for smooth low-degree polynomials without iterative stopping overhead.
-- `scale = "normal"` ($1/\Phi^{-1}(0.75) \approx 1.4826$, `src/ccnv/stats/regression.py`): Normal-consistent MAD scale factor (**Tier 1**). Makes $\operatorname{MAD}(r)$ an unbiased estimator of standard deviation $\sigma$ under Gaussian noise.
-- `_OUTLIER_SIGMA_CUTOFF = 2.5` and floor `0.08` (`src/ccnv/stats/regression.py`): Huber IRLS tuning multiplier $\delta = \max(2.5\sigma_{\text{MAD}}, 0.08)$ (**Tier 1 / Tier 4**). Corresponds to the $98.76\%$ Gaussian interval, with a minimum floor of $8\%$ relative depth deviation so ultra-clean or synthetic flat cohorts do not downweight normal Poisson noise.
-- Huber weight floor `0.05` and trend clamp `[0.20, 5.0]` (`src/ccnv/stats/regression.py`): Bounds maximum outlier downweighting to $20\times$ and maximum multiplicative coverage correction to $5\times$ (**Tier 4**).
+- `_MAX_N_FRACTION = 0.5` (`src/ccnv/io/tracks.py`): Maximum ambiguous base fraction (**Tier 3 — Genomic Biology & Assembly Coordinates** / **Tier 4 — Empirical Engineering & Numerical Guardrails**). Masks assembly gap bins where $>50\%$ of bases are unsequenced `N`s.
+- `DEFAULT_MIN_MAPPABILITY = 0.5` (`src/ccnv/models/config.py`): Default mappability threshold (**Tier 2 — Published Literature & Reference Methodology** / **Tier 3 — Genomic Biology & Assembly Coordinates**). Requires at least $50\%$ of $k$-mers in a bin to map uniquely.
+- `_MASK_FRACTION = 0.05` (`src/ccnv/features/cohort.py`): Low-coverage bin cutoff at $5\%$ of positive median cohort depth (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**). Eliminates dead regions and unmappable heterochromatin before PCA.
+- `SplineTransformer` GC knots/degree `(n_knots=5, degree=3)` and mappability `(n_knots=4, degree=2)` (`src/ccnv/stats/regression.py`): Quantile B-spline specification (**Tier 2 — Published Literature & Reference Methodology**: Benjamini & Speed, 2012; Wood, 2017).
+- `HuberRegressor` tuning constant `epsilon = 1.35`, penalty `alpha = 1e-4` (`src/ccnv/stats/regression.py`): Huber M-estimator tuning constant for $95\%$ Gaussian asymptotic efficiency (**Tier 1 — Statistical & Mathematical Theory**: Huber, 1964).
+- Multiplicative trend clamp `[0.20, 5.0]` (`src/ccnv/stats/regression.py`): Bounds multiplicative covariate correction to at most $5\times$ (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
 
 ---
 
@@ -185,34 +176,38 @@ with fallback to the midpoint $\tau_Y = \frac{1}{2}(\mu_{k_{\text{F}}} + \mu_{k_
 ### 3.3 Model & Function Selection Rationale
 
 - **Quantile Initialization ($P_{25}, P_{75}$) vs. k-means++**: Standard randomized k-means++ initialization in EM can converge to degenerate local optima on small cohorts. Deterministic quartile initialization guarantees reproducible, seed-invariant component assignment.
-- **Brent's Method (`brentq`) vs. Analytical Quadratic Formula**: Solving $P(Z = k_{\text{M}} \mid f) = 0.5$ via `brentq` on the bracketed interval $[\mu_{\text{F}}, \mu_{\text{M}}]$ directly queries `gmm.predict_proba` (which works in log-sum-exp space), avoiding numerical underflow or Selecting the wrong root of the two quadratic intersections when $\sigma_{\text{F}}^2 \ne \sigma_{\text{M}}^2$.
+- **Brent's Method (`brentq`) vs. Analytical Quadratic Formula**: Solving $P(Z = k_{\text{M}} \mid f) = 0.5$ via `brentq` on the bracketed interval $[\mu_{\text{F}}, \mu_{\text{M}}]$ directly queries `gmm.predict_proba` (which works in log-sum-exp space), avoiding numerical underflow or selecting the wrong root of the two quadratic intersections when $\sigma_{\text{F}}^2 \ne \sigma_{\text{M}}^2$.
 
 ### 3.4 Constants & Hyperparameters
 
-- `min_cohort_size = 10`, `min_sex_group_size = 5` (`src/ccnv/models/config.py:ReferenceConfig`): Minimum cohort and per-sex sample counts (**Tier 2 / Tier 4**). Ensures sufficient degrees of freedom for 5-component PCA and robust median/MAD estimation.
-- `_SEPARATION_MAD_MULTIPLIER = 4.0` (`src/ccnv/features/cohort.py`): Minimum inter-sex gap-to-MAD ratio (**Tier 1 / Tier 4**). Under a normal distribution, $4 \times \text{MAD}_{\text{unscaled}} \approx 2.7\sigma$ per side ($\approx 5.4\sigma$ total separation), preventing false bimodal splits on single-sex cohorts.
-- `percentiles = (25.0, 75.0)`, `weights_init = (0.5, 0.5)` (`src/ccnv/stats/prenatal_math.py:infer_sex_gmm_1d`): Deterministic GMM initialization at first and third quartiles (**Tier 1 / Tier 2**).
-- `tol = 1e-6`, `reg_covar = 1e-8`, `max_iter = 100` (`src/ccnv/stats/prenatal_math.py:infer_sex_gmm_1d`): EM convergence tolerance and diagonal covariance regularization (**Tier 4**). Prevents singular covariance collapse ($\sigma_k^2 \to 0$) when all female samples have identical `chrY` fractions.
+- `min_cohort_size = 10`, `min_sex_group_size = 5` (`src/ccnv/models/config.py:ReferenceConfig`): Minimum cohort and per-sex sample counts (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**). Ensures sufficient degrees of freedom for PCA and robust median/MAD estimation.
+- `_SEPARATION_MAD_MULTIPLIER = 4.0` (`src/ccnv/features/cohort.py`): Minimum inter-sex gap-to-MAD ratio (**Tier 1 — Statistical & Mathematical Theory** / **Tier 4 — Empirical Engineering & Numerical Guardrails**). Under a normal distribution, $4 \times \text{MAD}_{\text{unscaled}} \approx 2.7\sigma$ per side ($\approx 5.4\sigma$ total separation), preventing false bimodal splits on single-sex cohorts.
+- `percentiles = (25.0, 75.0)`, `weights_init = (0.5, 0.5)` (`src/ccnv/stats/prenatal_math.py:infer_sex_gmm_1d`): Deterministic GMM initialization at first and third quartiles (**Tier 1 — Statistical & Mathematical Theory** / **Tier 2 — Published Literature & Reference Methodology**).
+- `tol = 1e-6`, `reg_covar = 1e-8`, `max_iter = 100` (`src/ccnv/stats/prenatal_math.py:infer_sex_gmm_1d`): EM convergence tolerance and diagonal covariance regularization (**Tier 4 — Empirical Engineering & Numerical Guardrails**). Prevents singular covariance collapse ($\sigma_k^2 \to 0$) when all female samples have identical `chrY` fractions.
 
 ---
 
-## 4. Between-Sample Systemic Bias Removal: Centered Unscaled PCA
+## 4. Between-Sample Latent Bias Removal: Gavish-Donoho SVHT PCA & Robust Subspace Projection
 
 ### 4.1 Mathematical Formulation
 
-#### Reference Fitting (`src/ccnv/stats/pca.py:fit_pca`)
+#### 4.1.1 Gavish-Donoho Optimal Singular Value Hard Thresholding (SVHT)
 
-Let $\mathbf{Y} \in \mathbb{R}^{U \times S}$ be the covariate-corrected, depth-normalized coverage matrix over $U$ unmasked bins and $S$ cohort samples, and let $\mathbf{X} = \mathbf{Y}^\top \in \mathbb{R}^{S \times U}$ be the samples-by-bins matrix. The empirical per-bin cohort mean vector is:
+Let $\mathbf{Y} \in \mathbb{R}^{U \times S}$ be the covariate-corrected, depth-normalized coverage matrix over $U$ unmasked bins and $S$ cohort samples, and let $\mathbf{X} = \mathbf{Y}^\top \in \mathbb{R}^{S \times U}$ be the samples-by-bins matrix (`src/ccnv/stats/pca.py:fit_pca`, `src/ccnv/stats/pca.py:optimal_svht_rank`). The empirical cohort mean vector is:
 
 $$\boldsymbol{\mu} = \frac{1}{S} \sum_{s=1}^S \mathbf{X}_{s, :} \in \mathbb{R}^U$$
 
-Centered (unscaled) Singular Value Decomposition (SVD) decomposes the centered matrix $\tilde{\mathbf{X}} = \mathbf{X} - \mathbf{1}_S \boldsymbol{\mu}^\top$:
+Singular Value Decomposition (SVD) decomposes the centered matrix $\tilde{\mathbf{X}} = \mathbf{X} - \mathbf{1}_S \boldsymbol{\mu}^\top = \mathbf{U} \boldsymbol{\Sigma} \mathbf{V}^\top$, yielding singular values $s_1 \ge s_2 \ge \dots \ge s_{\min(S, U)}$.
 
-$$\tilde{\mathbf{X}} = \mathbf{U} \boldsymbol{\Sigma} \mathbf{V}^\top$$
+Rather than fixing PCA rank to an arbitrary constant, `ccnv` determines the optimal subspace rank $P$ via Gavish-Donoho Optimal Singular Value Hard Thresholding (Gavish & Donoho, 2014) when noise variance $\sigma^2$ is unknown:
 
-retaining the top $P = \min(n_{\text{components}}, S, U)$ right singular vectors (principal axes / loadings) $\mathbf{V}_P \in \mathbb{R}^{U \times P}$ (stored as `pca_loadings` of shape $P \times U$ in `fit_pca`). Sign ambiguity of singular vectors ($\mathbf{v}_p \leftrightarrow -\mathbf{v}_p$) is resolved deterministically via `sklearn.utils.extmath.svd_flip`.
+$$\beta = \frac{\min(S, U)}{\max(S, U)}, \qquad \omega(\beta) = 0.56\beta^3 - 0.95\beta^2 + 1.82\beta + 1.43, \qquad \tau_{\text{SVHT}} = \omega(\beta)\operatorname{median}_{k}(s_k)$$
 
-The rank-$P$ reconstruction of cohort systemic technical profiles is:
+$$P = \operatorname{clip}\!\left(\#\{k : s_k > \tau_{\text{SVHT}}\}, \; 1, \; \min(P_{\max}, S, U)\right)$$
+
+Gavish & Donoho (2014) proved that $\tau_{\text{SVHT}}$ minimizes asymptotic Mean Squared Error by cleanly separating low-rank systemic signals from the Marchenko-Pastur bulk noise distribution (Marchenko & Pastur, 1967).
+
+Sign ambiguity of singular vectors ($\mathbf{v}_p \leftrightarrow -\mathbf{v}_p$) is resolved deterministically via `sklearn.utils.extmath.svd_flip`. The rank-$P$ reconstruction is:
 
 $$\hat{\mathbf{X}} = (\tilde{\mathbf{X}} \mathbf{V}_P) \mathbf{V}_P^\top + \mathbf{1}_S \boldsymbol{\mu}^\top$$
 
@@ -220,362 +215,283 @@ Multiplicative systemic bias is divided out element-wise to produce the PCA-corr
 
 $$Y_{b, s}^{\text{corr}} = \begin{cases} \dfrac{X_{s, b}}{\hat{X}_{s, b}} & \text{if } \text{finite}\!\left(\dfrac{X_{s, b}}{\hat{X}_{s, b}}\right) \\ 1.0 & \text{otherwise} \end{cases}$$
 
-#### Single-Sample Projection (`src/ccnv/predict.py:project_coverage`)
+#### 4.1.2 Single-Sample Robust PCA Projection via HuberRegressor
 
-During `predict`, a test sample's normalized, covariate-corrected coverage vector $\mathbf{y} \in \mathbb{R}^U$ may have additional bins masked by sample-specific overrides ($\mathcal{A} \subseteq \{0, \dots, U-1\}$). Because restricting $\mathbf{V}_P$ to the subset of active bins $\mathcal{A}$ breaks exact column orthogonality, `ccnv` projects the centered sample profile onto the restricted loading subspace $\mathbf{V}_{P, \mathcal{A}} \in \mathbb{R}^{|\mathcal{A}| \times P}$ via ordinary least squares (`np.linalg.lstsq`) whenever $|\mathcal{A}| > \operatorname{rank}(\mathbf{V}_{P, \mathcal{A}})$:
+During single-sample prediction (`src/ccnv/predict.py:project_coverage`), a test sample's normalized coverage $\mathbf{y} \in \mathbb{R}^U$ is projected onto the reference PCA subspace over active bins $\mathcal{A} \subseteq \{0, \dots, U-1\}$.
 
-$$\hat{\mathbf{c}} = \arg\min_{\mathbf{c} \in \mathbb{R}^P} \left\| \left(\mathbf{y}_{\mathcal{A}} - \boldsymbol{\mu}_{\mathcal{A}}\right) - \mathbf{V}_{P, \mathcal{A}} \mathbf{c} \right\|_2^2$$
+Ordinary least squares (`lstsq`) projection minimizes $L_2$ error, causing large aneuploidies (e.g., Trisomy 21 or large focal duplications) to tilt the projection coefficients $\mathbf{c}$, absorbing the true CNV into the background and leaking compensating ghost waves onto euploid chromosomes (Candès et al., 2011). `ccnv` solves the projection via robust Huber M-estimation (`sklearn.linear_model.HuberRegressor(fit_intercept=False, epsilon=1.35)`):
 
-reconstructs the expected baseline across all unmasked bins $\hat{\mathbf{y}} = \mathbf{V}_P \hat{\mathbf{c}} + \boldsymbol{\mu}$, and divides out the systemic component:
+$$\hat{\mathbf{c}} = \arg\min_{\mathbf{c} \in \mathbb{R}^P, \sigma > 0} \sum_{i \in \mathcal{A}} \left(\sigma \cdot L_{1.35}\!\left(\frac{(y_i - \mu_i) - \mathbf{V}_{P, i}^\top \mathbf{c}}{\sigma}\right) + \sigma\right)$$
+
+reconstructing expected baseline $\hat{\mathbf{y}} = \mathbf{V}_P \hat{\mathbf{c}} + \boldsymbol{\mu}$ and dividing out the systemic component:
 
 $$y_b^{\text{corr}} = \frac{y_b}{\hat{y}_b} \quad \text{for } b \in \mathcal{A} \text{ with } \hat{y}_b > 0$$
 
 ### 4.2 Statistical Assumptions & Failure Modes
 
-- **Low-Rank Technical Subspace**: Assumes cohort-wide technical artifacts (library preparation kit differences, flowcell effects, fragment-length distributions, and higher-order residual GC waves) lie in a low-dimensional linear subspace spanned by the top $P$ eigenvectors, whereas rare germline or somatic CNVs are sample-specific and orthogonal to the top cohort PCs.
-- **Unscaled Covariance vs. Correlation PCA**: Because all bins are already normalized to comparable depth scales ($\sim 1/U$), centering without unit-variance scaling preserves natural Poisson variance weighting across bins; standardizing each bin to unit variance would amplify noisy low-mappability bins to carry equal weight to stable euchromatic bins.
-- **Overfitting When $P \approx S$**: If `pca_components` is set close to cohort size $S$, the PCA basis spans individual sample profiles and absorbs true biological CNVs ($\hat{\mathbf{y}} \to \mathbf{y}$, forcing $y_b^{\text{corr}} \to 1$). Keeping $P = 5 \ll S$ prevents signal absorption.
+- **Low-Rank Latent Structure**: Assumes systemic technical biases (library prep kits, flowcell tile effects, batch fragmentation signatures) lie in a low-dimensional subspace captured by Gavish-Donoho thresholding, while biological CNVs are sample-specific and orthogonal to the subspace.
+- **Outlier Bounding**: Huber projection with $\epsilon = 1.35$ limits the influence of outlying bins exceeding $1.35\sigma$, ensuring that whole-chromosome trisomies cannot bias the reconstructed diploid baseline.
 
 ### 4.3 Model & Function Selection Rationale
 
-- **Least-Squares Subspace Projection (`np.linalg.lstsq`) vs. Direct Dot Product**: If every reference bin is usable in the test sample ($\mathcal{A} = \{0, \dots, U-1\}$), $\mathbf{V}_P^\top \mathbf{V}_P = \mathbf{I}_P$ and least squares reduces to the orthogonal dot product $\hat{\mathbf{c}} = \mathbf{V}_P^\top (\mathbf{y} - \boldsymbol{\mu})$. However, when sample-specific covariate masking drops bins ($\mathcal{A} \subsetneq \{0, \dots, U-1\}$), $\mathbf{V}_{P, \mathcal{A}}^\top \mathbf{V}_{P, \mathcal{A}} \ne \mathbf{I}_P$; solving `lstsq` prevents projection distortion from missing coordinates.
-- **Multiplicative Division ($y_b / \hat{y}_b$) vs. Additive Subtraction ($y_b - \hat{y}_b$)**: Copy-number alterations scale read depth multiplicatively ($\text{CN}/2 \times \text{baseline}$). Dividing by the reconstructed baseline $\hat{y}_b$ directly yields a dimensionless relative copy ratio centered at $1.0$ across all bins regardless of each bin's baseline mappability $\mu_b$.
+- **Gavish-Donoho SVHT vs. Fixed PCA Rank**: A fixed rank (e.g., $P=5$) underfits large cohorts ($S \sim 500$) with complex batch structure and overfits small cohorts ($S \sim 10$). Gavish-Donoho thresholding adapts dynamically to sample size and noise level.
+- **Huber M-Estimation vs. OLS Projection**: In samples carrying large copy-number aberrations, Huber M-estimation downweights altered bins automatically, preserving true CNV amplitude and eliminating artificial baseline depression on euploid contigs (Huber, 1981).
 
 ### 4.4 Constants & Hyperparameters
 
-- `pca_components = 5` (`src/ccnv/models/config.py:ReferenceConfig`): Default number of principal components removed in `reference` (**Tier 2 / Tier 4**). Captures dominant batch and fragmentation modes in sWGS cohorts while leaving focal and chromosomal CNV signals intact.
+- SVHT cubic polynomial coefficients `(0.56, -0.95, 1.82, 1.43)` (`src/ccnv/stats/pca.py:optimal_svht_rank`): Closed-form optimal threshold for unknown noise variance (**Tier 2 — Published Literature & Reference Methodology**: Gavish & Donoho, 2014).
+- `pca_components = 5` (`src/ccnv/models/config.py:ReferenceConfig`): Default maximum components $P_{\max}$ (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- `HuberRegressor` tuning constant `epsilon = 1.35` (`src/ccnv/predict.py:project_coverage`): $95\%$ asymptotic Gaussian efficiency (**Tier 1 — Statistical & Mathematical Theory**: Huber, 1964).
 
 ---
 
-## 5. Within-Sample Reference Modeling: Off-Contig Nearest-Neighbor Search & Null Distribution
+## 5. Within-Sample Reference Graph & Empirical Bayes Null Modeling
 
-After between-sample PCA normalization, residual bin-to-bin variation remains within a single sample. Following the core insight of WISECONDOR (Straver et al., 2014), `ccnv` constructs a within-sample reference for each target bin by pairing it with $k$ bins located on *other chromosomes* that behave identically across the control cohort.
+Following the foundational insight of WISECONDOR (Straver et al., 2014), `ccnv` constructs a within-sample reference for each target bin by pairing it with $k$ bins located on other chromosomes that exhibit identical behavior across the control cohort.
 
 ### 5.1 Mathematical Formulation
 
-#### Batched Off-Contig Squared Euclidean Search (`src/ccnv/stats/neighbors.py:select_nearest_bins`)
+#### 5.1.1 Low-Dimensional Signal-Subspace $\mathbb{R}^{P+2}$ `KDTree` Neighbor Search
 
-For each unmasked bin $i \in \{0, \dots, U-1\}$ on contig $c_i$, let $\mathbf{v}_i \in \mathbb{R}^D$ denote its feature profile:
-- In **cohort mode**, $\mathbf{v}_i = \mathbf{Y}_{i, :}^{\text{corr}} \in \mathbb{R}^S$ is the bin's PCA-corrected coverage profile across all $S$ control samples.
-- In **flat FASTA mode** with covariates (`src/ccnv/features/covariates.py:covariate_features`), $\mathbf{v}_i \in \mathbb{R}^2$ is the standardized `(GC, mappability)` Z-score vector.
+In high dimensions ($S \approx 50\text{–}500$), pairwise Euclidean distances over raw PCA residuals concentrate around their mean ($\operatorname{Var}(D)/\mathbb{E}[D] \to 0$), degrading neighbor selection quality (Beyer et al., 1999). Two genomic bins are optimal reference partners if and only if they share identical sensitivity to latent technical factors and identical sequence properties.
 
-Pairwise squared Euclidean distances are computed in memory-bounded row batches using BLAS matrix multiplication (`sklearn.metrics.pairwise.euclidean_distances(..., squared=True)`):
+`ccnv` maps each bin $i$ into a $(P+2)$-dimensional signal subspace (`src/ccnv/stats/neighbors.py:build_signal_space_features`, `src/ccnv/stats/neighbors.py:select_nearest_bins`):
 
-$$d_{ij}^2 = \|\mathbf{v}_i - \mathbf{v}_j\|_2^2 = \|\mathbf{v}_i\|_2^2 + \|\mathbf{v}_j\|_2^2 - 2 \mathbf{v}_i^\top \mathbf{v}_j$$
+$$\mathbf{f}_i = \left[s_1 V_{1, i}, \dots, s_P V_{P, i}, \; z(\text{GC}_i), \; z(\text{map}_i)\right] \in \mathbb{R}^{P+2}$$
 
-To strictly prevent a chromosome-wide aneuploidy or large segmental CNV from contaminating its own reference baseline, all candidate bins on the same contig are masked to infinity:
+where $s_p V_{p, i}$ are singular-value-scaled PCA loadings and $z(\cdot)$ are standardized sequence covariates.
 
-$$\tilde{d}_{ij}^2 = \begin{cases} \infty & \text{if } c_i = c_j \\ d_{ij}^2 & \text{if } c_i \ne c_j \end{cases}$$
+For each chromosome $c$, a C-compiled $k$-d tree (`scipy.spatial.KDTree`) is built over all off-contig bins $\mathcal{C}_{\ne c} = \{j : \text{contig}_j \ne c\}$. For each query bin on contig $c$, querying the tree with `tree.query(..., k=k, workers=threads)` finds the $k$ nearest off-contig neighbors in $O(U \log U)$ time and returns squared Euclidean distances $d^2(\mathbf{f}_i, \mathbf{f}_j)$ (Bentley, 1975; Maneewongvatana & Mount, 1999).
 
-For each query bin $i$, the $k = \min(k_{\text{req}}, |\mathcal{C}_{\ne c_i}|)$ smallest off-contig candidates are selected in $O(U)$ expected time via Introselect (`np.argpartition`) and sorted deterministically by stable mergesort (`np.argsort(..., kind="mergesort")`), yielding candidate index set $\mathcal{N}_i^{(0)}$ and squared distances $\{d_{ij}^2\}_{j \in \mathcal{N}_i^{(0)}}$.
+#### 5.1.2 Iterative $3\sigma$ Distance Outlier Pruning
 
-#### Iterative $3\sigma$ Distance Outlier Pruning (`src/ccnv/stats/neighbors.py:distance_cutoff`)
-
-Bins in unique genomic environments (e.g., extreme GC or repetitive boundaries) may have poor matches among their $k$ nearest neighbors. Across the flattened pool of all finite non-negative neighbor distances $\mathcal{D} = \{d_{ij}^2\}_{i, j \in \mathcal{N}_i^{(0)}}$, an iterative $3\sigma$ clipping loop runs for $R = 3$ passes starting from $\tau_{\text{dist}}^{(0)} = \infty$:
+Across all neighbor distances $\mathcal{D} = \{d^2(\mathbf{f}_i, \mathbf{f}_j)\}$, a 3-pass iterative clipping loop runs (`src/ccnv/stats/neighbors.py:distance_cutoff`):
 
 $$\mathcal{D}^{(r)} = \left\{ u \in \mathcal{D} : u < \tau_{\text{dist}}^{(r-1)} \right\}, \quad \tau_{\text{dist}}^{(r)} = \operatorname{mean}\!\left(\mathcal{D}^{(r)}\right) + 3.0 \cdot \operatorname{std}\!\left(\mathcal{D}^{(r)}\right) \quad (r = 1, 2, 3)$$
 
-Candidate neighbors exceeding the final threshold ($d_{ij}^2 > \tau_{\text{dist}}^{(3)}$) are pruned (`src/ccnv/reference.py:_build_branch_table`), leaving the surviving neighbor set $\mathcal{N}_i = \{j \in \mathcal{N}_i^{(0)} : d_{ij}^2 \le \tau_{\text{dist}}^{(3)}\}$ and the bin's mean unsquared Euclidean distance:
+Neighbors exceeding $\tau_{\text{dist}}^{(3)}$ are pruned, recording each bin's surviving neighbor set $\mathcal{N}_i$ and mean unsquared distance $\bar{d}_i$.
 
-$$\bar{d}_i = \frac{1}{|\mathcal{N}_i|} \sum_{j \in \mathcal{N}_i} \sqrt{\max(d_{ij}^2, 0)}$$
+#### 5.1.3 PCA Degrees-of-Freedom Correction & Smyth Empirical Bayes Variance Shrinkage
 
-#### Empirical Null Distribution Parameterization (`src/ccnv/stats/neighbors.py:compute_null_models`)
+Using $S_{\text{null}} = \min(S, 100)$ control samples, per-bin log2 ratios are evaluated:
 
-Using the first $S_{\text{null}} = \min(S, 100)$ control samples, each bin's empirical log2 ratio relative to the median of its candidate neighbors is evaluated in every control sample $s \in \{1, \dots, S_{\text{null}}\}$:
+$$R_{i, s} = \log_2\!\left(\frac{Y_{i, s}^{\text{corr}}}{\operatorname{median}_{j \in \mathcal{N}_i}\!\left(Y_{j, s}^{\text{corr}}\right)}\right)$$
 
-$$R_{i, s} = \log_2\!\left(\frac{Y_{i, s}^{\text{corr}}}{\operatorname{median}_{j \in \mathcal{N}_i^{(0)}}\!\left(Y_{j, s}^{\text{corr}}\right)}\right)$$
+Because $P$ principal components were removed from $Y_{i, s}^{\text{corr}}$, the effective residual degrees of freedom are reduced from $S_{\text{null}} - 1$ to $d = \max(1, S_{\text{null}} - 1 - P)$. The sample variance is adjusted for degrees of freedom:
 
-Non-finite values are zeroed, and the per-bin null expectation $\mu_{\text{null}, i}$ and unbiased sample standard deviation $\sigma_{\text{null}, i}$ (with Bessel's correction, $\text{ddof} = 1$) are recorded:
+$$s_{i, \text{DOF}}^2 = \frac{S_{\text{null}} - 1}{d} \cdot \operatorname{Var}_{s}(R_{i, s})$$
 
-$$\mu_{\text{null}, i} = \frac{1}{S_{\text{null}}} \sum_{s=1}^{S_{\text{null}}} R_{i, s}, \quad \sigma_{\text{null}, i} = \sqrt{\frac{1}{S_{\text{null}} - 1} \sum_{s=1}^{S_{\text{null}}} \left(R_{i, s} - \mu_{\text{null}, i}\right)^2}$$
+To prevent noisy variance estimates from small cohorts from creating unstable inverse-variance weights, `ccnv` implements Smyth's Empirical Bayes variance shrinkage (`limma::squeezeVar`, Smyth, 2004; Phipson et al., 2016) in pure NumPy/SciPy (`src/ccnv/stats/neighbors.py:squeeze_var`). Under a scaled inverse-$\chi^2$ prior, log-variances $z_i = \ln(s_{i, \text{DOF}}^2)$ have theoretical expectation and variance involving digamma $\psi$ and trigamma $\psi_1$ functions:
+
+$$z_i = \ln(s_{i, \text{DOF}}^2) - \psi(d/2) + \ln(d/2)$$
+
+After Winsorizing $z_i$ at quantiles `winsor_tail_p = (0.05, 0.10)` to protect against hypervariable outliers, the prior degrees of freedom $d_0$ and prior scale $s_0^2$ are solved via `scipy.optimize.brentq`:
+
+$$\psi_1(d_0 / 2) = \operatorname{Var}_{\text{winsor}}(z_i) - \psi_1(d / 2)$$
+
+$$s_0^2 = \exp\!\left(\bar{z}_{\text{winsor}} + \psi(d_0/2) - \ln(d_0/2)\right)$$
+
+The moderated null variance shrinks individual variances toward the empirical prior:
+
+$$\tilde{\sigma}_{\text{null}, i}^2 = \frac{d_0 s_0^2 + d \cdot s_{i, \text{DOF}}^2}{d_0 + d}$$
 
 ### 5.2 Statistical Assumptions & Failure Modes
 
-- **Off-Contig Independence Under Single-Chromosome Aneuploidy**: Assumes that copy-number aberrations do not simultaneously affect a target bin on contig $c_i$ and the majority ($>50\%$) of its $k = 300$ matched reference bins distributed across the remaining chromosomes.
-- **Stationarity of Residual Co-Variation**: Assumes bins that co-vary across control samples in $\mathbf{Y}^{\text{corr}}$ share latent physical properties (local chromatin accessibility, fragment size distribution, mappability edge effects) that will also co-vary in future test samples.
-- **Gaussian Log2 Ratio Null**: Assumes $R_{i, s} \sim \mathcal{N}(\mu_{\text{null}, i}, \sigma_{\text{null}, i}^2)$ across diploid controls so that Z-scores $Z_i = (r_i - \mu_{\text{null}, i}) / \sigma_{\text{null}, i}$ follow a standard normal $\mathcal{N}(0, 1)$ distribution under the copy-neutral null hypothesis.
+- **Signal Subspace Sufficiency**: Assumes that technical co-variation between bins across sequencing runs is captured by the low-dimensional signal subspace $\mathbf{f}_i \in \mathbb{R}^{P+2}$.
+- **Conjugate Inverse-$\chi^2$ Prior**: Assumes true bin variances follow a scaled inverse-$\chi^2$ distribution with prior degrees of freedom $d_0$ and scale $s_0^2$, borrowing strength across hundreds of thousands of bins (Smyth, 2004).
 
 ### 5.3 Model & Function Selection Rationale
 
-- **Squared Euclidean Distance (`squared=True`) + `argpartition`**: Because $x \mapsto x^2$ is strictly monotonically increasing on $\mathbb{R}_{\ge 0}$, ranking neighbors by $d_{ij}^2$ produces the exact same $k$-nearest neighbor sets as $d_{ij}$ while avoiding $U^2 \approx 3.6 \times 10^{11}$ square-root evaluations across the human genome ($U \approx 600,000$ at $5\text{ kb}$). Using `np.argpartition` reduces per-row selection complexity from $O(U \log U)$ to $O(U)$, and sorting only the top $k$ indices with `kind="mergesort"` guarantees deterministic tie-breaking.
-- **Neighbor Median vs. Neighbor Mean**: Taking the median $\operatorname{median}_{j \in \mathcal{N}_i}(Y_{j, s}^{\text{corr}})$ rather than the mean provides a $50\%$ breakdown point against incidental CNVs occurring in off-contig reference bins within sample $s$.
+- **$\mathbb{R}^{P+2}$ `KDTree` vs. $S$-Dimensional Dense GEMM**: Evaluating distances in $\mathbb{R}^7$ via C-compiled `scipy.spatial.KDTree` reduces search complexity from $O(U^2 S)$ to $O(U \log U)$ and eliminates high-dimensional distance concentration (Beyer et al., 1999).
+- **Smyth Empirical Bayes (`squeeze_var`) vs. Raw Sample Variance**: In small cohorts ($S = 10\text{–}30$), raw sample variance $s_i^2$ has high sampling variance. Empirical Bayes shrinkage shrinks noisy extreme estimates toward the consensus genomic variance $s_0^2$.
 
 ### 5.4 Constants & Hyperparameters
 
-- `nearest_bins = 300` (`src/ccnv/models/config.py:ReferenceConfig`): Default number of off-contig reference neighbors $k$ (**Tier 2**, WISECONDOR / WisecondorX). Large enough that the median variance $\pi / (2k) \sigma^2$ is negligible ($\approx 0.5\%$ of single-bin variance) while small enough that closely matched bins exist in feature space.
-- `max_batch_memory_mb = 256` (`src/ccnv/models/config.py:ReferenceConfig`): Maximum memory allocation per distance matrix batch (**Tier 4**). Bounds row batch size $\lfloor 256\text{ MB} / (8 \cdot U) \rfloor$ so whole-genome $5\text{ kb}$ distance searches never trigger out-of-memory errors.
-- `repeats = 3`, multiplier `3.0` (`src/ccnv/stats/neighbors.py:distance_cutoff`): 3-pass iterative $\mu + 3\sigma$ distance outlier clipping (**Tier 2**, WISECONDOR). Prevents heavy-tailed outlier distances from inflating $\sigma$ on the first pass.
-- `_MAX_NULL_SAMPLES = 100` (`src/ccnv/stats/neighbors.py`): Maximum cohort samples used to estimate $\mu_{\text{null}, i}$ and $\sigma_{\text{null}, i}$ (**Tier 4**). Standard error of sample standard deviation $\sigma_{\text{null}, i}$ at $N = 100$ is $\sigma / \sqrt{2(N-1)} \approx 7.1\%$; capping at 100 bounds null-model runtime to $O(U \cdot k \cdot 100)$ on massive biobank cohorts.
-- Parallelism thresholds `n_bins > 2000` (`select_nearest_bins`) and `n_bins > 5000` (`compute_null_models`, `src/ccnv/stats/neighbors.py`): Minimum problem sizes before spawning `ProcessPoolExecutor` workers (**Tier 4**), avoiding IPC serialization overhead on small contigs or tests.
+- `nearest_bins = 300` (`src/ccnv/models/config.py:ReferenceConfig`): Default number of off-contig reference neighbors $k$ (**Tier 2 — Published Literature & Reference Methodology**, WISECONDOR / WisecondorX).
+- `winsor_tail_p = (0.05, 0.10)` (`src/ccnv/stats/neighbors.py:squeeze_var`): Winsorization quantiles for robust empirical Bayes moment estimation (**Tier 2 — Published Literature & Reference Methodology**: Phipson et al., 2016).
+- `_MAX_NULL_SAMPLES = 100` (`src/ccnv/stats/neighbors.py`): Maximum cohort samples for null distribution estimation (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- Distance clipping `repeats = 3`, multiplier `3.0` (`src/ccnv/stats/neighbors.py:distance_cutoff`): 3-pass iterative $\mu + 3\sigma$ neighbor distance outlier pruning (**Tier 2 — Published Literature & Reference Methodology**).
 
 ---
 
-## 6. Within-Sample Outlier Masking, Empirical MAD Fallback, and Precision Weighting
+## 6. Iterative Within-Sample Normalization & Empirical Bayes Precision Weighting
 
-During single-sample prediction (`src/ccnv/predict.py:normalize_branch`), if the test sample itself carries a large CNV on chromosome $A$, bins on chromosome $A$ that serve as off-contig reference neighbors for chromosome $B$ would skew chromosome $B$'s baseline if not excluded.
+During single-sample prediction (`src/ccnv/predict.py:normalize_branch`), if the test sample itself carries a CNV, bins in the CNV region that serve as reference partners for other chromosomes would corrupt baselines if not removed.
 
 ### 6.1 Mathematical Formulation
 
-Let $\mathbf{y}^{\text{corr}} \in \mathbb{R}^U$ be the test sample's PCA-projected coverage across unmasked bins, and let $\mathcal{N}_i \setminus \{i\}$ be bin $i$'s surviving off-contig reference indices. Initialize the eligible neighbor mask as $\mathcal{E}^{(0)} = \{i : \text{finite}(y_i^{\text{corr}}) \land y_i^{\text{corr}} > 0\}$.
+Let $\mathbf{y}^{\text{corr}} \in \mathbb{R}^U$ be the test sample's PCA-projected coverage. `ccnv` evaluates within-sample normalization using a vectorized 2D neighbor matrix $\mathbf{N} \in \mathbb{Z}^{U \times K_{\max}}$ with `np.nanmedian` over $M$ iterations (`mask_repeats`, default $3$).
 
-For $t = 1, \dots, M$ iterations (`mask_repeats`, default $3$):
+In each iteration $t$:
+1. Eligible bins are filtered: $\mathcal{E}^{(t-1)} = \{i : \text{finite}(y_i^{\text{corr}}) \land |Z_i^{(t-1)}| < \tau_{\text{mask}}\}$, where $\tau_{\text{mask}} = \Phi^{-1}(0.99) = 2.326347874$.
+2. For each bin, its within-sample baseline is computed across eligible surviving neighbors:
+   $$b_i^{(t)} = \operatorname{nanmedian}_{j \in \mathcal{N}_i \cap \mathcal{E}^{(t-1)}}\!\left(y_j^{\text{corr}}\right), \quad r_i^{(t)} = \log_2\!\left(\frac{y_i^{\text{corr}}}{b_i^{(t)}}\right)$$
+   $$Z_i^{(t)} = \frac{r_i^{(t)} - \mu_{\text{null}, i}}{\tilde{\sigma}_{\text{null}, i}}$$
 
-1. For each bin $i \in \{0, \dots, U-1\}$, restrict its neighbor pool to currently eligible bins $\mathcal{N}_i^{(t)} = (\mathcal{N}_i \setminus \{i\}) \cap \mathcal{E}^{(t-1)}$. If $|\mathcal{N}_i^{(t)}| < m_{\text{ref}}$ (`min_reference_bins`, default $3$) or $y_i^{\text{corr}} \le 0$, mark $r_i^{(t)} = \text{NaN}, Z_i^{(t)} = \text{NaN}$. Otherwise, compute the within-sample baseline, log2 ratio, and Z-score:
-   $$b_i^{(t)} = \operatorname{median}_{j \in \mathcal{N}_i^{(t)}}\!\left(y_j^{\text{corr}}\right), \quad r_i^{(t)} = \log_2\!\left(\frac{y_i^{\text{corr}}}{b_i^{(t)}}\right), \quad Z_i^{(t)} = \begin{cases} \dfrac{r_i^{(t)} - \mu_{\text{null}, i}}{\sigma_{\text{null}, i}} & \text{if } \sigma_{\text{null}, i} > 0 \\ \text{NaN} & \text{if } \sigma_{\text{null}, i} = 0 \end{cases}$$
-2. **Empirical MAD Fallback** (for flat FASTA references where $\sigma_{\text{null}, i} = 0$): For any bin with finite $r_i^{(t)}$ but missing $Z_i^{(t)}$, estimate the global sample median $m_r = \operatorname{median}(r^{(t)})$ and normal-consistent MAD scale $\hat{\sigma}_{\text{emp}} = 1.4826 \cdot \operatorname{median}(|r^{(t)} - m_r|)$ across all finite ratios, and set:
-   $$Z_i^{(t)} = \begin{cases} \dfrac{r_i^{(t)} - m_r}{\hat{\sigma}_{\text{emp}}} & \text{if } \hat{\sigma}_{\text{emp}} > 10^{-12} \\ 0.0 & \text{otherwise} \end{cases}$$
-3. Update the eligible neighbor mask by excluding extreme deviations exceeding the one-sided $99\text{th}$ percentile standard normal quantile $\tau_{\text{mask}} = \Phi^{-1}(0.99) = 2.326347874$:
-   $$\mathcal{E}^{(t)} = \left\{ i : \text{finite}(y_i^{\text{corr}}) \land \text{finite}(Z_i^{(t)}) \land \left|Z_i^{(t)}\right| < 2.326347874 \right\}$$
+After $M$ iterations, global median centering removes residual genome-wide baseline shift: $\tilde{r}_i = r_i^{(M)} - \operatorname{median}(r^{(M)})$.
 
-After $M$ iterations, global median centering removes any residual genome-wide baseline shift:
+#### Empirical Bayes Inverse-Variance Precision Weights
 
-$$\tilde{r}_i = r_i^{(M)} - \operatorname{median}_{j : \text{finite}(r_j^{(M)})}\!\left(r_j^{(M)}\right)$$
+Each valid bin is assigned an Empirical Bayes inverse-variance precision weight:
 
-Each valid bin ($|\mathcal{N}_i^{(M)}| \ge m_{\text{ref}}$) is assigned a segmentation weight $w_i$ inversely proportional to its mean neighbor distance $\bar{d}_i$ stored in the reference (`src/ccnv/predict.py:normalize_branch`):
+$$w_i = \begin{cases} \operatorname{clip}\!\left(\dfrac{s_0^2}{\tilde{\sigma}_{\text{null}, i}^2}, \; 0.05, \; 20.0\right) & \text{if } \tilde{\sigma}_{\text{null}, i} > 0 \text{ and } |\mathcal{N}_i^{(M)}| \ge m_{\text{ref}} \\ \dfrac{1}{\max(\bar{d}_i, 10^{-12})} & \text{if } \tilde{\sigma}_{\text{null}, i} = 0 \text{ (flat FASTA reference)} \\ 0.0 & \text{otherwise} \end{cases}$$
 
-$$w_i = \begin{cases} \dfrac{1.0}{\bar{d}_i} & \text{if } \text{finite}(\bar{d}_i) \land \bar{d}_i > 0 \\ 1.0 & \text{otherwise} \end{cases}$$
-
-Bins failing usability or neighbor count checks receive $r_i = \text{NaN}, Z_i = \text{NaN}, w_i = 0.0$.
+Under weighted least squares, setting $w_i \propto \tilde{\sigma}_{\text{null}, i}^{-2}$ makes the weighted sum-of-squares cost function proportional to the negative log-likelihood of a Gaussian observation model (Aitken, 1935; Killick et al., 2012).
 
 ### 6.2 Statistical Assumptions & Failure Modes
 
-- **Sparsity of Extreme Z-Scores**: Under the null $Z_i \sim \mathcal{N}(0, 1)$, masking $|Z_i| \ge 2.326347874$ removes only $2 \times (1 - 0.99) = 2\%$ of copy-neutral bins in expectation while stripping almost all high-amplitude CNV bins from acting as reference neighbors on subsequent passes.
-- **Inverse Distance Weighting**: Assumes a bin whose $k$ nearest off-contig neighbors are tightly clustered in feature space (small $\bar{d}_i$) has higher reference fidelity and should receive proportionally higher weight $w_i = 1/\bar{d}_i$ during segmentation.
+- **Gauss-Markov Optimality**: Inverse-variance weighting guarantees that the weighted segment mean $\bar{r}_w = (\sum w_i r_i) / (\sum w_i)$ is the Best Linear Unbiased Estimator (BLUE) under heteroscedastic bin variances (Aitken, 1935).
+- **Weight Clamping**: Clamping weights to $[0.05, 20.0]$ prevents ultra-low variance bins from dominating segmentation while bounding the influence of noisy bins.
 
-### 6.3 Model & Function Selection Rationale
+### 6.3 Constants & Hyperparameters
 
-- **Iterative Z-Score Sieve ($M=3$ passes)**: In Pass 1, a massive trisomy may slightly elevate the median of neighbor sets for other chromosomes, partially masking smaller CNVs. Removing $|Z_i| \ge 2.3263$ after Pass 1 cleans the neighbor pools for Pass 2, and Pass 3 stabilizes the final ratios and Z-scores.
-- **1.4826 MAD Fallback for Flat References**: In flat FASTA mode (`--fasta`), no control cohort exists to parameterize per-bin $\sigma_{\text{null}, i}$. Estimating genome-wide $\hat{\sigma}_{\text{emp}} = 1.4826 \cdot \text{MAD}(r)$ provides a robust, CNV-resistant scale estimator so Z-score outlier masking and calling remain functional without empirical controls.
-
-### 6.4 Constants & Hyperparameters
-
-- `_MASK_Z_THRESHOLD = 2.326347874` (`src/ccnv/predict.py`): Exact value of $\Phi^{-1}(0.99)$ (**Tier 1 / Tier 2**, WISECONDOR). Masks the top $1\%$ upper and $1\%$ lower tail of a standard normal distribution during iterative neighbor refinement.
-- `mask_repeats = 3` (`src/ccnv/models/config.py:PredictConfig`): Default number of within-sample iterative neighbor-masking passes (**Tier 2**).
-- `min_reference_bins = 3` (`src/ccnv/models/config.py:PredictConfig`): Minimum surviving eligible neighbors $|\mathcal{N}_i^{(M)}|$ required to emit a bin ratio in `predict` (**Tier 4**). Allows prediction on small test panels while requiring at least 3 points for a meaningful median.
-- `1.4826` (`src/ccnv/predict.py:normalize_branch`): Normal-consistent MAD scale factor $1/\Phi^{-1}(0.75)$ (**Tier 1**).
+- `_MASK_Z_THRESHOLD = 2.326347874` (`src/ccnv/predict.py`): $\Phi^{-1}(0.99)$ (**Tier 1 — Statistical & Mathematical Theory** / **Tier 2 — Published Literature & Reference Methodology**, WISECONDOR). Masks the outer $2\%$ tails during iterative neighbor refinement.
+- Weight clip bounds `[0.05, 20.0]` (`src/ccnv/predict.py:normalize_branch`): Bounded dynamic range for inverse-variance weights (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- `mask_repeats = 3`, `min_reference_bins = 3` (`src/ccnv/models/config.py:PredictConfig`): Iterations and minimum surviving neighbors (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**).
 
 ---
 
-## 7. Weighted Change-Point Segmentation and Event Calling
+## 7. Pre-Split Euchromatic Change-Point Segmentation and Event Calling
 
 ### 7.1 Mathematical Formulation
 
-#### Custom Weighted L2 Cost (`src/ccnv/stats/segmentation.py:WeightedL2Cost`)
+#### 7.1.1 Pre-Split Euchromatic Arm Block Partitioning
 
-For an ordered sequence of $B_c$ bins on a contig with log2 ratios $\mathbf{y} \in \mathbb{R}^{B_c}$ and non-negative weights $\mathbf{w} \in \mathbb{R}_{\ge 0}^{B_c}$ (where unusable/masked bins have $w_i = 0$ and $y_i = 0$), the weighted residual sum of squares (SSE) on any half-open index slice $[s, e)$ ($0 \le s < e \le B_c$) is:
+Rather than segmenting across entire chromosomes and splitting post-hoc, `src/ccnv/stats/segmentation.py:segment_contig` partitions each contig into contiguous euchromatic blocks separated by unmapped/masked gaps exceeding $\Delta_{\max} = 2{,}000{,}000\text{ bp}$ (centromeres, acrocentric p-arms, heterochromatic stalks) **before** change-point optimization. This prevents p-arm and q-arm baselines from coupling across centromeres (Olshen et al., 2004; Nilsen et al., 2012).
+
+#### 7.1.2 Change-Point Optimization and Solver Dispatch
+
+For an euchromatic block with log2 ratios $\mathbf{y}$ and precision weights $\mathbf{w}$, the weighted sum-of-squared-errors cost is:
 
 $$\operatorname{cost}(s, e) = \sum_{i=s}^{e-1} w_i \left(y_i - \bar{y}_{s:e}\right)^2, \quad \bar{y}_{s:e} = \frac{\sum_{i=s}^{e-1} w_i y_i}{\sum_{i=s}^{e-1} w_i}$$
 
-Using the algebraic identity $\sum w_i (y_i - \bar{y})^2 = \sum w_i y_i^2 - \frac{(\sum w_i y_i)^2}{\sum w_i}$, `WeightedL2Cost.fit` precomputes three prefix-sum arrays of length $B_c + 1$ in $O(B_c)$ time:
+`WeightedL2Cost` precomputes prefix sums of $w_i$, $w_i y_i$, and $w_i y_i^2$, allowing $O(1)$ interval cost evaluations. Solvers are dispatched based on algorithm and weight profile:
+- **`algorithm == "pelt"` with uniform weights**: Dispatches to C-compiled `ruptures.KernelCPD(kernel="linear", min_size=min_size, jump=jump)` executing exact linear-time PELT in compiled C (Killick et al., 2012; Truong et al., 2020).
+- **`algorithm == "pelt"` with variable weights**: Dispatches to exact `ruptures.Pelt(custom_cost=WeightedL2Cost())`.
+- **`algorithm == "binseg"`**: Dispatches to `ruptures.Binseg(custom_cost=WeightedL2Cost())`.
 
-$$W_k = \sum_{i=0}^{k-1} w_i, \quad V_k = \sum_{i=0}^{k-1} w_i y_i, \quad Q_k = \sum_{i=0}^{k-1} w_i y_i^2$$
+#### 7.1.3 Autocorrelation-Corrected Stouffer Precision Z-Score Calling
 
-allowing `WeightedL2Cost.error(s, e)` to evaluate any interval cost in $O(1)$ time:
+In `src/ccnv/predict.py:segment_and_call`, segments are summarized via Polars expressions. Taking the simple average of Z-scores shrinks variance as $1/N$, requiring single-bin deviations $|Z_i| \ge 3.0$ regardless of segment length and missing multi-bin low-fetal-fraction CNVs.
 
-$$\operatorname{cost}(s, e) = \begin{cases} 0.0 & \text{if } W_e - W_s = 0 \\ \max\!\left(0.0, (Q_e - Q_s) - \dfrac{(V_e - V_s)^2}{W_e - W_s}\right) & \text{if } W_e - W_s > 0 \end{cases}$$
+`ccnv` implements the Stouffer precision-weighted combination (Stouffer et al., 1949; Lipták, 1958; Whitlock, 2005) with Newey-West / AR(1) spatial autocorrelation correction (Diskin et al., 2008; Newey & West, 1987):
 
-#### Penalized Change-Point Optimization (`src/ccnv/stats/segmentation.py:segment_contig`)
+1. Estimate per-contig lag-1 autocorrelation natively in Polars:
+   $$\hat{\rho}_{1, c} = \operatorname{clip}\!\left(\operatorname{Corr}_{i \in \mathcal{U}_c}(Z_i, Z_{i-1}), \; 0.0, \; 0.95\right)$$
+2. For each segment $S_m$ with $N_m$ usable bins, evaluate the autocorrelation-adjusted Stouffer Z-score:
+   $$Z_{\text{seg}}(S_m) = \frac{\sum_{i \in S_m \cap \mathcal{U}} w_i Z_i}{\sqrt{\left(\sum_{i \in S_m \cap \mathcal{U}} w_i^2\right)\left(1 + \frac{2(N_m - 1)}{N_m}\hat{\rho}_{1, c}\right)}}$$
 
-Change-point detection seeks a partition $\mathcal{T} = (0 = t_0 < t_1 < \dots < t_K = B_c)$ with $K - 1$ internal breakpoints minimizing the penalized objective:
+Stouffer weighting scales detection sensitivity with $\sqrt{N_m}$ while the AR(1) factor $1 + \frac{2(N_m - 1)}{N_m}\hat{\rho}_{1, c}$ prevents false-positive inflation from local genomic correlation waves.
 
-$$\mathcal{L}(\mathcal{T}; \beta) = \sum_{m=1}^{K} \operatorname{cost}(t_{m-1}, t_m) + \beta (K - 1)$$
+### 7.2 Event Calling
 
-where $\beta > 0$ is `--penalty` (default $1.0$), subject to minimum segment length $t_m - t_{m-1} \ge \text{min\_size} = 2$ and grid stride $\text{jump} = 1$. Two solvers from `ruptures` are supported:
-- **Binary Segmentation (`binseg`, default)**: Greedily splits the interval $[t_{m-1}, t_m)$ at the index $t^*$ maximizing cost reduction $\Delta \operatorname{cost} = \operatorname{cost}(t_{m-1}, t_m) - [\operatorname{cost}(t_{m-1}, t^*) + \operatorname{cost}(t^*, t_m)]$ whenever $\Delta \operatorname{cost} > \beta$, running in $O(B_c \log B_c)$ time.
-- **Pruned Exact Linear Time (`pelt`)**: Solves the global exact dynamic programming recurrence with pruning in $O(B_c)$ to $O(B_c^2)$ time (Killick et al., 2012).
+A segment is classified as:
 
-#### Blacklist Gap Splitting (`src/ccnv/stats/segmentation.py:_split_blacklist_gaps`)
+$$\operatorname{call} = \begin{cases} \texttt{"gain"} & \text{if } Z_{\text{seg}} > \tau_Z \text{ (or } \bar{r}_{\text{seg}} > \tau_r \text{)} \\ \texttt{"loss"} & \text{if } Z_{\text{seg}} < -\tau_Z \text{ (or } \bar{r}_{\text{seg}} < -\tau_r \text{)} \\ \texttt{None} & \text{otherwise} \end{cases}$$
 
-After change-point detection, any candidate segment $[t_{m-1}, t_m)$ containing a contiguous run of masked bins ($w_i = 0$) whose genomic span $e_{\text{gap\_end}-1} - s_{\text{gap\_start}} > \Delta_{\max}$ (`max_blacklist_gap`, default $2,000,000\text{ bp}$) is split at the gap boundaries. Each resulting sub-segment is trimmed to its first and last usable bins and summarized by its weighted mean ratio $\bar{r}_{\text{seg}}$, total weight $W_{\text{seg}} = \sum w_i$, usable bin count, and weighted mean Z-score (`src/ccnv/predict.py:segment_and_call`):
+### 7.3 Constants & Hyperparameters
 
-$$\bar{r}_{\text{seg}} = \frac{\sum_{i \in \mathcal{U}_{\text{seg}}} w_i r_i}{\sum_{i \in \mathcal{U}_{\text{seg}}} w_i}, \quad \bar{Z}_{\text{seg}} = \frac{\sum_{i \in \mathcal{U}_{\text{seg}}} w_i Z_i}{\sum_{i \in \mathcal{U}_{\text{seg}}} w_i}$$
-
-#### Event Calling (`src/ccnv/predict.py:call_segment`)
-
-Let $(v, \tau)$ be $(\bar{r}_{\text{seg}}, \tau_{\text{ratio}})$ if `--ratio-threshold` is explicitly supplied, or $(\bar{Z}_{\text{seg}}, \tau_Z)$ otherwise (default $\tau_Z = 3.0$). A segment is classified as:
-
-$$\operatorname{call}(v, \tau) = \begin{cases} \texttt{"gain"} & \text{if } v > \tau \\ \texttt{"loss"} & \text{if } v < -\tau \\ \texttt{None} & \text{if } |v| \le \tau \text{ or } \neg\text{finite}(v) \end{cases}$$
-
-### 7.2 Statistical Assumptions & Failure Modes
-
-- **Piecewise-Constant Step Function**: Models copy-number ratios along a chromosome as a piecewise-constant signal corrupted by additive heteroscedastic noise with variance inversely proportional to $w_i$.
-- **Catastrophic Cancellation in Prefix Sums**: Because $Q_k - Q_s - (V_k - V_s)^2 / (W_k - W_s)$ subtracts two large floating-point numbers on flat segments, rounding error can yield $-10^{-16}$; clamping with `max(0.0, ...)` prevents negative costs from destabilizing `ruptures`.
-
-### 7.3 Model & Function Selection Rationale
-
-- **`Binseg` Default vs. `PELT` vs. CBS**: Circular Binary Segmentation (CBS, Olshen et al., 2004) requires $O(B_c^2)$ permutation testing at every split and lacks native per-bin precision weighting. `WeightedL2Cost` inside `ruptures.Binseg` evaluates splits in $O(1)$ per candidate via prefix sums, running in $O(B_c \log B_c)$ time (milliseconds per chromosome at $5\text{ kb}$) while honoring per-bin weights $w_i$.
-- **Post-Segmentation Blacklist Gap Splitting ($\Delta_{\max} = 2\text{ Mb}$)**: Running segmentation across the full contig index array allows short mappability dropouts ($< 2\text{ Mb}$, such as segmental duplications) to be bridged when flanking copy numbers agree, while splitting segments across centromeres and p-arm heterochromatin ($> 2\text{ Mb}$, e.g., acrocentric p-arms and `chr1`/`chr9`/`chr16` pericentromeric blocks) so calls never span across centromeres.
-
-### 7.4 Constants & Hyperparameters
-
-- `penalty = 1.0` (`src/ccnv/models/config.py:PredictConfig`): Default breakpoint penalty $\beta$ in weighted squared-error units (**Tier 2 / Tier 4**).
-- `min_size = 2`, `jump = 1` (`src/ccnv/stats/segmentation.py:segment_contig`): Minimum 2 bins per segment evaluated at every bin boundary (**Tier 2 / Tier 4**). Prevents single-bin spike calls while maintaining single-bin breakpoint precision.
-- `DEFAULT_MAX_BLACKLIST_GAP = 2_000_000` (`src/ccnv/stats/segmentation.py`): $2\text{ Mb}$ maximum bridged gap (**Tier 3**). Sized below human centromere lengths ($2\text{–}5\text{ Mb}$).
-- `z_threshold = 3.0` (`src/ccnv/models/config.py:PredictConfig`): Default segment Z-score calling threshold (**Tier 1 / Tier 2**). Corresponds to two-sided $p = 0.0027$ ($\Phi(-3) \approx 0.00135$ per tail).
+- `penalty = 1.0` (`src/ccnv/models/config.py:PredictConfig`): Breakpoint penalty $\beta$ (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- `DEFAULT_MAX_BLACKLIST_GAP = 2_000_000` bp (`src/ccnv/stats/segmentation.py`): Euchromatic block pre-split threshold (**Tier 3 — Genomic Biology & Assembly Coordinates**).
+- `z_threshold = 3.0` (`src/ccnv/models/config.py:PredictConfig`): Segment calling threshold (**Tier 1 — Statistical & Mathematical Theory** / **Tier 2 — Published Literature & Reference Methodology**).
+- Contig lag-1 autocorrelation clamp `[0.0, 0.95]` (`src/ccnv/predict.py:segment_and_call`): Prevents negative variance adjustments or singular inflation (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**: Diskin et al., 2008; Newey & West, 1987).
 
 ---
 
 ## 8. Prenatal Multi-Resolution Fetal Fraction Estimation (`FFY`, `PREFACE`, `FFX`)
 
-In `--mode prenatal`, `ccnv` calibrates and evaluates three complementary fetal fraction estimators from shallow maternal cfDNA sequencing without external deep-learning frameworks.
+In `--mode prenatal`, `ccnv` calibrates and evaluates three complementary fetal fraction estimators from shallow maternal cfDNA sequencing.
 
-### 8.1 Mathematical Formulation
+### 8.1 1D 2-GMM Fetal Sex Inference & Mappable Autosomal Density
 
-#### Autosome Selection and Mappable Autosomal Density (`src/ccnv/features/prenatal.py:_autosomal_density`)
-
-To prevent common viable fetal trisomies (T13, T18, T21) from biasing normalization baselines, prenatal autosomal calculations exclude chromosomes 13, 18, and 21 (`_EXCLUDED_PRENATAL_AUTOSOMES = {13, 18, 21}`), retaining canonical autosomes $\mathcal{A}_{\text{pre}} = \{1, \dots, 22\} \setminus \{13, 18, 21\}$. For any sample with bin counts $\mathbf{c}$ and bin widths $\mathbf{w} = \mathbf{e} - \mathbf{s}$, the mean mappable autosomal read density (reads per base pair) is:
+Autosomal density excludes chromosomes 13, 18, and 21 (`_EXCLUDED_PRENATAL_AUTOSOMES = {13, 18, 21}`):
 
 $$\rho_{\text{auto}} = \operatorname{mean}_{b \in \mathcal{A}_{\text{pre}}, c_b > 0}\!\left(\frac{c_b}{w_b}\right)$$
 
-#### 1. `FFY`: 5 kb `chrY` Informative Masking & Non-Negative Lasso (`src/ccnv/features/prenatal.py:fit_prenatal_models`)
+Prenatal fetal sex inference fits a 1D 2-GMM with Brent's root-finding (`infer_sex_gmm_1d`) on `chrY` read fractions, establishing the decision boundary $\tau_Y$ separating female and male fetuses.
 
-At native $5\text{ kb}$ resolution, each sample's `chrY` bin counts are normalized by expected autosomal density:
+### 8.2 Non-Negative `ElasticNetCV` on 5 kb `chrY` Bins (`FFY`)
 
-$$Y_{s, b}^{\text{norm}} = \frac{c_{s, b}}{\rho_{\text{auto}, s} \cdot w_b} \quad (b \in \text{chrY})$$
+At $5\text{ kb}$ resolution, normalized `chrY` depths are $Y_{s, b}^{\text{norm}} = c_{s, b} / (\rho_{\text{auto}, s} w_b)$. An informative bin mask $\mathcal{I}_Y$ selects non-PAR, non-`Yq12` bins ($[2,781,479, 28,800,000]$) with female median $< 0.15$ and male mean $>$ female median $+ 10^{-4}$.
 
-An informative `chrY` bin mask $\mathcal{I}_Y$ selects bins satisfying both genomic coordinate bounds and empirical male-vs-female signal criteria:
-1. **Coordinate Filter**: $[s_b, e_b) \subseteq [\text{PAR1}_{\text{end}}, \text{Yq12}_{\text{start}}] = [2,781,479,\; 28,800,000]$, excluding Pseudoautosomal Region 1 (PAR1, which recombines with `chrX`), PAR2, and the massive variable heterochromatic repeat block on `Yq12`.
-2. **Empirical Signal Filter**: Across resolved male ($\mathcal{M}$) and female ($\mathcal{F}$) cohort samples, the bin's male mean must exceed the female median by $> 10^{-4}$ and the female median must be $< 0.15$ (filtering autosomal-homologous transposed regions on `chrY` that misalignment-map in females):
-   $$\operatorname{mean}_{s \in \mathcal{M}}(Y_{s, b}^{\text{norm}}) > \operatorname{median}_{s \in \mathcal{F}}(Y_{s, b}^{\text{norm}}) + 10^{-4} \quad \land \quad \operatorname{median}_{s \in \mathcal{F}}(Y_{s, b}^{\text{norm}}) < 0.15$$
+In the $p \gg n$ regime ($B_Y \approx 2{,}000$ bins vs. $S \approx 20\text{--}100$ samples), pure $L_1$ Lasso saturates at $\le \min(S, B_Y)$ bins (Zou & Hastie, 2005; Rosset et al., 2004), discarding $>95\%$ of informative single-copy male sequence (`SRY`, `USP9Y`, `DDX3Y`, `UTY`, `ZFY`; Skaletsky et al., 2003; Hudecova et al., 2014; Straver et al., 2016).
 
-For cohort samples lacking ground-truth fetal fraction labels (`entry.ff`), a stoichiometric prior target $\tilde{f}_s^{\text{prior}}$ is derived from the mean normalized `chrY` depth $\bar{Y}_s = \operatorname{mean}_{b \in \mathcal{I}_Y}(Y_{s, b}^{\text{norm}})$. Because a single-copy fetal `chrY` in a $100\%$ male sample has half the copy number of a diploid autosome ($1\text{ copy} / 2\text{ copies} = 0.5$), the $100\%$ male baseline is $b_{100} = b_{\text{F}} + 0.5$, where $b_{\text{F}} = \operatorname{median}_{s \in \mathcal{F}}(\bar{Y}_s)$:
+`ccnv` fits non-negative Elastic Net with cross-validation (`src/ccnv/stats/prenatal_math.py:fit_elasticnet_ffy`, `sklearn.linear_model.ElasticNetCV(positive=True)`):
 
-$$\tilde{f}_s^{\text{prior}} = \begin{cases} \operatorname{clip}\!\left(\dfrac{\bar{Y}_s - b_{\text{F}}}{0.5}, 0.0, 1.0\right) & \text{if } s \in \mathcal{M} \\ 0.0 & \text{if } s \in \mathcal{F} \end{cases}$$
+$$\min_{\mathbf{w} \ge \mathbf{0}} \frac{1}{2S}\left\|\mathbf{y}_{\text{FF}} - \mathbf{X}_Y \mathbf{w}\right\|_2^2 + \alpha \rho \|\mathbf{w}\|_1 + \frac{\alpha(1 - \rho)}{2}\|\mathbf{w}\|_2^2, \qquad \rho \in \{0.01, 0.05, 0.10\}$$
 
-Any sample with an explicit `entry.ff` overrides $\tilde{f}_s^{\text{prior}}$ to form the training target vector $\mathbf{y}_{\text{FFY}} \in \mathbb{R}^S$. Non-negative Lasso regression (`src/ccnv/stats/prenatal_math.py:fit_lasso_fista`, implemented via coordinate descent in `sklearn.linear_model.Lasso(positive=True, fit_intercept=False)`) solves for sparse non-negative bin weights $\mathbf{w}_Y \in \mathbb{R}_{\ge 0}^{|\mathcal{I}_Y|}$ with $\alpha = 10^{-4}$:
+The $L_2$ penalty enforces the grouping effect, retaining all co-varying euchromatic `chrY` bins and eliminating out-of-sample overfit bias.
 
-$$\mathbf{w}_Y = \arg\min_{\mathbf{w} \ge \mathbf{0}} \left\{ \frac{1}{2S} \left\| \mathbf{Y}_{:, \mathcal{I}_Y}^{\text{norm}} \mathbf{w} - \mathbf{y}_{\text{FFY}} \right\|_2^2 + \alpha \|\mathbf{w}\|_1 \right\}$$
+### 8.3 Convex Logit-Link `RidgeCV` + `ElasticNetCV` Ensemble for `PREFACE`
 
-Because $L_1$ shrinkage introduces a downward multiplicative bias on raw predictions $\hat{\mathbf{f}}_{\text{raw}} = \mathbf{Y}_{:, \mathcal{I}_Y}^{\text{norm}} \mathbf{w}_Y$, an Ordinary Least Squares (OLS) calibration line $(\beta_0^{\text{FFY}}, \beta_1^{\text{FFY}})$ is fitted across male cohort samples (`ols_fit`):
+Autosomal counts are coarsened in memory to $100\text{ kb}$ (`prenatal_bin_size = 100000`). Truncated PCA extracts $D = \min(50, \max(1, S - 1))$ scores $\mathbf{X}_{\text{PCA}}$.
 
-$$\hat{f}_{\text{FFY}, s} = \max\!\left(0.0, \beta_0^{\text{FFY}} + \beta_1^{\text{FFY}} \left(\mathbf{y}_{s, \mathcal{I}_Y}^{\text{norm}} \cdot \mathbf{w}_Y\right)\right)$$
+`ccnv` implements a convex logit-space `SeqFF`-style ensemble (`src/ccnv/stats/prenatal_math.py:fit_preface_logit_ensemble`, Kim et al., 2015; Golub, Heath, & Wahba, 1979):
 
-#### 2. `PREFACE`: 100 kb Autosomal PCA + Sigmoid MLP / OLM with K-Fold Skew Correction
+$$u_s = \operatorname{logit}\!\left(\operatorname{clip}(y_s, 0.005, 0.85)\right) = \ln\!\left(\frac{\tilde{y}_s}{1 - \tilde{y}_s}\right)$$
 
-Cohort counts are coarsened in memory to $100\text{ kb}$ (`prenatal_bin_size = 100000`). For each autosomal bin $b \in \mathcal{A}_{\text{pre}}$, the log2 ratio against expected autosomal density is $L_{s, b} = \log_2\!\left(c_{s, b} / (\rho_{\text{auto}, s} w_b)\right)$. Bins with finite coverage in $< 99\%$ of cohort samples (`frac_valid < 0.99`) are flagged as masked, missing entries are mean-imputed per bin, and truncated unscaled PCA (`src/ccnv/stats/pca.py:pca_irlba_numpy`) extracts $D = \min(50, \max(1, S - 1))$ principal component score vectors $\mathbf{X}_{\text{PCA}} \in \mathbb{R}^{S \times D}$.
+$$\mathbf{w}_{\text{ens}} = \frac{1}{2}\left(\hat{\mathbf{w}}_{\text{RidgeCV}} + \hat{\mathbf{w}}_{\text{ElasticNetCV}}\right), \quad b_{\text{ens}} = \frac{1}{2}\left(\hat{b}_{\text{RidgeCV}} + \hat{b}_{\text{ElasticNetCV}}\right)$$
 
-Training labels $\mathbf{y}_{\text{pref}}$ use `entry.ff` where provided and `final_ffy` for unlabeled male pregnancies. Two predictors are trained on the labeled subset $(\mathbf{X}_L, \mathbf{y}_L)$:
-1. **Sigmoid Multi-Layer Perceptron (`fit_rprop_mlp`)**: A $D \to H \to 1$ architecture ($H = 2$ hidden units) with logistic sigmoid activations $\sigma(z) = (1 + e^{-z})^{-1}$ on both hidden and output layers:
-   $$\mathbf{h} = \sigma(\mathbf{X}_L \mathbf{W}_1 + \mathbf{b}_1), \quad \hat{\mathbf{y}}_{\text{MLP}} = \sigma(\mathbf{h} \mathbf{W}_2 + \mathbf{b}_2)$$
-   Minimizes half mean squared error $\mathcal{L}(\boldsymbol{\theta}) = \frac{1}{2 N_L} \|\hat{\mathbf{y}}_{\text{MLP}} - \mathbf{y}_L\|_2^2$ via quasi-Newton `L-BFGS-B` (`scipy.optimize.minimize`) using exact analytical backpropagation gradients across $n_{\text{inits}} = 5$ Glorot uniform initializations:
-   $$W_{1, ij}^{(0)} \sim \mathcal{U}\!\left(-\sqrt{\frac{6}{D + H}}, \sqrt{\frac{6}{D + H}}\right), \quad W_{2, jk}^{(0)} \sim \mathcal{U}\!\left(-\sqrt{\frac{6}{H + 1}}, \sqrt{\frac{6}{H + 1}}\right)$$
-2. **Ordinary Linear Model (`train_olm`)**: Standard multivariate linear regression $\hat{\mathbf{y}}_{\text{OLM}} = \mathbf{X}_L \mathbf{w}_{\text{OLM}} + b_{\text{OLM}}$.
+$$\hat{f}_{\text{PREFACE}}(\mathbf{z}) = \operatorname{expit}\!\left(\mathbf{z}^\top \mathbf{w}_{\text{ens}} + b_{\text{ens}}\right)$$
 
-To correct regression-to-the-mean shrinkage, $K$-fold cross-validation ($K = \min(10, N_L)$) generates out-of-fold predictions $\hat{\mathbf{y}}_{\text{MLP}}^{\text{CV}}$ and $\hat{\mathbf{y}}_{\text{OLM}}^{\text{CV}}$, and fits OLS calibration lines $(\gamma_0^{\text{MLP}}, \gamma_1^{\text{MLP}})$ and $(\gamma_0^{\text{OLM}}, \gamma_1^{\text{OLM}})$ mapping out-of-fold predictions to $\mathbf{y}_L$.
+This convex formulation eliminates non-convex local minima and saturating tail artifacts of Sigmoid MLPs, guaranteeing monotonic predictions strictly within $(0, 1)$ with analytic LOOCV standard error $\sigma_{\text{pref}}$.
 
-During inference (`src/ccnv/features/prenatal.py:predict_prenatal`), if the raw MLP output lies within the physiologically plausible operating interval $\hat{y}_{\text{MLP}} \in [0.01, 0.50]$, the skew-corrected MLP prediction is used; otherwise (e.g., if extreme PCA scores saturate the sigmoid into flat $0$ or $1$ tails), inference falls back to the skew-corrected OLM:
+### 8.4 `FFX`: 100 kb `chrX` Robust Huber Regression
 
-$$\hat{f}_{\text{PREFACE}} = \begin{cases} \gamma_0^{\text{MLP}} + \gamma_1^{\text{MLP}} \hat{y}_{\text{MLP}} & \text{if } 0.01 \le \hat{y}_{\text{MLP}} \le 0.50 \\ \gamma_0^{\text{OLM}} + \gamma_1^{\text{OLM}} \hat{y}_{\text{OLM}} & \text{otherwise} \end{cases}$$
-
-#### 3. `FFX`: 100 kb `chrX` Robust Huber Regression
-
-For each sample, the geometric mean `chrX` copy ratio relative to autosomal density at $100\text{ kb}$ is:
-
-$$R_{X, s} = 2^{\operatorname{nanmean}_{b \in \text{chrX}} \log_2\left(\frac{c_{s, b}}{\rho_{\text{auto}, s} w_b}\right)}$$
-
-In a normal male pregnancy ($\text{XY}$ fetus in an $\text{XX}$ mother), maternal cfDNA contributes 2 copies of `chrX` and fetal cfDNA contributes 1 copy, so theoretical `chrX` ratio decreases linearly with fetal fraction: $E[R_X] = 1 - 0.5 f \implies f = 2.0 - 2.0 R_X$. Across male cohort samples ($s \in \mathcal{M}$), `ccnv` calibrates the empirical relationship between $R_{X, s}$ and $\hat{f}_{\text{FFY}, s}$ via Huber M-estimation (`src/ccnv/stats/prenatal_math.py:rlm_huber`, using `sklearn.linear_model.HuberRegressor` with $\epsilon = 1.345$):
+For male pregnancies, `chrX` ratio $R_X$ decreases with fetal fraction: $E[R_X] = 1 - 0.5 f$. `ccnv` calibrates this relationship via Huber M-estimation (`src/ccnv/stats/prenatal_math.py:rlm_huber`, $\epsilon = 1.345$):
 
 $$\hat{f}_{\text{FFX}} = \beta_0^{\text{FFX}} + \beta_1^{\text{FFX}} R_X$$
 
-falling back to theoretical stoichiometric constants $(\beta_0^{\text{FFX}}, \beta_1^{\text{FFX}}) = (2.0, -2.0)$ when fewer than 2 male samples exist in the cohort.
+falling back to theoretical $(2.0, -2.0)$ when fewer than 2 male controls exist.
 
-### 8.2 Statistical Assumptions & Failure Modes
+### 8.5 Constants & Hyperparameters
 
-- **Nucleosome Positioning & Fragmentation Footprint in `PREFACE`**: Maternal and fetal cfDNA fragments differ in modal length ($\sim 166\text{ bp}$ maternal vs. $\sim 143\text{ bp}$ fetal) due to linker-DNA trimming around nucleosomes, creating consistent regional coverage differences across $100\text{ kb}$ autosomal bins that correlate linearly and non-linearly with fetal fraction (Kim et al., 2015; Raman et al., 2019b).
-- **Semi-Supervised Bootstrapping from Male Fetuses**: When ground-truth fetal fractions are omitted from the samplesheet, `PREFACE` and `FFX` train using `FFY`-derived fetal fractions on male pregnancies as targets, assuming autosomal fragmentation signatures of fetal fraction are sex-invariant and generalize to female pregnancies.
-
-### 8.3 Model & Function Selection Rationale
-
-- **Non-Negative Lasso (`positive=True`) for `FFY`**: `chrY` contains mosaic repeats and variable-copy ampliconic regions. Non-negative $L_1$ regularization automatically selects the sparse subset of `chrY` bins that scale linearly with male fetal DNA while strictly forbidding negative bin weights that could cause non-monotonic or negative fetal fraction estimates.
-- **L-BFGS-B with Analytical Gradients vs. Rprop for `PREFACE` MLP**: While the original R `PREFACE` package used `neuralnet` (Resilient Backpropagation), second-order quasi-Newton `L-BFGS-B` with exact vectorized matrix gradients and Glorot initialization converges in a fraction of the epochs with superior numerical precision and zero external R/C++ dependencies.
-- **Sigmoid Output + `[0.01, 0.50]` OLM Fallback**: A sigmoid output layer naturally bounds predictions to $(0, 1)$, matching a physical proportion, while the `[0.01, 0.50]` guardrail switches to the unbounded linear model (`OLM`) if an out-of-distribution sample pushes the sigmoid into vanishing-gradient saturation.
-- **Huber M-Estimation ($\epsilon = 1.345$) for `FFX`**: Maternal cohorts occasionally contain undiagnosed maternal `XXX`, mosaic Turner (`45,X/46,XX`), or fetal sex chromosome aneuploidies (`XXY`); Huber regression prevents these outliers from corrupting the `chrX`-to-FF calibration slope.
-
-### 8.4 Constants & Hyperparameters
-
-- `_PAR1_START = 2_781_479`, `_YQ12_END = 28_800_000` (`src/ccnv/features/prenatal.py`): Human `chrY` unique region coordinate bounds in bp (**Tier 3**). Excludes GRCh38 PAR1 ($1\text{–}2,781,479\text{ bp}$) and `Yq12` heterochromatin ($>28.8\text{ Mb}$).
-- `_EXCLUDED_PRENATAL_AUTOSOMES = {13, 18, 21}` (`src/ccnv/features/prenatal.py`): Excluded chromosomes in prenatal autosomal density and `PREFACE` (**Tier 2 / Tier 3**). Prevents viable fetal trisomies (Down, Edwards, Patau syndromes) from corrupting autosomal baseline density or `PREFACE` PCA scores.
-- `med_female < 0.15`, `mean_male > med_female + 1e-4` (`src/ccnv/features/prenatal.py`): Informative `chrY` bin selection cutoffs (**Tier 3 / Tier 4**). Rejects X-transposed/autosomal-homologous bins with $>15\%$ female misalignment background.
-- `male_100_baseline = female_baseline + 0.5` (`src/ccnv/features/prenatal.py`): Haploid `chrY` vs. diploid autosome stoichiometric constant $1/2 = 0.5$ (**Tier 3**).
-- `alpha = 1e-4`, `max_iter = 2000`, `tol = 1e-6` (`src/ccnv/features/prenatal.py`, `src/ccnv/stats/prenatal_math.py:fit_lasso_fista`): Lasso $L_1$ penalty and coordinate descent tolerances (**Tier 4**).
-- `prenatal_bin_size = 100_000` (`src/ccnv/models/config.py:ReferenceConfig`): $100\text{ kb}$ coarsened bin width for `PREFACE` and `FFX` (**Tier 2**, SeqFF / PREFACE). Reduces Poisson noise by $\sqrt{20} \approx 4.47\times$ relative to $5\text{ kb}$ bins.
-- `frac_valid < 0.99` (`src/ccnv/features/prenatal.py`): Masks $100\text{ kb}$ autosomal bins missing in $>1\%$ of cohort samples (**Tier 2 / Tier 4**).
-- `n_feat = min(50, max(1, n_samples - 1))` (`src/ccnv/features/prenatal.py`): Maximum principal components passed to `PREFACE` (**Tier 2**, PREFACE).
-- `hidden_dim = 2`, `n_inits = 5` (`n_inits = 2`, `max_epochs = 400` in CV; `max_epochs = 1500`, `gtol = 1e-4` in full fit, `src/ccnv/stats/prenatal_math.py:fit_rprop_mlp`): 2-neuron hidden layer architecture and L-BFGS-B optimization parameters (**Tier 2 / Tier 4**). Keeps total MLP parameters to $2D + 5 \le 105$ to prevent overfitting on cohort sizes $S \sim 100$.
-- `limit = sqrt(6.0 / (n_in + n_out))` (`src/ccnv/stats/prenatal_math.py:fit_rprop_mlp`): Glorot / Xavier uniform initialization bound (**Tier 1**, Glorot & Bengio, 2010). Preserves activation variance across sigmoid layers at initialization.
-- `k_folds = min(10, labeled_idx.size)` (`src/ccnv/features/prenatal.py`): 10-fold cross-validation for out-of-fold OLS skew calibration (**Tier 2**).
-- `0.01 <= raw_mlp <= 0.50` (`src/ccnv/features/prenatal.py:predict_prenatal`): Plausible fetal fraction gate ($1\%\text{–}50\%$) before OLM fallback (**Tier 3 / Tier 4**).
-- `k = 1.345` (`src/ccnv/stats/prenatal_math.py:rlm_huber`): Standard Huber tuning constant achieving $95\%$ asymptotic efficiency under normal errors (**Tier 1**, Huber, 1964).
-- `ffx_int, ffx_slope = 2.0, -2.0` (`src/ccnv/features/prenatal.py`): Theoretical `chrX` stoichiometric fallback $f = 2 - 2 R_X$ (**Tier 3**).
+- `_PAR1_START = 2_781_479`, `_YQ12_END = 28_800_000` (`src/ccnv/features/prenatal.py`): Euchromatic `chrY` bounds (**Tier 3 — Genomic Biology & Assembly Coordinates**).
+- `_EXCLUDED_PRENATAL_AUTOSOMES = {13, 18, 21}` (`src/ccnv/features/prenatal.py`): Autosomal exclusions (**Tier 2 — Published Literature & Reference Methodology** / **Tier 3 — Genomic Biology & Assembly Coordinates**).
+- `ElasticNetCV` `l1_ratio = [0.01, 0.05, 0.1]` for `FFY` (**Tier 2 — Published Literature & Reference Methodology**: Zou & Hastie, 2005; Kim et al., 2015).
+- `PREFACE` logit clip bounds `[0.005, 0.85]` and `RidgeCV` alpha grid $10^{-2} \dots 10^4$ (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**: Kim et al., 2015; Golub et al., 1979).
 
 ---
 
-## 9. Sex Chromosome Aneuploidy (SCA) Calling and Segment Discordance Stoichiometry
+## 9. Prenatal Single-Sample Inference: 2D Stoichiometric Bayesian SCA, Precision Fusion, & Fetal-Fraction LLR
 
 ### 9.1 Mathematical Formulation
 
-#### Sex Chromosome Aneuploidy Classification (`src/ccnv/features/prenatal.py:classify_sca`)
+#### 9.1.1 2D Stoichiometric Gaussian Bayes SCA Classifier
 
-Let $\mu_{X, \text{F}}$ and $\sigma_{X, \text{F}} = \max(\text{std}_{X, \text{F}}, 10^{-4})$ be the reference cohort's diploid female `chrX` ratio mean and standard deviation. For a test sample with `chrX` ratio $R_X$, `FFX` estimate $\hat{f}_{\text{FFX}}$, `FFY` estimate $\hat{f}_{\text{FFY}}$, and `PREFACE` estimate $\hat{f}_{\text{pref}}$, the `chrX` Z-score and `FFX` Z-score relative to the diploid female (`XX`) expectation are:
+In `src/ccnv/features/prenatal.py:classify_sca`, sex chromosome aneuploidy classification evaluates the joint observation vector $\mathbf{x} = (\Delta_X, f_Y)^\top = (R_X - 1, \hat{f}_{\text{FFY}})^\top$ against the 6 stoichiometric karyotypes $k \in \{\text{XX}, \text{XY}, \text{XO}, \text{XXX}, \text{XXY}, \text{XYY}\}$ anchored at reference fetal fraction $\hat{f}_0$:
 
-$$Z_X = \frac{R_X - \mu_{X, \text{F}}}{\sigma_{X, \text{F}}}, \quad Z_{\text{FFX}} = \frac{\hat{f}_{\text{FFX}} - (\beta_0^{\text{FFX}} + \beta_1^{\text{FFX}} \mu_{X, \text{F}})}{\max(|\beta_1^{\text{FFX}}| \sigma_{X, \text{F}}, 0.005)}$$
+$$\boldsymbol{\mu}_{\text{XX}} = (0, 0)^\top, \quad \boldsymbol{\mu}_{\text{XY}} = \left(-\tfrac{1}{2}\hat{f}_0, \hat{f}_0\right)^\top, \quad \boldsymbol{\mu}_{\text{XO}} = \left(-\tfrac{1}{2}\hat{f}_0, 0\right)^\top$$
 
-(Note that because $\beta_1^{\text{FFX}} \approx -2.0 < 0$, a `chrX` loss $R_X < \mu_{X, \text{F}}$ produces a positive $Z_{\text{FFX}} > 0$, and a `chrX` gain $R_X > \mu_{X, \text{F}}$ produces a negative $Z_{\text{FFX}} < 0$.)
+$$\boldsymbol{\mu}_{\text{XXX}} = \left(+\tfrac{1}{2}\hat{f}_0, 0\right)^\top, \quad \boldsymbol{\mu}_{\text{XXY}} = \left(0, \hat{f}_0\right)^\top, \quad \boldsymbol{\mu}_{\text{XYY}} = \left(-\tfrac{1}{2}\hat{f}_0, 2\hat{f}_0\right)^\top$$
 
-With critical threshold $z_{\text{cut}} = 3.0$:
+Using diagonal covariance $\boldsymbol{\Sigma}_k = \operatorname{diag}(\sigma_X^2, \sigma_Y^2)$, calibrated Bayesian posterior probabilities are evaluated:
 
-- **If `fetal_sex == "F"` ($\text{chrY score} < \tau_Y$)**:
-  - $Z_{\text{FFX}} \ge +3.0 \implies \texttt{"XO"}$ (Monosomy X / Turner syndrome; `chrX` significantly depleted without `chrY`).
-  - $Z_{\text{FFX}} \le -3.0 \implies \texttt{"XXX"}$ (Trisomy X; `chrX` significantly elevated without `chrY`).
-  - $|Z_{\text{FFX}}| < 3.0 \implies \texttt{"XX"}$ (Normal euploid female).
+$$P(C = k \mid \mathbf{x}) = \frac{\pi_k \, \mathcal{N}(\mathbf{x} \mid \boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k)}{\sum_{j} \pi_j \, \mathcal{N}(\mathbf{x} \mid \boldsymbol{\mu}_j, \boldsymbol{\Sigma}_j)}$$
 
-- **If `fetal_sex == "M"` ($\text{chrY score} \ge \tau_Y$)**:
-  Compute the gonosome fetal-fraction discordance Z-score $Z_{XY}$ and the `chrY`-vs-autosomal Z-score $Z_{Y, \text{pref}}$ using minimum noise floors of $1.5\%$ fetal fraction ($\sigma_{XY} = \max(|\beta_1^{\text{FFX}}| \sigma_{X, \text{F}}, 0.015)$, $\sigma_{\text{pref}} = \max(\sigma_{X, \text{F}}, 0.015)$):
-  $$Z_{XY} = \frac{\hat{f}_{\text{FFX}} - \hat{f}_{\text{FFY}}}{\sigma_{XY}}, \quad Z_{Y, \text{pref}} = \frac{\hat{f}_{\text{FFY}} - \hat{f}_{\text{pref}}}{\sigma_{\text{pref}}}$$
-  1. $Z_{XY} \le -3.0 \;\land\; Z_{Y, \text{pref}} \ge +3.0 \;\land\; \dfrac{\hat{f}_{\text{FFY}}}{\max(\hat{f}_{\text{FFX}}, 0.01)} > 1.5 \implies \texttt{"XYY"}$ (Jacobs syndrome: two copies of fetal `chrY` double $\hat{f}_{\text{FFY}}$ relative to both $\hat{f}_{\text{FFX}}$ and autosomal $\hat{f}_{\text{pref}}$).
-  2. $Z_{XY} \le -3.0 \;\land\; |Z_{\text{FFX}}| < 3.0 \implies \texttt{"XXY"}$ (Klinefelter syndrome: male `chrY` present, but `chrX` remains at the diploid `XX` maternal baseline so $\hat{f}_{\text{FFX}} \approx 0 \ll \hat{f}_{\text{FFY}}$).
-  3. $|Z_{XY}| < 3.0 \;\land\; |Z_{Y, \text{pref}}| < 3.0 \implies \texttt{"XY"}$ (Normal concordant male: $\hat{f}_{\text{FFY}} \approx \hat{f}_{\text{FFX}} \approx \hat{f}_{\text{pref}}$).
-  4. Otherwise $\implies \texttt{"DISCORDANT\_MIXED"}$ (Mosaicism, maternal SCA, or discordant gonosome ratios).
+Samples exceeding the 2D Mahalanobis outlier gate $d_M^2(\mathbf{x}, \boldsymbol{\mu}_{k^*}) > \chi^2_{2, 0.999} = 13.8155$ are classified as `DISCORDANT_MIXED` (e.g., maternal mosaicism or vanishing twin; Mazloom et al., 2013; Bianchi et al., 2015).
 
-Confidence scores are mapped linearly to $[0.5, 1.0]$ from the Z-score margin relative to $z_{\text{cut}}$:
+#### 9.1.2 Inverse-Variance Precision Fusion for `active_ff`
 
-$$\text{confidence} = \begin{cases} \operatorname{clip}\!\left(0.5 + 0.5 \cdot \dfrac{|Z| - z_{\text{cut}}}{z_{\text{cut}}}, 0.5, 1.0\right) & \text{if aneuploid} \\[8pt] \operatorname{clip}\!\left(0.5 + 0.5 \cdot \dfrac{z_{\text{cut}} - |Z|}{z_{\text{cut}}}, 0.5, 1.0\right) & \text{if euploid} \end{cases}$$
+In concordant `XY` pregnancies, independent estimators are combined via optimal Bates-Granger (1969) precision pooling (`src/ccnv/features/prenatal.py:predict_prenatal`):
 
-#### Active Fetal Fraction Selection (`src/ccnv/features/prenatal.py:predict_prenatal`)
+$$f_{\text{active}} = \frac{\sum_{m \in \{\text{FFY}, \text{PREFACE}, \text{FFX}\}} \sigma_m^{-2} \hat{f}_m}{\sum_{m \in \{\text{FFY}, \text{PREFACE}, \text{FFX}\}} \sigma_m^{-2}}, \qquad \sigma_{\text{active}}^2 = \left(\sum_{m} \sigma_m^{-2}\right)^{-1}$$
 
-$$\hat{f}_{\text{active}} = \begin{cases} \max(0, \hat{f}_{\text{FFY}}) & \text{if } \text{fetal\_sex} = \texttt{"M"} \land \text{SCA} \in \{\texttt{"XY"}, \texttt{"XXY"}\} \\ \max(0, \hat{f}_{\text{pref}}) & \text{otherwise (female fetus, XYY, or DISCORDANT\_MIXED)} \end{cases}$$
+yielding an estimator with strictly lower variance than any individual component. For female fetuses (`XX`), `active_ff` routes to $\hat{f}_{\text{PREFACE}}$.
 
-#### Prenatal Segment Stoichiometry and Discordance Tagging (`src/ccnv/features/prenatal.py:annotate_prenatal_segments`)
+#### 9.1.3 Fetal-Fraction-Parameterized Log-Likelihood Ratio ($\operatorname{LLR}_{\text{fetal}}$) Segment Discordance
 
-In a mixture of $(1 - f_{\text{active}})$ diploid maternal DNA ($2$ copies) and $f_{\text{active}}$ fetal DNA suffering a heterozygous single-copy gain ($3$ copies) or loss ($1$ copy), the expected relative depth is $\frac{2(1 - f_{\text{active}}) + (2 \pm 1) f_{\text{active}}}{2} = 1 \pm 0.5 f_{\text{active}}$. Thus, for each segment with observed log2 ratio $r_{\text{seg}}$:
+In `src/ccnv/features/prenatal.py:annotate_prenatal_segments`, segments are evaluated using the Gaussian log-likelihood ratio (Adalsteinsson et al., 2017) comparing the fetal single-copy hypothesis $\mu_1 = \operatorname{sign}(\bar{r}_m)\log_2(1 \pm 0.5 f_{\text{active}})$ against maternal CNVs ($\mu_{\text{mat}} = \pm 0.585$) and diploid noise ($\mu_0 = 0$):
 
-$$r_{\text{exp}} = \begin{cases} \log_2(1 + 0.5 f_{\text{active}}) & \text{if } r_{\text{seg}} \ge 0 \\ \log_2\!\left(\max(10^{-6}, 1 - 0.5 f_{\text{active}})\right) & \text{if } r_{\text{seg}} < 0 \end{cases}$$
+$$\operatorname{LLR}_{\text{fetal}}(S_m) = \frac{1}{2}\sum_{i \in S_m} w_i \left[ r_i^2 - (r_i - \mu_1)^2 \right]$$
 
-Inverting this relationship yields the segment's implied single-copy fetal fraction:
+Discordance rules flag calls as `SCA_DISCORDANT`, `SUB_FETAL_RATIO` ($|r_{\text{seg}}| < 0.5 |r_{\text{exp}}|$), or `SUPER_FETAL_RATIO` ($f_{\text{implied}} > \max(2.5 f_{\text{active}}, f_{\text{active}} + 0.15)$).
 
-$$f_{\text{implied}} = 2 \cdot \left|2^{r_{\text{seg}}} - 1\right|$$
+### 9.2 Constants & Hyperparameters
 
-A called segment ($\text{call} \ne \texttt{None}$ or $|Z_{\text{seg}}| \ge z_{\text{thresh}}$) is flagged as `discordant = True` under three mutually exclusive priority rules:
-1. **`SCA_DISCORDANT`**: Segment is on `chrX` or `chrY` and either an SCA is called or the segment itself is called.
-2. **`SUB_FETAL_RATIO`**: $|r_{\text{seg}}| < 0.5 \cdot |r_{\text{exp}}|$ (observed amplitude is less than half of a pure fetal single-copy change, indicating confined placental mosaicism or technical wave artifact).
-3. **`SUPER_FETAL_RATIO`**: $f_{\text{implied}} > \max(2.5 \cdot f_{\text{active}}, f_{\text{active}} + 0.15)$ (observed amplitude vastly exceeds a single fetal copy change, indicating a maternal constitutional CNV or high-level amplification).
-
-### 9.2 Statistical Assumptions & Failure Modes
-
-- **Single-Copy Heterozygous Fetal Deviation**: Expected ratio $r_{\text{exp}} = \log_2(1 \pm 0.5 f_{\text{active}})$ assumes a 1-copy gain (trisomy/duplication, $\text{CN}=3$) or 1-copy loss (monosomy/deletion, $\text{CN}=1$) in a diploid background. A homozygous fetal deletion ($\text{CN}=0$) or 4-copy triplication ($\text{CN}=4$) produces $f_{\text{implied}} \approx 2 f_{\text{active}}$, which stays below the $2.5 f_{\text{active}}$ `SUPER_FETAL_RATIO` cutoff unless $2 f_{\text{active}} > f_{\text{active}} + 0.15$ (i.e., $f_{\text{active}} > 15\%$).
-- **Euploid Maternal Background**: SCA classification assumes the mother is constitutionally `46,XX`; a maternal `47,XXX` or mosaic `45,X/46,XX` shifts $R_X$ by $\gg 0.5 f_{\text{active}}$, triggering `XXX`, `XO`, or `DISCORDANT_MIXED`.
-
-### 9.3 Model & Function Selection Rationale
-
-- **Active FF Routing (`XY`/`XXY` $\to$ `FFY`, `XYY`/`F` $\to$ `PREFACE`)**: In `XY` and `XXY` fetuses, the fetus carries exactly 1 copy of `chrY`, making `FFY` the lowest-variance direct estimator of fetal fraction. In `XYY` fetuses, `chrY` dosage is doubled ($\hat{f}_{\text{FFY}} \approx 2 f_{\text{true}}$), so routing `XYY` to autosomal `PREFACE` prevents doubling $r_{\text{exp}}$ across all autosomes.
-
-### 9.4 Constants & Hyperparameters
-
-- `z_cut = 3.0` (`src/ccnv/features/prenatal.py:classify_sca`): $3\sigma$ Z-score threshold for SCA classification (**Tier 1 / Tier 2**).
-- `sigma_xy >= 0.015`, `sigma_pref >= 0.015`, `std_ffx_f >= 0.005`, `fem_chrx_std >= 0.005` (`src/ccnv/features/prenatal.py`): Minimum standard deviation floors ($0.5\%\text{–}1.5\%$ FF units, **Tier 4**). Prevents tiny empirical variances in small cohorts from inflating $Z_{XY}$ or $Z_{\text{FFX}}$ into false-positive SCA calls.
-- `ffy / max(ffx, 0.01) > 1.5` (`src/ccnv/features/prenatal.py:classify_sca`): Minimum ratio of `FFY` to `FFX` for `XYY` calling (**Tier 3**). Halfway between normal `XY` stoichiometry ($1.0$) and ideal `XYY` stoichiometry ($2.0$).
-- `min_fetal_fraction_warning = 0.04` (`src/ccnv/models/config.py:PredictConfig`): $4\%$ minimum fetal fraction QC warning threshold (**Tier 2 / Tier 3**). Standard clinical ACMG/ISPD lower limit of quantification for sWGS NIPT.
-- `0.5 * abs(expected_ratio)` (`SUB_FETAL_RATIO`) and `max(2.5 * active_ff, active_ff + 0.15)` (`SUPER_FETAL_RATIO`, `src/ccnv/features/prenatal.py:annotate_prenatal_segments`): Stoichiometric discordance bounds (**Tier 3 / Tier 4**).
+- `SCA` Mahalanobis outlier threshold $\chi^2_{2, 0.999} = 13.8155$ (**Tier 2 — Published Literature & Reference Methodology**: Mazloom et al., 2013; Bianchi et al., 2015).
+- Default estimator standard errors `ffy_std = 0.01`, `preface_std = 0.02`, `ffx_std = 0.025` in `PrenatalModelMetadata` (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- `min_fetal_fraction_warning = 0.04` (`src/ccnv/models/config.py:PredictConfig`): $4\%$ clinical NIPT quantification lower limit (**Tier 2 — Published Literature & Reference Methodology** / **Tier 3 — Genomic Biology & Assembly Coordinates**).
 
 ---
 
@@ -601,10 +517,10 @@ Verdict escalation follows strict severity ordering $\texttt{PASS} (0) < \texttt
 
 ### 10.2 Constants & Hyperparameters
 
-- `DEFAULT_MIN_REF_BINS = 150` (`src/ccnv/qc/reference.py`): Half of the default $k = 300$ neighbor pool (**Tier 2 / Tier 4**). Warns if distance pruning removed more than half of a bin's neighbors.
-- `OUTLIER_N_SIGMA = 3.0`, `outlier_pct > 1.0` (`src/ccnv/qc/reference.py`): $3\sigma$ outlier threshold and $1\%$ tail fraction cutoff (**Tier 1**). Under a normal distribution, $\mathbb{P}(X \ge \mu + 3\sigma) = 0.135\%$; exceeding $1.0\%$ indicates heavy right-skewness in neighbor distances.
-- `CHRY_MIN_USABLE_PCT_WARN = 50.0`, `CHRY_MIN_USABLE_PCT_FAIL = 20.0` (`src/ccnv/qc/reference.py`): Minimum usable `chrY` bin percentages (**Tier 3 / Tier 4**). Because $>50\%$ of human `chrY` (`Yq12`) is heterochromatic and unmappable, $\sim 35\text{–}45\%$ usable bins is typical on full `chrY` assemblies (triggering an informational `WARN`), whereas $<20\%$ indicates severe `chrY` dropout.
-- `std_of_means` / `mean_of_means` thresholds `2.0` (`WARN`) and `10.0` (`FAIL`), `CHRY_MEAN_DIST_WARN = 5.0`, `CHRY_MEAN_DIST_FAIL = 100.0` (`src/ccnv/qc/reference.py`): Empirical distance dispersion cutoffs (**Tier 4**).
+- `DEFAULT_MIN_REF_BINS = 150` (`src/ccnv/qc/reference.py`): Half of default $k = 300$ neighbor pool (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- `OUTLIER_N_SIGMA = 3.0`, `outlier_pct > 1.0` (`src/ccnv/qc/reference.py`): $3\sigma$ outlier threshold and $1\%$ tail fraction cutoff (**Tier 1 — Statistical & Mathematical Theory**).
+- `CHRY_MIN_USABLE_PCT_WARN = 50.0`, `CHRY_MIN_USABLE_PCT_FAIL = 20.0` (`src/ccnv/qc/reference.py`): Minimum usable `chrY` bin percentages (**Tier 3 — Genomic Biology & Assembly Coordinates** / **Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- `std_of_means` / `mean_of_means` thresholds `2.0` (`WARN`) and `10.0` (`FAIL`), `CHRY_MEAN_DIST_WARN = 5.0`, `CHRY_MEAN_DIST_FAIL = 100.0` (`src/ccnv/qc/reference.py`): Distance dispersion cutoffs (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
 
 ---
 
@@ -612,55 +528,110 @@ Verdict escalation follows strict severity ordering $\texttt{PASS} (0) < \texttt
 
 | Constant / Parameter | Value | Source Location | Tier | Mathematical / Biological Rationale |
 | :--- | :--- | :--- | :--- | :--- |
-| `DEFAULT_BIN_SIZE` | `5000` bp | `src/ccnv/models/config.py` | Tier 2 / 4 | Standard sWGS bin width balancing Poisson count noise vs. spatial resolution |
-| `prenatal_bin_size` | `100000` bp | `src/ccnv/models/config.py` | Tier 2 | 20x coarsened resolution for `PREFACE` and `FFX` (SeqFF / PREFACE) |
-| `min_mapping_quality` | `1` | `src/ccnv/models/config.py` | Tier 2 | Excludes multi-mapping reads ($\text{MAPQ}=0$) in BWA/Bowtie2 |
-| `DEFAULT_MIN_MAPPABILITY` | `0.5` | `src/ccnv/models/config.py` | Tier 2 / 3 | Requires $\ge 50\%$ uniquely mappable $k$-mers per bin |
-| `_MAX_N_FRACTION` | `0.5` | `src/ccnv/io/tracks.py` | Tier 3 / 4 | Masks bins with $>50\%$ ambiguous reference bases (`N`) |
-| `_MASK_FRACTION` | `0.05` | `src/ccnv/features/cohort.py` | Tier 2 / 4 | Masks dead/heterochromatic bins with $\le 5\%$ of median cohort coverage |
-| `_MIN_VARIANCE_STD` | `1e-6` | `src/ccnv/stats/regression.py` | Tier 4 | Minimum feature std to prevent division by zero during standardization |
-| Covariate $z$-clamp | `[-2.5, 2.5]` | `src/ccnv/stats/regression.py` | Tier 1 / 4 | Central $98.76\%$ normal interval; prevents Vandermonde polynomial runaway at tails |
-| GC / Map poly degree | `3` / `2` | `src/ccnv/features/covariates.py` | Tier 2 / 3 | Cubic basis for unimodal/inflected PCR GC wave; quadratic for mappability |
-| `_IRLS_ITERATIONS` | `3` | `src/ccnv/stats/regression.py` | Tier 4 | Fixed Gauss-Newton IRLS steps for polynomial trend convergence |
-| MAD normal scale | `1.4826` | `src/ccnv/stats/regression.py`, `predict.py` | Tier 1 | $1/\Phi^{-1}(0.75)$; unbiased normal standard deviation scale from MAD |
-| `_OUTLIER_SIGMA_CUTOFF` | `2.5` (floor `0.08`) | `src/ccnv/stats/regression.py` | Tier 1 / 4 | Huber IRLS tuning cutoff $\delta = \max(2.5\sigma_{\text{MAD}}, 0.08)$ |
-| Huber weight floor | `0.05` | `src/ccnv/stats/regression.py` | Tier 4 | Prevents Vandermonde rank deficiency when an entire GC regime is aneuploid |
-| Trend clamp | `[0.20, 5.0]` | `src/ccnv/stats/regression.py` | Tier 4 | Bounds multiplicative covariate correction to at most $5\times$ |
-| `min_cohort_size` | `10` | `src/ccnv/models/config.py` | Tier 2 / 4 | Minimum control samples required to fit reference PCA and null models |
-| `min_sex_group_size` | `5` | `src/ccnv/models/config.py` | Tier 2 / 4 | Minimum samples per sex required to build `female_sex` / `male_sex` branches |
-| `_SEPARATION_MAD_MULTIPLIER` | `4.0` | `src/ccnv/features/cohort.py` | Tier 1 / 4 | Requires inter-sex order-statistic gap $\ge 4 \times \text{MAD}$ ($\approx 5.4\sigma$ separation) |
-| GMM init percentiles | `25.0`, `75.0` | `src/ccnv/stats/prenatal_math.py` | Tier 1 / 2 | Deterministic quartile initialization for 1D 2-GMM on `chrY` fractions |
-| `pca_components` | `5` | `src/ccnv/models/config.py` | Tier 2 / 4 | Default principal components removed in between-sample normalization |
-| `nearest_bins` ($k$) | `300` | `src/ccnv/models/config.py` | Tier 2 | Off-contig nearest reference neighbors per bin (WISECONDOR / WisecondorX) |
-| `distance_cutoff` | `repeats=3`, `3.0`$\sigma$ | `src/ccnv/stats/neighbors.py` | Tier 2 | 3-pass iterative $\mu + 3\sigma$ neighbor distance outlier pruning |
-| `_MAX_NULL_SAMPLES` | `100` | `src/ccnv/stats/neighbors.py` | Tier 4 | Caps control sample count for empirical null $\mu_{\text{null}}, \sigma_{\text{null}}$ estimation |
-| `_MASK_Z_THRESHOLD` | `2.326347874` | `src/ccnv/predict.py` | Tier 1 / 2 | $\Phi^{-1}(0.99)$; masks outer $2\%$ of bins during within-sample neighbor refinement |
-| `mask_repeats` | `3` | `src/ccnv/models/config.py` | Tier 2 | Number of iterative within-sample outlier-masking passes |
-| `min_reference_bins` | `3` | `src/ccnv/models/config.py` | Tier 4 | Minimum surviving eligible neighbors required to compute bin log2 ratio |
-| `penalty` ($\beta$) | `1.0` | `src/ccnv/models/config.py` | Tier 2 / 4 | Default `WeightedL2Cost` breakpoint penalty in `ruptures.Binseg` |
-| `min_size` / `jump` | `2` / `1` | `src/ccnv/stats/segmentation.py` | Tier 2 / 4 | Minimum 2 bins per segment, evaluated at single-bin resolution |
-| `DEFAULT_MAX_BLACKLIST_GAP` | `2,000,000` bp | `src/ccnv/stats/segmentation.py` | Tier 3 | Splits segments across unmapped centromeres and heterochromatic gaps $>2\text{ Mb}$ |
-| `z_threshold` | `3.0` | `src/ccnv/models/config.py` | Tier 1 / 2 | Default segment calling threshold ($|Z| > 3.0$, two-sided $p \approx 0.0027$) |
-| `_PAR1_START` / `_YQ12_END` | `2,781,479` / `28,800,000` | `src/ccnv/features/prenatal.py` | Tier 3 | Human GRCh38 unique euchromatic `chrY` bounds (excludes PAR1 and `Yq12`) |
-| `_EXCLUDED_PRENATAL_AUTOSOMES` | `{13, 18, 21}` | `src/ccnv/features/prenatal.py` | Tier 2 / 3 | Excludes common trisomy chromosomes from prenatal baseline and `PREFACE` |
-| `male_100_baseline` offset | `+0.5` | `src/ccnv/features/prenatal.py` | Tier 3 | Haploid `chrY` ($1$ copy) to diploid autosome ($2$ copies) stoichiometry ($1/2$) |
-| `FFY` Lasso $\alpha$ | `1e-4` | `src/ccnv/features/prenatal.py` | Tier 4 | $L_1$ sparsity penalty for non-negative `chrY` bin weight selection |
-| `PREFACE` max PCs / hidden | `50` / `2` | `src/ccnv/features/prenatal.py` | Tier 2 | Truncated PCA dimension ($D \le 50$) and $D \to 2 \to 1$ Sigmoid MLP architecture |
-| Glorot init bound | $\sqrt{6/(n_{\text{in}} + n_{\text{out}})}$ | `src/ccnv/stats/prenatal_math.py` | Tier 1 | Variance-preserving uniform initialization for sigmoid networks (Glorot & Bengio, 2010) |
-| `PREFACE` MLP gate | `[0.01, 0.50]` | `src/ccnv/features/prenatal.py` | Tier 3 / 4 | Physiological fetal fraction operating window ($1\%\text{–}50\%$) before OLM fallback |
-| `rlm_huber` $k$ ($\epsilon$) | `1.345` | `src/ccnv/stats/prenatal_math.py` | Tier 1 | Huber M-estimator tuning constant for $95\%$ Gaussian asymptotic efficiency |
-| `FFX` fallback `(int, slope)` | `(2.0, -2.0)` | `src/ccnv/features/prenatal.py` | Tier 3 | Theoretical `chrX` depletion line $f = 2 - 2 R_X$ in male pregnancies |
-| `min_fetal_fraction_warning` | `0.04` | `src/ccnv/models/config.py` | Tier 2 / 3 | Clinical $4\%$ lower limit of fetal fraction warning threshold |
-| `DEFAULT_MIN_REF_BINS` | `150` | `src/ccnv/qc/reference.py` | Tier 2 / 4 | Ref-QC warning threshold at $50\%$ of default $k=300$ neighbor pool |
+| `DEFAULT_BIN_SIZE` | `5000` bp | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Standard sWGS bin width balancing Poisson count noise vs. spatial resolution |
+| `prenatal_bin_size` | `100000` bp | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology | 20x coarsened resolution for `PREFACE` and `FFX` (SeqFF / PREFACE) |
+| `min_mapping_quality` | `1` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology | Excludes multi-mapping reads ($\text{MAPQ}=0$) in BWA/Bowtie2 |
+| `DEFAULT_MIN_MAPPABILITY` | `0.5` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 3 — Genomic Biology & Assembly Coordinates | Requires $\ge 50\%$ uniquely mappable $k$-mers per bin |
+| `_MAX_N_FRACTION` | `0.5` | `src/ccnv/io/tracks.py` | Tier 3 — Genomic Biology & Assembly Coordinates / Tier 4 — Empirical Engineering & Numerical Guardrails | Masks bins with $>50\%$ ambiguous reference bases (`N`) |
+| `_MASK_FRACTION` | `0.05` | `src/ccnv/features/cohort.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Masks dead/heterochromatic bins with $\le 5\%$ of median cohort coverage |
+| `_MIN_VARIANCE_STD` | `1e-6` | `src/ccnv/stats/regression.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Minimum feature std to prevent division by zero during standardization |
+| `SplineTransformer` knots/degrees | GC `(5, 3)`, Map `(4, 2)` | `src/ccnv/stats/regression.py` | Tier 2 — Published Literature & Reference Methodology | Natural cubic B-splines capturing non-linear GC wave and mappability saturation without Runge oscillations |
+| `HuberRegressor` `epsilon` / `alpha` | `1.35` / `1e-4` | `src/ccnv/stats/regression.py`, `predict.py` | Tier 1 — Statistical & Mathematical Theory | 95% asymptotic efficiency under Gaussian noise with L2 regularization |
+| Trend clamp | `[0.20, 5.0]` | `src/ccnv/stats/regression.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Bounds multiplicative covariate correction to at most $5\times$ |
+| `min_cohort_size` | `10` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Minimum control samples required to fit reference PCA and null models |
+| `min_sex_group_size` | `5` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Minimum samples per sex required to build `female_sex` / `male_sex` branches |
+| `_SEPARATION_MAD_MULTIPLIER` | `4.0` | `src/ccnv/features/cohort.py` | Tier 1 — Statistical & Mathematical Theory / Tier 4 — Empirical Engineering & Numerical Guardrails | Requires inter-sex order-statistic gap $\ge 4 \times \text{MAD}$ ($\approx 5.4\sigma$ separation) |
+| GMM init percentiles | `25.0`, `75.0` | `src/ccnv/stats/prenatal_math.py` | Tier 1 — Statistical & Mathematical Theory / Tier 2 — Published Literature & Reference Methodology | Deterministic quartile initialization for 1D 2-GMM on `chrY` fractions |
+| SVHT coefficients | `(0.56, -0.95, 1.82, 1.43)` | `src/ccnv/stats/pca.py` | Tier 2 — Published Literature & Reference Methodology | Gavish-Donoho optimal singular value hard threshold polynomial for unknown noise variance |
+| `pca_components` | `5` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Maximum principal components per branch |
+| `nearest_bins` ($k$) | `300` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology | Off-contig nearest reference neighbors per bin (WISECONDOR / WisecondorX) |
+| `distance_cutoff` | `repeats=3`, `3.0`$\sigma$ | `src/ccnv/stats/neighbors.py` | Tier 2 — Published Literature & Reference Methodology | 3-pass iterative $\mu + 3\sigma$ neighbor distance outlier pruning |
+| `winsor_tail_p` | `(0.05, 0.10)` | `src/ccnv/stats/neighbors.py` | Tier 2 — Published Literature & Reference Methodology | Winsorized log-variance quantiles for Smyth Empirical Bayes shrinkage |
+| `_MAX_NULL_SAMPLES` | `100` | `src/ccnv/stats/neighbors.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Caps control sample count for empirical null $\mu_{\text{null}}, \sigma_{\text{null}}$ estimation |
+| `_MASK_Z_THRESHOLD` | `2.326347874` | `src/ccnv/predict.py` | Tier 1 — Statistical & Mathematical Theory / Tier 2 — Published Literature & Reference Methodology | $\Phi^{-1}(0.99)$; masks outer $2\%$ of bins during within-sample neighbor refinement |
+| `mask_repeats` | `3` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology | Number of iterative within-sample outlier-masking passes |
+| `min_reference_bins` | `3` | `src/ccnv/models/config.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Minimum surviving eligible neighbors required to compute bin log2 ratio |
+| EB weight clamp | `[0.05, 20.0]` | `src/ccnv/predict.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Clamps inverse moderated variance weights to maintain bounded dynamic range |
+| `penalty` ($\beta$) | `1.0` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Default `WeightedL2Cost` breakpoint penalty in `ruptures` |
+| `min_size` / `jump` | `2` / `1` | `src/ccnv/stats/segmentation.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Minimum 2 bins per segment, evaluated at single-bin resolution |
+| `DEFAULT_MAX_BLACKLIST_GAP` | `2,000,000` bp | `src/ccnv/stats/segmentation.py` | Tier 3 — Genomic Biology & Assembly Coordinates | Splits segments across unmapped centromeres and heterochromatic gaps $>2\text{ Mb}$ |
+| Contig AR(1) clamp | `[0.0, 0.95]` | `src/ccnv/predict.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Clamps contig lag-1 autocorrelation in Stouffer precision Z-score |
+| `z_threshold` | `3.0` | `src/ccnv/models/config.py` | Tier 1 — Statistical & Mathematical Theory / Tier 2 — Published Literature & Reference Methodology | Default segment calling threshold ($|Z| > 3.0$, two-sided $p \approx 0.0027$) |
+| `_PAR1_START` / `_YQ12_END` | `2,781,479` / `28,800,000` | `src/ccnv/features/prenatal.py` | Tier 3 — Genomic Biology & Assembly Coordinates | Human GRCh38 unique euchromatic `chrY` bounds (excludes PAR1 and `Yq12`) |
+| `_EXCLUDED_PRENATAL_AUTOSOMES` | `{13, 18, 21}` | `src/ccnv/features/prenatal.py` | Tier 2 — Published Literature & Reference Methodology / Tier 3 — Genomic Biology & Assembly Coordinates | Excludes common trisomy chromosomes from prenatal baseline and `PREFACE` |
+| `ElasticNetCV` `l1_ratio` | `[0.01, 0.05, 0.1]` | `src/ccnv/stats/prenatal_math.py` | Tier 2 — Published Literature & Reference Methodology | Elastic Net grouping mixture for non-negative `FFY` estimation |
+| `PREFACE` logit bounds | `[0.005, 0.85]` | `src/ccnv/stats/prenatal_math.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Logit-link clipping bounds for convex `RidgeCV` + `ElasticNetCV` ensemble |
+| `SCA` Mahalanobis $\chi^2$ gate | `13.8155` | `src/ccnv/features/prenatal.py` | Tier 2 — Published Literature & Reference Methodology | $\chi^2_{2, 0.999}$ boundary identifying discordant mixed gonosome karyotypes |
+| Estimator SE defaults | `(0.01, 0.02, 0.025)` | `src/ccnv/models/results.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Default standard errors for `FFY`, `PREFACE`, and `FFX` in precision fusion |
+| `min_fetal_fraction_warning` | `0.04` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 3 — Genomic Biology & Assembly Coordinates | Clinical $4\%$ lower limit of fetal fraction warning threshold |
+| `DEFAULT_MIN_REF_BINS` | `150` | `src/ccnv/qc/reference.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Ref-QC warning threshold at $50\%$ of default $k=300$ neighbor pool |
 
 ---
 
-## 12. References
+## 12. Complete Academic & Library Reference Bibliography
 
-1. **Glorot, X., & Bengio, Y. (2010).** Understanding the difficulty of training deep feedforward neural networks. *Proceedings of the Thirteenth International Conference on Artificial Intelligence and Statistics (AISTATS)*, PMLR 9:249–256.
-2. **Huber, P. J. (1964).** Robust Estimation of a Location Parameter. *The Annals of Mathematical Statistics*, 35(1), 73–101.
-3. **Killick, R., Fearnhead, P., & Eckley, I. A. (2012).** Optimal Detection of Changepoints With a Linear Computational Cost. *Journal of the American Statistical Association*, 107(500), 1590–1598.
-4. **Kim, S. K., Hannum, G., Geis, J., et al. (2015).** Determination of fetal DNA fraction from the plasma of pregnant women using sequence read counts. *Prenatal Diagnosis*, 35(8), 810–815.
-5. **Raman, L., Dheedene, A., De Smet, M., Van Dorpe, J., & Menten, B. (2019a).** WisecondorX: improved copy number detection for routine shallow whole-genome sequencing. *Nucleic Acids Research*, 47(4), 1605–1614.
-6. **Raman, L., Baetens, M., De Smet, M., Dheedene, A., Van Dorpe, J., & Menten, B. (2019b).** PREFACE: in silico pipeline for accurate cell-free fetal DNA fraction prediction. *Genetics in Medicine*, 21(10), 2371–2379.
-7. **Straver, R., Sistermans, E. A., Holstege, H., Visser, A., Oudejans, C. B. M., & Reinders, M. J. T. (2014).** WISECONDOR: detection of fetal aberrations from shallow sequencing maternal plasma based on a within-sample comparison scheme. *Nucleic Acids Research*, 42(5), e31.
+### 12.1 Peer-Reviewed Scientific References
+
+1. **Adalsteinsson, V. A., Ha, G., Freeman, S. S., Choudhury, A. D., Stover, D. G., Parsons, H. A., Gydush, G., Reed, S. C., Rotem, D., Rhoades, J., Loginov, D., Dunmire, C., Dukeman, C. A., Morrow, D. A., Van Allen, E. M., Waks, A. G., Gauthier, E. M., Barretina, J., Lin, N. U., ... Love, J. C. (2017).** Scalable whole-exome sequencing of cell-free DNA reveals high concordance with metastatic tumors. *Nature Communications*, 8(1), 1324. https://doi.org/10.1038/s41467-017-00965-y
+2. **Aitchison, J. (1982).** The statistical analysis of compositional data. *Journal of the Royal Statistical Society: Series B (Methodological)*, 44(2), 139–160. https://doi.org/10.1111/j.2517-6161.1982.tb01195.x
+3. **Aitken, A. C. (1935).** IV.—On Least Squares and Linear Combinations of Observations. *Proceedings of the Royal Society of Edinburgh*, 55, 42–48. https://doi.org/10.1017/S0370164600014346
+4. **Anders, S., & Huber, W. (2010).** Differential expression analysis for sequence count data. *Genome Biology*, 11(10), R106. https://doi.org/10.1186/gb-2010-11-10-r106
+5. **Anscombe, F. J. (1948).** The transformation of Poisson, binomial and negative-binomial data. *Biometrika*, 35(3/4), 246–254. https://doi.org/10.1093/biomet/35.3-4.246
+6. **Bates, J. M., & Granger, C. W. J. (1969).** The combination of forecasts. *Operational Research Quarterly*, 20(4), 451–468. https://doi.org/10.1057/jors.1969.103
+7. **Benjamini, Y., & Speed, T. P. (2012).** Summarizing and correcting the GC content bias in high-throughput sequencing. *Nucleic Acids Research*, 40(10), e72. https://doi.org/10.1093/nar/gks001
+8. **Bentley, J. L. (1975).** Multidimensional binary search trees used for associative searching. *Communications of the ACM*, 18(9), 509–517. https://doi.org/10.1145/361002.361007
+9. **Beyer, K., Goldstein, J., Ramakrishnan, R., & Shaft, U. (1999).** When is "nearest neighbor" meaningful? In *Database Theory — ICDT'99* (pp. 217–235). Springer. https://doi.org/10.1007/3-540-49257-7_15
+10. **Bianchi, D. W., Parsa, S., Bhatt, S., Halks-Miller, M., Chung, K., Sehnert, A. J., & Trent, R. J. (2015).** Fetal sex chromosome testing by maternal plasma DNA sequencing: clinical laboratory experience and biology. *Obstetrics & Gynecology*, 125(2), 375–382. https://doi.org/10.1097/AOG.0000000000000637
+11. **Candès, E. J., Li, X., Ma, Y., & Wright, J. (2011).** Robust principal component analysis? *Journal of the ACM*, 58(3), Article 11. https://doi.org/10.1145/1970392.1970395
+12. **Colange, M., Appé, G., Meunier, L., et al. (2025).** InMoose: an open-source Python library for bulk transcriptomics data analysis. *Bioinformatics*, 41(2), btaf034. https://doi.org/10.1093/bioinformatics/btaf034
+13. **de Boor, C. (1978).** *A Practical Guide to Splines*. Springer-Verlag. https://doi.org/10.1007/978-1-4612-6333-3
+14. **Diskin, S. J., Li, M., Hou, C., Yang, S., Glessner, J., Hakonarson, H., Bucan, M., Maris, J. M., & Wang, K. (2008).** Adjustment of genomic waves in signal intensities from whole-genome SNP genotyping platforms. *Nucleic Acids Research*, 36(19), e126. https://doi.org/10.1093/nar/gkn556
+15. **Donoho, D. L., Gavish, M., & Romanov, E. (2023).** ScreeNOT: Exact MSE-optimal singular value thresholding in correlated noise. *The Annals of Statistics*, 51(1), 122–148. https://doi.org/10.1214/22-AOS2232
+16. **Fuller, W. A. (1987).** *Measurement Error Models*. John Wiley & Sons. https://doi.org/10.1002/9780470316665
+17. **Gavish, M., & Donoho, D. L. (2014).** The optimal hard threshold for singular values is $4/\sqrt{3}$. *IEEE Transactions on Information Theory*, 60(8), 5040–5053. https://doi.org/10.1109/TIT.2014.2323359
+18. **Glorot, X., & Bengio, Y. (2010).** Understanding the difficulty of training deep feedforward neural networks. *Proceedings of the Thirteenth International Conference on Artificial Intelligence and Statistics (AISTATS)*, PMLR 9:249–256.
+19. **Golub, G. H., Heath, M., & Wahba, G. (1979).** Generalized cross-validation as a method for choosing a good ridge parameter. *Technometrics*, 21(2), 215–223. https://doi.org/10.1080/00401706.1979.10489751
+20. **Hastie, T., & Tibshirani, R. (1990).** *Generalized Additive Models*. Chapman & Hall/CRC. https://doi.org/10.1201/9780203743829
+21. **Huber, P. J. (1964).** Robust estimation of a location parameter. *The Annals of Mathematical Statistics*, 35(1), 73–101. https://doi.org/10.1214/aoms/1177703732
+22. **Huber, P. J. (1981).** *Robust Statistics*. John Wiley & Sons. https://doi.org/10.1002/0471725250
+23. **Hudecova, I., Sahota, D., Heung, M. M., Jin, Y., Lee, W. S., Leung, T. Y., Lo, Y. M. D., & Chiu, R. W. (2014).** Maternal plasma fetal DNA fractions in pregnancies with low and high risks for fetal chromosomal aneuploidies. *PLOS ONE*, 9(2), e88484. https://doi.org/10.1371/journal.pone.0088484
+24. **Killick, R., Fearnhead, P., & Eckley, I. A. (2012).** Optimal detection of changepoints with a linear computational cost. *Journal of the American Statistical Association*, 107(500), 1590–1598. https://doi.org/10.1080/01621459.2012.737745
+25. **Kim, S. K., Hannum, G., Geis, J., Tynan, J., Hogg, G., Zhao, C., Jensen, T. J., & Ehrich, M. (2015).** Determination of fetal DNA fraction from the plasma of pregnant women using sequence read counts. *Prenatal Diagnosis*, 35(8), 810–815. https://doi.org/10.1002/pd.4615
+26. **Lipták, T. (1958).** On the combination of independent tests. *Magyar Tudományos Akadémia Matematikai Kutató Intézetének Közleményei*, 3, 171–197.
+27. **Love, M. I., Huber, W., & Anders, S. (2014).** Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. *Genome Biology*, 15(12), 550. https://doi.org/10.1186/s13059-014-0550-8
+28. **Maneewongvatana, S., & Mount, D. M. (1999).** Analysis of approximate nearest neighbor searching with clustered point sets. *Data Structures, Near Neighbor Searches, and Methodology: Fifth and Sixth DIMACS Implementation Challenges*, 59, 105–123.
+29. **Marchenko, V. A., & Pastur, L. A. (1967).** Distribution of eigenvalues for some sets of random matrices. *Mathematics of the USSR-Sbornik*, 1(4), 457–483. https://doi.org/10.1070/SM1967v001n04ABEH001994
+30. **Mazloom, A. R., Džakula, Ž., Oeth, P., Wang, H., Jensen, T., Tynan, J., McCullough, R., Saldivar, J. S., Ehrich, M., van den Boom, D., Bombard, A., & Deciu, C. (2013).** Noninvasive prenatal detection of sex chromosomal aneuploidies by sequencing circulating cell-free DNA from maternal plasma. *Prenatal Diagnosis*, 33(6), 591–597. https://doi.org/10.1002/pd.4127
+31. **Minka, T. P. (2000).** Automatic choice of dimensionality for PCA. In *Advances in Neural Information Processing Systems (NeurIPS)*, 13, 598–604.
+32. **Muzellec, B., Teleńczuk, M., Cabeli, V., & Andreux, M. (2023).** PyDESeq2: a python package for bulk RNA-seq differential expression analysis. *Bioinformatics*, 39(9), btad547. https://doi.org/10.1093/bioinformatics/btad547
+33. **Newey, W. K., & West, K. D. (1987).** A simple, positive semi-definite, heteroskedasticity and autocorrelation consistent covariance matrix. *Econometrica*, 55(3), 703–708. https://doi.org/10.2307/1913610
+34. **Nilsen, G., Liestøl, K., Van Loo, P., Vollan, H. K. M., Eide, M. B., Rueda, O. M., Chin, S. F., Russell, R., Baumbusch, L. O., Caldas, C., Børresen-Dale, A. L., & Lingjærde, O. C. (2012).** Copynumber: Efficient PCA and segmentation of copy number data. *BMC Genomics*, 13, 591. https://doi.org/10.1186/1471-2164-13-591
+35. **Olshen, A. B., Venkatraman, E. S., Lucito, R., & Wigler, M. (2004).** Circular binary segmentation for the analysis of array-based DNA copy number data. *Biostatistics*, 5(4), 557–572. https://doi.org/10.1093/biostatistics/kxh008
+36. **Owen, A. B. (2007).** A robust hybrid of lasso and ridge with the elastic net. *The Annals of Applied Statistics*, 1(1), 18–44. https://doi.org/10.1214/07-AOAS104
+37. **Phipson, B., Lee, S., Majewski, I. J., Alexander, W. S., & Smyth, G. K. (2016).** Robust hyperparameter estimation protects against hypervariable genes and improves power to detect differential expression. *The Annals of Applied Statistics*, 10(2), 946–963. https://doi.org/10.1214/16-AOAS920
+38. **Raman, L., Dheedene, A., De Smet, M., Van Dorpe, J., & Menten, B. (2019a).** WisecondorX: improved copy number detection for routine shallow whole-genome sequencing. *Nucleic Acids Research*, 47(4), 1605–1614. https://doi.org/10.1093/nar/gky1263
+39. **Raman, L., Baetens, M., De Smet, M., Dheedene, A., Van Dorpe, J., & Menten, B. (2019b).** PREFACE: in silico pipeline for accurate cell-free fetal DNA fraction prediction. *Genetics in Medicine*, 21(10), 2371–2379. https://doi.org/10.1038/s41436-019-0497-5
+40. **Robinson, M. D., & Oshlack, A. (2010).** A scaling normalization method for differential expression analysis of RNA-seq data. *Genome Biology*, 11(3), R25. https://doi.org/10.1186/gb-2010-11-3-r25
+41. **Rosset, S., Zhu, J., & Hastie, T. (2004).** Boosting as a regularized path to a maximum margin classifier. *Journal of Machine Learning Research*, 5, 941–973.
+42. **Skaletsky, H., Kuroda-Kawaguchi, T., Minx, P. J., Cordum, H. S., Hillier, L., Brown, L. G., Repping, S., Pyntikova, T., Ali, J., Bieri, T., Chinwalla, A., Delehaunty, A., Delehaunty, K., Du, H., Fewell, G., Fulton, L., Fulton, R., Graves, T., Kuo, D. E., ... Page, D. C. (2003).** The male-specific region of the human Y chromosome is a mosaic of discrete sequence classes. *Nature*, 423(6942), 825–837. https://doi.org/10.1038/nature01722
+43. **Smyth, G. K. (2004).** Linear models and empirical Bayes methods for assessing differential expression in microarray experiments. *Statistical Applications in Genetics and Molecular Biology*, 3(1), Article 3. https://doi.org/10.2202/1544-6115.1027
+44. **Stouffer, S. A., Suchman, E. A., DeVinney, L. C., Star, S. A., & Williams, R. M. Jr. (1949).** *The American Soldier: Adjustment During Army Life* (Vol. 1). Princeton University Press.
+45. **Straver, R., Sistermans, E. A., Holstege, H., Visser, A., Oudejans, C. B. M., & Reinders, M. J. T. (2014).** WISECONDOR: detection of fetal aberrations from shallow sequencing maternal plasma based on a within-sample comparison scheme. *Nucleic Acids Research*, 42(5), e31. https://doi.org/10.1093/nar/gkt1253
+46. **Straver, R., Oudejans, C. B., Sistermans, E. A., & Reinders, M. J. (2016).** Calculating the fetal fraction for noninvasive prenatal testing based on genome-wide nucleosome profiles. *Prenatal Diagnosis*, 36(7), 614–621. https://doi.org/10.1002/pd.4816
+47. **Talevich, E., Shain, A. H., Botton, T., & Bastian, B. C. (2016).** CNVkit: Genome-wide copy number detection and visualization from targeted DNA sequencing. *PLOS Computational Biology*, 12(4), e1004873. https://doi.org/10.1371/journal.pcbi.1004873
+48. **Truong, C., Oudre, L., & Vayatis, N. (2020).** Selective review of offline change point detection methods. *Signal Processing*, 167, 107299. https://doi.org/10.1016/j.sigpro.2019.107299
+49. **Whitlock, M. C. (2005).** Combining probability from independent tests: the weighted Z-method is superior to Fisher's approach. *Journal of Evolutionary Biology*, 18(5), 1368–1373. https://doi.org/10.1111/j.1420-9101.2005.00917.x
+50. **Wood, S. N. (2017).** *Generalized Additive Models: An Introduction with R* (2nd ed.). Chapman and Hall/CRC. https://doi.org/10.1201/9781315370279
+51. **Zhang, N. R., & Siegmund, D. O. (2007).** A modified Bayes information criterion with applications to the analysis of comparative genomic hybridization data. *Biometrics*, 63(1), 22–32. https://doi.org/10.1111/j.1541-0420.2006.00662.x
+52. **Zou, H., & Hastie, T. (2005).** Regularization and variable selection via the elastic net. *Journal of the Royal Statistical Society: Series B (Statistical Methodology)*, 67(2), 301–320. https://doi.org/10.1111/j.1467-9868.2005.00503.x
+
+### 12.2 Python Library & Algorithmic Documentation
+
+- **Polars DataFrames & Query Engine**: [Polars Official Documentation](https://docs.pola.rs/), covering [LazyFrame expressions](https://docs.pola.rs/api/python/stable/reference/lazyframe/index.html), [`group_by`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.group_by.html), [`join_asof`](https://docs.pola.rs/api/python/stable/reference/lazyframe/api/polars.LazyFrame.join_asof.html), [`corr`](https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.corr.html), and [`from_arrow`](https://docs.pola.rs/api/python/stable/reference/api/polars.from_arrow.html).
+- **SciPy Spatial KDTree**: [`scipy.spatial.KDTree`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.KDTree.html) for exact C++ multi-threaded spatial nearest neighbor queries.
+- **SciPy Special Functions**: [`scipy.special.digamma`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.digamma.html) (psi function), [`scipy.special.polygamma`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.polygamma.html) (trigamma $\psi_1$), [`scipy.special.logit`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.logit.html), [`scipy.special.expit`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.expit.html), and [`scipy.special.logsumexp`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.logsumexp.html).
+- **SciPy Optimization**: [`scipy.optimize.brentq`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.brentq.html) for bracketed root finding.
+- **SciPy Statistical Distributions**: [`scipy.stats.multivariate_normal`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.multivariate_normal.html) and [`scipy.stats.chi2`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.chi2.html).
+- **Scikit-Learn Linear Models**: [`sklearn.linear_model.HuberRegressor`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.HuberRegressor.html), [`sklearn.linear_model.ElasticNetCV`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.ElasticNetCV.html), and [`sklearn.linear_model.RidgeCV`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.RidgeCV.html).
+- **Scikit-Learn Preprocessing & Composition**: [`sklearn.preprocessing.SplineTransformer`](https://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.SplineTransformer.html), [`sklearn.preprocessing.PolynomialFeatures`](https://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.PolynomialFeatures.html), and [`sklearn.decomposition.PCA`](https://scikit-learn.org/stable/modules/generated/sklearn.decomposition.PCA.html).
+- **Ruptures Change-Point Solvers**: [`ruptures.KernelCPD`](https://centre-borelli.github.io/ruptures-docs/user-guide/detection/kernelcpd/) (compiled-C linear PELT), [`ruptures.Pelt`](https://centre-borelli.github.io/ruptures-docs/user-guide/detection/pelt/), and [`ruptures.Binseg`](https://centre-borelli.github.io/ruptures-docs/user-guide/detection/binseg/).
