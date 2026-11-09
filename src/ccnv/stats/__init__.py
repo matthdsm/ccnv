@@ -22,6 +22,7 @@ from ccnv.stats.prenatal_math import (
 from ccnv.stats.regression import (
     apply_1d_correction,
     build_1d_basis,
+    build_joint_covariate_basis,
     fit_sample_trend,
 )
 from ccnv.stats.segmentation import (
@@ -40,6 +41,7 @@ __all__ = [
     "WeightedL2Cost",
     "apply_1d_correction",
     "build_1d_basis",
+    "build_joint_covariate_basis",
     "compute_null_models",
     "distance_cutoff",
     "fit_lasso_fista",

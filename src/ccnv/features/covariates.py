@@ -13,7 +13,7 @@ from ccnv.models import (
     DEFAULT_MIN_MAPPABILITY,
     CovariateError,
 )
-from ccnv.stats.regression import apply_1d_correction, build_1d_basis
+from ccnv.stats.regression import apply_1d_correction, build_joint_covariate_basis
 
 __all__ = [
     "DEFAULT_MIN_MAPPABILITY",
@@ -76,26 +76,19 @@ def correct_covariate_bias(
     if n_usable < 4 or (gc is None and mappability is None):
         return data.copy()
 
-    gc_design = (
-        build_1d_basis(np.asarray(gc, dtype=np.float64)[mask], degree=3)
-        if gc is not None and np.any(np.isfinite(np.asarray(gc)[mask]))
+    gc_sub = np.asarray(gc, dtype=np.float64)[mask] if gc is not None else None
+    map_sub = (
+        np.asarray(mappability, dtype=np.float64)[mask]
+        if mappability is not None
         else None
     )
-    map_design = (
-        build_1d_basis(np.asarray(mappability, dtype=np.float64)[mask], degree=2)
-        if (
-            mappability is not None
-            and np.any(np.isfinite(np.asarray(mappability)[mask]))
-        )
-        else None
-    )
-    if gc_design is None and map_design is None:
+    joint_design = build_joint_covariate_basis(gc_sub, map_sub)
+    if joint_design is None:
         return data.copy()
 
     out = data.copy()
     sub = out[mask]
-    sub = apply_1d_correction(sub, gc_design)
-    sub = apply_1d_correction(sub, map_design)
+    sub = apply_1d_correction(sub, joint_design)
     out[mask] = sub
     return out
 

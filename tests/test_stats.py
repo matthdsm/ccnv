@@ -28,6 +28,7 @@ from ccnv.stats.prenatal_math import (
 from ccnv.stats.regression import (
     apply_1d_correction,
     build_1d_basis,
+    build_joint_covariate_basis,
     fit_sample_trend,
 )
 from ccnv.stats.segmentation import (
@@ -47,6 +48,7 @@ class TestStatsPackageExports(unittest.TestCase):
             "WeightedL2Cost",
             "apply_1d_correction",
             "build_1d_basis",
+            "build_joint_covariate_basis",
             "compute_null_models",
             "distance_cutoff",
             "fit_lasso_fista",
@@ -229,6 +231,31 @@ class TestRegression(unittest.TestCase):
         self.assertAlmostEqual(
             float(np.sum(corrected)), float(np.sum(raw_cov)), places=4
         )
+
+    def test_build_joint_covariate_basis(self) -> None:
+        self.assertIsNone(build_joint_covariate_basis(None, None))
+
+        gc = np.linspace(0.3, 0.7, 50)
+        mapp = np.linspace(0.6, 1.0, 50)
+
+        # GC only: degree=3, n_knots=5 -> 5 + 3 - 1 = 7 columns
+        gc_only = build_joint_covariate_basis(gc, None)
+        self.assertIsNotNone(gc_only)
+        assert gc_only is not None
+        self.assertEqual(gc_only.shape, (50, 7))
+
+        # Mappability only: degree=2, n_knots=4 -> 4 + 2 - 1 = 5 columns
+        map_only = build_joint_covariate_basis(None, mapp)
+        self.assertIsNotNone(map_only)
+        assert map_only is not None
+        self.assertEqual(map_only.shape, (50, 5))
+
+        # Both: 1 + 6 (gc) + 4 (map) + 1 (interaction) = 12 columns
+        joint = build_joint_covariate_basis(gc, mapp)
+        self.assertIsNotNone(joint)
+        assert joint is not None
+        self.assertEqual(joint.shape, (50, 12))
+        np.testing.assert_allclose(joint[:, 0], np.ones(50))
 
 
 class TestPrenatalMath(unittest.TestCase):
