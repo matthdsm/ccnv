@@ -49,6 +49,7 @@ from ccnv.models import (
 )
 from ccnv.qc.reference import run_reference_qc_on_table
 from ccnv.stats.neighbors import (
+    build_signal_space_features,
     compute_null_models,
     distance_cutoff,
     select_nearest_bins,
@@ -447,19 +448,10 @@ def _build_branch_table(
     _, contig_ids = np.unique(
         np.asarray(contig_subset[usable], dtype=str), return_inverse=True
     )
-    profiles = (
-        cov_mat
-        if (
-            config.fasta is not None
-            and (
-                cov_mat := covariate_features(
-                    usable, gc=branch_gc, mappability=branch_map
-                )
-            )
-            is not None
-        )
-        else corrected
-    )
+    cov_mat = covariate_features(usable, gc=branch_gc, mappability=branch_map)
+    profiles = build_signal_space_features(pca_loadings, covariate_mat=cov_mat)
+    if profiles.size == 0 or np.allclose(profiles, 0.0):
+        profiles = corrected
     logger.debug(
         "branch %s: selecting %d nearest off-contig bins (batch memory limit=%d MB)",
         branch,
@@ -474,7 +466,10 @@ def _build_branch_table(
         threads=config.threads,
     )
     null_mean, null_std = compute_null_models(
-        corrected, nearest_idx, threads=config.threads
+        corrected,
+        nearest_idx,
+        threads=config.threads,
+        n_pca_components=0 if config.fasta is not None else pca_loadings.shape[0],
     )
     logger.debug(
         "branch %s: null models computed for %d bins",

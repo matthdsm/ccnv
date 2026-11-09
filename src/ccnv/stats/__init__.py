@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from ccnv.stats.neighbors import (
+    build_signal_space_features,
     compute_null_models,
     distance_cutoff,
     select_nearest_bins,
+    squeeze_var,
 )
 from ccnv.stats.pca import (
     fit_pca,
+    optimal_svht_rank,
     pca_irlba_numpy,
 )
 from ccnv.stats.prenatal_math import (
@@ -42,6 +45,7 @@ __all__ = [
     "apply_1d_correction",
     "build_1d_basis",
     "build_joint_covariate_basis",
+    "build_signal_space_features",
     "compute_null_models",
     "distance_cutoff",
     "fit_lasso_fista",
@@ -50,10 +54,12 @@ __all__ = [
     "fit_sample_trend",
     "infer_sex_gmm_1d",
     "ols_fit",
+    "optimal_svht_rank",
     "pca_irlba_numpy",
     "rlm_huber",
     "segment_contig",
     "segment_genome",
     "select_nearest_bins",
+    "squeeze_var",
     "train_olm",
 ]

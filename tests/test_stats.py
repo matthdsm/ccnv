@@ -49,6 +49,7 @@ class TestStatsPackageExports(unittest.TestCase):
             "apply_1d_correction",
             "build_1d_basis",
             "build_joint_covariate_basis",
+            "build_signal_space_features",
             "compute_null_models",
             "distance_cutoff",
             "fit_lasso_fista",
@@ -57,11 +58,13 @@ class TestStatsPackageExports(unittest.TestCase):
             "fit_sample_trend",
             "infer_sex_gmm_1d",
             "ols_fit",
+            "optimal_svht_rank",
             "pca_irlba_numpy",
             "rlm_huber",
             "segment_contig",
             "segment_genome",
             "select_nearest_bins",
+            "squeeze_var",
             "train_olm",
         ]
         for symbol in expected_symbols:
@@ -117,6 +120,16 @@ class TestPCA(unittest.TestCase):
         self.assertEqual(scores.shape, (10, 2))
         np.testing.assert_allclose(scores, 0.0)
 
+    def test_optimal_svht_rank_recovers_true_low_rank_signal(self) -> None:
+        from ccnv.stats.pca import optimal_svht_rank
+
+        rng = np.random.default_rng(42)
+        u = rng.normal(size=(300, 3)) * 8.0
+        v = rng.normal(size=(3, 40))
+        noisy = u @ v + rng.normal(0.0, 1.0, size=(300, 40))
+        rank = optimal_svht_rank(noisy, max_components=10)
+        self.assertEqual(rank, 3)
+
 
 class TestNeighbors(unittest.TestCase):
     def test_select_nearest_bins_basic(self) -> None:
@@ -167,6 +180,72 @@ class TestNeighbors(unittest.TestCase):
         # Empty / non-finite
         self.assertEqual(distance_cutoff([]), float("inf"))
         self.assertEqual(distance_cutoff([[float("nan")]]), float("inf"))
+
+    def test_squeeze_var_matches_smyth_2004_closed_form(self) -> None:
+        from ccnv.stats.neighbors import squeeze_var
+
+        rng = np.random.default_rng(42)
+        # Simulate 2,000 bins with true inverse-chi-square prior d0=8, s0_sq=0.04, df=10
+        d0_true, s0_sq_true, df = 8.0, 0.04, 10.0
+        true_sigma2 = (d0_true * s0_sq_true) / rng.chisquare(df=d0_true, size=2000)
+        sample_var = true_sigma2 * (rng.chisquare(df=df, size=2000) / df)
+
+        var_post, d0_hat, s0_sq_hat = squeeze_var(
+            sample_var, df=df, winsor_tail_p=(0.0, 0.0)
+        )
+        self.assertAlmostEqual(s0_sq_hat, s0_sq_true, delta=0.008)
+        self.assertAlmostEqual(d0_hat, d0_true, delta=2.5)
+        expected_post = (d0_hat * s0_sq_hat + df * sample_var) / (d0_hat + df)
+        np.testing.assert_allclose(var_post, expected_post, rtol=1e-12)
+
+    def test_compute_null_models_applies_pca_dof_correction_and_eb_moderation(
+        self,
+    ) -> None:
+        from ccnv.stats.neighbors import compute_null_models
+
+        rng = np.random.default_rng(7)
+        corrected = 1.0 + rng.normal(0.0, 0.05, size=(30, 10))
+        nbrs = [[(i + 1) % 30, (i + 2) % 30] for i in range(30)]
+        _, std_no_pca = compute_null_models(corrected, nbrs, n_pca_components=0)
+        _, std_pca4 = compute_null_models(corrected, nbrs, n_pca_components=4)
+        # With P=4 removed from S=10 samples, DOF shrinks from 9 to 5 -> std scales by sqrt(9/5)
+        self.assertGreater(
+            float(np.median(std_pca4)), float(np.median(std_no_pca)) * 1.2
+        )
+
+    def test_select_nearest_bins_kdtree_off_contig_exact(self) -> None:
+        from ccnv.stats.neighbors import select_nearest_bins
+
+        profiles = np.array([[0.0, 0.0], [0.1, 0.0], [5.0, 5.0], [5.1, 5.0]])
+        cids = np.array([0, 1, 0, 1])
+        idx, dist = select_nearest_bins(profiles, cids, k=2, max_batch_memory_mb=16)
+        self.assertEqual(idx[0], [1, 3])
+        self.assertEqual(idx[1], [0, 2])
+        self.assertAlmostEqual(dist[0][0], 0.01, places=6)
+
+    def test_build_signal_space_features(self) -> None:
+        from ccnv.stats.neighbors import build_signal_space_features
+
+        loadings = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])  # 2 components, 3 bins
+        feats = build_signal_space_features(loadings)
+        self.assertEqual(feats.shape, (3, 2))
+        np.testing.assert_allclose(feats, loadings.T)
+
+        s_vals = np.array([2.0, 0.5])
+        feats_scaled = build_signal_space_features(loadings, singular_values=s_vals)
+        expected_scaled = loadings.T * s_vals
+        np.testing.assert_allclose(feats_scaled, expected_scaled)
+
+        cov = np.array([[0.1], [0.2], [0.3]])
+        feats_cov = build_signal_space_features(loadings, covariate_mat=cov)
+        self.assertEqual(feats_cov.shape, (3, 3))
+        np.testing.assert_allclose(feats_cov[:, :2], loadings.T)
+        np.testing.assert_allclose(feats_cov[:, 2:], cov)
+
+        # Flat FASTA fallback: zero loadings with cov
+        zero_loadings = np.zeros((2, 3))
+        feats_flat = build_signal_space_features(zero_loadings, covariate_mat=cov)
+        np.testing.assert_allclose(feats_flat, cov)
 
 
 class TestSegmentation(unittest.TestCase):
