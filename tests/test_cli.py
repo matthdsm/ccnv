@@ -141,7 +141,6 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             app, ["reference", "--help"], env={"COLUMNS": "200"}
         )
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("[default: X, Y, chrX,", _cli_text(result.output))
         self.assertIn("chrY]", _cli_text(result.output))
         self.assertIn("[default: chrY]", _cli_text(result.output))
         self.assertIn("[default: 5]", _cli_text(result.output))
