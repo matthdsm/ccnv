@@ -271,6 +271,65 @@ def _build_target_grid(
     )
 
 
+def _redistribute_by_overlap(
+    src_starts: NDArray[np.int64],
+    src_ends: NDArray[np.int64],
+    src_counts: NDArray[np.floating],
+    tgt_starts: NDArray[np.int64],
+    tgt_ends: NDArray[np.int64],
+) -> NDArray[np.float64]:
+    """Redistribute count mass from arbitrary source intervals to target bins by overlap."""
+    n_targets = tgt_starts.size
+    if n_targets == 0:
+        return (
+            np.empty((0, src_counts.shape[1]), dtype=np.float64)
+            if src_counts.ndim == 2
+            else np.empty(0, dtype=np.float64)
+        )
+    if src_starts.size == 0:
+        return (
+            np.zeros((n_targets, src_counts.shape[1]), dtype=np.float64)
+            if src_counts.ndim == 2
+            else np.zeros(n_targets, dtype=np.float64)
+        )
+
+    is_2d = src_counts.ndim == 2
+    out = (
+        np.zeros((n_targets, src_counts.shape[1]), dtype=np.float64)
+        if is_2d
+        else np.zeros(n_targets, dtype=np.float64)
+    )
+
+    t_bin_size = max(int(tgt_ends[0] - tgt_starts[0]), 1)
+    lens = src_ends - src_starts
+    valid = lens > 0
+    if not np.any(valid):
+        return out
+
+    s_s = src_starts[valid]
+    s_e = src_ends[valid]
+    s_c = src_counts[valid]
+    s_len = lens[valid].astype(np.float64)
+
+    first_k = np.clip(s_s // t_bin_size, 0, n_targets - 1)
+    last_k = np.clip((s_e - 1) // t_bin_size, 0, n_targets - 1)
+
+    for i in range(len(s_s)):
+        for k in range(int(first_k[i]), int(last_k[i]) + 1):
+            ov = max(
+                0,
+                min(int(s_e[i]), int(tgt_ends[k]))
+                - max(int(s_s[i]), int(tgt_starts[k])),
+            )
+            if ov > 0:
+                frac = ov / s_len[i]
+                if is_2d:
+                    out[k] += frac * s_c[i]
+                else:
+                    out[k] += frac * s_c[i]
+    return out
+
+
 def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
     """Rescale sample Parquet counts to target_bin_size without changing length."""
     if target_bin_size <= 0:
@@ -310,12 +369,26 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
         ]
     ).with_metadata(new_metadata)
 
+    intervals_contained = False
     if (
         isinstance(current_bin_size, int)
         and current_bin_size > 0
         and target_bin_size % current_bin_size == 0
         and target_bin_size > current_bin_size
     ):
+        df = pl.from_arrow(table)
+        assert isinstance(df, pl.DataFrame)
+        intervals_contained = (
+            df.height == 0
+            or df.select(
+                (
+                    (pl.col("start") // target_bin_size)
+                    == ((pl.col("end") - 1) // target_bin_size)
+                ).all()
+            ).item()
+        )
+
+    if intervals_contained:
         target_grid = _build_target_grid(contig_lengths, target_bin_size)
         df = pl.from_arrow(table)
         assert isinstance(df, pl.DataFrame)
@@ -389,9 +462,20 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
             s_starts = start_col[s:e]
             s_ends = end_col[s:e]
             s_counts = count_col[s:e]
-            target_counts = rebin_counts(
-                s_starts, s_ends, s_counts, target_starts, target_ends
+            is_part = (
+                s_starts.size > 0
+                and s_starts[0] == 0
+                and s_ends[-1] == target_ends[-1]
+                and np.array_equal(s_starts[1:], s_ends[:-1])
             )
+            if is_part:
+                target_counts = rebin_counts(
+                    s_starts, s_ends, s_counts, target_starts, target_ends
+                )
+            else:
+                target_counts = _redistribute_by_overlap(
+                    s_starts, s_ends, s_counts, target_starts, target_ends
+                )
         new_contigs.append(np.full(target_starts.size, contig_name, dtype=object))
         new_starts.append(target_starts)
         new_ends.append(target_ends)
@@ -533,10 +617,17 @@ def rebin_cohort(cohort: Cohort, target_bin_size: int) -> Cohort:
     current_bin_size = cohort.bin_size
     n_samples = cohort.counts.shape[1]
 
+    intervals_contained = cohort.starts.size == 0 or bool(
+        np.all(
+            (cohort.starts // target_bin_size) == ((cohort.ends - 1) // target_bin_size)
+        )
+    )
+
     if (
         current_bin_size > 0
         and target_bin_size % current_bin_size == 0
         and target_bin_size > current_bin_size
+        and intervals_contained
     ):
         target_grid = _build_target_grid(cohort.contig_lengths, target_bin_size)
         if cohort.counts.shape[0] > 0 and n_samples > 0:
@@ -616,18 +707,33 @@ def rebin_cohort(cohort: Cohort, target_bin_size: int) -> Cohort:
             s_i, e_i = span
             src_s = cohort.starts[s_i:e_i]
             src_e = cohort.ends[s_i:e_i]
-            t_counts = np.column_stack(
-                [
-                    rebin_counts(
-                        src_s,
-                        src_e,
-                        cohort.counts[s_i:e_i, j],
-                        t_starts,
-                        t_ends,
-                    )
-                    for j in range(n_samples)
-                ]
+            is_part = (
+                src_s.size > 0
+                and src_s[0] == 0
+                and src_e[-1] == t_ends[-1]
+                and np.array_equal(src_s[1:], src_e[:-1])
             )
+            if is_part:
+                t_counts = np.column_stack(
+                    [
+                        rebin_counts(
+                            src_s,
+                            src_e,
+                            cohort.counts[s_i:e_i, j],
+                            t_starts,
+                            t_ends,
+                        )
+                        for j in range(n_samples)
+                    ]
+                )
+            else:
+                t_counts = _redistribute_by_overlap(
+                    src_s,
+                    src_e,
+                    cohort.counts[s_i:e_i, :],
+                    t_starts,
+                    t_ends,
+                )
         new_c.extend([c_name] * t_starts.size)
         new_s.append(t_starts)
         new_e.append(t_ends)

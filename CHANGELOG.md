@@ -23,10 +23,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Comprehensive mathematical methodology overhaul in `docs/methodology.md`, incorporating 51 peer-reviewed citations with DOIs, official Python library documentation links, and complete 4-tier provenance taxonomy.
 - Cell-free DNA (cfDNA) prenatal analysis mode (`--mode prenatal`): integrated prenatal screening into `ccnv reference` and `ccnv predict`, estimating fetal fraction via `FFY`, `FFX`, and `FFA`, classifying fetal sex and sex chromosome aneuploidies (`XX`, `XY`, `XO`, `XXX`, `XXY`, `XYY`, `DISCORDANT_MIXED`), and evaluating CNV segment discordance against active fetal fraction expectations.
 - `rebin_counts` and `rebin_sample_table` for 1D mass-conserving count interpolation across bin grids.
-- `ccnv convert`: stream BAM/CRAM into versioned sample Parquet, auto-index missing `.bai`/`.crai`, bin canonical chromosomes (or `--all-contigs`), and split `--threads` across contig workers and htslib decode.
+- `ccnv extract`: stream BAM/CRAM into versioned sample Parquet, auto-index missing `.bai`/`.crai`, bin canonical chromosomes (or `--all-contigs`), and split `--threads` across contig workers and htslib decode.
 - `ccnv reference`: build autosomal and optional sex-contig models from control Parquet, or a flat uniform-depth model from FASTA when there is no cohort.
-- `ccnv predict`: PCA-normalize, segment with weighted Binseg, call gains and losses, and write bgzipped/indexed BED, VCFv4.2, and optional SVG.
-- Versioned Parquet contracts (`1.0.0`), header-authoritative contig layouts, and organism-agnostic naming (no fixed 24-chromosome genome).
+- `ccnv predict`: PCA-normalize, segment with weighted Binseg, call gains and losses, and write bgzipped/indexed BED, VCFv4.2, and interactive Plotly HTML (`_plot.html`).
+- Versioned Parquet contracts (`2.0.0`), header-authoritative contig layouts, and organism-agnostic naming (no fixed 24-chromosome genome).
 - Sex-contig branches inferred from a Y-signal contig (`--sex-cutoff` optional); no per-sample sex labels on the CLI.
 - CI that publishes multi-arch (`linux/amd64`, `linux/arm64`) GHCR images from `pixi.lock` (`latest` on `master`; SHA, version, and `stable` on release) and attaches a Python wheel to GitHub Releases. Local images: `pixi run docker-build`.
 - Real-world NIPT conversion, reference creation, and prediction benchmarks documented in `docs/benchmark.md`.

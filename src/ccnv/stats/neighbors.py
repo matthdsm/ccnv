@@ -101,7 +101,7 @@ def select_nearest_bins(
 def squeeze_var(
     var: NDArray[np.floating],
     df: float,
-    winsor_tail_p: tuple[float, float] = (0.05, 0.10),
+    winsor_tail_p: tuple[float, float] = (0.0, 0.0),
 ) -> tuple[NDArray[np.float64], float, float]:
     """Empirical Bayes variance moderation matching Smyth (2004) / limma::squeezeVar."""
     var_arr = np.asarray(var, dtype=np.float64)
@@ -112,16 +112,8 @@ def squeeze_var(
     v = var_arr[valid]
     z = np.log(v) - float(digamma(df / 2.0)) + np.log(df / 2.0)
 
-    low_p, high_p = winsor_tail_p
-    if low_p > 0.0 or high_p > 0.0:
-        q_low = float(np.quantile(z, low_p)) if low_p > 0.0 else -np.inf
-        q_high = float(np.quantile(z, 1.0 - high_p)) if high_p > 0.0 else np.inf
-        z_winsor = np.clip(z, q_low, q_high)
-    else:
-        z_winsor = z
-
-    mean_z = float(np.mean(z_winsor))
-    var_z = float(np.var(z_winsor, ddof=1))
+    mean_z = float(np.mean(z))
+    var_z = float(np.var(z, ddof=1))
     excess_var = var_z - float(polygamma(1, df / 2.0))
 
     if excess_var <= 1e-7:

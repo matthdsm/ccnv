@@ -34,7 +34,7 @@ The `ccnv.stats` package provides stateless numerical, statistical, and machine 
 
 - `[src/ccnv/stats/pca.py:optimal_svht_rank]`: Selects rank between 1 and $\min(P_{\max}, S, U)$ via closed-form Gavish-Donoho threshold polynomial.
 - `[src/ccnv/stats/neighbors.py:select_nearest_bins]`: Nearest-bin search explicitly queries off-contig bins via leave-one-contig-out `scipy.spatial.KDTree` to strictly prevent intra-contig neighbor selection.
-- `[src/ccnv/stats/neighbors.py:squeeze_var]`: Requires finite positive degrees of freedom and at least 3 positive variance estimates; tail variances Winsorized at `(0.05, 0.10)`.
+- `[src/ccnv/stats/neighbors.py:squeeze_var]`: Requires finite positive degrees of freedom and at least 2 positive variance estimates; evaluates unclipped log-variance moments to match theoretical trigamma sampling variance.
 - `[src/ccnv/stats/neighbors.py:compute_null_models]`: Null distribution sampling is bounded to at most 100 cohort samples; residual degrees of freedom are adjusted for PCA rank.
 - `[src/ccnv/stats/pca.py:fit_pca]`: Requires $n_{\text{components}} \ge 1$ and at least $n_{\text{components}}$ valid samples; enforces deterministic sign orientation on PCA loadings.
 - `[src/ccnv/stats/regression.py:fit_sample_trend]`: Huber regression uses tuning threshold $\epsilon = 1.35$ and penalty $\alpha = 10^{-4}$; trend is clamped to $[0.20, 5.0]$.

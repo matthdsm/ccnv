@@ -193,6 +193,49 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             rebinned.column("contig").to_pylist(), ["chr1", "chr1", "chr2"]
         )
 
+    def test_rebin_sample_table_boundary_crossing_overlap_redistribution(self) -> None:
+        from ccnv.features.cohort import rebin_sample_table
+
+        # Interval [45, 75) crosses target boundary at 50
+        table = make_sample_table(
+            [20.0, 30.0, 40.0],
+            contigs=["chr1", "chr1", "chr1"],
+            starts=[10, 45, 90],
+            ends=[30, 75, 110],
+            contig_lengths={"chr1": 150},
+            bin_size=20,
+        )
+        rebinned = rebin_sample_table(table, 50)
+        self.assertEqual(rebinned.column("start").to_pylist(), [0, 50, 100])
+        self.assertEqual(rebinned.column("end").to_pylist(), [50, 100, 150])
+        # Bin 0..50 gets [10, 30) (len 20, count 20) + 5/30 of [45, 75) (count 5) = 25.0
+        # Bin 50..100 gets 25/30 of [45, 75) (count 25) + 10/20 of [90, 110) (count 20) = 45.0
+        # Bin 100..150 gets 10/20 of [90, 110) (count 20) = 20.0
+        np.testing.assert_allclose(
+            rebinned.column("count").to_numpy(), [25.0, 45.0, 20.0]
+        )
+
+    def test_rebin_cohort_boundary_crossing_overlap_redistribution(self) -> None:
+        from ccnv.features.cohort import Cohort, rebin_cohort
+
+        cohort = Cohort(
+            counts=np.array([[20.0, 40.0], [30.0, 60.0], [40.0, 80.0]]),
+            contigs=("chr1", "chr1", "chr1"),
+            starts=np.array([10, 45, 90], dtype=np.int64),
+            ends=np.array([30, 75, 110], dtype=np.int64),
+            contig_lengths={"chr1": 150},
+            bin_size=20,
+            identities=({"id": "a"}, {"id": "b"}),
+            paths=(Path("a.ccnv"), Path("b.ccnv")),
+        )
+        rebinned = rebin_cohort(cohort, 50)
+        np.testing.assert_array_equal(rebinned.starts, [0, 50, 100])
+        np.testing.assert_array_equal(rebinned.ends, [50, 100, 150])
+        np.testing.assert_allclose(
+            rebinned.counts,
+            [[25.0, 50.0], [45.0, 90.0], [20.0, 40.0]],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
