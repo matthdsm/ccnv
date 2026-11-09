@@ -446,28 +446,33 @@ class TestCalling(unittest.TestCase):
         bins = (
             BinResult(
                 branch=BRANCH_AUTOSOMAL,
-                contigs=("chr1", "chr1", "chr1"),
-                starts=np.array([0, 100, 200], dtype=np.int64),
-                ends=np.array([100, 200, 300], dtype=np.int64),
-                ratios=np.array([0.5, 0.5, np.nan], dtype=np.float64),
-                zscores=np.array([3.5, 3.5, np.nan], dtype=np.float64),
-                weights=np.array([1.0, 1.0, 0.0], dtype=np.float64),
-                reference_sizes=np.array([10, 10, 0], dtype=np.int64),
-                masked=np.array([False, False, True], dtype=np.bool_),
+                contigs=("chr1",) * 6,
+                starts=np.arange(6, dtype=np.int64) * 100,
+                ends=np.arange(1, 7, dtype=np.int64) * 100,
+                ratios=np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0], dtype=np.float64),
+                zscores=np.array(
+                    [3.5, 3.5, 3.5, np.nan, np.nan, np.nan], dtype=np.float64
+                ),
+                weights=np.ones(6, dtype=np.float64),
+                reference_sizes=np.full(6, 10, dtype=np.int64),
+                masked=np.zeros(6, dtype=np.bool_),
             ),
         )
         segs = segment_and_call(
             bins,
-            {"chr1": 300},
-            penalty=0.001,
+            {"chr1": 600},
+            penalty=0.1,
             z_threshold=3.0,
             ratio_threshold=None,
         )
-        self.assertGreaterEqual(len(segs), 1)
+        self.assertEqual(len(segs), 2)
+        matched = False
         for s in segs:
-            if s.start == 200 and s.end == 300:
+            if s.start == 300 and s.end == 600:
                 self.assertEqual(s.zscore, 0.0)
                 self.assertIsNone(s.call)
+                matched = True
+        self.assertTrue(matched)
 
 
 class TestCoordinatesAndOutputs(unittest.TestCase):
