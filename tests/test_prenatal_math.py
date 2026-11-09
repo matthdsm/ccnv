@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import unittest
 import unittest.mock
 
@@ -104,6 +105,56 @@ class TestFitLassoFISTA(unittest.TestCase):
         y = np.zeros(20, dtype=np.float64)
         w = fit_lasso_fista(x, y, alpha=1e-4)
         np.testing.assert_allclose(w, 0.0, atol=1e-12)
+
+
+class TestFitElasticNetFFY(unittest.TestCase):
+    def test_ffy_elasticnet_retains_correlated_chry_bins_when_p_gt_n(self) -> None:
+        from ccnv.stats.prenatal_math import fit_elasticnet_ffy
+
+        rng = np.random.default_rng(42)
+        # S = 20 samples, B_Y = 200 correlated euchromatic chrY bins
+        true_ff = np.concatenate([np.zeros(10), rng.uniform(0.04, 0.25, size=10)])
+        X = np.outer(true_ff, np.ones(200)) + rng.normal(0.0, 0.005, size=(20, 200))
+        X = np.clip(X, 0.0, None)
+
+        weights, intercept = fit_elasticnet_ffy(X, true_ff, seed=42)
+        self.assertTrue(np.all(weights >= 0.0))
+        # Pure Lasso caps non-zeros at <= 20; ElasticNet with l1_ratio <= 0.1 retains > 80 bins
+        self.assertGreater(int(np.count_nonzero(weights > 0)), 80)
+        preds = intercept + X @ weights
+        np.testing.assert_allclose(preds[10:], true_ff[10:], atol=0.02)
+
+    def test_empty_or_zero_input(self) -> None:
+        from ccnv.stats.prenatal_math import fit_elasticnet_ffy
+
+        w, b = fit_elasticnet_ffy(np.empty((0, 5)), np.empty(0))
+        self.assertEqual(w.shape, (5,))
+        self.assertEqual(b, 0.0)
+
+
+class TestFitPrefaceLogitEnsemble(unittest.TestCase):
+    def test_recovers_smooth_bounded_fetal_fraction(self) -> None:
+        from ccnv.stats.prenatal_math import fit_preface_logit_ensemble
+
+        rng = np.random.default_rng(42)
+        n_samples = 30
+        n_features = 10
+        X = rng.standard_normal((n_samples, n_features))
+        true_beta = rng.uniform(-0.5, 0.5, size=n_features)
+        true_logits = X @ true_beta - 2.0
+        from scipy.special import expit
+
+        true_ff = expit(true_logits)
+
+        weights, bias, sigma = fit_preface_logit_ensemble(X, true_ff, seed=42)
+        self.assertEqual(weights.shape, (n_features,))
+        self.assertTrue(math.isfinite(bias))
+        self.assertGreater(sigma, 0.0)
+        self.assertLess(sigma, 0.10)
+
+        preds = expit(X @ weights + bias)
+        self.assertTrue(np.all((preds > 0.0) & (preds < 1.0)))
+        np.testing.assert_allclose(preds, true_ff, atol=0.05)
 
 
 class TestPCAIrlbaNumpy(unittest.TestCase):

@@ -69,6 +69,10 @@ class PrenatalModelMetadata:
     ffx_slope: float
     female_chrx_ratio_mean: float
     female_chrx_ratio_std: float
+    ffy_std: float = 0.01
+    preface_std: float = 0.02
+    ffx_std: float = 0.025
+    preface_logit_mode: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -103,6 +107,10 @@ class PrenatalModelMetadata:
             "ffx_slope": float(self.ffx_slope),
             "female_chrx_ratio_mean": float(self.female_chrx_ratio_mean),
             "female_chrx_ratio_std": float(self.female_chrx_ratio_std),
+            "ffy_std": float(self.ffy_std),
+            "preface_std": float(self.preface_std),
+            "ffx_std": float(self.ffx_std),
+            "preface_logit_mode": bool(self.preface_logit_mode),
         }
 
     @classmethod
@@ -137,6 +145,10 @@ class PrenatalModelMetadata:
             ffx_slope=float(data["ffx_slope"]),
             female_chrx_ratio_mean=float(data["female_chrx_ratio_mean"]),
             female_chrx_ratio_std=float(data["female_chrx_ratio_std"]),
+            ffy_std=float(data.get("ffy_std", 0.01)),
+            preface_std=float(data.get("preface_std", 0.02)),
+            ffx_std=float(data.get("ffx_std", 0.025)),
+            preface_logit_mode=bool(data.get("preface_logit_mode", False)),
         )
 
     def encode(self) -> bytes:

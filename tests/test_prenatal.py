@@ -244,6 +244,49 @@ class TestClassifySCA(unittest.TestCase):
         self.assertEqual(result.call, "DISCORDANT_MIXED")
         self.assertTrue(result.is_aneuploid)
 
+    def test_classify_sca_bayesian_posterior_and_mahalanobis_discordant_gate(
+        self,
+    ) -> None:
+        # Verify all 7 phenotypes (XX, XY, XO, XXX, XXY, XYY, DISCORDANT_MIXED)
+        # return calibrated Bayesian posterior probabilities in (0.5, 1.0]
+        cases = [
+            ("F", None, 0.0, 0.10, 1.0, "XX", False),
+            ("M", 0.10, 0.10, 0.10, 0.95, "XY", False),
+            ("F", None, 0.10, 0.10, 0.95, "XO", True),
+            ("F", None, -0.10, 0.10, 1.05, "XXX", True),
+            ("M", 0.10, 0.0, 0.10, 1.0, "XXY", True),
+            ("M", 0.20, 0.10, 0.10, 0.95, "XYY", True),
+            ("M", 0.05, 0.30, 0.05, 0.85, "DISCORDANT_MIXED", True),
+        ]
+        for fsex, ffy, ffx, pref, rx, exp_call, exp_aneu in cases:
+            res = classify_sca(
+                fetal_sex=fsex,
+                ffy=ffy,
+                ffx=ffx,
+                preface=pref,
+                chrx_ratio=rx,
+                prenatal_meta=self.meta,
+            )
+            self.assertEqual(res.call, exp_call, f"Failed call for {exp_call}")
+            self.assertEqual(
+                res.is_aneuploid, exp_aneu, f"Failed aneuploidy for {exp_call}"
+            )
+            self.assertGreater(
+                res.confidence, 0.5, f"Confidence too low for {exp_call}"
+            )
+            self.assertLessEqual(res.confidence, 1.0, f"Confidence > 1 for {exp_call}")
+
+        res_xy = classify_sca(
+            "M",
+            ffy=0.10,
+            ffx=0.10,
+            preface=0.10,
+            chrx_ratio=0.95,
+            prenatal_meta=self.meta,
+        )
+        self.assertEqual(res_xy.call, "XY")
+        self.assertGreater(res_xy.confidence, 0.85)
+
 
 class TestAnnotatePrenatalSegments(unittest.TestCase):
     def setUp(self) -> None:
@@ -503,6 +546,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
             olm_bias=0.12,
             olm_skew_intercept=0.0,
             olm_skew_slope=1.0,
+            preface_logit_mode=False,
         )
         female_sample = self.sample_tables[1]
         res = predict_prenatal(female_sample, ref_table, fallback_meta)

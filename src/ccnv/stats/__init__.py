@@ -15,7 +15,9 @@ from ccnv.stats.pca import (
     pca_irlba_numpy,
 )
 from ccnv.stats.prenatal_math import (
+    fit_elasticnet_ffy,
     fit_lasso_fista,
+    fit_preface_logit_ensemble,
     fit_rprop_mlp,
     infer_sex_gmm_1d,
     ols_fit,
@@ -48,8 +50,10 @@ __all__ = [
     "build_signal_space_features",
     "compute_null_models",
     "distance_cutoff",
+    "fit_elasticnet_ffy",
     "fit_lasso_fista",
     "fit_pca",
+    "fit_preface_logit_ensemble",
     "fit_rprop_mlp",
     "fit_sample_trend",
     "infer_sex_gmm_1d",
