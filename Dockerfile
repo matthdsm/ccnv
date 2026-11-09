@@ -1,4 +1,4 @@
-FROM ghcr.io/prefix-dev/pixi:0.81.0 AS build
+FROM ghcr.io/prefix-dev/pixi:0.84.0 AS build
 
 WORKDIR /app
 COPY pyproject.toml pixi.lock README.md LICENSE.md ./
@@ -10,7 +10,7 @@ RUN pixi install --locked -e prod \
     && cat /shell-hook >> /app/entrypoint.sh \
     && printf '\nexec "$@"\n' >> /app/entrypoint.sh
 
-FROM ubuntu:24.04 AS production
+FROM ubuntu:26.04 AS production
 
 WORKDIR /app
 COPY --from=build /app/.pixi/envs/prod /app/.pixi/envs/prod

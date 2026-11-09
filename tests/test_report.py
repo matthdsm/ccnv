@@ -9,17 +9,24 @@ from pathlib import Path
 import numpy as np
 import pysam
 
+from ccnv.io.tracks import load_cytobands_track
+from ccnv.models.results import (
+    BinResult,
+    FetalFractionResult,
+    SCAResult,
+    SegmentResult,
+)
 from ccnv.report import (
     BINS_BED_HEADER,
     CALLS_BED_HEADER,
     PLOTLY_CDN_URL,
+    PRENATAL_CALLS_BED_HEADER,
+    PRENATAL_SEGMENTS_BED_HEADER,
     SEGMENTS_BED_HEADER,
     natural_sort_key,
-    read_cytobands,
     write_genome_plot,
     write_outputs,
 )
-from ccnv.results import BinResult, SegmentResult
 
 
 def _extract_payload(html: str) -> dict[str, object]:
@@ -138,7 +145,7 @@ class TestReport(unittest.TestCase):
             with gzip.open(cyto_gz, "wt", encoding="utf-8") as handle:
                 handle.write(cyto_lines)
 
-            parsed = read_cytobands(cyto_gz, contig_lengths)
+            parsed = load_cytobands_track(cyto_gz, contig_lengths)
             self.assertEqual(len(parsed), 3)
             self.assertEqual(parsed[0].contig, "1")
             self.assertEqual((parsed[0].start, parsed[0].end), (0, 40_000))
@@ -154,7 +161,7 @@ class TestReport(unittest.TestCase):
                 bins,
                 (),
                 contig_lengths,
-                cytobands=cyto_gz,
+                cytobands=parsed,
             )
             payload = _extract_payload(html_path.read_text(encoding="utf-8"))
 
@@ -304,6 +311,207 @@ class TestReport(unittest.TestCase):
             self.assertFalse(Path(f"{prefix}_bins.vcf.gz.tbi").exists())
             self.assertTrue(outputs.bins_bed.is_file())
             self.assertTrue(Path(f"{prefix}_bins.bed.gz.tbi").is_file())
+
+    def test_write_outputs_prenatal_mode_beds_and_vcfs(self) -> None:
+        contig_lengths = {"chr1": 200_000}
+        bins = (
+            BinResult(
+                branch="autosomal",
+                contigs=("chr1", "chr1"),
+                starts=np.array([0, 100_000], dtype=np.int64),
+                ends=np.array([100_000, 200_000], dtype=np.int64),
+                ratios=np.array([0.08, 0.01], dtype=np.float64),
+                zscores=np.array([3.1, 3.1], dtype=np.float64),
+                weights=np.array([1.0, 1.0], dtype=np.float64),
+                reference_sizes=np.array([10, 10], dtype=np.int64),
+                masked=np.array([False, False], dtype=bool),
+            ),
+        )
+        segments = (
+            SegmentResult(
+                "chr1",
+                0,
+                100_000,
+                0.08,
+                3.1,
+                1.0,
+                1,
+                "gain",
+                expected_ratio=0.084,
+                implied_ff=0.115,
+                discordant=False,
+            ),
+            SegmentResult(
+                "chr1",
+                100_000,
+                200_000,
+                0.01,
+                3.1,
+                1.0,
+                1,
+                "gain",
+                expected_ratio=0.084,
+                implied_ff=0.014,
+                discordant=True,
+                discordance_reason="SUB_FETAL_RATIO",
+            ),
+        )
+        sca = SCAResult("XY", False, 0.98, -0.2)
+        prenatal = FetalFractionResult(
+            fetal_sex="M",
+            active_ff=0.12,
+            active_ff_source="FFY",
+            ffy=0.12,
+            ffx=0.115,
+            preface=0.118,
+            chrx_ratio=0.94,
+            chry_score=0.006,
+            yfrac_threshold=0.004,
+            sca=sca,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prefix = Path(tmpdir) / "prenatal_sample"
+            outputs = write_outputs(
+                prefix,
+                bins,
+                segments,
+                contig_lengths,
+                plot=False,
+                vcf=True,
+                mode="prenatal",
+                prenatal_result=prenatal,
+            )
+            with gzip.open(outputs.segments_bed, "rt") as h:
+                seg_lines = h.read().splitlines()
+            self.assertEqual(
+                tuple(seg_lines[0].split("\t")), PRENATAL_SEGMENTS_BED_HEADER
+            )
+            row_non_disc = seg_lines[1].split("\t")
+            self.assertEqual(row_non_disc[10], "false")
+            self.assertEqual(row_non_disc[11], "")
+            row_disc = seg_lines[2].split("\t")
+            self.assertEqual(row_disc[10], "true")
+            self.assertEqual(row_disc[11], "SUB_FETAL_RATIO")
+
+            with gzip.open(outputs.calls_bed, "rt") as h:
+                calls_lines = h.read().splitlines()
+            self.assertEqual(
+                tuple(calls_lines[0].split("\t")), PRENATAL_CALLS_BED_HEADER
+            )
+            self.assertEqual(len(calls_lines), 3)
+
+            assert outputs.segments_vcf is not None
+            with pysam.VariantFile(str(outputs.segments_vcf)) as vf:
+                vcf_header_text = str(vf.header)
+                self.assertIn("##fetalSex=M", vcf_header_text)
+                self.assertIn("##fetalFraction=0.1200", vcf_header_text)
+                self.assertIn("##scaCall=XY", vcf_header_text)
+                self.assertIn("##INFO=<ID=DISCORDANT", vcf_header_text)
+                self.assertIn("##INFO=<ID=DISC_REASON", vcf_header_text)
+                self.assertIn("##FORMAT=<ID=EXP_LOG2R", vcf_header_text)
+                self.assertIn("##FORMAT=<ID=IMPLIED_FF", vcf_header_text)
+
+                recs = list(vf.fetch("chr1"))
+                self.assertEqual(len(recs), 2)
+                self.assertNotIn("DISCORDANT", recs[0].info)
+                self.assertAlmostEqual(
+                    recs[0].samples["prenatal_sample"]["EXP_LOG2R"],
+                    0.084,
+                    places=3,
+                )
+                self.assertAlmostEqual(
+                    recs[0].samples["prenatal_sample"]["IMPLIED_FF"],
+                    0.115,
+                    places=3,
+                )
+
+                self.assertTrue(recs[1].info["DISCORDANT"])
+
+                self.assertEqual(recs[1].info["DISC_REASON"], "SUB_FETAL_RATIO")
+                self.assertAlmostEqual(
+                    recs[1].samples["prenatal_sample"]["EXP_LOG2R"],
+                    0.084,
+                    places=3,
+                )
+                self.assertAlmostEqual(
+                    recs[1].samples["prenatal_sample"]["IMPLIED_FF"],
+                    0.014,
+                    places=3,
+                )
+
+    def test_write_genome_plot_with_prenatal_badge_and_discordant_traces(
+        self,
+    ) -> None:
+        contig_lengths = {"chr1": 200_000}
+        bins = (
+            BinResult(
+                branch="autosomal",
+                contigs=("chr1",),
+                starts=np.array([0], dtype=np.int64),
+                ends=np.array([200_000], dtype=np.int64),
+                ratios=np.array([0.0], dtype=np.float64),
+                zscores=np.array([0.0], dtype=np.float64),
+                weights=np.array([1.0], dtype=np.float64),
+                reference_sizes=np.array([10], dtype=np.int64),
+                masked=np.array([False], dtype=bool),
+            ),
+        )
+        segments = (
+            SegmentResult(
+                "chr1",
+                0,
+                200_000,
+                0.01,
+                3.5,
+                1.0,
+                1,
+                "gain",
+                expected_ratio=0.084,
+                implied_ff=0.014,
+                discordant=True,
+                discordance_reason="SUB_FETAL_RATIO",
+            ),
+        )
+        sca = SCAResult("XY", False, 0.98, -0.2)
+        prenatal = FetalFractionResult(
+            fetal_sex="M",
+            active_ff=0.10,
+            active_ff_source="FFY",
+            ffy=0.10,
+            ffx=0.095,
+            preface=0.102,
+            chrx_ratio=0.95,
+            chry_score=0.005,
+            yfrac_threshold=0.004,
+            sca=sca,
+            low_ff_warning=False,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html_path = Path(tmpdir) / "prenatal_plot.html"
+            write_genome_plot(
+                html_path,
+                bins,
+                segments,
+                contig_lengths,
+                prenatal_result=prenatal,
+            )
+            content = html_path.read_text(encoding="utf-8")
+
+        self.assertIn('id="prenatal-badge"', content)
+        self.assertIn("Segments (Discordant)", content)
+        self.assertIn("#9333ea", content)
+        self.assertIn("diamond", content)
+        payload = _extract_payload(content)
+        self.assertIn("prenatal", payload)
+        prenatal_dict = payload["prenatal"]
+        assert isinstance(prenatal_dict, dict)
+        self.assertEqual(prenatal_dict["fetal_sex"], "M")
+        self.assertEqual(prenatal_dict["active_ff"], 0.10)
+        seg_rows = payload["segments"]
+        assert isinstance(seg_rows, list)
+        self.assertEqual(len(seg_rows[0]), 10)
+        self.assertTrue(seg_rows[0][6])
+        self.assertEqual(seg_rows[0][9], "SUB_FETAL_RATIO")
 
     def test_natural_sort_key(self) -> None:
         raw = [

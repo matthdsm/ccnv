@@ -7,12 +7,18 @@ from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import yaml
 from typer.testing import CliRunner
 
 from ccnv.cli import SampleInputError, app, expand_sample_inputs
 from ccnv.models import ReadFilters
+from ccnv.models.schemas import (
+    REFERENCE_SCHEMA,
+    SAMPLE_SCHEMA,
+    ArtifactKind,
+    metadata_for,
+)
 from ccnv.reference import DEFAULT_SEX_CONTIGS, DEFAULT_SEX_SIGNAL_CONTIGS
-from ccnv.schemas import REFERENCE_SCHEMA, SAMPLE_SCHEMA, ArtifactKind, metadata_for
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -25,21 +31,21 @@ def _cli_text(output: str) -> str:
 
 
 class TestCliPathChecks(unittest.TestCase):
-    def test_convert_rejects_missing_alignment(self) -> None:
+    def test_extract_rejects_missing_alignment(self) -> None:
         result = CliRunner().invoke(
-            app, ["convert", "/does/not/exist.bam", "--prefix", "out"]
+            app, ["extract", "/does/not/exist.bam", "--prefix", "out"]
         )
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("does not exist", _cli_text(result.output))
 
-    def test_convert_rejects_missing_fasta(self) -> None:
+    def test_extract_rejects_missing_fasta(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "sample.bam"
             bam_path.write_bytes(b"BAM")
             result = CliRunner().invoke(
                 app,
                 [
-                    "convert",
+                    "extract",
                     str(bam_path),
                     "--fasta",
                     str(Path(tmpdir) / "missing.fa"),
@@ -86,42 +92,71 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             with self.assertRaisesRegex(SampleInputError, "no sample CCNV files"):
                 expand_sample_inputs([empty])
 
-    def test_cli_reference_expands_directory(self) -> None:
+    def test_cli_reference_with_samplesheet(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            nested = root / "controls" / "set-a"
-            nested.mkdir(parents=True)
-            first = _write_sample(nested / "s1.ccnv")
-            second = _write_sample(root / "controls" / "s2.ccnv")
+            sample = _write_sample(root / "s1.ccnv")
+            sheet = _write_samplesheet(root / "samples.yaml", [sample])
             with patch("ccnv.cli.run_reference") as run:
                 result = CliRunner().invoke(
                     app,
                     [
                         "reference",
-                        str(root / "controls"),
+                        "--samplesheet",
+                        str(sheet),
                         "--prefix",
                         str(root / "ref"),
                     ],
                 )
             self.assertEqual(result.exit_code, 0, result.output)
             config = run.call_args.args[0]
-            self.assertEqual(config.samples, (second, first))
+            self.assertEqual(config.samplesheet_path, sheet)
+            self.assertEqual(config.mode, "germline")
+            self.assertEqual(config.prenatal_bin_size, 100_000)
             self.assertEqual(config.sex_contigs, DEFAULT_SEX_CONTIGS)
             self.assertEqual(config.sex_signal_contig, DEFAULT_SEX_SIGNAL_CONTIGS[0])
 
+    def test_cli_reference_short_samplesheet_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample = _write_sample(root / "s1.ccnv")
+            sheet = _write_samplesheet(root / "samples.yaml", [sample])
+            with patch("ccnv.cli.run_reference") as run:
+                result = CliRunner().invoke(
+                    app,
+                    [
+                        "reference",
+                        "-s",
+                        str(sheet),
+                        "--prefix",
+                        str(root / "ref"),
+                    ],
+                )
+            self.assertEqual(result.exit_code, 0, result.output)
+            config = run.call_args.args[0]
+            self.assertEqual(config.samplesheet_path, sheet)
+
     def test_reference_help_shows_typer_defaults(self) -> None:
-        result = CliRunner().invoke(app, ["reference", "--help"])
+        result = CliRunner().invoke(
+            app, ["reference", "--help"], env={"COLUMNS": "200"}
+        )
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("[default: X, Y, chrX,", _cli_text(result.output))
         self.assertIn("chrY]", _cli_text(result.output))
         self.assertIn("[default: chrY]", _cli_text(result.output))
         self.assertIn("[default: 5]", _cli_text(result.output))
         self.assertIn("[default: 300]", _cli_text(result.output))
+        self.assertIn("--samplesheet", _cli_text(result.output))
+        self.assertIn("-s", _cli_text(result.output))
+        self.assertIn("--fasta", _cli_text(result.output))
+        self.assertIn("--mode", _cli_text(result.output))
+        self.assertIn("[default: germline]", _cli_text(result.output))
+        self.assertIn("--prenatal-binsize", _cli_text(result.output))
+        self.assertIn("[default: 100000]", _cli_text(result.output))
 
     def test_short_help_flag_works_on_app_and_subcommands(self) -> None:
         for args in (
             ["-h"],
-            ["convert", "-h"],
+            ["extract", "-h"],
             ["reference", "-h"],
             ["ref-qc", "-h"],
             ["predict", "-h"],
@@ -141,9 +176,11 @@ class TestReferenceSampleExpansion(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("[default: autosomal]", _cli_text(result.output))
         self.assertRegex(_cli_text(result.output), r"<autosomal\|female.*\|male>")
+        self.assertIn("--mode", _cli_text(result.output))
+        self.assertIn("[default: germline]", _cli_text(result.output))
 
     def test_loglevel_flag_is_on_every_command(self) -> None:
-        for command in ("convert", "reference", "ref-qc", "predict"):
+        for command in ("extract", "reference", "ref-qc", "predict"):
             with self.subTest(command=command):
                 result = CliRunner().invoke(app, [command, "--help"])
                 self.assertEqual(result.exit_code, 0, result.output)
@@ -151,7 +188,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 self.assertIn("[default: WARNING]", _cli_text(result.output))
 
     def test_invalid_loglevel_is_rejected(self) -> None:
-        result = CliRunner().invoke(app, ["convert", "--loglevel", "verbose"])
+        result = CliRunner().invoke(app, ["extract", "--loglevel", "verbose"])
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("verbose", _cli_text(result.output))
 
@@ -159,12 +196,14 @@ class TestReferenceSampleExpansion(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.ccnv")
+            sheet = _write_samplesheet(root / "samples.yaml", [sample])
             with patch("ccnv.cli.run_reference") as run:
                 result = CliRunner().invoke(
                     app,
                     [
                         "reference",
-                        str(sample),
+                        "-s",
+                        str(sheet),
                         "--prefix",
                         str(root / "ref"),
                         "--sex-contig",
@@ -187,12 +226,14 @@ class TestReferenceSampleExpansion(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.ccnv")
+            sheet = _write_samplesheet(root / "samples.yaml", [sample])
             with patch("ccnv.cli.run_reference") as run:
                 result = CliRunner().invoke(
                     app,
                     [
                         "reference",
-                        str(sample),
+                        "-s",
+                        str(sheet),
                         "--prefix",
                         str(root / "ref"),
                         "-t",
@@ -207,11 +248,13 @@ class TestReferenceSampleExpansion(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.ccnv")
+            sheet = _write_samplesheet(root / "samples.yaml", [sample])
             result = CliRunner().invoke(
                 app,
                 [
                     "reference",
-                    str(sample),
+                    "-s",
+                    str(sheet),
                     "--prefix",
                     str(root / "ref"),
                     "--sample-sex",
@@ -225,12 +268,14 @@ class TestReferenceSampleExpansion(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.ccnv")
+            sheet = _write_samplesheet(root / "samples.yaml", [sample])
             with patch("ccnv.cli.run_reference") as run:
                 result = CliRunner().invoke(
                     app,
                     [
                         "reference",
-                        str(sample),
+                        "-s",
+                        str(sheet),
                         "--prefix",
                         str(root / "ref"),
                         "--no-qc-report",
@@ -239,6 +284,149 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             config = run.call_args.args[0]
             self.assertFalse(config.qc_report)
+
+    def test_reference_requires_samplesheet_or_fasta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = CliRunner().invoke(
+                app,
+                ["reference", "--prefix", str(Path(tmpdir) / "ref")],
+            )
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn(
+                "provide exactly one of --samplesheet or --fasta",
+                _cli_text(result.output),
+            )
+
+    def test_reference_rejects_both_samplesheet_and_fasta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample = _write_sample(root / "s1.ccnv")
+            sheet = _write_samplesheet(root / "samples.yaml", [sample])
+            fasta = root / "genome.fa"
+            fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+            result = CliRunner().invoke(
+                app,
+                [
+                    "reference",
+                    "--samplesheet",
+                    str(sheet),
+                    "--fasta",
+                    str(fasta),
+                    "--prefix",
+                    str(root / "ref"),
+                ],
+            )
+            self.assertEqual(result.exit_code, 2)
+            self.assertIn(
+                "provide either --samplesheet or --fasta, not both",
+                _cli_text(result.output),
+            )
+
+    def test_reference_rejects_samples_with_samplesheet_or_fasta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample = _write_sample(root / "s1.ccnv")
+            sheet = _write_samplesheet(root / "samples.yaml", [sample])
+            fasta = root / "genome.fa"
+            fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+            expected = (
+                "cannot combine positional sample arguments with "
+                "--samplesheet or --fasta"
+            )
+
+            res1 = CliRunner().invoke(
+                app,
+                [
+                    "reference",
+                    str(sample),
+                    "--samplesheet",
+                    str(sheet),
+                    "--prefix",
+                    str(root / "ref"),
+                ],
+            )
+            self.assertEqual(res1.exit_code, 2)
+            self.assertIn(expected, _cli_text(res1.output))
+
+            res2 = CliRunner().invoke(
+                app,
+                [
+                    "reference",
+                    str(sample),
+                    "--fasta",
+                    str(fasta),
+                    "--prefix",
+                    str(root / "ref"),
+                ],
+            )
+            self.assertEqual(res2.exit_code, 2)
+            self.assertIn(expected, _cli_text(res2.output))
+
+    def test_reference_forwards_fasta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fasta = root / "genome.fa"
+            fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+            with patch("ccnv.cli.run_reference") as run:
+                result = CliRunner().invoke(
+                    app,
+                    [
+                        "reference",
+                        "--fasta",
+                        str(fasta),
+                        "--prefix",
+                        str(root / "ref"),
+                    ],
+                )
+            self.assertEqual(result.exit_code, 0, result.output)
+            config = run.call_args.args[0]
+            self.assertEqual(config.fasta, fasta)
+            self.assertIsNone(config.samplesheet_path)
+
+    def test_reference_mode_and_prenatal_binsize(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample = _write_sample(root / "s1.ccnv")
+            sheet = _write_samplesheet(root / "samples.yaml", [sample])
+            with patch("ccnv.cli.run_reference") as run:
+                result = CliRunner().invoke(
+                    app,
+                    [
+                        "reference",
+                        "-s",
+                        str(sheet),
+                        "--mode",
+                        "prenatal",
+                        "--prenatal-binsize",
+                        "50000",
+                        "--prefix",
+                        str(root / "ref"),
+                    ],
+                )
+            self.assertEqual(result.exit_code, 0, result.output)
+            config = run.call_args.args[0]
+            self.assertEqual(config.mode, "prenatal")
+            self.assertEqual(config.prenatal_bin_size, 50_000)
+
+    def test_reference_rejects_invalid_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample = _write_sample(root / "s1.ccnv")
+            sheet = _write_samplesheet(root / "samples.yaml", [sample])
+            result = CliRunner().invoke(
+                app,
+                [
+                    "reference",
+                    "-s",
+                    str(sheet),
+                    "--mode",
+                    "invalid_mode",
+                    "--prefix",
+                    str(root / "ref"),
+                ],
+            )
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("invalid_mode", _cli_text(result.output))
 
     def test_cli_ref_qc_generates_json_and_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -334,6 +522,61 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertIn("--cytobands is ignored when --no-plot is set", result.output)
             self.assertFalse((root / "out_no_plot_plot.html").exists())
+
+    def test_predict_forwards_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample = _write_sample(root / "s1.ccnv")
+            reference = _write_reference(root / "ref.ccnv")
+
+            # Default mode: germline
+            with patch("ccnv.cli.run_predict") as run:
+                result = CliRunner().invoke(
+                    app, ["predict", str(sample), str(reference)]
+                )
+                self.assertEqual(result.exit_code, 0, result.output)
+                config = run.call_args.args[0]
+                self.assertEqual(config.mode, "germline")
+
+            # Explicit prenatal mode
+            with patch("ccnv.cli.run_predict") as run:
+                result = CliRunner().invoke(
+                    app,
+                    [
+                        "predict",
+                        str(sample),
+                        str(reference),
+                        "--mode",
+                        "prenatal",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, result.output)
+                config = run.call_args.args[0]
+                self.assertEqual(config.mode, "prenatal")
+
+    def test_predict_rejects_invalid_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample = _write_sample(root / "s1.ccnv")
+            reference = _write_reference(root / "ref.ccnv")
+            result = CliRunner().invoke(
+                app,
+                [
+                    "predict",
+                    str(sample),
+                    str(reference),
+                    "--mode",
+                    "not_a_mode",
+                ],
+            )
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("not_a_mode", _cli_text(result.output))
+
+
+def _write_samplesheet(path: Path, samples: list[Path]) -> Path:
+    data = [{"id": f"s{i}", "filepath": str(s)} for i, s in enumerate(samples)]
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return path
 
 
 def _write_sample(path: Path) -> Path:

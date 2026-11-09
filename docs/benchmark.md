@@ -1,6 +1,6 @@
 # Benchmarks & Concordance with WisecondorX
 
-This document summarizes the numerical concordance, storage footprint, and algorithmic differences between `ccnv` and WisecondorX across conversion, reference construction, and prediction on shallow whole-genome sequencing (sWGS) data.
+This document summarizes the numerical concordance, storage footprint, and algorithmic differences between `ccnv` and WisecondorX across extraction, reference construction, and prediction on shallow whole-genome sequencing (sWGS) data.
 
 ## Architectural & Algorithmic Summary
 
@@ -14,7 +14,7 @@ This document summarizes the numerical concordance, storage footprint, and algor
 | **Segmentation Engine** | Unweighted R `DNAcopy` (CBS) via `rpy2` (`alpha`) | Pure-Python weighted `ruptures` Binary Segmentation (`Binseg`) with precision weights $w = 1 / (\sigma_{\text{null}}^2 + \epsilon)$ |
 | **Deliverables** | Plain-text BED and PNG plots | Bgzipped/tabix-indexed BED (`.bed.gz`), VCFv4.2 (`.vcf.gz`), and interactive Plotly HTML (`_plot.html`) |
 
-## 1. Conversion (`convert`) Benchmark
+## 1. Extraction (`extract`) Benchmark
 
 Evaluated on a real-world NIPT sample binned at 5 kb across 24 chromosomes (`chr1`–`chr22`, `chrX`, `chrY`), totaling 617,665 bins and 66,629,087 raw reads.
 

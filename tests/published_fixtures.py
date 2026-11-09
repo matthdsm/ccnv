@@ -7,10 +7,10 @@ from pathlib import Path
 
 import pysam
 
-from ccnv.convert import run as convert
-from ccnv.models import ConvertConfig, parquet_path
+from ccnv.extract import run as extract
+from ccnv.models import ExtractConfig
 
-CONVERT_FIXTURES = Path(__file__).parent / "fixtures" / "convert"
+EXTRACT_FIXTURES = Path(__file__).parent / "fixtures" / "extract"
 _DATASETS = "https://raw.githubusercontent.com/nf-cmgg/test-datasets/wisecondorx/"
 PUBLISHED_CRAM_URL = f"{_DATASETS}data/genomics/homo_sapiens/illumina/cram/test.cram"
 PUBLISHED_CRAM2_URL = f"{_DATASETS}data/genomics/homo_sapiens/illumina/cram/test2.cram"
@@ -18,10 +18,10 @@ PUBLISHED_FASTA_URL = (
     f"{_DATASETS}data/genomics/homo_sapiens/genome/seq/"
     "GCA_000001405.15_GRCh38_full_plus_hs38d1_analysis_set_chr21.fna"
 )
-PUBLISHED_CRAM = CONVERT_FIXTURES / "test.cram"
-PUBLISHED_CRAM2 = CONVERT_FIXTURES / "test2.cram"
+PUBLISHED_CRAM = EXTRACT_FIXTURES / "test.cram"
+PUBLISHED_CRAM2 = EXTRACT_FIXTURES / "test2.cram"
 PUBLISHED_FASTA = (
-    CONVERT_FIXTURES / "GCA_000001405.15_GRCh38_full_plus_hs38d1_analysis_set_chr21.fna"
+    EXTRACT_FIXTURES / "GCA_000001405.15_GRCh38_full_plus_hs38d1_analysis_set_chr21.fna"
 )
 CHR21_LENGTH = 46_709_983
 PUBLISHED_BIN_SIZE = 100_000
@@ -60,10 +60,14 @@ def ensure_published_fasta() -> Path:
     return fasta
 
 
-def convert_published_samples(root: Path) -> tuple[Path, Path]:
-    """Convert both published CRAMs into sample Parquet under ``root``."""
+def extract_published_samples(root: Path) -> tuple[Path, Path]:
+    """Extract published CRAMs into sample Parquet under ``root``, reusing cache."""
+
+    import shutil
 
     fasta = ensure_published_fasta()
+    cache_dir = EXTRACT_FIXTURES / ".cache_extracted"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for index, (cached, url) in enumerate(
         (
@@ -73,7 +77,19 @@ def convert_published_samples(root: Path) -> tuple[Path, Path]:
         start=1,
     ):
         cram = ensure_published_file(cached, url)
-        prefix = root / f"sample{index}"
-        convert(ConvertConfig(cram, prefix, PUBLISHED_BIN_SIZE, fasta=fasta))
-        paths.append(parquet_path(prefix))
+        cached_sample = cache_dir / f"sample{index}.ccnv"
+        if not cached_sample.is_file() or cached_sample.stat().st_size == 0:
+            extract(
+                ExtractConfig(
+                    cram,
+                    cache_dir / f"sample{index}",
+                    PUBLISHED_BIN_SIZE,
+                    fasta=fasta,
+                )
+            )
+        dest = root / f"sample{index}.ccnv"
+        if not dest.is_file() or dest.resolve() != cached_sample.resolve():
+            root.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(cached_sample, dest)
+        paths.append(dest)
     return paths[0], paths[1]

@@ -7,25 +7,31 @@ from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
 from time import perf_counter
-from typing import Annotated, NoReturn
+from typing import Annotated, NoReturn, cast
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 import typer
 
-from ccnv.convert import ConvertError
-from ccnv.convert import run as run_convert
+from ccnv.extract import ExtractError
+from ccnv.extract import run as run_extract
+from ccnv.io.parquet import is_sample_parquet
 from ccnv.models import (
     DEFAULT_BIN_SIZE,
     DEFAULT_MIN_MAPPABILITY,
-    ConvertConfig,
+    ExtractConfig,
     PredictConfig,
     ReadFilters,
     ReferenceConfig,
     ReferenceQCConfig,
 )
+from ccnv.models import (
+    AnalysisMode as AnalysisModeLiteral,
+)
 from ccnv.predict import PredictError
 from ccnv.predict import run as run_predict
+from ccnv.ref_qc import (
+    ReferenceQCError,
+    run_reference_qc,
+)
 from ccnv.reference import (
     DEFAULT_SEX_CONTIGS,
     DEFAULT_SEX_SIGNAL_CONTIGS,
@@ -34,11 +40,6 @@ from ccnv.reference import (
 from ccnv.reference import (
     run as run_reference,
 )
-from ccnv.reference_qc import (
-    ReferenceQCError,
-    run_reference_qc,
-)
-from ccnv.schemas import ArtifactKind, SchemaError, decode_metadata
 
 app = typer.Typer(
     name="ccnv",
@@ -66,6 +67,13 @@ class SexBranch(StrEnum):
     autosomal = "autosomal"
     female = "female"
     male = "male"
+
+
+class AnalysisMode(StrEnum):
+    """Allowed pipeline analysis modes."""
+
+    germline = "germline"
+    prenatal = "prenatal"
 
 
 def configure_logging(level: LogLevel) -> None:
@@ -97,6 +105,52 @@ LogLevelOption = Annotated[
     ),
 ]
 
+ModeOption = Annotated[
+    AnalysisMode,
+    typer.Option(
+        "--mode",
+        case_sensitive=False,
+        help="Analysis mode: germline constitutional CNV or prenatal NIPS cfDNA",
+    ),
+]
+
+MappabilityOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--mappability",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help=(
+            "Mappability BigWig (.bw/.bigWig) track for covariate normalization "
+            "(k-mer length should roughly match average sequencing read length)"
+        ),
+    ),
+]
+
+GcOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--gc",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="GC content track (.bw/.bigWig, .bed/.bed.gz, or .fa/.fasta/.fna)",
+    ),
+]
+
+MinMappabilityOption = Annotated[
+    float,
+    typer.Option(
+        "--min-mappability",
+        min=0.0,
+        max=1.0,
+        help="Minimum bin mappability in [0, 1] required to stay unmasked",
+    ),
+]
+
 
 class SampleInputError(ValueError):
     """Raised when reference sample arguments cannot be expanded."""
@@ -113,7 +167,7 @@ def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
             matches = [
                 candidate.resolve()
                 for candidate in sorted(resolved.rglob("*.ccnv"))
-                if _is_sample_parquet(candidate)
+                if is_sample_parquet(candidate)
             ]
             if not matches:
                 raise SampleInputError(f"{path} contains no sample CCNV files")
@@ -128,16 +182,8 @@ def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
     return tuple(samples)
 
 
-def _is_sample_parquet(path: Path) -> bool:
-    try:
-        metadata = decode_metadata(pq.read_schema(path).metadata)
-    except (OSError, TypeError, ValueError, SchemaError, pa.ArrowException):
-        return False
-    return metadata.get("artifact_kind") == ArtifactKind.SAMPLE.value
-
-
 @app.command()
-def convert(
+def extract(
     alignment: Annotated[
         Path,
         typer.Argument(
@@ -207,17 +253,17 @@ def convert(
     ] = DEFAULT_THREADS,
     loglevel: LogLevelOption = LogLevel.warning,
 ) -> None:
-    """Convert one alignment into canonical binned counts."""
+    """Extract binned counts from one alignment into canonical sample Parquet."""
 
     configure_logging(loglevel)
     cli_logger.debug(
-        "starting convert: alignment=%s, bin_size=%d, threads=%d",
+        "starting extract: alignment=%s, bin_size=%d, threads=%d",
         alignment,
         bin_size,
         threads,
     )
     started = perf_counter()
-    config = ConvertConfig(
+    config = ExtractConfig(
         alignment,
         prefix if prefix is not None else alignment.with_suffix(""),
         bin_size,
@@ -233,9 +279,9 @@ def convert(
         all_contigs=all_contigs,
     )
     try:
-        run_convert(config)
-        cli_logger.debug("convert completed in %.3f s", perf_counter() - started)
-    except ConvertError as error:
+        run_extract(config)
+        cli_logger.debug("extract completed in %.3f s", perf_counter() - started)
+    except ExtractError as error:
         _fail(error, 1)
 
 
@@ -248,17 +294,42 @@ def reference(
     samples: Annotated[
         list[Path] | None,
         typer.Argument(
-            exists=True,
-            file_okay=True,
-            dir_okay=True,
-            readable=True,
-            help=(
-                "Sample Parquet files and/or directories; directories are searched"
-                " recursively for sample Parquet."
-                "To build a flat reference, provide exactly one fasta file."
-            ),
+            hidden=True,
+            help="Deprecated: provide --samplesheet or --fasta instead",
         ),
     ] = None,
+    samplesheet: Annotated[
+        Path | None,
+        typer.Option(
+            "-s",
+            "--samplesheet",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Root-list samplesheet (.yaml, .yml, or .json) describing the cohort",
+        ),
+    ] = None,
+    fasta: Annotated[
+        Path | None,
+        typer.Option(
+            "--fasta",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            help="Reference FASTA for flat reference building",
+        ),
+    ] = None,
+    mode: ModeOption = AnalysisMode.germline,
+    prenatal_binsize: Annotated[
+        int,
+        typer.Option(
+            "--prenatal-binsize",
+            min=1,
+            help="Bin size in bases for prenatal models (default: 100000)",
+        ),
+    ] = 100_000,
     bin_size: Annotated[
         int, typer.Option(min=1, help="Target bin size in bases")
     ] = DEFAULT_BIN_SIZE,
@@ -277,9 +348,9 @@ def reference(
         ),
     ] = None,
     sex_contig: Annotated[
-        list[str],
+        list[str] | None,
         typer.Option("--sex-contig", help="Sex contig name; repeat as needed"),
-    ] = DEFAULT_SEX_CONTIGS,
+    ] = None,
     sex_signal_contig: Annotated[
         str,
         typer.Option(help="Contig used for inferred sex; higher fraction is male"),
@@ -324,40 +395,9 @@ def reference(
             help="Generate reference quality control report",
         ),
     ] = True,
-    mappability: Annotated[
-        Path | None,
-        typer.Option(
-            "--mappability",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            help=(
-                "Mappability BigWig (.bw/.bigWig) track for covariate normalization "
-                "(k-mer length should roughly match average sequencing read length)"
-            ),
-        ),
-    ] = None,
-    gc: Annotated[
-        Path | None,
-        typer.Option(
-            "--gc",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            help="GC content track (.bw/.bigWig, .bed/.bed.gz, or .fa/.fasta/.fna)",
-        ),
-    ] = None,
-    min_mappability: Annotated[
-        float,
-        typer.Option(
-            "--min-mappability",
-            min=0.0,
-            max=1.0,
-            help="Minimum bin mappability in [0, 1] required to stay unmasked",
-        ),
-    ] = DEFAULT_MIN_MAPPABILITY,
+    mappability: MappabilityOption = None,
+    gc: GcOption = None,
+    min_mappability: MinMappabilityOption = DEFAULT_MIN_MAPPABILITY,
     threads: Annotated[
         int,
         typer.Option(
@@ -373,22 +413,45 @@ def reference(
 
     configure_logging(loglevel)
     cli_logger.debug(
-        "starting reference: prefix=%s, bin_size=%d, threads=%d",
+        "starting reference: prefix=%s, bin_size=%d, mode=%s, threads=%d",
         prefix,
         bin_size,
+        mode.value,
         threads,
     )
     started = perf_counter()
     sample_paths: tuple[Path, ...] = ()
-    fasta: Path | None = None
-    if samples:
-        if len(samples) == 1 and samples[0].suffix.lower() in (".fasta", ".fa", ".fna"):
-            fasta = samples[0]
+    if samples and (samplesheet is not None or fasta is not None):
+        _fail(
+            ValueError(
+                "cannot combine positional sample arguments with "
+                "--samplesheet or --fasta"
+            ),
+            2,
+        )
+    if samplesheet is None and fasta is None:
+        if samples:
+            if len(samples) == 1 and samples[0].suffix.lower() in (
+                ".fasta",
+                ".fa",
+                ".fna",
+            ):
+                fasta = samples[0]
+            else:
+                try:
+                    sample_paths = expand_sample_inputs(samples)
+                except SampleInputError as error:
+                    _fail(error, 2)
         else:
-            try:
-                sample_paths = expand_sample_inputs(samples)
-            except SampleInputError as error:
-                _fail(error, 2)
+            _fail(
+                ValueError("provide exactly one of --samplesheet or --fasta"),
+                2,
+            )
+    elif samplesheet is not None and fasta is not None:
+        _fail(
+            ValueError("provide either --samplesheet or --fasta, not both"),
+            2,
+        )
     try:
         run_reference(
             ReferenceConfig(
@@ -404,12 +467,17 @@ def reference(
                 min_cohort_size=min_cohort_size,
                 min_mappability=min_mappability,
                 min_sex_group_size=min_sex_group_size,
+                mode=cast(AnalysisModeLiteral, mode.value),
                 nearest_bins=nearest_bins,
                 pca_components=pca_components,
                 prefix=prefix,
+                prenatal_bin_size=prenatal_binsize,
                 qc_report=qc_report,
                 samples=sample_paths,
-                sex_contigs=tuple(sex_contig),
+                samplesheet_path=samplesheet,
+                sex_contigs=(
+                    tuple(sex_contig) if sex_contig is not None else DEFAULT_SEX_CONTIGS
+                ),
                 sex_cutoff=sex_cutoff,
                 sex_signal_contig=sex_signal_contig,
                 threads=threads,
@@ -549,50 +617,21 @@ def predict(
             "--vcf/--no-vcf", help="Write VCFv4.2 outputs for bins and segments"
         ),
     ] = True,
-    mappability: Annotated[
-        Path | None,
-        typer.Option(
-            "--mappability",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            help=(
-                "Mappability BigWig (.bw/.bigWig) override track for normalization "
-                "(k-mer length should roughly match average sequencing read length)"
-            ),
-        ),
-    ] = None,
-    gc: Annotated[
-        Path | None,
-        typer.Option(
-            "--gc",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            help="GC content override track (.bw/.bigWig, .bed/.bed.gz, or .fa/.fasta)",
-        ),
-    ] = None,
-    min_mappability: Annotated[
-        float,
-        typer.Option(
-            "--min-mappability",
-            min=0.0,
-            max=1.0,
-            help="Minimum bin mappability in [0, 1] required to stay unmasked",
-        ),
-    ] = DEFAULT_MIN_MAPPABILITY,
+    mappability: MappabilityOption = None,
+    gc: GcOption = None,
+    min_mappability: MinMappabilityOption = DEFAULT_MIN_MAPPABILITY,
+    mode: ModeOption = AnalysisMode.germline,
     loglevel: LogLevelOption = LogLevel.warning,
 ) -> None:
     """Predict copy-number events for one sample."""
 
     configure_logging(loglevel)
     cli_logger.debug(
-        "starting predict: sample=%s, reference=%s, sex=%s",
+        "starting predict: sample=%s, reference=%s, sex=%s, mode=%s",
         sample,
         reference,
         sex.value,
+        mode.value,
     )
     started = perf_counter()
     try:
@@ -614,6 +653,7 @@ def predict(
                 mappability=mappability,
                 gc=gc,
                 min_mappability=min_mappability,
+                mode=cast(AnalysisModeLiteral, mode.value),
             )
         )
 

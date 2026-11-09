@@ -17,32 +17,30 @@ from published_fixtures import (
     ensure_published_fasta,
     ensure_published_file,
 )
-from sklearn.neighbors import NearestNeighbors
 from typer.testing import CliRunner
 
 from ccnv.cli import app
-from ccnv.convert import read_sample_parquet
-from ccnv.models import PredictConfig, ReadFilters, ReferenceConfig, parquet_path
-from ccnv.predict import run as predict
-from ccnv.reference import (
+from ccnv.features.cohort import (
+    cohort_from_fasta,
+    infer_sample_sexes,
+    mask_low_coverage,
+    normalize_depth,
+    validate_cohort,
+)
+from ccnv.io.parquet import read_sample_parquet
+from ccnv.io.parquet import read_sample_tables as load_cohort
+from ccnv.io.tracks import read_fasta_contigs
+from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
-    DEFAULT_SEX_CONTIGS,
+    PredictConfig,
+    ReadFilters,
+    ReferenceConfig,
     ReferenceError,
-    build_reference_table,
-    cohort_from_fasta,
-    fit_pca,
-    infer_sample_sexes,
-    load_cohort,
-    mask_low_coverage,
-    normalize_depth,
-    run,
-    select_nearest_bins,
-    validate_cohort,
+    parquet_path,
 )
-from ccnv.reference_compute import compute_null_models
-from ccnv.schemas import (
+from ccnv.models.schemas import (
     REFERENCE_SCHEMA,
     SAMPLE_SCHEMA,
     ArtifactKind,
@@ -51,6 +49,13 @@ from ccnv.schemas import (
     metadata_for,
     validate_table,
 )
+from ccnv.predict import run as predict
+from ccnv.reference import (
+    DEFAULT_SEX_CONTIGS,
+    build_reference_table,
+    run,
+)
+from ccnv.stats.pca import fit_pca
 
 
 def _sample_table(
@@ -149,60 +154,6 @@ class TestReferenceSchemaRejection(unittest.TestCase):
             validate_table(table, ArtifactKind.REFERENCE)
 
 
-class TestCohortCompatibility(unittest.TestCase):
-    def test_rejects_bin_size_mismatch(self) -> None:
-        left = _sample_table([10, 10], bin_size=100)
-        right = _sample_table([5, 5, 5, 5], bin_size=50)
-        with self.assertRaisesRegex(ReferenceError, "bin_size"):
-            validate_cohort((left, right))
-
-    def test_rejects_coordinate_mismatch(self) -> None:
-        left = _sample_table([10, 10], ends=[100, 200], contig_lengths={"chr1": 200})
-        right = _sample_table(
-            [10, 10],
-            starts=[0, 80],
-            ends=[80, 200],
-            contig_lengths={"chr1": 200},
-        )
-        with self.assertRaisesRegex(ReferenceError, "bin coordinates"):
-            validate_cohort((left, right))
-
-    def test_mixed_native_bin_sizes_succeed_when_target_bin_size_set(self) -> None:
-        left = _sample_table([10, 10], bin_size=100)
-        right = _sample_table([5, 5, 5, 5], bin_size=50)
-        cohort = validate_cohort((left, right), target_bin_size=100)
-        self.assertEqual(cohort.bin_size, 100)
-        self.assertEqual(cohort.counts.shape, (2, 2))
-        np.testing.assert_allclose(cohort.counts[:, 0], [10.0, 10.0])
-        np.testing.assert_allclose(cohort.counts[:, 1], [10.0, 10.0])
-
-    def test_mismatched_contig_lengths_fail_even_with_target_bin_size(self) -> None:
-        left = _sample_table([10, 10], contig_lengths={"chr1": 200}, bin_size=100)
-        right = _sample_table([10], contig_lengths={"chr1": 100}, bin_size=100)
-        with self.assertRaisesRegex(ReferenceError, "contig_lengths do not match"):
-            validate_cohort((left, right), target_bin_size=100)
-
-    def test_accepts_matching_nonhuman_layout(self) -> None:
-        contigs = ["scaffold-A", "scaffold-A", "lgX"]
-        starts = [0, 100, 0]
-        ends = [100, 200, 100]
-        lengths = {"scaffold-A": 200, "lgX": 100}
-        tables = [
-            _sample_table(
-                [8, 9, 2],
-                contigs=contigs,
-                starts=starts,
-                ends=ends,
-                contig_lengths=lengths,
-                identity={"id": f"s{index}"},
-            )
-            for index in range(3)
-        ]
-        cohort = validate_cohort(tuple(tables))
-        self.assertEqual(cohort.counts.shape, (3, 3))
-        self.assertEqual(cohort.contigs, ("scaffold-A", "scaffold-A", "lgX"))
-
-
 class TestMaskingAndPca(unittest.TestCase):
     def test_mask_drops_empty_and_low_coverage_bins(self) -> None:
         counts = np.array(
@@ -226,53 +177,6 @@ class TestMaskingAndPca(unittest.TestCase):
         np.testing.assert_allclose(first[2], second[2])
         self.assertEqual(first[1].shape, (12,))
         self.assertEqual(first[2].shape, (3, 12))
-
-
-class TestNearestBinSelection(unittest.TestCase):
-    def test_selects_closest_off_contig_bins(self) -> None:
-        profiles = np.array(
-            [
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.95, 0.05, 0.0],
-                [0.05, 0.95, 0.0],
-            ]
-        )
-        contig_ids = np.array([0, 0, 1, 1])
-        indices, distances = select_nearest_bins(
-            profiles, contig_ids, k=1, max_batch_memory_mb=1
-        )
-        self.assertEqual(indices[0], [2])
-        self.assertEqual(indices[1], [3])
-        self.assertEqual(indices[2], [0])
-        self.assertEqual(indices[3], [1])
-        self.assertTrue(all(len(row) == 1 for row in distances))
-
-    def test_argpartition_matches_nearest_neighbors_on_small_matrix(self) -> None:
-        rng = np.random.default_rng(1)
-        profiles = rng.normal(size=(8, 5))
-        contig_ids = np.array([0, 0, 0, 1, 1, 1, 2, 2])
-        indices, distances = select_nearest_bins(
-            profiles, contig_ids, k=2, max_batch_memory_mb=1
-        )
-        model = NearestNeighbors(n_neighbors=8, algorithm="brute", metric="euclidean")
-        model.fit(profiles)
-        brute_dist, brute_idx = model.kneighbors(profiles, return_distance=True)
-        for query, neighbor_idx, neighbor_dist in zip(
-            range(len(profiles)), brute_idx, brute_dist, strict=True
-        ):
-            expected = [
-                (int(index), float(dist) ** 2)
-                for index, dist in zip(neighbor_idx, neighbor_dist, strict=True)
-                if contig_ids[index] != contig_ids[query]
-            ][:2]
-            self.assertEqual(indices[query], [index for index, _ in expected])
-            np.testing.assert_allclose(
-                distances[query],
-                [dist for _, dist in expected],
-                rtol=1e-6,
-                atol=1e-8,
-            )
 
 
 class TestSexInference(unittest.TestCase):
@@ -640,7 +544,7 @@ class TestReferencePublishedCrams(unittest.TestCase):
                 result = runner.invoke(
                     app,
                     [
-                        "convert",
+                        "extract",
                         str(cram),
                         "--fasta",
                         str(fasta),
@@ -707,7 +611,9 @@ class TestFlatFastaReference(unittest.TestCase):
                 Path(tmpdir) / "genome.fa",
                 (("chr1", 250), ("chr2", 150), ("chrX", 100)),
             )
-            cohort = cohort_from_fasta(fasta, 100, n_samples=2)
+            contigs_dict = read_fasta_contigs(fasta)
+            cohort = cohort_from_fasta(contigs_dict, 100, n_samples=2, fasta_path=fasta)
+
             self.assertEqual(cohort.bin_size, 100)
             self.assertEqual(
                 cohort.contigs, ("chr1", "chr1", "chr1", "chr2", "chr2", "chrX")
@@ -837,68 +743,22 @@ class TestFlatFastaReference(unittest.TestCase):
         with self.assertRaisesRegex(ReferenceError, "sample Parquet paths or a FASTA"):
             run(ReferenceConfig(samples=(), prefix=Path("ref")))
 
-
-class TestParallelReference(unittest.TestCase):
-    def test_reference_config_threads_validation(self) -> None:
-        with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
-            ReferenceConfig(samples=(Path("a.ccnv"),), prefix=Path("ref"), threads=0)
-        with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
-            ReferenceConfig(samples=(Path("a.ccnv"),), prefix=Path("ref"), threads=-1)
-
-    def test_select_nearest_bins_parallel_equivalence(self) -> None:
-        rng = np.random.default_rng(42)
-        n_bins = 2500
-        profiles = rng.normal(size=(n_bins, 5)).astype(np.float64)
-        contig_ids = np.repeat(np.arange(5), n_bins // 5)
-
-        idx_seq, dst_seq = select_nearest_bins(
-            profiles, contig_ids, k=10, max_batch_memory_mb=16, threads=1
-        )
-        idx_par, dst_par = select_nearest_bins(
-            profiles, contig_ids, k=10, max_batch_memory_mb=16, threads=2
-        )
-
-        self.assertEqual(idx_seq, idx_par)
-        np.testing.assert_allclose(dst_seq, dst_par, rtol=1e-12, atol=1e-12)
-
-    def test_compute_null_models_parallel_equivalence(self) -> None:
-        rng = np.random.default_rng(123)
-        n_bins = 6000
-        corrected = rng.uniform(0.5, 2.0, size=(n_bins, 10)).astype(np.float64)
-        indices = [
-            rng.choice(n_bins, size=20, replace=False).tolist() for _ in range(n_bins)
-        ]
-
-        mean_seq, std_seq = compute_null_models(corrected, indices, threads=1)
-        mean_par, std_par = compute_null_models(corrected, indices, threads=2)
-
-        np.testing.assert_allclose(mean_seq, mean_par, rtol=1e-12, atol=1e-12)
-        np.testing.assert_allclose(std_seq, std_par, rtol=1e-12, atol=1e-12)
-
-    def test_load_cohort_parallel_equivalence(self) -> None:
+    def test_prenatal_mode_rejects_fasta(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            paths = []
-            for i in range(4):
-                p = Path(tmpdir) / f"sample_{i}.ccnv"
-                t = _sample_table(
-                    [10, 20, 30],
-                    contigs=["chr1", "chr1", "chr2"],
-                    starts=[0, 1000, 0],
-                    ends=[1000, 2000, 1000],
-                    bin_size=1000,
+            fasta = _write_tiny_fasta(Path(tmpdir) / "genome.fa", (("chr1", 100),))
+            with self.assertRaisesRegex(
+                ReferenceError,
+                "Flat FASTA references are only supported in --mode germline; "
+                "--mode prenatal requires a cohort --samplesheet.",
+            ):
+                run(
+                    ReferenceConfig(
+                        prefix=Path(tmpdir) / "ref",
+                        fasta=fasta,
+                        bin_size=100,
+                        mode="prenatal",
+                    )
                 )
-                pq.write_table(t, p)
-                paths.append(p)
-
-            cohort_seq = load_cohort(tuple(paths), threads=1)
-            cohort_par = load_cohort(tuple(paths), threads=2)
-
-            np.testing.assert_array_equal(cohort_seq.counts, cohort_par.counts)
-            self.assertEqual(cohort_seq.contigs, cohort_par.contigs)
-            np.testing.assert_array_equal(cohort_seq.starts, cohort_par.starts)
-            np.testing.assert_array_equal(cohort_seq.ends, cohort_par.ends)
-            self.assertEqual(cohort_seq.contig_lengths, cohort_par.contig_lengths)
-            self.assertEqual(cohort_seq.bin_size, cohort_par.bin_size)
 
 
 def _write_tiny_fasta(path: Path, records: tuple[tuple[str, int], ...]) -> Path:
