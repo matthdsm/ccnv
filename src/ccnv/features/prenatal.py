@@ -190,7 +190,6 @@ def classify_sca(
     ffa: float = 0.0,
     chrx_ratio: float = 1.0,
     prenatal_meta: PrenatalModelMetadata | None = None,
-    z_cut: float = 3.0,
     *,
     preface: float | None = None,
 ) -> SCAResult:
