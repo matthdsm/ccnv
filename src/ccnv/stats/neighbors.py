@@ -195,7 +195,7 @@ def _run_null_chunk(
         values_clean = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
         out_mean[offset] = float(np.mean(values_clean))
         s = float(np.std(values_clean, ddof=1)) if values_clean.size > 1 else 0.0
-        out_std[offset] = s if np.isfinite(s) and s > 0 else 0.0
+        out_std[offset] = s if np.isfinite(s) and s > 1e-8 else 0.0
 
     return start, out_mean, out_std
 

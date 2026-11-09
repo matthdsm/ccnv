@@ -47,6 +47,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Prevented zero-division and missing Z-score degradation in `predict.normalize_branch` by guarding against machine-epsilon `null_std` values and falling back to sample ratio standard deviation when empirical median absolute deviation degenerates to zero.
 - Resolved `UnboundLocalError` for `fasta` variable in `ccnv reference` CLI command.
 - Scaled depth normalization strictly over unmasked bins in reference build and prediction coverage, and guarded PCA reconstruction against underdetermined active bin rank.
 

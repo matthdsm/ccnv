@@ -481,7 +481,7 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
             null_std = model.null_std[idx]
             local_zscores[idx] = (
                 (ratio_val - model.null_mean[idx]) / null_std
-                if null_std > 0
+                if null_std > 1e-8
                 else np.nan
             )
         missing_zscores = np.isfinite(local_ratios) & ~np.isfinite(local_zscores)
@@ -491,9 +491,11 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
             empirical_std = 1.4826 * float(
                 scipy.stats.median_abs_deviation(finite_ratios_sub, scale=1.0)
             )
+            if empirical_std <= 1e-8:
+                empirical_std = float(np.std(finite_ratios_sub))
             local_zscores[missing_zscores] = (
                 (local_ratios[missing_zscores] - median_ratio) / empirical_std
-                if empirical_std > 1e-12
+                if empirical_std > 1e-8
                 else 0.0
             )
         eligible = (

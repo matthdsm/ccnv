@@ -756,6 +756,41 @@ class TestPredictPublishedCrams(unittest.TestCase):
         self.assertEqual(result.ratios.shape, (4,))
         self.assertTrue(np.all(np.isfinite(result.zscores)))
 
+    def test_normalize_branch_zero_mad_fallback_to_std(self) -> None:
+        # When >50% of bins share identical ratios, MAD degenerates to 0;
+        # std fallback should produce finite, non-zero z-scores for outliers.
+        model = BranchModel(
+            branch=BRANCH_AUTOSOMAL,
+            contigs=("chr1", "chr1", "chr1", "chr2", "chr2", "chr2"),
+            starts=np.array([0, 100, 200, 0, 100, 200], dtype=np.int64),
+            ends=np.array([100, 200, 300, 100, 200, 300], dtype=np.int64),
+            counts=np.array([20.0, 20.0, 20.0, 20.0, 20.0, 80.0]),
+            masked=np.zeros(6, dtype=np.bool_),
+            pca_mean=np.full(6, 0.25),
+            pca_loadings=np.zeros((1, 6)),
+            nearest_indices=(
+                np.array([3, 4, 5]),
+                np.array([3, 4, 5]),
+                np.array([3, 4, 5]),
+                np.array([0, 1, 2]),
+                np.array([0, 1, 2]),
+                np.array([0, 1, 2]),
+            ),
+            mean_distance=np.ones(6, dtype=np.float32),
+            null_mean=np.zeros(6, dtype=np.float64),
+            null_std=np.zeros(6, dtype=np.float64),
+        )
+        config = PredictConfig(
+            Path("sample"),
+            Path("reference"),
+            Path("output"),
+            min_reference_bins=2,
+        )
+        result = normalize_branch(model, config)
+        self.assertEqual(result.ratios.shape, (6,))
+        self.assertTrue(np.all(np.isfinite(result.zscores)))
+        self.assertGreater(result.zscores[5], 2.0)
+
     def test_resolve_sample_sex_inferences_and_validations(self) -> None:
         from ccnv.predict import _resolve_sample_sex
 
