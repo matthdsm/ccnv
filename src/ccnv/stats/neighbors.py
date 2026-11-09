@@ -130,6 +130,7 @@ def squeeze_var(
     else:
 
         def func(d0: float) -> float:
+            """Root objective for prior degrees of freedom d0."""
             return float(polygamma(1, d0 / 2.0)) - excess_var
 
         d0_hat = float(brentq(func, 1e-8, 1e8))

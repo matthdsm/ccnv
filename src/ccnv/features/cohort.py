@@ -139,6 +139,7 @@ def mask_low_coverage(normalized: NDArray[np.floating]) -> NDArray[np.bool_]:
 
 
 def _median_abs_deviation(values: NDArray[np.floating]) -> float:
+    """Compute the unscaled Median Absolute Deviation (MAD) of an array."""
     arr = np.asarray(values, dtype=np.float64)
     if arr.size == 0:
         return 0.0
@@ -147,6 +148,7 @@ def _median_abs_deviation(values: NDArray[np.floating]) -> float:
 
 
 def _validate_sex_cutoff(cutoff: float | None) -> None:
+    """Validate that sex separation cutoff is in range [0, 1]."""
     if cutoff is None:
         return
     if not math.isfinite(cutoff) or cutoff < 0.0 or cutoff > 1.0:
@@ -158,6 +160,7 @@ def _labels_from_cutoff(
     recorded: tuple[float, ...],
     cutoff: float,
 ) -> SexInference:
+    """Assign sex labels by thresholding contig fractions against an explicit cutoff."""
     _validate_sex_cutoff(cutoff)
     labels = tuple("male" if float(value) > cutoff else "female" for value in values)
     return SexInference(
@@ -242,6 +245,7 @@ def infer_sample_sexes(
 def _build_target_grid(
     contig_lengths: Mapping[str, int], target_bin_size: int
 ) -> pl.DataFrame:
+    """Construct a canonical DataFrame grid of genomic bin intervals for given contigs."""
     grid_contigs: list[str] = []
     grid_starts: list[np.ndarray] = []
     grid_ends: list[np.ndarray] = []
@@ -424,6 +428,7 @@ def _parse_sample_table(
     label: str,
     target_bin_size: int | None = None,
 ) -> _ParsedSample:
+    """Validate and unpack a sample table, rebinning if needed."""
     try:
         validate_table(table, ArtifactKind.SAMPLE)
     except SchemaError as error:
@@ -467,6 +472,7 @@ def _assemble_cohort(
     paths: Sequence[Path],
     target_bin_size: int | None = None,
 ) -> Cohort:
+    """Combine parsed sample tables into an aligned Cohort structure."""
     (
         first_meta,
         expected_lengths,

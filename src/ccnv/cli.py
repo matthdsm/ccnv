@@ -663,6 +663,7 @@ def predict(
 
 
 def _fail(error: BaseException, code: int) -> NoReturn:
+    """Print error message to stderr and terminate CLI with given exit code."""
     typer.secho(str(error), err=True, fg="red")
     raise typer.Exit(code=code) from error
 

@@ -28,6 +28,7 @@ __all__ = [
 
 @functools.cache
 def _get_samplesheet_schema() -> dict[str, Any]:
+    """Load and cache the JSON schema for samplesheet validation."""
     schema_ref = importlib.resources.files("ccnv.io").joinpath(
         "samplesheet.schema.json"
     )
@@ -36,6 +37,7 @@ def _get_samplesheet_schema() -> dict[str, Any]:
 
 
 def _validate_sample_file(path: Path) -> None:
+    """Validate that sample path exists and conforms to sample Parquet schema."""
     if not path.is_file():
         raise ReferenceError(f"{path}: sample file not found")
     try:

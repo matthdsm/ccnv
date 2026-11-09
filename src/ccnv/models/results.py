@@ -57,6 +57,7 @@ class SCAResult:
     ff_delta: float | None = None
 
     def __post_init__(self) -> None:
+        """Validate SCA call validity."""
         if self.call not in ("XX", "XY", "XO", "XXX", "XXY", "XYY", "DISCORDANT_MIXED"):
             raise ValueError(f"invalid SCA call: {self.call!r}")
 
@@ -84,6 +85,7 @@ class FetalFractionResult:
         return self.ffa
 
     def __post_init__(self) -> None:
+        """Validate fetal sex and active FF source invariants."""
         if self.fetal_sex not in ("M", "F"):
             raise ValueError(f"fetal_sex must be 'M' or 'F', got {self.fetal_sex!r}")
         if self.active_ff_source not in ("FFY", "FFA"):

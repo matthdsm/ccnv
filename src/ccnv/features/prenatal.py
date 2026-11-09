@@ -86,6 +86,7 @@ def _build_prenatal_branch_table(
     pca_loadings: list[list[float]] | None = None,
     null_mean: NDArray[np.float64] | None = None,
 ) -> pa.Table:
+    """Build a prenatal branch table containing coordinates and null models."""
     n_bins = len(contigs)
     return pa.table(
         {
@@ -203,7 +204,7 @@ def classify_sca(
     chrx_zscore = float((chrx_ratio - mu_f) / std_f)
 
     rx = float(chrx_ratio)
-    delta_x = (rx - 1.0) if abs(rx - 1.0) > 1e-6 else -0.5 * ffx
+    delta_x = rx - 1.0
     f_y = float(ffy) if (fetal_sex == "M" and ffy is not None) else 0.0
     ff_delta = float(ffx - f_y) if fetal_sex == "M" else None
 
@@ -842,16 +843,6 @@ def annotate_prenatal_segments(
 
         implied_ff = 2.0 * abs(2.0**seg.ratio - 1.0)
 
-        # Standard error sigma_m and fetal-fraction LLR
-        if abs(seg.zscore) > 0.1:
-            sigma_m = abs(seg.ratio) / max(abs(seg.zscore), 1e-6)
-        else:
-            sigma_m = 0.20 / math.sqrt(max(seg.bin_count, 1))
-        sigma_m = max(sigma_m, 1e-6)
-
-        mu_1 = expected_ratio
-        llr_fetal = (seg.ratio**2 - (seg.ratio - mu_1) ** 2) / (2.0 * sigma_m**2)
-
         norm_contig = normalize_chr(seg.contig)
         is_gonosome = norm_contig in {"X", "Y"}
         has_call = (seg.call is not None) or (abs(seg.zscore) >= z_threshold)
@@ -862,7 +853,7 @@ def annotate_prenatal_segments(
         if is_gonosome and (prenatal_result.sca.is_aneuploid or has_call):
             discordant = True
             reason = "SCA_DISCORDANT"
-        elif has_call and (abs(seg.ratio) < 0.5 * abs(expected_ratio) or llr_fetal < 0):
+        elif has_call and abs(seg.ratio) < 0.5 * abs(expected_ratio):
             discordant = True
             reason = "SUB_FETAL_RATIO"
         elif has_call and implied_ff > max(2.5 * active_ff, active_ff + 0.15):

@@ -55,20 +55,25 @@ def fit_pca(
     if data.ndim != 2 or data.size == 0:
         raise ReferenceError("PCA requires a non-empty bins-by-samples matrix")
     samples = data.T
-    if n_components is None:
-        n_components = optimal_svht_rank(data, max_components=10)
-    else:
-        n_components = min(n_components, samples.shape[0], samples.shape[1])
-    if n_components < 1:
+    if n_components is not None and n_components < 1:
         raise ReferenceError("PCA requires at least one sample and one unmasked bin")
+    max_k = min(
+        10 if n_components is None else n_components,
+        samples.shape[0],
+        samples.shape[1],
+    )
+    if max_k < 1:
+        raise ReferenceError("PCA requires at least one sample and one unmasked bin")
+    rank = optimal_svht_rank(data, max_components=max_k)
+    rank = min(rank, samples.shape[0], samples.shape[1])
     mean = np.mean(samples, axis=0)
     if np.allclose(samples, mean):
         return (
             np.ones(data.shape, dtype=np.float64),
             mean.astype(np.float64, copy=False),
-            np.zeros((n_components, samples.shape[1]), dtype=np.float64),
+            np.zeros((rank, samples.shape[1]), dtype=np.float64),
         )
-    pca = PCA(n_components=n_components, svd_solver="full")
+    pca = PCA(n_components=rank, svd_solver="full")
     pca.fit(samples)
     if (
         hasattr(pca, "explained_variance_ratio_")
@@ -77,7 +82,7 @@ def fit_pca(
         finite_vars = np.nan_to_num(pca.explained_variance_ratio_ * 100.0)
         logger.debug(
             "PCA fitted %d components: explained variance [%s] (total=%.2f%%)",
-            n_components,
+            rank,
             ", ".join(f"{v:.2f}%" for v in finite_vars),
             float(np.sum(finite_vars)),
         )

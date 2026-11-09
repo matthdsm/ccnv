@@ -22,6 +22,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - End-to-end DataFrame-native execution (`F12`) using Polars expressions, zero-copy Arrow-to-Polars interop, Rust integer-multiple coarsening fast path, and vectorized 2D neighbor-matrix median evaluations.
 - Comprehensive mathematical methodology overhaul in `docs/methodology.md`, incorporating 51 peer-reviewed citations with DOIs, official Python library documentation links, and complete 4-tier provenance taxonomy.
 - Cell-free DNA (cfDNA) prenatal analysis mode (`--mode prenatal`): integrated prenatal screening into `ccnv reference` and `ccnv predict`, estimating fetal fraction via `FFY`, `FFX`, and `FFA`, classifying fetal sex and sex chromosome aneuploidies (`XX`, `XY`, `XO`, `XXX`, `XXY`, `XYY`, `DISCORDANT_MIXED`), and evaluating CNV segment discordance against active fetal fraction expectations.
+- `rebin_counts` and `rebin_sample_table` for 1D mass-conserving count interpolation across bin grids.
+- `ccnv convert`: stream BAM/CRAM into versioned sample Parquet, auto-index missing `.bai`/`.crai`, bin canonical chromosomes (or `--all-contigs`), and split `--threads` across contig workers and htslib decode.
+- `ccnv reference`: build autosomal and optional sex-contig models from control Parquet, or a flat uniform-depth model from FASTA when there is no cohort.
+- `ccnv predict`: PCA-normalize, segment with weighted Binseg, call gains and losses, and write bgzipped/indexed BED, VCFv4.2, and optional SVG.
+- Versioned Parquet contracts (`1.0.0`), header-authoritative contig layouts, and organism-agnostic naming (no fixed 24-chromosome genome).
+- Sex-contig branches inferred from a Y-signal contig (`--sex-cutoff` optional); no per-sample sex labels on the CLI.
+- CI that publishes multi-arch (`linux/amd64`, `linux/arm64`) GHCR images from `pixi.lock` (`latest` on `master`; SHA, version, and `stable` on release) and attaches a Python wheel to GitHub Releases. Local images: `pixi run docker-build`.
+- Real-world NIPT conversion, reference creation, and prediction benchmarks documented in `docs/benchmark.md`.
+- CI rejects pull requests that do not update `CHANGELOG.md`.
 
 ### Changed
 
@@ -38,18 +47,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `ccnv ref-qc`: evaluate reference model usability and quality heuristics (`PASS`, `WARN`, `FAIL`) on existing reference files, emitting `<prefix>_qc.json` and a stderr summary.
 - Reference creation quality control: `ccnv reference` automatically evaluates reference metrics and writes `<prefix>_qc.json` during build (toggleable via `--qc-report / --no-qc-report`).
 - Comprehensive pipeline architecture documentation (`docs/pipeline.md`) with detailed Mermaid flowcharts for all pipeline subcommands (`convert`, `reference`, `ref-qc`, `predict`), and embedded stage flowcharts in the CLI reference (`docs/cli.md`).
-- `rebin_counts` and `rebin_sample_table` for 1D mass-conserving count interpolation across bin grids.
-- `ccnv convert`: stream BAM/CRAM into versioned sample Parquet, auto-index missing `.bai`/`.crai`, bin canonical chromosomes (or `--all-contigs`), and split `--threads` across contig workers and htslib decode.
-- `ccnv reference`: build autosomal and optional sex-contig models from control Parquet, or a flat uniform-depth model from FASTA when there is no cohort.
-- `ccnv predict`: PCA-normalize, segment with weighted Binseg, call gains and losses, and write bgzipped/indexed BED, VCFv4.2, and optional SVG.
-- Versioned Parquet contracts (`1.0.0`), header-authoritative contig layouts, and organism-agnostic naming (no fixed 24-chromosome genome).
-- Sex-contig branches inferred from a Y-signal contig (`--sex-cutoff` optional); no per-sample sex labels on the CLI.
-- CI that publishes multi-arch (`linux/amd64`, `linux/arm64`) GHCR images from `pixi.lock` (`latest` on `master`; SHA, version, and `stable` on release) and attaches a Python wheel to GitHub Releases. Local images: `pixi run docker-build`.
-- Real-world NIPT conversion, reference creation, and prediction benchmarks documented in `docs/benchmark.md`.
-- CI rejects pull requests that do not update `CHANGELOG.md`.
-
-### Changed
-
 - Updated `docs/pipeline.md`, `docs/cli.md`, `README.md`, `AGENTS.md`, and `src/**/README.md` to reflect all upgraded statistical, machine learning, and DataFrame-native foundations.
 - Removed stale `ProcessPoolExecutor` invariants and side effects in `src/ccnv/stats/README.md` and root `src/ccnv/README.md`, replacing them with multi-threaded `KDTree.query(..., workers=threads)`.
 - Corrected rebinning count persistence in `src/ccnv/features/cohort.py:rebin_sample_table` to output `float64` continuous totals.

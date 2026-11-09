@@ -73,6 +73,7 @@ def split_thread_budget(budget: int, n_tasks: int) -> tuple[int, int]:
 
 
 def _worker_handle(task: _ContigTask) -> pysam.AlignmentFile:
+    """Retrieve or open a cached per-process AlignmentFile handle."""
     key = (
         str(task.path),
         task.fmt,
@@ -87,12 +88,14 @@ def _worker_handle(task: _ContigTask) -> pysam.AlignmentFile:
 
 
 def _bin_contig(task: _ContigTask) -> tuple[np.ndarray, dict[str, int]]:
+    """Bin reads for a contig task using a cached worker alignment handle."""
     return bin_contig_with_handle(_worker_handle(task), task)
 
 
 def bin_contig_with_handle(
     handle: pysam.AlignmentFile, task: _ContigTask
 ) -> tuple[np.ndarray, dict[str, int]]:
+    """Stream and bin reads for a contig using an open alignment handle."""
     starts, _ = bin_intervals(task.length, task.bin_size)
     qc = empty_qc()
     reads = list(
@@ -108,6 +111,7 @@ def bin_contig_with_handle(
 def _binned_contigs(
     tasks: Sequence[_ContigTask], workers: int, handle: pysam.AlignmentFile
 ) -> Iterator[Iterator[tuple[np.ndarray, dict[str, int]]]]:
+    """Yield an iterator of binned contig counts across single-process or worker pool."""
     if workers <= 1 or len(tasks) < 2:
         yield (bin_contig_with_handle(handle, task) for task in tasks)
     else:

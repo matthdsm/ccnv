@@ -485,15 +485,16 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
         active_padded[:U] = np.where(eligible, corrected, np.nan)
 
         if max_k > 0:
-            usable_nbr_counts = np.sum(
-                np.isfinite(active_padded[neighbor_matrix]), axis=1
-            )
+            usable_nbr_counts = np.zeros(U, dtype=np.int64)
             baselines = np.full(U, np.nan, dtype=np.float64)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 for start_idx in range(0, U, CHUNK_SIZE):
                     end_idx = min(start_idx + CHUNK_SIZE, U)
                     chunk_vals = active_padded[neighbor_matrix[start_idx:end_idx]]
+                    usable_nbr_counts[start_idx:end_idx] = np.sum(
+                        np.isfinite(chunk_vals), axis=1
+                    )
                     baselines[start_idx:end_idx] = np.nanmedian(chunk_vals, axis=1)
         else:
             usable_nbr_counts = np.zeros(U, dtype=np.int64)
@@ -552,6 +553,12 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
     if np.any(finite_ratios):
         median_shift = float(np.median(local_ratios[finite_ratios]))
         local_ratios[finite_ratios] -= median_shift
+
+    finite_zscores = np.isfinite(local_zscores)
+    if np.any(finite_zscores):
+        zscore_shift = float(np.median(local_zscores[finite_zscores]))
+        local_zscores[finite_zscores] -= zscore_shift
+
     logger.debug(
         "branch %s: %d finite ratios, median shift=%.4f (mean=%.4f, std=%.4f)",
         model.branch,
@@ -880,6 +887,7 @@ def _resolve_sample_sex(
     metadata: dict[str, object],
     branches: set[object],
 ) -> Sex | None:
+    """Infer sample genetic sex from sex-signal contig coverage against reference cutoff."""
     if requested != "autosomal":
         return requested
     if not ({BRANCH_FEMALE_SEX, BRANCH_MALE_SEX} & branches):
@@ -917,6 +925,7 @@ def _resolve_sample_sex(
 
 
 def _contig_lengths(metadata: dict[str, object]) -> dict[str, int]:
+    """Extract contig lengths dictionary from reference metadata."""
     val = metadata.get("contig_lengths")
     if not isinstance(val, dict):
         raise PredictError("artifact metadata has no contig lengths")
@@ -924,6 +933,7 @@ def _contig_lengths(metadata: dict[str, object]) -> dict[str, int]:
 
 
 def _validate_config(config: PredictConfig) -> None:
+    """Validate prediction configuration parameters."""
     if (
         not np.isfinite(config.penalty)
         or config.penalty <= 0
@@ -952,6 +962,7 @@ def _validate_config(config: PredictConfig) -> None:
 
 
 def _require_aligned(length: int, *arrays: ArrayLike) -> None:
+    """Ensure all provided arrays have 1D shape matching expected length."""
     if any(np.asarray(a).shape != (length,) for a in arrays):
         raise PredictError(
             "prediction result arrays must be aligned and one-dimensional"

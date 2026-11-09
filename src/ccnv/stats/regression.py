@@ -27,6 +27,7 @@ __all__ = [
 
 
 def _is_valid_covariate(arr: NDArray[np.float64] | None) -> bool:
+    """Check if covariate array is non-empty, finite, and has variance above threshold."""
     if arr is None or arr.size < 2:
         return False
     if not np.all(np.isfinite(arr)):

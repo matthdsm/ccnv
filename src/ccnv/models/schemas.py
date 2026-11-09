@@ -85,6 +85,7 @@ class PrenatalModelMetadata:
         return self.ffa_logit_mode
 
     def __post_init__(self) -> None:
+        """Validate prenatal model metadata dimensions and types."""
         if (
             not isinstance(self.prenatal_bin_size, int)
             or isinstance(self.prenatal_bin_size, bool)
@@ -98,6 +99,7 @@ class PrenatalModelMetadata:
             object.__setattr__(self, "mlp_b2", [float(self.mlp_b2)])
 
     def to_dict(self) -> dict[str, Any]:
+        """Convert metadata container to a JSON-serializable dictionary."""
         return {
             "prenatal_bin_size": int(self.prenatal_bin_size),
             "yfrac_threshold": float(self.yfrac_threshold),
@@ -127,6 +129,7 @@ class PrenatalModelMetadata:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PrenatalModelMetadata:
+        """Construct prenatal model metadata from a parsed dictionary."""
         raw_bin_size = data["prenatal_bin_size"]
         if isinstance(raw_bin_size, bool):
             raise TypeError(
@@ -168,12 +171,14 @@ class PrenatalModelMetadata:
         )
 
     def encode(self) -> bytes:
+        """Serialize metadata container to canonical JSON UTF-8 bytes."""
         return json.dumps(
             self.to_dict(), sort_keys=True, separators=(",", ":")
         ).encode()
 
     @classmethod
     def decode(cls, raw: bytes | str | Mapping[str, Any]) -> PrenatalModelMetadata:
+        """Decode prenatal model metadata from JSON bytes, string, or mapping."""
         if isinstance(raw, (bytes, bytearray)):
             raw = raw.decode("utf-8")
         if isinstance(raw, str):
@@ -191,6 +196,7 @@ class PrenatalModelMetadata:
     def from_metadata(
         cls, metadata: Mapping[bytes, bytes] | None
     ) -> PrenatalModelMetadata | None:
+        """Extract and decode prenatal model metadata from Arrow schema metadata."""
         if metadata is None:
             return None
         raw = metadata.get(PRENATAL_METADATA_KEY)
@@ -200,6 +206,7 @@ class PrenatalModelMetadata:
 
     @classmethod
     def from_table(cls, table: pa.Table) -> PrenatalModelMetadata | None:
+        """Extract and decode prenatal model metadata from an Arrow Table."""
         return cls.from_metadata(table.schema.metadata)
 
 
@@ -232,6 +239,7 @@ class ReferenceMetadata:
     prenatal: PrenatalModelMetadata | None = None
 
     def __post_init__(self) -> None:
+        """Validate reference metadata configuration and contig lengths."""
         if (
             not isinstance(self.bin_size, int)
             or isinstance(self.bin_size, bool)
@@ -257,6 +265,7 @@ class ReferenceMetadata:
             raise ValueError("contig_lengths must be a non-empty mapping")
 
     def to_metadata(self) -> dict[str, object]:
+        """Convert reference metadata to a dictionary for Arrow table persistence."""
         model: dict[str, object] = {
             "bin_size": self.bin_size,
             "branches": list(self.branches),
@@ -288,6 +297,7 @@ class ReferenceMetadata:
         return values
 
     def build_arrow_metadata(self) -> dict[bytes, bytes]:
+        """Build Arrow metadata mapping containing reference metadata."""
         return metadata_for(
             ArtifactKind.REFERENCE,
             contig_lengths=self.contig_lengths,
@@ -296,6 +306,7 @@ class ReferenceMetadata:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> ReferenceMetadata:
+        """Construct reference metadata from a decoded metadata dictionary."""
         model_obj = data.get("model")
         model = dict(model_obj) if isinstance(model_obj, Mapping) else {}
         contig_lengths_obj = data.get("contig_lengths", {})
@@ -395,10 +406,12 @@ class ReferenceMetadata:
 
     @classmethod
     def from_schema(cls, schema: pa.Schema) -> ReferenceMetadata:
+        """Construct reference metadata from an Arrow Schema."""
         return cls.from_dict(decode_metadata(schema.metadata))
 
     @classmethod
     def from_table(cls, table: pa.Table) -> ReferenceMetadata:
+        """Construct reference metadata from an Arrow Table."""
         return cls.from_schema(table.schema)
 
 

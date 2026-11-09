@@ -53,6 +53,7 @@ class WeightedL2Cost(BaseCost):
     min_size = 1
 
     def __init__(self) -> None:
+        """Initialize empty weighted L2 cost accumulator."""
         self.signal = np.empty((0, 2), dtype=np.float64)
         self._weight_sum = np.zeros(1, dtype=np.float64)
         self._weighted_value_sum = np.zeros(1, dtype=np.float64)
@@ -250,6 +251,7 @@ def segment_genome(
 
 
 def _cumulative(values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Prefix cumulative sum with leading zero."""
     return np.concatenate((np.zeros(1, dtype=np.float64), np.cumsum(values)))
 
 
@@ -262,6 +264,7 @@ def _find_breakpoints(
     min_size: int,
     jump: int,
 ) -> list[int]:
+    """Detect change-point indices in a euchromatic block using ruptures."""
     n_samples = signal.shape[0]
     if n_samples < 2 * min_size:
         return [n_samples]
@@ -305,6 +308,7 @@ def _validate_inputs(
     NDArray[np.float64],
     NDArray[np.float64],
 ]:
+    """Validate input interval coordinates, numerical arrays, and segmentation parameters."""
     if not contig:
         raise ValueError("contig must not be empty")
     if contig_length <= 0:
@@ -352,6 +356,7 @@ def _split_blacklist_gaps(
     usable: NDArray[np.bool_],
     max_gap: int,
 ) -> Sequence[tuple[int, int]]:
+    """Partition interval range into contiguous euchromatic blocks split at large masked gaps."""
     splits: list[tuple[int, int]] = []
     cursor = left
     index = left
@@ -381,6 +386,7 @@ def _make_segment(
     weights: NDArray[np.float64],
     usable: NDArray[np.bool_],
 ) -> Segment | None:
+    """Create a Segment object with weighted mean ratio and total weight."""
     valid_indexes = np.flatnonzero(usable[left:right]) + left
     if valid_indexes.size == 0:
         return None

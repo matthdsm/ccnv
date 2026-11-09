@@ -29,6 +29,7 @@ class ReadFilters:
     require_proper_pair: bool = True
 
     def __post_init__(self) -> None:
+        """Validate filter thresholds."""
         if self.min_mapping_quality < 0:
             raise ValueError("min_mapping_quality must be non-negative")
 
@@ -44,6 +45,7 @@ class ExtractConfig:
     all_contigs: bool = False
 
     def __post_init__(self) -> None:
+        """Validate extraction configuration invariants."""
         if self.bin_size <= 0:
             raise ValueError("bin_size must be a positive integer")
         if self.threads <= 0:
@@ -83,6 +85,7 @@ class ReferenceConfig:
         return self.samples
 
     def __post_init__(self) -> None:
+        """Validate and normalize reference configuration invariants."""
         if isinstance(self.samples, (Path, str)):
             object.__setattr__(self, "prefix", Path(self.samples))
             object.__setattr__(self, "samples", ())
@@ -135,6 +138,7 @@ class PredictConfig:
     min_fetal_fraction_warning: float = 0.04
 
     def __post_init__(self) -> None:
+        """Validate prediction configuration invariants."""
         if self.mode not in ("germline", "prenatal"):
             raise ValueError(
                 f"mode must be 'germline' or 'prenatal', got {self.mode!r}"

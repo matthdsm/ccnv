@@ -112,7 +112,7 @@ ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
 | `--mode` | `germline` | Prediction mode: `germline` (standard diploid CNV analysis) or `prenatal` (joint CNV, Bates-Granger precision-fused fetal fraction, 2D stoichiometric Bayesian SCA, and LLR discordance analysis). |
 | `--prefix` | sample stem | Output path prefix. |
 | `--sex` | `autosomal` | Branch selection: `autosomal` (infers sex when sex branches exist), `female`, or `male`. (In `prenatal` mode, `chrX` is always normalized against the diploid `XX` female branch). |
-| `--penalty` | `1.0` | Weighted sum-of-squared-errors segmentation penalty per breakpoint (evaluated across pre-split euchromatic arm blocks with C-compiled KernelCPD, Pelt, or Binseg). |
+| `--penalty` | `1.0` | Weighted sum-of-squared-errors segmentation penalty per breakpoint (evaluated across pre-split euchromatic arm blocks with weighted Binseg). |
 | `--z-threshold` | `3.0` | Absolute autocorrelation-corrected Stouffer Z-score threshold for calling gains and losses. |
 | `--ratio-threshold` | unset | Absolute $\log_2$ ratio call threshold (overrides `--z-threshold` when set). |
 | `--min-reference-bins` | `3` | Minimum within-sample reference bins required to normalize a target bin. |
@@ -140,7 +140,7 @@ flowchart LR
     B --> C["Branch Selection & B-Spline Scaling"]
     C --> D["Robust HuberRegressor PCA Projection"]
     D --> E["Vectorized Within-Sample Normalization & EB Precision Weights"]
-    E --> F["Pre-Split Euchromatic Segmentation (KernelCPD / Pelt / Binseg)"]
+    E --> F["Pre-Split Euchromatic Segmentation (Weighted Binseg)"]
     F --> G["Polars Autocorrelation-Corrected Stouffer Z-Score Calling"]
     G --> H["BED.gz, VCF.gz & HTML"]
 ```

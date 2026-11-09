@@ -19,6 +19,7 @@ from sklearn.linear_model import (
     RidgeCV,
 )
 from sklearn.mixture import GaussianMixture
+from sklearn.model_selection import KFold, cross_val_predict
 
 __all__ = [
     "fit_elasticnet_ffy",
@@ -85,6 +86,7 @@ def infer_sex_gmm_1d(
         return y >= thresh, thresh
 
     def _posterior_diff(val: float) -> float:
+        """Evaluate difference between male component posterior probability and 0.5."""
         probs = gmm.predict_proba(np.array([[val]], dtype=np.float64))
         return float(probs[0, male_idx] - 0.5)
 
@@ -231,8 +233,45 @@ def fit_ffa_logit_ensemble(
     )
     b_ens = 0.5 * (float(ridge.intercept_) + float(enet.intercept_))
 
-    y_pred = scipy.special.expit(x_arr @ w_ens + b_ens)
-    sigma_ffa = max(float(np.sqrt(np.mean((y_pred - y_clip) ** 2))), 0.005)
+    sigma_ffa: float | None = None
+    if n_samples >= 6:
+        try:
+            cv_outer = min(5, n_samples)
+            cv_inner = max(
+                2, min(3, n_samples - (n_samples + cv_outer - 1) // cv_outer)
+            )
+            cv = KFold(n_splits=cv_outer, shuffle=True, random_state=seed)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", (ConvergenceWarning, UserWarning))
+                r_pred = cross_val_predict(
+                    RidgeCV(alphas=np.logspace(-2, 4, 40)), x_arr, u, cv=cv
+                )
+                e_pred = cross_val_predict(
+                    ElasticNetCV(
+                        l1_ratio=[0.1, 0.5],
+                        cv=cv_inner,
+                        random_state=seed,
+                        max_iter=3000,
+                    ),
+                    x_arr,
+                    u,
+                    cv=cv,
+                )
+            ens_pred = scipy.special.expit(0.5 * (r_pred + e_pred))
+            sigma_ffa = max(float(np.sqrt(np.mean((ens_pred - y_clip) ** 2))), 0.005)
+        except (
+            ValueError,
+            TypeError,
+            ZeroDivisionError,
+            FloatingPointError,
+            RuntimeError,
+        ):
+            sigma_ffa = None
+
+    if sigma_ffa is None:
+        y_pred = scipy.special.expit(x_arr @ w_ens + b_ens)
+        sigma_ffa = max(float(np.sqrt(np.mean((y_pred - y_clip) ** 2))), 0.005)
+
     return w_ens, b_ens, sigma_ffa
 
 
@@ -277,6 +316,7 @@ def fit_rprop_mlp(
     def _loss_and_grad(
         theta: NDArray[np.float64],
     ) -> tuple[float, NDArray[np.float64]]:
+        """Compute MSE loss and analytical gradient for 2-layer MLP."""
         w1 = theta[:s1].reshape(n_features, hidden_dim)
         b1 = theta[s1:s2]
         w2 = theta[s2:s3].reshape(hidden_dim, 1)

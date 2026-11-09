@@ -21,7 +21,7 @@ flowchart TD
     subgraph Inference["Sample Inference & Segmentation"]
         I --> J["ccnv.predict: project_coverage (Huber) & normalize_branch (Vectorized 2D)"]
         C --> J
-        J --> K["ccnv.stats.segmentation: Pre-Split Euchromatic Segmentation (KernelCPD / Pelt / Binseg)"]
+        J --> K["ccnv.stats.segmentation: Pre-Split Euchromatic Segmentation (Weighted Binseg)"]
         K --> L["ccnv.predict: segment_and_call (Polars Stouffer AR1 Z-Score)"]
     end
     subgraph Reporting["Artifact Generation"]
