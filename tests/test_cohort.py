@@ -100,5 +100,99 @@ class TestCohortLoading(unittest.TestCase):
             self.assertEqual(rebinned.counts.shape, (2, 4))
 
 
+class TestCohortDepthAndRebinning(unittest.TestCase):
+    def test_normalize_depth_median_of_ratios_matches_deseq2_and_resists_trisomy(
+        self,
+    ) -> None:
+        from ccnv.features.cohort import estimate_size_factors, normalize_depth
+
+        # 10 bins x 4 samples; sample 0 has 2x library depth and a 10x amplification in bins 0..2
+        base = np.full((10, 4), 100.0, dtype=np.float64)
+        base[:, 0] = 200.0
+        base[0:3, 0] = 2000.0  # 30% of genome amplified 10x in sample 0
+
+        # Reference DESeq2 formula: geometric mean per row, then median of ratios per sample
+        log_gm = np.mean(np.log(base), axis=1, keepdims=True)
+        expected_sf = np.median(base / np.exp(log_gm), axis=0)
+        sf = estimate_size_factors(base)
+        np.testing.assert_allclose(
+            sf / np.median(sf),
+            expected_sf / np.median(expected_sf),
+            rtol=1e-12,
+        )
+
+        normed = normalize_depth(base)
+        # Unamplified diploid bins (3..9) in sample 0 must equal diploid bins in samples 1..3
+        np.testing.assert_allclose(normed[3:, 0], normed[3:, 1], rtol=1e-12)
+
+    def test_normalize_depth_sparse_zero_fallback(self) -> None:
+        from ccnv.features.cohort import normalize_depth
+
+        sparse = np.array([[10.0, 0.0], [0.0, 20.0]], dtype=np.float64)
+        normed = normalize_depth(sparse)
+        np.testing.assert_allclose(normed.sum(axis=0), [1.0, 1.0], rtol=1e-12)
+
+    def test_rebin_cohort_polars_fast_path_coarsening(self) -> None:
+        from ccnv.features.cohort import Cohort, rebin_cohort
+
+        cohort = Cohort(
+            counts=np.arange(1, 9, dtype=np.float64).reshape(4, 2),
+            contigs=("chr1", "chr1", "chr1", "chr1"),
+            starts=np.array([0, 50, 100, 150], dtype=np.int64),
+            ends=np.array([50, 100, 150, 180], dtype=np.int64),
+            contig_lengths={"chr1": 180},
+            bin_size=50,
+            identities=({"id": "a"}, {"id": "b"}),
+            paths=(Path("a.ccnv"), Path("b.ccnv")),
+        )
+        rebinned = rebin_cohort(cohort, 100)
+        np.testing.assert_array_equal(rebinned.starts, [0, 100])
+        np.testing.assert_array_equal(rebinned.ends, [100, 180])
+        np.testing.assert_allclose(rebinned.counts, [[4.0, 6.0], [12.0, 14.0]])
+
+    def test_estimate_size_factors_validation(self) -> None:
+        from ccnv.features.cohort import InvalidInputError, estimate_size_factors
+
+        with self.assertRaises(InvalidInputError):
+            estimate_size_factors(np.array([1.0, 2.0]))
+
+        with self.assertRaises(InvalidInputError):
+            estimate_size_factors(np.array([[-1.0, 2.0], [3.0, 4.0]]))
+
+        with self.assertRaises(InvalidInputError):
+            estimate_size_factors(np.array([[0.0, 2.0], [0.0, 4.0]]))
+
+        with self.assertRaises(InvalidInputError):
+            estimate_size_factors(
+                np.array([[1.0, 2.0], [3.0, 4.0]]),
+                mask=np.array([True]),
+            )
+
+        with self.assertRaises(InvalidInputError):
+            estimate_size_factors(
+                np.array([[1.0, 2.0], [3.0, 4.0]]),
+                mask=np.array([False, False]),
+            )
+
+    def test_rebin_sample_table_polars_fast_path(self) -> None:
+        from ccnv.features.cohort import rebin_sample_table
+
+        table = make_sample_table(
+            [10.0, 20.0, 30.0, 40.0],
+            contigs=["chr1", "chr1", "chr1", "chr1"],
+            starts=[0, 50, 100, 150],
+            ends=[50, 100, 150, 180],
+            contig_lengths={"chr1": 180, "chr2": 100},
+            bin_size=50,
+        )
+        rebinned = rebin_sample_table(table, 100)
+        self.assertEqual(rebinned.column("start").to_pylist(), [0, 100, 0])
+        self.assertEqual(rebinned.column("end").to_pylist(), [100, 180, 100])
+        self.assertEqual(rebinned.column("count").to_pylist(), [30.0, 70.0, 0.0])
+        self.assertEqual(
+            rebinned.column("contig").to_pylist(), ["chr1", "chr1", "chr2"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
