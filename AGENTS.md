@@ -91,6 +91,7 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 ## Agent Specific Instructions
 
 - **Environment Awareness:** Always prefer `pixi run <command>` over direct execution if a pixi task exists.
+- **GitHub Actions:** Ensure github actions are using the latest version at all times, updating the workflow files as needed. Reverting to older versions is strictly forbidden.
 - **Surgical Updates:** When fixing bugs, prioritize small, targeted changes and adding a corresponding test case.
 - **Documentation:** Update this document and README if you make changes that affect the overall architecture or development workflow. Keep all WisecondorX comparisons strictly inside `docs/benchmark.md`.
 - **Markdown Formatting:** Do not hard-wrap lines in Markdown files; rely on editor soft-wrapping for line length. Keep paragraphs and list items on a single logical line. Avoid unnecessary newlines, redundant blank lines, and empty lines inside Mermaid diagram blocks.
