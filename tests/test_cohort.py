@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 from helpers import make_sample_table
 
@@ -274,7 +275,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
     def test_rebin_sample_table_drops_null_elements_in_fragment_lengths(self) -> None:
         from ccnv.features.cohort import rebin_sample_table
 
-        # Coarsen 50 bp -> 100 bp with null element inside list
+        # Coarsen 50 bp -> 100 bp with an explicit Arrow null element inside list
         table = make_sample_table(
             [10, 20],
             contigs=["chr1", "chr1"],
@@ -284,10 +285,39 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             bin_size=50,
             fragment_lengths=[[120, 130], [140]],
         )
+        frag_idx = table.schema.get_field_index("fragment_lengths")
+        table = table.set_column(
+            frag_idx,
+            pa.field("fragment_lengths", pa.list_(pa.uint16()), nullable=False),
+            pa.array([[120, None, 130], [140]], type=pa.list_(pa.uint16())),
+        )
         rebinned = rebin_sample_table(table, 100)
         self.assertEqual(
             rebinned.column("fragment_lengths").to_pylist(),
             [[120, 130, 140]],
+        )
+        # Also verify empty target bin produces [] without nulls and preserves target-grid order
+        sparse = make_sample_table(
+            [10, 20],
+            contigs=["chr2", "chr1"],
+            starts=[50, 0],
+            ends=[100, 50],
+            contig_lengths={"chr1": 200, "chr2": 100},
+            bin_size=50,
+            fragment_lengths=[[150], [140]],
+        )
+        rebinned_sparse = rebin_sample_table(sparse, 100)
+        self.assertEqual(
+            rebinned_sparse.column("contig").to_pylist(),
+            ["chr1", "chr1", "chr2"],
+        )
+        self.assertEqual(
+            rebinned_sparse.column("start").to_pylist(),
+            [0, 100, 0],
+        )
+        self.assertEqual(
+            rebinned_sparse.column("fragment_lengths").to_pylist(),
+            [[140], [], [150]],
         )
 
     def test_rebin_sample_table_non_nested_drops_fragmentomic_metadata_with_warning(

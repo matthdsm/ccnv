@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Final
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy import ndimage, signal
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import ElasticNetCV, RidgeCV
+from sklearn.model_selection import KFold
 
 from ccnv.models.schemas import FragmentomicsMetadata, PrenatalModelMetadata
 
@@ -238,23 +241,29 @@ def deconvolve_fetal_maternal_densities(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Cohort deconvolution of pure fetal and maternal cfDNA fragment length densities."""
     lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
-    n_males = int(np.sum(male_mask))
-    n_females = int(np.sum(~male_mask))
+    male_arr = np.asarray(male_mask, dtype=bool)
+    ff = np.asarray(ffy_values, dtype=np.float64)
+    eligible_males = male_arr & np.isfinite(ff) & (ff >= 0.08)
+    female_mask = ~male_arr
+    n_eligible_males = int(np.sum(eligible_males))
+    n_females = int(np.sum(female_mask))
 
     chry_arr = np.asarray(aligned_chry_hists, dtype=np.float64)
     auto_arr = np.asarray(aligned_auto_hists, dtype=np.float64)
 
-    male_chry_reads = np.sum(chry_arr[male_mask]) if n_males > 0 else 0.0
+    male_chry_reads = (
+        float(np.sum(chry_arr[eligible_males])) if n_eligible_males > 0 else 0.0
+    )
 
     # 1. Pure Fetal Density p_F(L)
-    if n_males >= 5 and male_chry_reads >= 500.0:
-        pooled_male = np.sum(chry_arr[male_mask], axis=0)
+    if n_eligible_males >= 5 and male_chry_reads >= 500.0:
+        pooled_male = np.sum(chry_arr[eligible_males], axis=0)
         pooled_female = (
-            np.sum(chry_arr[~male_mask], axis=0)
+            np.sum(chry_arr[female_mask], axis=0)
             if n_females > 0
             else np.zeros(FRAG_NUM_BINS)
         )
-        bg_scale = float(n_males) / max(float(n_females), 1.0)
+        bg_scale = float(n_eligible_males) / max(float(n_females), 1.0)
         h_fetal = np.maximum(pooled_male - bg_scale * pooled_female, 0.0)
         # Smooth with Gaussian sigma=1.5
         smoothed_f = ndimage.gaussian_filter1d(h_fetal, sigma=1.5)
@@ -281,7 +290,6 @@ def deconvolve_fetal_maternal_densities(
     row_sums[row_sums == 0.0] = 1.0
     norm_auto = auto_arr / row_sums
 
-    ff = np.asarray(ffy_values, dtype=np.float64)
     if len(ff) >= 5 and np.ptp(ff) > 0.03:
         # Fit OLS across samples for each bin to find intercept at f=0
         # norm_auto ~ beta_1 * ff + beta_0
@@ -409,6 +417,11 @@ def fit_ff_fragmentomics_ensemble(
     """Train a convex logit-link RidgeCV + ElasticNetCV ensemble for FF_size."""
     X = np.asarray(features, dtype=np.float64)
     y = np.asarray(ff_targets, dtype=np.float64)
+    n_samples = X.shape[0]
+    if n_samples < 5:
+        raise ValueError(
+            f"fit_ff_fragmentomics_ensemble requires at least 5 samples, got {n_samples}"
+        )
 
     mean = np.mean(X, axis=0)
     scale = np.std(X, axis=0)
@@ -418,24 +431,45 @@ def fit_ff_fragmentomics_ensemble(
     # Logit transform of target
     y_clipped = np.clip(y, 0.005, 0.85)
     u = np.log(y_clipped / (1.0 - y_clipped))
+    ridge_alphas = np.logspace(-2, 4, 20)
+    enet_alphas = np.logspace(-3, 2, 20)
 
-    ridge = RidgeCV(alphas=np.logspace(-2, 4, 20))
-    ridge.fit(Z, u)
+    def _fit_ensemble_pair(
+        z_mat: NDArray[np.float64], u_vec: NDArray[np.float64]
+    ) -> tuple[NDArray[np.float64], float]:
+        """Fit 50/50 RidgeCV + ElasticNetCV logit ensemble on standardized features."""
+        r_est = RidgeCV(alphas=ridge_alphas)
+        r_est.fit(z_mat, u_vec)
+        e_est = ElasticNetCV(
+            l1_ratio=[0.1, 0.5, 0.9],
+            alphas=enet_alphas,
+            cv=min(5, z_mat.shape[0]),
+            random_state=42,
+            max_iter=2000,
+        )
+        e_est.fit(z_mat, u_vec)
+        return (
+            0.5 * r_est.coef_ + 0.5 * e_est.coef_,
+            float(0.5 * r_est.intercept_ + 0.5 * e_est.intercept_),
+        )
 
-    enet = ElasticNetCV(
-        l1_ratio=[0.1, 0.5, 0.9],
-        alphas=np.logspace(-3, 2, 20),
-        max_iter=2000,
-    )
-    enet.fit(Z, u)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        warnings.simplefilter("ignore", UserWarning)
 
-    # Convex 50/50 ensemble
-    weights = 0.5 * ridge.coef_ + 0.5 * enet.coef_
-    bias = float(0.5 * ridge.intercept_ + 0.5 * enet.intercept_)
+        weights, bias = _fit_ensemble_pair(Z, u)
+        oof_pred = np.empty(n_samples, dtype=np.float64)
+        kfold = KFold(n_splits=min(5, n_samples), shuffle=True, random_state=42)
+        for train_idx, val_idx in kfold.split(X):
+            f_mean = np.mean(X[train_idx], axis=0)
+            f_scale = np.std(X[train_idx], axis=0)
+            f_scale[f_scale < 1e-6] = 1.0
+            Z_tr = (X[train_idx] - f_mean) / f_scale
+            Z_va = (X[val_idx] - f_mean) / f_scale
+            w_fold, b_fold = _fit_ensemble_pair(Z_tr, u[train_idx])
+            oof_pred[val_idx] = 1.0 / (1.0 + np.exp(-(Z_va @ w_fold + b_fold)))
 
-    u_pred = Z @ weights + bias
-    y_pred = 1.0 / (1.0 + np.exp(-u_pred))
-    loocv_std = float(max(np.std(y - y_pred), 0.015))
+    loocv_std = float(max(np.std(y - oof_pred), 0.015))
 
     return weights, bias, mean, scale, loocv_std
 
@@ -475,6 +509,9 @@ def segment_fragment_llr(
         return 0.0, 0.0
 
     lens = np.asarray(lengths, dtype=np.float64)
+    lens = lens[lens > 0.0]
+    if lens.size == 0:
+        return 0.0, 0.0
     short_ratio = float(np.mean(lens <= 150.0))
 
     # Shift fragment lengths onto canonical frame

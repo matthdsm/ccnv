@@ -328,6 +328,7 @@ class ReferenceMetadata:
     flat: bool = False
     gc_corrected: bool = False
     mappability_corrected: bool = False
+    fragmentomics_corrected: bool = False
     min_mappability: float = DEFAULT_MIN_MAPPABILITY
     schema_version: str = SCHEMA_VERSION
     coordinate_system: str = COORDINATE_SYSTEM
@@ -381,6 +382,7 @@ class ReferenceMetadata:
             "flat": self.flat,
             "gc_corrected": self.gc_corrected,
             "mappability_corrected": self.mappability_corrected,
+            "fragmentomics_corrected": self.fragmentomics_corrected,
             "min_mappability": self.min_mappability,
         }
         values: dict[str, object] = {
@@ -491,6 +493,7 @@ class ReferenceMetadata:
             flat=bool(model.get("flat", False)),
             gc_corrected=bool(model.get("gc_corrected", False)),
             mappability_corrected=bool(model.get("mappability_corrected", False)),
+            fragmentomics_corrected=bool(model.get("fragmentomics_corrected", False)),
             min_mappability=float(
                 model.get("min_mappability", DEFAULT_MIN_MAPPABILITY)
             ),

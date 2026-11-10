@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from numpy.typing import NDArray
 
+from ccnv.models.exceptions import PredictError
 from ccnv.models.results import ActiveFFSource
 from ccnv.models.schemas import (
     FRAGMENTOMICS_METADATA_KEY,
@@ -40,6 +41,8 @@ __all__ = [
     "extract_segment_fragment_lengths",
     "fit_cohort_fragmentomics_model",
     "fuse_active_fetal_fraction",
+    "is_paired_sample_metadata",
+    "resolve_fragmentomics_compatibility",
     "score_segment_origin",
 ]
 
@@ -107,11 +110,15 @@ def extract_bin_fragmentomic_covariates(
             values = np.asarray(frag_col.values, dtype=np.float64)
             if values.size > 0:
                 offsets = np.asarray(frag_col.offsets)
-                cum = np.empty(values.size + 1, dtype=np.float64)
-                cum[0] = 0.0
-                np.cumsum(values, out=cum[1:])
-                sum_lens = cum[offsets[1:]] - cum[offsets[:-1]]
-                bin_counts = offsets[1:] - offsets[:-1]
+                known = values > 0.0
+                cum_sum = np.empty(values.size + 1, dtype=np.float64)
+                cum_sum[0] = 0.0
+                np.cumsum(np.where(known, values, 0.0), out=cum_sum[1:])
+                cum_cnt = np.empty(values.size + 1, dtype=np.int64)
+                cum_cnt[0] = 0
+                np.cumsum(known, dtype=np.int64, out=cum_cnt[1:])
+                sum_lens = cum_sum[offsets[1:]] - cum_sum[offsets[:-1]]
+                bin_counts = cum_cnt[offsets[1:]] - cum_cnt[offsets[:-1]]
                 has_reads = bin_counts > 0
                 if np.any(has_reads):
                     computed = sum_lens[has_reads] / bin_counts[has_reads]
@@ -250,8 +257,12 @@ def score_segment_origin(
     """Calculate segment short-fragment ratio, LLR_size, and origin classification."""
     if len(lengths) == 0:
         return None, None, None
+    known_lens = np.asarray(lengths)
+    known_lens = known_lens[known_lens > 0]
+    if known_lens.size == 0:
+        return None, None, None
     sr, llr = segment_fragment_llr(
-        lengths,
+        known_lens,
         shift_bp,
         p_fetal=p_fetal,
         p_maternal=p_maternal,
@@ -348,43 +359,56 @@ def align_reference_to_weighted_sample(
     sample: pa.Table,
     weighted_sample: pa.Table,
 ) -> pa.Table:
-    """Scale reference pca_mean and null_mean to match active Fisher-weighted sample counts."""
+    """Calibrate reference pca_mean to the Fisher-weighted sample baseline without per-bin cancellation."""
     u_counts = np.asarray(
         sample.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
     )
     w_counts = np.asarray(
         weighted_sample.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
     )
-    scale_factors = np.where(u_counts > 0, w_counts / np.maximum(u_counts, 1e-6), 1.0)
     sm_coords = pl.DataFrame(
         {
             "contig": sample.column("contig").to_pylist(),
             "start": sample.column("start").to_numpy(),
             "end": sample.column("end").to_numpy(),
-            "scale_factor": scale_factors,
+            "u_count": u_counts,
+            "w_count": w_counts,
         }
     )
     ref_df = pl.from_arrow(reference)
-    joined_ref = ref_df.join(sm_coords, on=["contig", "start", "end"], how="left")
-    ref_scales = joined_ref["scale_factor"].fill_null(1.0).to_numpy()
-    new_pca_mean = (
-        np.asarray(reference.column("pca_mean").to_numpy(), dtype=np.float64)
-        * ref_scales
+    joined_ref = ref_df.join(
+        sm_coords,
+        on=["contig", "start", "end"],
+        how="left",
+        maintain_order="left",
     )
+    matched = joined_ref["u_count"].is_not_null() & joined_ref["w_count"].is_not_null()
+    candidate_df = joined_ref.filter(matched)
+    if "branch" in candidate_df.columns:
+        auto_df = candidate_df.filter(pl.col("branch") == "autosomal")
+        if auto_df.height > 0:
+            candidate_df = auto_df
+    if "masked" in candidate_df.columns:
+        unmasked_df = candidate_df.filter(~pl.col("masked").cast(pl.Boolean))
+        if unmasked_df.height > 0:
+            candidate_df = unmasked_df
+
+    u_matched = candidate_df["u_count"].to_numpy()
+    w_matched = candidate_df["w_count"].to_numpy()
+    pos = (u_matched > 0.0) & np.isfinite(u_matched) & np.isfinite(w_matched)
+    baseline_scale = 1.0
+    if np.any(pos):
+        med = float(np.median(w_matched[pos] / u_matched[pos]))
+        if np.isfinite(med) and med > 0.0:
+            baseline_scale = med
+
+    matched_mask = matched.to_numpy()
+    old_pca_mean = np.asarray(reference.column("pca_mean").to_numpy(), dtype=np.float64)
+    new_pca_mean = np.where(matched_mask, old_pca_mean * baseline_scale, old_pca_mean)
     pca_idx = reference.schema.get_field_index("pca_mean")
-    out_ref = reference.set_column(
+    return reference.set_column(
         pca_idx, "pca_mean", pa.array(new_pca_mean, type=pa.float64())
     )
-    if "null_mean" in reference.schema.names:
-        new_null_mean = (
-            np.asarray(reference.column("null_mean").to_numpy(), dtype=np.float64)
-            * ref_scales
-        )
-        null_idx = reference.schema.get_field_index("null_mean")
-        out_ref = out_ref.set_column(
-            null_idx, "null_mean", pa.array(new_null_mean, type=pa.float64())
-        )
-    return out_ref
 
 
 def apply_prenatal_fisher_weighting(
@@ -414,3 +438,70 @@ def apply_prenatal_fisher_weighting(
     w_counts = evaluate_weighted_coverage(sample, weights, shift_bp=shift_bp)
     count_idx = sample.schema.get_field_index("count")
     return sample.set_column(count_idx, "count", pa.array(w_counts, type=pa.float64()))
+
+
+def is_paired_sample_metadata(metadata: Mapping[object, object] | None) -> bool:
+    """Return whether decoded or raw Arrow sample metadata indicates paired-end reads."""
+    if not metadata:
+        return False
+    frag_meta = extract_sample_fragmentomics(metadata)
+    if frag_meta is not None:
+        return bool(frag_meta.paired_end)
+    for k in ("fragmentomics", "ccnv.fragmentomics", FRAGMENTOMICS_METADATA_KEY):
+        val = metadata.get(k)
+        if val is None and isinstance(k, str) and k.encode() in metadata:
+            val = metadata[k.encode()]
+        elif val is None and isinstance(k, bytes) and k.decode() in metadata:
+            val = metadata[k.decode()]
+        if isinstance(val, Mapping):
+            return bool(val.get("paired_end", False))
+        if isinstance(val, (bytes, str)):
+            try:
+                loaded = json.loads(val)
+                if isinstance(loaded, Mapping):
+                    return bool(loaded.get("paired_end", False))
+            except json.JSONDecodeError, UnicodeDecodeError, TypeError:
+                continue
+    return False
+
+
+def resolve_fragmentomics_compatibility(sample: pa.Table, reference: pa.Table) -> bool:
+    """Validate sample vs reference fragmentomic correction settings and return whether to apply them."""
+    sample_meta = decode_metadata(sample.schema.metadata)
+    frag_meta = extract_sample_fragmentomics(sample_meta)
+    if frag_meta is not None:
+        sample_has_frag = bool(frag_meta.paired_end)
+    elif is_paired_sample_metadata(sample_meta):
+        sample_has_frag = True
+    elif "fragment_lengths" in sample.column_names:
+        frag_col = sample.column("fragment_lengths").combine_chunks()
+        sample_has_frag = (
+            isinstance(frag_col, pa.ListArray) and len(frag_col.values) > 0
+        )
+    else:
+        sample_has_frag = False
+
+    ref_meta = decode_metadata(reference.schema.metadata)
+    ref_model = ref_meta.get("model", {})
+    if not isinstance(ref_model, Mapping):
+        ref_model = {}
+
+    if bool(ref_model.get("flat", False)):
+        return sample_has_frag
+
+    if "fragmentomics_corrected" in ref_model:
+        ref_frag = bool(ref_model["fragmentomics_corrected"])
+        if ref_frag != sample_has_frag:
+            raise PredictError(
+                f"sample fragmentomics ({'paired-end' if sample_has_frag else 'single-end'}) "
+                f"does not match cohort reference fragmentomics_corrected={ref_frag}; "
+                "use matching library types or rebuild the reference"
+            )
+        return ref_frag
+
+    if sample_has_frag:
+        raise PredictError(
+            "reference lacks fragmentomics_corrected metadata (uncorrected legacy cohort reference) "
+            "and cannot be projected against a paired-end sample; rebuild the reference"
+        )
+    return False

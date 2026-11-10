@@ -252,6 +252,8 @@ def build_reference_table(
         "flat": config.fasta is not None,
         "gc_corrected": (config.gc is not None) or (config.fasta is not None),
         "mappability_corrected": config.mappability is not None,
+        "fragmentomics_corrected": (cohort.mean_frag_len is not None)
+        or (cohort.endpoint_ratio is not None),
         "min_mappability": config.min_mappability,
         "mode": config.mode,
         **(

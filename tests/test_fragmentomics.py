@@ -228,6 +228,33 @@ class TestFragmentomicsKernels(unittest.TestCase):
         self.assertAlmostEqual(np.sum(p_f_hat), 1.0, places=5)
         self.assertAlmostEqual(np.sum(p_m_hat), 1.0, places=5)
 
+        # Low-FFY (< 0.08) males are excluded from both eligible-male and female pools
+        lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
+        pure_fetal_peak = np.zeros(FRAG_NUM_BINS, dtype=np.float64)
+        pure_fetal_peak[143 - FRAG_MIN_LEN] = 500.0
+        bad_low_ff_male_peak = np.zeros(FRAG_NUM_BINS, dtype=np.float64)
+        bad_low_ff_male_peak[250 - FRAG_MIN_LEN] = 50_000.0
+        chry_mix = np.vstack(
+            [
+                np.tile(pure_fetal_peak, (5, 1)),
+                bad_low_ff_male_peak[np.newaxis, :],
+                np.zeros((2, FRAG_NUM_BINS), dtype=np.float64),
+            ]
+        )
+        auto_mix = np.tile(
+            np.exp(-0.5 * ((lengths - 166.0) / 12.0) ** 2) * 1000.0, (8, 1)
+        )
+        male_mix = np.array([True] * 6 + [False] * 2, dtype=bool)
+        ffy_mix = np.array([0.12, 0.11, 0.10, 0.14, 0.09, 0.03, 0.0, 0.0])
+        p_f_clean, _ = deconvolve_fetal_maternal_densities(
+            aligned_auto_hists=auto_mix,
+            aligned_chry_hists=chry_mix,
+            male_mask=male_mix,
+            ffy_values=ffy_mix,
+        )
+        self.assertGreater(p_f_clean[143 - FRAG_MIN_LEN], 0.10)
+        self.assertAlmostEqual(p_f_clean[250 - FRAG_MIN_LEN], 0.0, places=6)
+
     def test_feature_vector_and_ensemble_training(self) -> None:
         meta = FragmentomicsMetadata(
             paired_end=True,
@@ -265,7 +292,10 @@ class TestFragmentomicsKernels(unittest.TestCase):
         self.assertEqual(len(weights), 36)
         self.assertEqual(len(mean), 36)
         self.assertEqual(len(scale), 36)
-        self.assertGreater(loocv_std, 0.0)
+        self.assertGreaterEqual(loocv_std, 0.015)
+
+        with self.assertRaises(ValueError):
+            fit_ff_fragmentomics_ensemble(X[:4], y[:4])
 
         # Test predict_ff_fragmentomics
         dummy_model = PrenatalModelMetadata(
@@ -333,7 +363,7 @@ class TestFragmentomicsKernels(unittest.TestCase):
         # Negative LLR supports maternal origin over fetal origin
         self.assertLess(llr_mat, -1.0)
 
-        # Empty segment returns 0.0, 0.0
+        # Empty segment or unknown-only (0) lengths return 0.0, 0.0 and 0s are ignored
         empty_res = segment_fragment_llr(
             lengths=np.array([], dtype=np.uint16),
             shift_bp=0.0,
@@ -343,6 +373,35 @@ class TestFragmentomicsKernels(unittest.TestCase):
             is_gain=True,
         )
         self.assertEqual(empty_res, (0.0, 0.0))
+        zero_only = segment_fragment_llr(
+            lengths=np.array([0, 0, 0], dtype=np.uint16),
+            shift_bp=0.0,
+            p_fetal=p_f,
+            p_maternal=p_m,
+            active_ff=0.10,
+            is_gain=True,
+        )
+        self.assertEqual(zero_only, (0.0, 0.0))
+        sr_padded, llr_padded = segment_fragment_llr(
+            lengths=np.concatenate(
+                [maternal_segment_lengths, np.zeros(500, dtype=int)]
+            ),
+            shift_bp=0.0,
+            p_fetal=p_f,
+            p_maternal=p_m,
+            active_ff=0.10,
+            is_gain=True,
+        )
+        sr_clean, llr_clean = segment_fragment_llr(
+            lengths=maternal_segment_lengths,
+            shift_bp=0.0,
+            p_fetal=p_f,
+            p_maternal=p_m,
+            active_ff=0.10,
+            is_gain=True,
+        )
+        self.assertAlmostEqual(sr_padded, sr_clean)
+        self.assertAlmostEqual(llr_padded, llr_clean)
 
     def test_evaluate_weighted_coverage(self) -> None:
         from helpers import make_sample_table
@@ -415,6 +474,18 @@ class TestFragmentomicsKernels(unittest.TestCase):
         self.assertAlmostEqual(ep_ratios[1], 0.0)
         self.assertAlmostEqual(ep_ratios[2], 2.0)
 
+        # Out-of-range sentinel 0 in fragment_lengths is excluded from mean/count
+        table_with_zeros = make_sample_table(
+            [3, 1, 1],
+            contigs=["chr1", "chr1", "chr1"],
+            starts=[0, 100, 200],
+            ends=[100, 200, 300],
+            fragment_lengths=[[0, 120, 140], [0], [180]],
+            endpoint_counts=[4, 0, 2],
+        )
+        mean_z, _ = extract_bin_fragmentomic_covariates(table_with_zeros)
+        np.testing.assert_allclose(mean_z, [130.0, 155.0, 180.0])
+
     def test_fit_cohort_fragmentomics_model_fewer_than_five_samples_skips_ensemble(
         self,
     ) -> None:
@@ -464,23 +535,38 @@ class TestFragmentomicsKernels(unittest.TestCase):
 
         ref_table = pa.table(
             {
-                "branch": pa.array(["autosomal", "autosomal"]),
-                "contig": pa.array(["chr1", "chr1"]),
-                "start": pa.array([0, 100], type=pa.int64()),
-                "end": pa.array([100, 200], type=pa.int64()),
-                "pca_mean": pa.array([10.0, 20.0], type=pa.float64()),
-                "null_mean": pa.array([10.0, 20.0], type=pa.float64()),
+                "branch": pa.array(["autosomal", "autosomal", "autosomal"]),
+                "contig": pa.array(["chr2", "chr1", "chr1"]),
+                "start": pa.array([0, 0, 100], type=pa.int64()),
+                "end": pa.array([100, 100, 200], type=pa.int64()),
+                "pca_mean": pa.array([30.0, 10.0, 20.0], type=pa.float64()),
+                "null_mean": pa.array([0.01, -0.02, 0.03], type=pa.float64()),
             }
         )
-        u_sample = make_sample_table([10.0, 20.0], starts=[0, 100], ends=[100, 200])
-        w_sample = make_sample_table([15.0, 40.0], starts=[0, 100], ends=[100, 200])
+        # Diploid baseline ratios: chr1:0 = 15/10 = 1.5, chr2:0 = 45/30 = 1.5; CNV bin chr1:100 = 40/20 = 2.0
+        # Median baseline scale = median([1.5, 1.5, 2.0]) = 1.5; log2 null_mean stays invariant!
+        u_sample = make_sample_table(
+            [10.0, 20.0, 30.0],
+            contigs=["chr1", "chr1", "chr2"],
+            starts=[0, 100, 0],
+            ends=[100, 200, 100],
+        )
+        w_sample = make_sample_table(
+            [15.0, 40.0, 45.0],
+            contigs=["chr1", "chr1", "chr2"],
+            starts=[0, 100, 0],
+            ends=[100, 200, 100],
+        )
 
         aligned_ref = align_reference_to_weighted_sample(ref_table, u_sample, w_sample)
-        np.testing.assert_allclose(
-            aligned_ref.column("pca_mean").to_numpy(), [15.0, 40.0]
+        self.assertEqual(
+            aligned_ref.column("contig").to_pylist(), ["chr2", "chr1", "chr1"]
         )
         np.testing.assert_allclose(
-            aligned_ref.column("null_mean").to_numpy(), [15.0, 40.0]
+            aligned_ref.column("pca_mean").to_numpy(), [45.0, 15.0, 30.0]
+        )
+        np.testing.assert_allclose(
+            aligned_ref.column("null_mean").to_numpy(), [0.01, -0.02, 0.03]
         )
 
 

@@ -527,16 +527,16 @@ $$
 \hat{f}_{\text{size}}(\mathbf{z}) = \mathrm{clip}\left(\mathrm{expit}\left(\mathbf{z}^{\top} \mathbf{w}_{\text{size}} + b_{\text{size}}\right), \quad 0.005, \quad 0.50\right)
 $$
 
-with residual standard error $\sigma_{\text{size}} = \max(\mathrm{std}(\mathbf{y} - \hat{\mathbf{y}}), 0.015)$ (retaining default `ff_size_std = 0.018` when fewer than 5 labeled samples are available).
+with 5-fold out-of-fold cross-validated residual standard error $\sigma_{\text{size}} = \max(\mathrm{std}(\mathbf{y} - \hat{\mathbf{y}}_{\text{OOF}}), 0.015)$ (retaining default `ff_size_std = 0.018` when fewer than 5 labeled samples are available).
 
 ### 8.6 Cohort Cell-Free DNA Fragment Length Deconvolution
 
 Across paired-end prenatal cohorts, `src/ccnv/stats/fragmentomics.py:deconvolve_fetal_maternal_densities` estimates pure fetal $\hat{p}_F(L)$ and maternal $\hat{p}_M(L)$ densities over $L \in [30, 600]\text{ bp}$:
 
-1. **Pure Fetal Density $\hat{p}_F(L)$**: When $\vert \mathcal{S}_M \vert \ge 5$ male pregnancies contribute at least $500$ total mode-aligned `chrY` fragments, pooled female `chrY` misalignment background is subtracted from pooled male `chrY` counts and smoothed with a Gaussian kernel ($\sigma = 1.5\text{ bp}$):
+1. **Pure Fetal Density $\hat{p}_F(L)$**: Defining eligible male pregnancies $\mathcal{S}_M^{\ast} = \lbrace s \in \mathcal{S}_M : f_{Y,s} \ge 0.08 \rbrace$, when $\vert \mathcal{S}_M^{\ast} \vert \ge 5$ eligible males contribute at least $500$ total mode-aligned `chrY` fragments, pooled female `chrY` misalignment background is subtracted from pooled eligible-male `chrY` counts (excluding low-FFY males $\mathcal{S}_M \setminus \mathcal{S}_M^{\ast}$ from both pools) and smoothed with a Gaussian kernel ($\sigma = 1.5\text{ bp}$):
 
 $$
-h_F(L) = \max\left(0, \sum_{s \in \mathcal{S}_M} h_{s, \text{chrY}}^{\text{aligned}}(L) - \frac{\vert \mathcal{S}_M \vert}{\max(\vert \mathcal{S}_F \vert, 1)} \sum_{s \in \mathcal{S}_F} h_{s, \text{chrY}}^{\text{aligned}}(L)\right), \qquad \hat{p}_F(L) = \frac{(G_{1.5} \ast h_F)(L)}{\sum_{l=30}^{600} (G_{1.5} \ast h_F)(l)}
+h_F(L) = \max\left(0, \sum_{s \in \mathcal{S}_M^{\ast}} h_{s, \text{chrY}}^{\text{aligned}}(L) - \frac{\vert \mathcal{S}_M^{\ast} \vert}{\max(\vert \mathcal{S}_F \vert, 1)} \sum_{s \in \mathcal{S}_F} h_{s, \text{chrY}}^{\text{aligned}}(L)\right), \qquad \hat{p}_F(L) = \frac{(G_{1.5} \ast h_F)(L)}{\sum_{l=30}^{600} (G_{1.5} \ast h_F)(l)}
 $$
 
 falling back to a normalized parametric multi-Gaussian ($143, 133, 123\text{ bp}$) plus $10.4\text{ bp}$ cosine template when male `chrY` coverage is sparse.
@@ -551,7 +551,7 @@ $$
 w^{\ast}(L) = \mathrm{clip}\left(\alpha^{\ast} \frac{\hat{p}_F(L)}{\max(p_{\text{mix}}(L), 10^{-12})}, \quad 0.25, \quad 3.0\right), \qquad \sum_{L=30}^{600} p_{\text{mix}}(L) w^{\ast}(L) = 1.0
 $$
 
-`src/ccnv/features/fragmentomics.py:evaluate_weighted_coverage` maps sample `uint16` fragment lengths through a shift-interpolated $65{,}536$-entry `float32` lookup table via `np.cumsum` slice differences, and `align_reference_to_weighted_sample` scales reference `pca_mean` and `null_mean` by $c_i^{(w)} / \max(c_i^{(u)}, 10^{-6})$ so PCA projection and within-sample normalization share consistent weighted baselines.
+`src/ccnv/features/fragmentomics.py:evaluate_weighted_coverage` maps sample `uint16` fragment lengths through a shift-interpolated $65{,}536$-entry `float32` lookup table via `np.cumsum` slice differences, and `align_reference_to_weighted_sample` scales reference `pca_mean` uniformly by the median unmasked autosomal ratio $\mathrm{median}_i\left(c_i^{(w)} / c_i^{(u)}\right)$ (leaving $\log_2$-space `null_mean` invariant) so PCA projection shares the calibrated weighted diploid baseline without cancelling per-bin fetal enrichment.
 
 ### 8.8 Constants & Hyperparameters
 

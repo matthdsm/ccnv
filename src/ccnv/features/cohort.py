@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 from collections.abc import Mapping, Sequence
@@ -16,7 +15,10 @@ import pyarrow as pa
 from numpy.typing import NDArray
 
 from ccnv.features.binning import bin_intervals, rebin_counts
-from ccnv.features.fragmentomics import extract_bin_fragmentomic_covariates
+from ccnv.features.fragmentomics import (
+    extract_bin_fragmentomic_covariates,
+    is_paired_sample_metadata,
+)
 from ccnv.models import (
     FRAGMENTOMICS_METADATA_KEY,
     ArtifactKind,
@@ -454,9 +456,9 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
             with_cols = [pl.col("count").fill_null(0.0).cast(pl.Float64)]
             if has_frag:
                 with_cols.append(
-                    pl.col("fragment_lengths").fill_null(
-                        pl.lit([], dtype=pl.List(pl.UInt16))
-                    )
+                    pl.col("fragment_lengths")
+                    .fill_null(pl.lit([], dtype=pl.List(pl.UInt16)))
+                    .list.drop_nulls()
                 )
             if has_ep:
                 with_cols.append(pl.col("endpoint_count").fill_null(0).cast(pl.UInt32))
@@ -464,7 +466,7 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
                 with_cols.append(pl.col("frag_gc_sum").fill_null(0.0).cast(pl.Float32))
 
             result_df = target_grid.join(
-                agg_df, on=["contig", "start"], how="left"
+                agg_df, on=["contig", "start"], how="left", maintain_order="left"
             ).with_columns(with_cols)
         else:
             with_cols = [pl.lit(0.0, dtype=pl.Float64).alias("count")]
@@ -687,36 +689,13 @@ def _assemble_cohort(
     frag_lens: list[NDArray[np.float64]] = []
     ep_ratios: list[NDArray[np.float64]] = []
 
-    def _is_paired(meta: Mapping[object, object] | None) -> bool:
-        if not meta:
-            return False
-        for k in ("fragmentomics", "ccnv.fragmentomics", FRAGMENTOMICS_METADATA_KEY):
-            val = meta.get(k)
-            if val is None and isinstance(k, str) and k.encode() in meta:
-                val = meta[k.encode()]
-            elif val is None and isinstance(k, bytes) and k.decode() in meta:
-                val = meta[k.decode()]
-            if val is not None:
-                if hasattr(val, "paired_end"):
-                    return bool(val.paired_end)
-                if isinstance(val, dict):
-                    return bool(val.get("paired_end", False))
-                if isinstance(val, (bytes, str)):
-                    try:
-                        loaded = json.loads(val)
-                        if isinstance(loaded, dict):
-                            return bool(loaded.get("paired_end", False))
-                    except json.JSONDecodeError, UnicodeDecodeError, TypeError:
-                        continue
-        return False
-
-    first_paired = _is_paired(first_meta)
+    first_paired = is_paired_sample_metadata(first_meta)
 
     for path, sample_data in zip(paths, parsed, strict=True):
         metadata, lengths, contigs, starts, ends, counts, frag_len, ep_ratio = (
             sample_data
         )
-        if _is_paired(metadata) != first_paired:
+        if is_paired_sample_metadata(metadata) != first_paired:
             raise ReferenceError(
                 "mixed single-end and paired-end cohort controls are not supported"
             )
@@ -820,7 +799,7 @@ def rebin_cohort(cohort: Cohort, target_bin_size: int) -> Cohort:
                 .agg(pl.col("^c_.*$").sum())
             )
             result_df = target_grid.join(
-                agg_df, on=["contig", "start"], how="left"
+                agg_df, on=["contig", "start"], how="left", maintain_order="left"
             ).with_columns(pl.col("^c_.*$").fill_null(0.0).cast(pl.Float64))
             new_counts = (
                 result_df.select(sample_col_names).to_numpy()

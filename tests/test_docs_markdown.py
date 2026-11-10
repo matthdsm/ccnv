@@ -1,4 +1,5 @@
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -136,11 +137,6 @@ class TestDocsMarkdown(unittest.TestCase):
                 errors.append(
                     f"{rel}:{lineno} disallowed \\operatorname macro; use \\mathrm or \\text"
                 )
-            for m in re.finditer(r"\^(\*|\\top|\w+-\d+)", stripped):
-                lineno = stripped[: m.start()].count("\n") + 1
-                errors.append(
-                    f"{rel}:{lineno} unbraced superscript '^{m.group(1)}'; wrap in {{...}}"
-                )
             for m in re.finditer(r"(?m)^[ \t]*\$\$(.+?)\$\$[ \t]*$", stripped):
                 lineno = stripped[: m.start()].count("\n") + 1
                 errors.append(
@@ -156,12 +152,22 @@ class TestDocsMarkdown(unittest.TestCase):
             for m in re.finditer(r"\$\$(.*?)\$\$", stripped, flags=re.DOTALL):
                 lineno = stripped[: m.start()].count("\n") + 1
                 all_exprs.append((lineno, m.group(1)))
+            for m in re.finditer(r"\\\[(.*?)\\\]", stripped, flags=re.DOTALL):
+                lineno = stripped[: m.start()].count("\n") + 1
+                all_exprs.append((lineno, m.group(1)))
+            for m in re.finditer(r"\\\((.*?)\\\)", stripped):
+                lineno = stripped[: m.start()].count("\n") + 1
+                all_exprs.append((lineno, m.group(1)))
             for lineno, raw, inner in self._iter_inline_math(stripped):
                 if inner.startswith(" ") or inner.endswith(" "):
                     errors.append(f"{rel}:{lineno} space-padded inline math: '{raw}'")
                 all_exprs.append((lineno, inner))
 
             for lineno, expr in all_exprs:
+                for m in re.finditer(r"\^(\*|\\top|\w+-\d+)", expr):
+                    errors.append(
+                        f"{rel}:{lineno} unbraced superscript '^{m.group(1)}'; wrap in {{...}}"
+                    )
                 if "%" in expr:
                     errors.append(
                         f"{rel}:{lineno} '%' in math triggers TeX comment hazard; move outside math"
@@ -356,3 +362,35 @@ class TestDocsMarkdown(unittest.TestCase):
         self.assertEqual(
             errors, [], "Markdown link/URL issues found:\n" + "\n".join(errors)
         )
+
+    def test_unbraced_superscript_scoped_to_math_only(self) -> None:
+        """Verify prose tokens like x^* do not fail while math spans $x^*$ and \\(x^*\\) are flagged."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prose_md = Path(tmpdir) / "prose.md"
+            prose_md.write_text(
+                "Plain prose token x^* and tag v1-2.\n", encoding="utf-8"
+            )
+            math_dollar_md = Path(tmpdir) / "dollar.md"
+            math_dollar_md.write_text("Inline math $x^*$ fails.\n", encoding="utf-8")
+            math_paren_md = Path(tmpdir) / "paren.md"
+            math_paren_md.write_text(
+                "Arithmatex \\(x^\\top\\) fails.\n", encoding="utf-8"
+            )
+
+            orig_files = self.tracked_md_files
+            orig_root = self.repo_root
+            try:
+                self.repo_root = Path(tmpdir)
+                self.tracked_md_files = [prose_md]
+                self.test_shared_latex_syntax_and_balance()
+
+                self.tracked_md_files = [math_dollar_md]
+                with self.assertRaises(AssertionError):
+                    self.test_shared_latex_syntax_and_balance()
+
+                self.tracked_md_files = [math_paren_md]
+                with self.assertRaises(AssertionError):
+                    self.test_shared_latex_syntax_and_balance()
+            finally:
+                self.tracked_md_files = orig_files
+                self.repo_root = orig_root

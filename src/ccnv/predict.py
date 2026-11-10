@@ -27,6 +27,7 @@ from ccnv.features.fragmentomics import (
     align_reference_to_weighted_sample,
     apply_prenatal_fisher_weighting,
     extract_bin_fragmentomic_covariates,
+    resolve_fragmentomics_compatibility,
 )
 from ccnv.features.prenatal import annotate_prenatal_segments, predict_prenatal
 from ccnv.io.parquet import load_sample_or_extract, read_reference_parquet
@@ -126,6 +127,7 @@ def run(config: PredictConfig) -> PredictionOutputs:
         mode=config.mode,
         fasta=config.fasta,
     )
+    raw_sample = inputs.sample
     prenatal_meta: PrenatalModelMetadata | None = None
     prenatal_result: FetalFractionResult | None = None
     if config.mode == "prenatal":
@@ -133,15 +135,15 @@ def run(config: PredictConfig) -> PredictionOutputs:
         if prenatal_meta is None:
             raise PredictError("reference is missing prenatal metadata (ccnv.prenatal)")
         prenatal_result = predict_prenatal(
-            inputs.sample,
+            raw_sample,
             inputs.reference,
             prenatal_meta,
             min_ff_warning=config.min_fetal_fraction_warning,
         )
-        weighted_sample = apply_prenatal_fisher_weighting(inputs.sample, prenatal_meta)
-        if weighted_sample is not inputs.sample:
+        weighted_sample = apply_prenatal_fisher_weighting(raw_sample, prenatal_meta)
+        if weighted_sample is not raw_sample:
             weighted_ref = align_reference_to_weighted_sample(
-                inputs.reference, inputs.sample, weighted_sample
+                inputs.reference, raw_sample, weighted_sample
             )
             inputs = replace(inputs, sample=weighted_sample, reference=weighted_ref)
 
@@ -163,7 +165,7 @@ def run(config: PredictConfig) -> PredictionOutputs:
                 segments,
                 prenatal_result,
                 z_threshold=config.z_threshold,
-                sample_table=inputs.sample,
+                sample_table=raw_sample,
                 prenatal_meta=prenatal_meta,
             )
         )
@@ -172,7 +174,7 @@ def run(config: PredictConfig) -> PredictionOutputs:
         qc_json_path,
         build_predict_qc_payload(
             mode=config.mode,
-            sample_table=inputs.sample,
+            sample_table=raw_sample,
             segments=segments,
             prenatal_result=prenatal_result,
         ),
@@ -274,6 +276,7 @@ def load_inputs(
             reference_bin_size,
         )
         sample = rebin_sample_table(sample, reference_bin_size)
+    resolve_fragmentomics_compatibility(sample, reference)
     active_ref = reference.filter(
         pc.is_in(reference.column("branch"), pa.array(branches))
     )
@@ -310,11 +313,8 @@ def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
 
     ref_pl = pl.from_arrow(ref_b)
     sm_pl = pl.from_arrow(inputs.sample)
-    has_frag = (
-        "fragment_lengths" in inputs.sample.column_names
-        or "endpoint_count" in inputs.sample.column_names
-    )
-    if has_frag:
+    use_frag = resolve_fragmentomics_compatibility(inputs.sample, inputs.reference)
+    if use_frag:
         f_len, e_rat = extract_bin_fragmentomic_covariates(inputs.sample)
         sm_pl = sm_pl.with_columns(
             pl.Series("mean_frag_len", f_len),
@@ -334,10 +334,10 @@ def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
         raise PredictError(f"branch {branch!r} bin count mismatch")
 
     mean_frag_len = (
-        joined["mean_frag_len"].to_numpy().astype(np.float64) if has_frag else None
+        joined["mean_frag_len"].to_numpy().astype(np.float64) if use_frag else None
     )
     endpoint_ratio = (
-        joined["endpoint_ratio"].to_numpy().astype(np.float64) if has_frag else None
+        joined["endpoint_ratio"].to_numpy().astype(np.float64) if use_frag else None
     )
 
     c_vals = ref_pl["contig"].to_list()

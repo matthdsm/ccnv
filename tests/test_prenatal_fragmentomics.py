@@ -251,6 +251,20 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         self.assertLess(llr_m, -2.0)
         self.assertEqual(origin_m, "MATERNAL_CONFIRMED")
 
+        # Unknown-only (0) fragment lengths return (None, None, None)
+        self.assertEqual(
+            score_segment_origin(
+                np.zeros(10, dtype=np.int64),
+                shift_bp=0.0,
+                p_fetal=p_fet,
+                p_maternal=p_mat,
+                active_ff=0.10,
+                is_gain=True,
+                has_call=True,
+            ),
+            (None, None, None),
+        )
+
     def test_fit_and_predict_prenatal_with_fragmentomics(self) -> None:
         contigs = ["chr1", "chr2", "chrX", "chrY"]
         tables = []
@@ -338,12 +352,18 @@ class TestPrenatalFragmentomics(unittest.TestCase):
 
     def test_prenatal_prediction_fisher_weighting_reference_scaling(self) -> None:
         from ccnv.features.fragmentomics import align_reference_to_weighted_sample
+        from ccnv.predict import BranchModel, project_coverage
 
+        # 5 bins with identical unweighted counts (10 reads each):
+        # Bins 0..3 are diploid background (166 bp); bin 4 is fetal-enriched (135 bp)
         sample_tbl = make_sample_table(
-            [10, 20],
-            starts=[0, 100],
-            ends=[100, 200],
-            fragment_lengths=[[140, 166], [166]],
+            [10, 10, 10, 10, 10],
+            contigs=["chr1"] * 5,
+            starts=[0, 100, 200, 300, 400],
+            ends=[100, 200, 300, 400, 500],
+            contig_lengths={"chr1": 500},
+            bin_size=100,
+            fragment_lengths=[[166] * 10] * 4 + [[135] * 10],
         )
         grid = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
         p_mat = norm.pdf(grid, loc=166.0, scale=12.0)
@@ -359,12 +379,12 @@ class TestPrenatalFragmentomics(unittest.TestCase):
 
         ref_table = pa.table(
             {
-                "branch": pa.array(["autosomal", "autosomal"]),
-                "contig": pa.array(["chr1", "chr1"]),
-                "start": pa.array([0, 100], type=pa.int64()),
-                "end": pa.array([100, 200], type=pa.int64()),
-                "pca_mean": pa.array([10.0, 20.0], type=pa.float64()),
-                "null_mean": pa.array([10.0, 20.0], type=pa.float64()),
+                "branch": pa.array(["autosomal"] * 5),
+                "contig": pa.array(["chr1"] * 5),
+                "start": pa.array([0, 100, 200, 300, 400], type=pa.int64()),
+                "end": pa.array([100, 200, 300, 400, 500], type=pa.int64()),
+                "pca_mean": pa.array([10.0] * 5, type=pa.float64()),
+                "null_mean": pa.array([0.0] * 5, type=pa.float64()),
             }
         )
         weighted_ref = align_reference_to_weighted_sample(
@@ -372,15 +392,35 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         )
         u_counts = sample_tbl.column("count").to_numpy()
         w_counts = weighted_sample.column("count").to_numpy()
-        expected_scales = w_counts / u_counts
+        expected_baseline_scale = float(np.median(w_counts / u_counts))
         np.testing.assert_allclose(
             weighted_ref.column("pca_mean").to_numpy(),
-            [10.0 * expected_scales[0], 20.0 * expected_scales[1]],
+            np.full(5, 10.0 * expected_baseline_scale),
         )
         np.testing.assert_allclose(
             weighted_ref.column("null_mean").to_numpy(),
-            [10.0 * expected_scales[0], 20.0 * expected_scales[1]],
+            np.zeros(5),
         )
+
+        # Verify project_coverage preserves the Fisher-weighted enrichment in bin 4
+        # under mean reconstruction (rank 0 PCA loadings, unchanged unweighted counts)
+        branch_model = BranchModel(
+            branch="autosomal",
+            contigs=("chr1",) * 5,
+            starts=np.array([0, 100, 200, 300, 400], dtype=np.int64),
+            ends=np.array([100, 200, 300, 400, 500], dtype=np.int64),
+            counts=w_counts.astype(np.float64),
+            masked=np.zeros(5, dtype=bool),
+            pca_mean=weighted_ref.column("pca_mean").to_numpy().astype(np.float64),
+            pca_loadings=np.empty((0, 5), dtype=np.float64),
+            nearest_indices=(np.array([1], dtype=np.int32),) * 5,
+            mean_distance=np.ones(5, dtype=np.float32),
+            null_mean=np.zeros(5, dtype=np.float64),
+            null_std=np.full(5, 0.05, dtype=np.float64),
+        )
+        projected = project_coverage(branch_model)
+        np.testing.assert_allclose(projected.corrected[:4], 1.0, rtol=1e-6)
+        self.assertGreater(projected.corrected[4], 1.5)
 
         # Confirm unweighted fallback when fragment lengths unavailable
         se_sample = make_sample_table([10, 20], starts=[0, 100], ends=[100, 200])
