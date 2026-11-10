@@ -11,11 +11,21 @@ import scipy.special
 import scipy.stats
 from numpy.typing import NDArray
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.linear_model import HuberRegressor, Lasso, LinearRegression
+from sklearn.linear_model import (
+    ElasticNetCV,
+    HuberRegressor,
+    Lasso,
+    LinearRegression,
+    RidgeCV,
+)
 from sklearn.mixture import GaussianMixture
+from sklearn.model_selection import KFold, cross_val_predict
 
 __all__ = [
+    "fit_elasticnet_ffy",
+    "fit_ffa_logit_ensemble",
     "fit_lasso_fista",
+    "fit_preface_logit_ensemble",
     "fit_rprop_mlp",
     "infer_sex_gmm_1d",
     "ols_fit",
@@ -76,6 +86,7 @@ def infer_sex_gmm_1d(
         return y >= thresh, thresh
 
     def _posterior_diff(val: float) -> float:
+        """Evaluate difference between male component posterior probability and 0.5."""
         probs = gmm.predict_proba(np.array([[val]], dtype=np.float64))
         return float(probs[0, male_idx] - 0.5)
 
@@ -130,6 +141,144 @@ def fit_lasso_fista(
     return np.asarray(model.coef_, dtype=np.float64)
 
 
+def fit_elasticnet_ffy(
+    X: NDArray[np.floating] | np.ndarray,
+    y: NDArray[np.floating] | np.ndarray,
+    seed: int = 42,
+) -> tuple[NDArray[np.float64], float]:
+    """Solve non-negative ElasticNetCV on chrY bins to estimate fetal fraction.
+
+    Minimizes:
+        (1 / (2 * N)) * ||Xw + b - y||_2^2 + alpha * rho * ||w||_1
+        + (alpha * (1 - rho) / 2) * ||w||_2^2
+    subject to w >= 0, selecting alpha and rho in {0.01, 0.05, 0.10} via CV.
+    """
+    x_arr = np.asarray(X, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.float64).ravel()
+    n_samples, n_features = x_arr.shape
+
+    if (
+        n_samples < 2
+        or n_features == 0
+        or np.allclose(x_arr, 0.0)
+        or np.allclose(y_arr, 0.0)
+    ):
+        return np.zeros(n_features, dtype=np.float64), 0.0
+
+    cv_folds = min(5, max(2, n_samples))
+    model = ElasticNetCV(
+        l1_ratio=[0.01, 0.05, 0.1],
+        positive=True,
+        fit_intercept=True,
+        cv=cv_folds,
+        random_state=seed,
+        max_iter=3000,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        warnings.simplefilter("ignore", UserWarning)
+        model.fit(x_arr, y_arr)
+
+    weights = np.asarray(model.coef_, dtype=np.float64)
+    intercept = float(model.intercept_)
+    return weights, intercept
+
+
+def fit_ffa_logit_ensemble(
+    X: NDArray[np.floating] | np.ndarray,
+    y: NDArray[np.floating] | np.ndarray,
+    seed: int = 42,
+) -> tuple[NDArray[np.float64], float, float]:
+    """Fit convex logit-link RidgeCV and ElasticNetCV ensemble for FFA (fetal fraction autosomal).
+
+    Transforms fetal fraction targets to logit space u_i = logit(clip(y_i, 0.005, 0.85))
+    and fits RidgeCV (alphas in 10^-2 to 10^4) and ElasticNetCV (l1_ratio in {0.1, 0.5}).
+    Averages linear coefficients in logit space:
+        w_ens = 0.5 * (w_ridge + w_enet)
+        b_ens = 0.5 * (b_ridge + b_enet)
+    Predictions in (0, 1) are given by:
+        y_hat = expit(x^T w_ens + b_ens)
+    Returns (w_ens, b_ens, sigma_ffa) where sigma_ffa is the RMSE of predictions.
+    """
+    x_arr = np.asarray(X, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.float64).ravel()
+    n_samples, n_features = x_arr.shape
+
+    if n_samples < 2 or n_features == 0:
+        mean_y = float(np.mean(y_arr)) if n_samples > 0 else 0.10
+        b_fallback = float(scipy.special.logit(np.clip(mean_y, 0.005, 0.85)))
+        return np.zeros(n_features, dtype=np.float64), b_fallback, 0.02
+
+    y_clip = np.clip(y_arr, 0.005, 0.85)
+    u = scipy.special.logit(y_clip)
+
+    cv_folds = min(5, max(2, n_samples))
+    ridge = RidgeCV(alphas=np.logspace(-2, 4, 40), store_cv_results=True)
+    enet = ElasticNetCV(
+        l1_ratio=[0.1, 0.5],
+        cv=cv_folds,
+        random_state=seed,
+        max_iter=3000,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        warnings.simplefilter("ignore", UserWarning)
+        ridge.fit(x_arr, u)
+        enet.fit(x_arr, u)
+
+    w_ens = 0.5 * (
+        np.asarray(ridge.coef_, dtype=np.float64)
+        + np.asarray(enet.coef_, dtype=np.float64)
+    )
+    b_ens = 0.5 * (float(ridge.intercept_) + float(enet.intercept_))
+
+    sigma_ffa: float | None = None
+    if n_samples >= 6:
+        try:
+            cv_outer = min(5, n_samples)
+            cv_inner = max(
+                2, min(3, n_samples - (n_samples + cv_outer - 1) // cv_outer)
+            )
+            cv = KFold(n_splits=cv_outer, shuffle=True, random_state=seed)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", (ConvergenceWarning, UserWarning))
+                r_pred = cross_val_predict(
+                    RidgeCV(alphas=np.logspace(-2, 4, 40)), x_arr, u, cv=cv
+                )
+                e_pred = cross_val_predict(
+                    ElasticNetCV(
+                        l1_ratio=[0.1, 0.5],
+                        cv=cv_inner,
+                        random_state=seed,
+                        max_iter=3000,
+                    ),
+                    x_arr,
+                    u,
+                    cv=cv,
+                )
+            ens_pred = scipy.special.expit(0.5 * (r_pred + e_pred))
+            sigma_ffa = max(float(np.sqrt(np.mean((ens_pred - y_clip) ** 2))), 0.005)
+        except (
+            ValueError,
+            TypeError,
+            ZeroDivisionError,
+            FloatingPointError,
+            RuntimeError,
+        ):
+            sigma_ffa = None
+
+    if sigma_ffa is None:
+        y_pred = scipy.special.expit(x_arr @ w_ens + b_ens)
+        sigma_ffa = max(float(np.sqrt(np.mean((y_pred - y_clip) ** 2))), 0.005)
+
+    return w_ens, b_ens, sigma_ffa
+
+
+# Backwards compatibility alias for PREFACE
+fit_preface_logit_ensemble = fit_ffa_logit_ensemble
+
+
 def fit_rprop_mlp(
     X: NDArray[np.floating] | np.ndarray,
     y: NDArray[np.floating] | np.ndarray,
@@ -167,6 +316,7 @@ def fit_rprop_mlp(
     def _loss_and_grad(
         theta: NDArray[np.float64],
     ) -> tuple[float, NDArray[np.float64]]:
+        """Compute MSE loss and analytical gradient for 2-layer MLP."""
         w1 = theta[:s1].reshape(n_features, hidden_dim)
         b1 = theta[s1:s2]
         w2 = theta[s2:s3].reshape(hidden_dim, 1)

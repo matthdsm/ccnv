@@ -49,6 +49,7 @@ from ccnv.models import (
 )
 from ccnv.qc.reference import run_reference_qc_on_table
 from ccnv.stats.neighbors import (
+    build_signal_space_features,
     compute_null_models,
     distance_cutoff,
     select_nearest_bins,
@@ -192,6 +193,7 @@ def build_reference_table(
         sample_indices: NDArray[np.integer],
         contig_names: tuple[str, ...],
     ) -> None:
+        """Construct and append a reference branch table for the given cohort subset."""
         branch_tables.append(
             _build_branch_table(
                 branch=branch_name,
@@ -275,6 +277,7 @@ def build_reference_table(
 
 
 def _validate_config(config: ReferenceConfig) -> None:
+    """Validate reference build configuration parameters and input paths."""
     if config.mode == "prenatal" and config.fasta is not None:
         raise ReferenceError(
             "Flat FASTA references are only supported in --mode germline; "
@@ -314,6 +317,7 @@ def _validate_config(config: ReferenceConfig) -> None:
 def _resolve_contig_roles(
     cohort: Cohort, config: ReferenceConfig
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Partition cohort contigs into autosomal and sex-chromosome sets."""
     ordered, avail = tuple(dict.fromkeys(cohort.contigs)), set(cohort.contigs)
     req_sex = (
         None if config.sex_contigs is None else tuple(dict.fromkeys(config.sex_contigs))
@@ -350,6 +354,7 @@ def _resolve_contig_roles(
 def _resolve_sexes(
     cohort: Cohort, config: ReferenceConfig, sex_contigs: tuple[str, ...]
 ) -> tuple[tuple[SexLabel, ...] | None, str, SexInference | None, str | None]:
+    """Resolve sample sex assignments from samplesheet or coverage inference."""
     signal = _resolve_sex_signal(cohort, config)
     if not sex_contigs or signal is None:
         return None, "none", None, signal
@@ -383,6 +388,7 @@ def _resolve_sexes(
 
 
 def _resolve_sex_signal(cohort: Cohort, config: ReferenceConfig) -> str | None:
+    """Identify the sex-signal contig available in the cohort."""
     avail, req = set(cohort.contigs), config.sex_signal_contig
     if req is None or req == DEFAULT_SEX_SIGNAL_CONTIGS[0]:
         return next((n for n in DEFAULT_SEX_SIGNAL_CONTIGS if n in avail), None)
@@ -392,6 +398,7 @@ def _resolve_sex_signal(cohort: Cohort, config: ReferenceConfig) -> str | None:
 
 
 def _contig_fractions(cohort: Cohort, contig: str) -> NDArray[np.float64]:
+    """Calculate per-sample fractional depth for a specific contig."""
     totals = cohort.counts.sum(axis=0)
     if np.any(totals <= 0):
         raise ReferenceError("every sample must have a positive total count")
@@ -409,6 +416,7 @@ def _build_branch_table(
     cohort_mappability: NDArray[np.float64] | None = None,
     cohort_n_mask: NDArray[np.bool_] | None = None,
 ) -> pa.Table:
+    """Build a reference branch Parquet table including PCA, KDTree, and null models."""
     selected = np.isin(cohort.contigs, contig_names)
     if not np.any(selected):
         raise ReferenceError(f"branch {branch!r} has no bins")
@@ -447,19 +455,15 @@ def _build_branch_table(
     _, contig_ids = np.unique(
         np.asarray(contig_subset[usable], dtype=str), return_inverse=True
     )
-    profiles = (
-        cov_mat
-        if (
-            config.fasta is not None
-            and (
-                cov_mat := covariate_features(
-                    usable, gc=branch_gc, mappability=branch_map
-                )
-            )
-            is not None
-        )
-        else corrected
+    cov_mat = covariate_features(usable, gc=branch_gc, mappability=branch_map)
+    scaled_loadings = (
+        pca_loadings * np.sqrt(pca_loadings.shape[1])
+        if pca_loadings.size > 0
+        else pca_loadings
     )
+    profiles = build_signal_space_features(scaled_loadings, covariate_mat=cov_mat)
+    if profiles.size == 0 or np.allclose(profiles, 0.0):
+        profiles = corrected
     logger.debug(
         "branch %s: selecting %d nearest off-contig bins (batch memory limit=%d MB)",
         branch,
@@ -474,7 +478,10 @@ def _build_branch_table(
         threads=config.threads,
     )
     null_mean, null_std = compute_null_models(
-        corrected, nearest_idx, threads=config.threads
+        corrected,
+        nearest_idx,
+        threads=config.threads,
+        n_pca_components=0 if config.fasta is not None else pca_loadings.shape[0],
     )
     logger.debug(
         "branch %s: null models computed for %d bins",

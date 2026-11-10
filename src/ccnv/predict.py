@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
 
 import numpy as np
+import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 import scipy.stats
 from numpy.typing import ArrayLike, NDArray
+from sklearn.linear_model import HuberRegressor
 
 from ccnv.features.cohort import rebin_sample_table
 from ccnv.features.covariates import (
@@ -273,51 +276,29 @@ def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
     ref_b = inputs.reference.filter(pc.equal(inputs.reference.column("branch"), branch))
     if ref_b.num_rows == 0:
         raise PredictError(f"branch {branch!r} has no reference rows")
-    ref_coords = set(bin_coordinates(ref_b))
-    sm_b = inputs.sample.filter(
-        pc.is_in(
-            inputs.sample.column("contig"),
-            pa.array(list(set(ref_b.column("contig").unique().to_pylist()))),
-        )
+
+    ref_pl = pl.from_arrow(ref_b)
+    sm_pl = pl.from_arrow(inputs.sample)
+    joined = ref_pl.select(["contig", "start", "end"]).join(
+        sm_pl.select(["contig", "start", "end", "count"]),
+        on=["contig", "start", "end"],
+        how="left",
+        maintain_order="left",
     )
-    c_m = [
-        item in ref_coords
-        for item in zip(
-            sm_b.column("contig").to_pylist(),
-            sm_b.column("start").to_pylist(),
-            sm_b.column("end").to_pylist(),
-            strict=True,
-        )
-    ]
-    sample_branch = sm_b.filter(pa.array(c_m, type=pa.bool_()))
-    if sample_branch.num_rows != ref_b.num_rows:
+    if joined["count"].null_count() != 0 or joined.height != ref_pl.height:
         raise PredictError(f"branch {branch!r} bin count mismatch")
 
-    c_vals = ref_b.column("contig").to_pylist()
-    starts = np.asarray(
-        ref_b.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    ends = np.asarray(
-        ref_b.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    counts = np.asarray(
-        sample_branch.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
-    )
-    masked = np.asarray(
-        ref_b.column("masked").to_numpy(zero_copy_only=False), dtype=np.bool_
-    )
-    gc_col = np.asarray(
-        ref_b.column("gc").to_numpy(zero_copy_only=False), dtype=np.float32
-    )
-    map_col = np.asarray(
-        ref_b.column("mappability").to_numpy(zero_copy_only=False), dtype=np.float32
-    )
+    c_vals = ref_pl["contig"].to_list()
+    starts = ref_pl["start"].to_numpy().astype(np.int64)
+    ends = ref_pl["end"].to_numpy().astype(np.int64)
+    counts = joined["count"].to_numpy().astype(np.float64)
+    masked = ref_pl["masked"].to_numpy().astype(np.bool_)
+    gc_col = ref_pl["gc"].to_numpy().astype(np.float32)
+    map_col = ref_pl["mappability"].to_numpy().astype(np.float32)
     gc = gc_col if np.any(gc_col >= 0) else None
     map_ = map_col if np.any(map_col >= 0) else None
     unmasked = ~masked
-    pca_m = np.asarray(
-        ref_b.column("pca_mean").to_numpy(zero_copy_only=False), dtype=np.float64
-    )[unmasked]
+    pca_m = ref_pl["pca_mean"].to_numpy().astype(np.float64)[unmasked]
     raw_ld = [
         item
         for item, keep in zip(
@@ -328,7 +309,7 @@ def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
     pca_ld = (
         np.asarray(raw_ld, dtype=np.float64).T
         if raw_ld and raw_ld[0]
-        else np.empty((0, np.count_nonzero(unmasked)), dtype=np.float64)
+        else np.empty((0, int(np.count_nonzero(unmasked))), dtype=np.float64)
     )
     raw_nbrs = [
         item
@@ -338,19 +319,13 @@ def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
         if keep
     ]
     nearest_idx = tuple(np.asarray(nbrs, dtype=np.int32) for nbrs in raw_nbrs)
-    mean_dist = np.asarray(
-        ref_b.column("mean_distance").to_numpy(zero_copy_only=False), dtype=np.float32
-    )[unmasked]
+    mean_dist = ref_pl["mean_distance"].to_numpy().astype(np.float32)[unmasked]
     nearest_dst = tuple(
         np.full(nbrs.shape, dist, dtype=np.float32)
         for nbrs, dist in zip(nearest_idx, mean_dist, strict=True)
     )
-    null_m = np.asarray(
-        ref_b.column("null_mean").to_numpy(zero_copy_only=False), dtype=np.float64
-    )[unmasked]
-    null_s = np.asarray(
-        ref_b.column("null_std").to_numpy(zero_copy_only=False), dtype=np.float64
-    )[unmasked]
+    null_m = ref_pl["null_mean"].to_numpy().astype(np.float64)[unmasked]
+    null_s = ref_pl["null_std"].to_numpy().astype(np.float64)[unmasked]
     return BranchModel(
         branch=branch,
         contigs=tuple(c_vals),
@@ -396,22 +371,52 @@ def project_coverage(
         raise PredictError(
             f"branch {model.branch!r} has zero sample coverage on usable bins"
         )
+
+    active_unmasked = covariate_usable[unmasked_reference_bins]
+    pos_mu = active_unmasked & (model.pca_mean > 0)
+    scale = usable_total
+    if np.count_nonzero(pos_mu) >= 2:
+        ratios = model.counts[unmasked_reference_bins][pos_mu] / model.pca_mean[pos_mu]
+        valid_ratios = ratios[np.isfinite(ratios) & (ratios > 0)]
+        if valid_ratios.size >= 2:
+            s_hat = float(np.median(valid_ratios))
+            if s_hat > 0 and np.isfinite(s_hat):
+                scale = s_hat
+
     normalized = correct_covariate_bias(
-        model.counts / usable_total, covariate_usable, gc=gc, mappability=mappability
+        model.counts / scale, covariate_usable, gc=gc, mappability=mappability
     )
     selected = normalized[unmasked_reference_bins]
     if selected.shape != model.pca_mean.shape:
         raise PredictError("PCA mean does not align with unmasked sample bins")
     active_subset = covariate_usable[unmasked_reference_bins] & np.isfinite(selected)
     reconstruction = model.pca_mean.copy()
-    if np.count_nonzero(active_subset) > int(
-        np.linalg.matrix_rank(model.pca_loadings[:, active_subset].T)
-    ):
+    n_active = int(np.count_nonzero(active_subset))
+    rank = (
+        int(np.linalg.matrix_rank(model.pca_loadings[:, active_subset].T))
+        if model.pca_loadings.size > 0
+        else 0
+    )
+    if n_active > rank > 0:
         subset_centered = selected[active_subset] - model.pca_mean[active_subset]
-        coeffs, *_ = np.linalg.lstsq(
-            model.pca_loadings[:, active_subset].T, subset_centered, rcond=None
-        )
+        X = model.pca_loadings[:, active_subset].T
+        coeffs = None
+        if n_active >= max(rank + 2, 4) and float(np.std(subset_centered)) > 1e-12:
+            try:
+                huber = HuberRegressor(
+                    fit_intercept=False,
+                    alpha=0.0,
+                    epsilon=1.35,
+                    max_iter=100,
+                )
+                huber.fit(X, subset_centered)
+                coeffs = huber.coef_
+            except ValueError:
+                coeffs = None
+        if coeffs is None:
+            coeffs, *_ = np.linalg.lstsq(X, subset_centered, rcond=None)
         reconstruction = (coeffs @ model.pca_loadings) + model.pca_mean
+
     corrected = np.full(normalized.shape, np.nan, dtype=np.float64)
     valid = active_subset & np.isfinite(reconstruction) & (reconstruction > 0)
     corrected_values = np.full(selected.shape, np.nan, dtype=np.float64)
@@ -450,40 +455,72 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
         min_mappability=config.min_mappability,
     )
     unmasked_indices = np.flatnonzero(~model.masked)
+    U = unmasked_indices.size
     corrected = projected.corrected[unmasked_indices]
     ratios = np.full(model.counts.shape, np.nan)
     zscores = np.full(model.counts.shape, np.nan)
     weights = np.zeros(model.counts.shape)
     reference_sizes = np.zeros(model.counts.shape, dtype=np.int64)
-    eligible = np.isfinite(corrected) & (corrected > 0)
-    local_ratios = np.full(corrected.shape, np.nan)
-    local_zscores = np.full(corrected.shape, np.nan)
+
     filtered_neighbors = tuple(
         neighbors[neighbors != i] for i, neighbors in enumerate(model.nearest_indices)
     )
+    max_k = max((nbrs.size for nbrs in filtered_neighbors), default=0)
+
+    if max_k == 0:
+        neighbor_matrix = np.full((U, 0), U, dtype=np.int32)
+    else:
+        neighbor_matrix = np.full((U, max_k), U, dtype=np.int32)
+        for i, nbrs in enumerate(filtered_neighbors):
+            if nbrs.size > 0:
+                neighbor_matrix[i, : nbrs.size] = nbrs
+
+    eligible = np.isfinite(corrected) & (corrected > 0)
+    local_ratios = np.full(corrected.shape, np.nan)
+    local_zscores = np.full(corrected.shape, np.nan)
+    CHUNK_SIZE = 25_000
+
     for iteration in range(config.mask_repeats):
-        for idx in range(unmasked_indices.size):
-            val, neighbors = corrected[idx], filtered_neighbors[idx]
-            selected_neighbors = neighbors[eligible[neighbors]]
-            reference_sizes[unmasked_indices[idx]] = selected_neighbors.size
-            if (
-                not np.isfinite(val)
-                or val <= 0
-                or selected_neighbors.size < config.min_reference_bins
-            ):
-                local_ratios[idx], local_zscores[idx] = np.nan, np.nan
-                continue
-            baseline = float(np.median(corrected[selected_neighbors]))
-            if not np.isfinite(baseline) or baseline <= 0:
-                continue
-            ratio_val = float(np.log2(val / baseline))
-            local_ratios[idx] = ratio_val
-            null_std = model.null_std[idx]
-            local_zscores[idx] = (
-                (ratio_val - model.null_mean[idx]) / null_std
-                if null_std > 1e-8
-                else np.nan
-            )
+        active_padded = np.full(U + 1, np.nan, dtype=np.float64)
+        active_padded[:U] = np.where(eligible, corrected, np.nan)
+
+        if max_k > 0:
+            usable_nbr_counts = np.zeros(U, dtype=np.int64)
+            baselines = np.full(U, np.nan, dtype=np.float64)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                for start_idx in range(0, U, CHUNK_SIZE):
+                    end_idx = min(start_idx + CHUNK_SIZE, U)
+                    chunk_vals = active_padded[neighbor_matrix[start_idx:end_idx]]
+                    usable_nbr_counts[start_idx:end_idx] = np.sum(
+                        np.isfinite(chunk_vals), axis=1
+                    )
+                    baselines[start_idx:end_idx] = np.nanmedian(chunk_vals, axis=1)
+        else:
+            usable_nbr_counts = np.zeros(U, dtype=np.int64)
+            baselines = np.full(U, np.nan, dtype=np.float64)
+
+        reference_sizes[unmasked_indices] = usable_nbr_counts
+
+        valid_bins = (
+            np.isfinite(corrected)
+            & (corrected > 0)
+            & (usable_nbr_counts >= config.min_reference_bins)
+            & np.isfinite(baselines)
+            & (baselines > 0)
+        )
+        local_ratios[:] = np.nan
+        local_zscores[:] = np.nan
+
+        local_ratios[valid_bins] = np.log2(
+            corrected[valid_bins] / baselines[valid_bins]
+        )
+
+        has_std = valid_bins & (model.null_std > 1e-8)
+        local_zscores[has_std] = (
+            local_ratios[has_std] - model.null_mean[has_std]
+        ) / model.null_std[has_std]
+
         missing_zscores = np.isfinite(local_ratios) & ~np.isfinite(local_zscores)
         if np.any(missing_zscores):
             finite_ratios_sub = local_ratios[np.isfinite(local_ratios)]
@@ -510,11 +547,18 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
             config.mask_repeats,
             int(np.count_nonzero(eligible)),
         )
+
     finite_ratios = np.isfinite(local_ratios)
     median_shift = 0.0
     if np.any(finite_ratios):
         median_shift = float(np.median(local_ratios[finite_ratios]))
         local_ratios[finite_ratios] -= median_shift
+
+    finite_zscores = np.isfinite(local_zscores)
+    if np.any(finite_zscores):
+        zscore_shift = float(np.median(local_zscores[finite_zscores]))
+        local_zscores[finite_zscores] -= zscore_shift
+
     logger.debug(
         "branch %s: %d finite ratios, median shift=%.4f (mean=%.4f, std=%.4f)",
         model.branch,
@@ -525,12 +569,17 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
     )
     ratios[unmasked_indices] = local_ratios
     zscores[unmasked_indices] = local_zscores
-    valid_distances = (model.mean_distance > 0) & np.isfinite(model.mean_distance)
-    weights[unmasked_indices] = np.where(
-        valid_distances,
-        1.0 / np.where(valid_distances, model.mean_distance, 1.0),
+
+    pos_null = model.null_std > 0
+    s0_sq = float(np.median(model.null_std[pos_null] ** 2)) if np.any(pos_null) else 1.0
+    eb_weights = np.clip(s0_sq / np.maximum(model.null_std**2, 1e-8), 0.05, 20.0)
+    tier2_weights = np.where(
+        model.mean_distance > 0,
+        1.0 / np.maximum(model.mean_distance, 1e-12),
         1.0,
     )
+    weights[unmasked_indices] = np.where(pos_null, eb_weights, tier2_weights)
+
     valid = (
         projected.usable
         & np.isfinite(ratios)
@@ -574,6 +623,102 @@ def call_segment(
     return None
 
 
+def _compute_contig_rho1(z_contig: NDArray[np.float64]) -> float:
+    """Compute per-contig lag-1 autocorrelation on finite diploid-clipped z-scores."""
+    mask = np.isfinite(z_contig) & (np.abs(z_contig) <= 2.5)
+    z_clip = z_contig[mask]
+    if z_clip.size < 3:
+        return 0.0
+    x = z_clip[:-1]
+    y = z_clip[1:]
+    std_x = float(np.std(x))
+    std_y = float(np.std(y))
+    if std_x < 1e-12 or std_y < 1e-12:
+        return 0.0
+    corr = float(np.corrcoef(x, y)[0, 1])
+    if not np.isfinite(corr):
+        return 0.0
+    return float(np.clip(corr, 0.0, 0.95))
+
+
+def _evaluate_stouffer_segment_scores(
+    bins_df: pl.DataFrame,
+    segs_df: pl.DataFrame,
+) -> pl.DataFrame:
+    """Evaluate autocorrelation-corrected Stouffer Z-scores via asof interval join."""
+    bins_sorted = bins_df.sort(["contig", "start"])
+    segs_sorted = segs_df.sort(["contig", "seg_start"])
+
+    joined = bins_sorted.join_asof(
+        segs_sorted.select(["seg_id", "contig", "seg_start", "seg_end"]),
+        left_on="start",
+        right_on="seg_start",
+        by="contig",
+        strategy="backward",
+        check_sortedness=False,
+    ).filter(pl.col("end") <= pl.col("seg_end"))
+
+    usable = joined.filter(pl.col("zscore").is_finite() & (pl.col("weight") > 0))
+
+    if usable.height == 0:
+        return segs_df.with_columns(
+            [
+                pl.lit(0).alias("n_usable"),
+                pl.lit(0.0).alias("zscore"),
+            ]
+        ).sort("seg_id")
+
+    stats = (
+        usable.group_by("seg_id")
+        .agg(
+            [
+                pl.len().alias("n_usable"),
+                (pl.col("weight") * pl.col("zscore")).sum().alias("sum_w_z"),
+                (pl.col("weight") * pl.col("weight")).sum().alias("sum_w_sq"),
+                pl.col("rho1").first().alias("rho1"),
+            ]
+        )
+        .with_columns(
+            (
+                pl.col("sum_w_sq")
+                * (
+                    1.0
+                    + pl.when(pl.col("n_usable") > 1)
+                    .then(
+                        2.0
+                        * (pl.col("n_usable") - 1)
+                        / pl.col("n_usable")
+                        * pl.col("rho1")
+                    )
+                    .otherwise(0.0)
+                )
+            )
+            .sqrt()
+            .alias("denom")
+        )
+        .with_columns(
+            pl.when(pl.col("denom") > 1e-12)
+            .then(pl.col("sum_w_z") / pl.col("denom"))
+            .otherwise(0.0)
+            .alias("zscore")
+        )
+    )
+    return (
+        segs_df.join(
+            stats.select(["seg_id", "n_usable", "zscore"]),
+            on="seg_id",
+            how="left",
+        )
+        .with_columns(
+            [
+                pl.col("n_usable").fill_null(0),
+                pl.col("zscore").fill_null(0.0),
+            ]
+        )
+        .sort("seg_id")
+    )
+
+
 def segment_and_call(
     bins: tuple[BinResult, ...],
     contig_lengths: dict[str, int],
@@ -583,7 +728,10 @@ def segment_and_call(
     ratio_threshold: float | None = None,
     max_blacklist_gap: int = 2_000_000,
 ) -> tuple[SegmentResult, ...]:
-    """Segment all selected branches and classify their weighted means."""
+    """Segment all selected branches and classify with AR(1)-corrected Stouffer Z-scores."""
+    if not bins:
+        return ()
+
     by_contig: dict[
         str,
         tuple[
@@ -594,78 +742,132 @@ def segment_and_call(
             int,
         ],
     ] = {}
-    evidence: dict[
-        str,
-        tuple[
-            NDArray[np.int64],
-            NDArray[np.int64],
-            NDArray[np.float64],
-            NDArray[np.float64],
-        ],
-    ] = {}
+
+    all_contigs: list[str] = []
+    all_starts_list: list[NDArray[np.int64]] = []
+    all_ends_list: list[NDArray[np.int64]] = []
+    all_zscores_list: list[NDArray[np.float64]] = []
+    all_weights_list: list[NDArray[np.float64]] = []
+    all_rho1_list: list[NDArray[np.float64]] = []
+
     for result in bins:
         contig_array = np.asarray(result.contigs, dtype=object)
         for contig_name in dict.fromkeys(result.contigs):
             selected = contig_array == contig_name
-            contig_starts = result.starts[selected]
-            contig_ends = result.ends[selected]
-            contig_weights = result.weights[selected]
+            c_starts = result.starts[selected]
+            c_ends = result.ends[selected]
+            c_ratios = result.ratios[selected]
+            c_weights = result.weights[selected]
+            c_zscores = result.zscores[selected]
+
             by_contig[contig_name] = (
-                contig_starts,
-                contig_ends,
-                result.ratios[selected],
-                contig_weights,
+                c_starts,
+                c_ends,
+                c_ratios,
+                c_weights,
                 contig_lengths[contig_name],
             )
-            evidence[contig_name] = (
-                contig_starts,
-                contig_ends,
-                result.zscores[selected],
-                contig_weights,
-            )
+            rho1 = _compute_contig_rho1(c_zscores)
+
+            all_contigs.extend([contig_name] * int(np.count_nonzero(selected)))
+            all_starts_list.append(c_starts)
+            all_ends_list.append(c_ends)
+            all_zscores_list.append(c_zscores)
+            all_weights_list.append(c_weights)
+            all_rho1_list.append(np.full(c_starts.size, rho1, dtype=np.float64))
+
     raw_segments = segment_genome(
         by_contig,
         penalty=penalty,
         algorithm="binseg",
         max_blacklist_gap=max_blacklist_gap,
     )
+    if not raw_segments:
+        logger.debug("called 0 segments: 0 gains, 0 losses, 0 neutral")
+        return ()
+
+    all_starts = (
+        np.concatenate(all_starts_list)
+        if all_starts_list
+        else np.empty(0, dtype=np.int64)
+    )
+    all_ends = (
+        np.concatenate(all_ends_list) if all_ends_list else np.empty(0, dtype=np.int64)
+    )
+    all_zscores = (
+        np.concatenate(all_zscores_list)
+        if all_zscores_list
+        else np.empty(0, dtype=np.float64)
+    )
+    all_weights = (
+        np.concatenate(all_weights_list)
+        if all_weights_list
+        else np.empty(0, dtype=np.float64)
+    )
+    all_rho1 = (
+        np.concatenate(all_rho1_list)
+        if all_rho1_list
+        else np.empty(0, dtype=np.float64)
+    )
+
+    bins_df = pl.DataFrame(
+        {
+            "contig": all_contigs,
+            "start": all_starts,
+            "end": all_ends,
+            "zscore": all_zscores,
+            "weight": all_weights,
+            "rho1": all_rho1,
+        }
+    )
+
+    segs_df = pl.DataFrame(
+        {
+            "seg_id": np.arange(len(raw_segments), dtype=np.int64),
+            "contig": [s.contig for s in raw_segments],
+            "seg_start": np.array([s.start for s in raw_segments], dtype=np.int64),
+            "seg_end": np.array([s.end for s in raw_segments], dtype=np.int64),
+            "mean": np.array([s.mean for s in raw_segments], dtype=np.float64),
+            "weight": np.array([s.weight for s in raw_segments], dtype=np.float64),
+            "bin_count": np.array([s.bin_count for s in raw_segments], dtype=np.int64),
+        }
+    )
+
+    final_segs = _evaluate_stouffer_segment_scores(bins_df, segs_df)
+
     output: list[SegmentResult] = []
-    for segment in raw_segments:
-        contig_starts, contig_ends, contig_zscores, contig_weights = evidence[
-            segment.contig
-        ]
-        overlapping = (
-            (contig_starts < segment.end)
-            & (contig_ends > segment.start)
-            & np.isfinite(contig_zscores)
-            & (contig_weights > 0)
-        )
-        segment_zscore = (
-            float(
-                np.average(
-                    contig_zscores[overlapping], weights=contig_weights[overlapping]
-                )
+    for row in final_segs.iter_rows(named=True):
+        contig = row["contig"]
+        start = row["seg_start"]
+        end = min(row["seg_end"], contig_lengths[contig])
+        ratio = row["mean"]
+        seg_zscore = row["zscore"]
+        weight = row["weight"]
+        bin_count = row["bin_count"]
+        n_usable = row["n_usable"]
+        call = (
+            call_segment(
+                ratio,
+                seg_zscore,
+                z_threshold=z_threshold,
+                ratio_threshold=ratio_threshold,
             )
-            if np.any(overlapping)
-            else np.nan
+            if n_usable > 0
+            else None
         )
         output.append(
             SegmentResult(
-                contig=segment.contig,
-                start=segment.start,
-                end=min(segment.end, contig_lengths[segment.contig]),
-                ratio=segment.mean,
-                zscore=segment_zscore,
-                weight=segment.weight,
-                bin_count=segment.bin_count,
-                call=call_segment(
-                    segment.mean,
-                    segment_zscore,
-                    z_threshold=z_threshold,
-                    ratio_threshold=ratio_threshold,
-                ),
+                contig=contig,
+                start=start,
+                end=end,
+                ratio=ratio,
+                zscore=seg_zscore,
+                weight=weight,
+                bin_count=bin_count,
+                call=call,
             )
         )
+
     gains = sum(1 for s in output if s.call == "gain")
     losses = sum(1 for s in output if s.call == "loss")
     neutral = sum(1 for s in output if s.call is None)
@@ -685,6 +887,7 @@ def _resolve_sample_sex(
     metadata: dict[str, object],
     branches: set[object],
 ) -> Sex | None:
+    """Infer sample genetic sex from sex-signal contig coverage against reference cutoff."""
     if requested != "autosomal":
         return requested
     if not ({BRANCH_FEMALE_SEX, BRANCH_MALE_SEX} & branches):
@@ -722,6 +925,7 @@ def _resolve_sample_sex(
 
 
 def _contig_lengths(metadata: dict[str, object]) -> dict[str, int]:
+    """Extract contig lengths dictionary from reference metadata."""
     val = metadata.get("contig_lengths")
     if not isinstance(val, dict):
         raise PredictError("artifact metadata has no contig lengths")
@@ -729,6 +933,7 @@ def _contig_lengths(metadata: dict[str, object]) -> dict[str, int]:
 
 
 def _validate_config(config: PredictConfig) -> None:
+    """Validate prediction configuration parameters."""
     if (
         not np.isfinite(config.penalty)
         or config.penalty <= 0
@@ -757,6 +962,7 @@ def _validate_config(config: PredictConfig) -> None:
 
 
 def _require_aligned(length: int, *arrays: ArrayLike) -> None:
+    """Ensure all provided arrays have 1D shape matching expected length."""
     if any(np.asarray(a).shape != (length,) for a in arrays):
         raise PredictError(
             "prediction result arrays must be aligned and one-dimensional"

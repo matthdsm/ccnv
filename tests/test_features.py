@@ -228,32 +228,32 @@ class TestFeaturesPrenatal(unittest.TestCase):
 
     def test_classify_sca_female(self) -> None:
         res_xx = classify_sca(
-            "F", None, ffx=0.0, preface=0.1, chrx_ratio=1.0, prenatal_meta=self.meta
+            "F", None, ffx=0.0, ffa=0.1, chrx_ratio=1.0, prenatal_meta=self.meta
         )
         self.assertEqual(res_xx.call, "XX")
         self.assertFalse(res_xx.is_aneuploid)
 
         res_xo = classify_sca(
-            "F", None, ffx=0.2, preface=0.1, chrx_ratio=0.9, prenatal_meta=self.meta
+            "F", None, ffx=0.2, ffa=0.1, chrx_ratio=0.9, prenatal_meta=self.meta
         )
         self.assertEqual(res_xo.call, "XO")
         self.assertTrue(res_xo.is_aneuploid)
 
         res_xxx = classify_sca(
-            "F", None, ffx=-0.2, preface=0.1, chrx_ratio=1.1, prenatal_meta=self.meta
+            "F", None, ffx=-0.2, ffa=0.1, chrx_ratio=1.1, prenatal_meta=self.meta
         )
         self.assertEqual(res_xxx.call, "XXX")
         self.assertTrue(res_xxx.is_aneuploid)
 
     def test_classify_sca_male(self) -> None:
         res_xy = classify_sca(
-            "M", ffy=0.1, ffx=0.1, preface=0.1, chrx_ratio=0.95, prenatal_meta=self.meta
+            "M", ffy=0.1, ffx=0.1, ffa=0.1, chrx_ratio=0.95, prenatal_meta=self.meta
         )
         self.assertEqual(res_xy.call, "XY")
         self.assertFalse(res_xy.is_aneuploid)
 
         res_xxy = classify_sca(
-            "M", ffy=0.1, ffx=-0.1, preface=0.1, chrx_ratio=1.0, prenatal_meta=self.meta
+            "M", ffy=0.1, ffx=-0.1, ffa=0.1, chrx_ratio=1.0, prenatal_meta=self.meta
         )
         self.assertEqual(res_xxy.call, "XXY")
         self.assertTrue(res_xxy.is_aneuploid)
@@ -266,7 +266,7 @@ class TestFeaturesPrenatal(unittest.TestCase):
             active_ff_source="FFY",
             ffy=0.10,
             ffx=0.10,
-            preface=0.10,
+            ffa=0.10,
             chrx_ratio=0.95,
             chry_score=0.01,
             yfrac_threshold=0.002,

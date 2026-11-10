@@ -176,7 +176,9 @@ class TestMaskingAndPca(unittest.TestCase):
         np.testing.assert_allclose(first[1], second[1])
         np.testing.assert_allclose(first[2], second[2])
         self.assertEqual(first[1].shape, (12,))
-        self.assertEqual(first[2].shape, (3, 12))
+        self.assertGreaterEqual(first[2].shape[0], 1)
+        self.assertLessEqual(first[2].shape[0], 3)
+        self.assertEqual(first[2].shape[1], 12)
 
 
 class TestSexInference(unittest.TestCase):

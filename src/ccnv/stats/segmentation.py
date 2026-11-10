@@ -53,6 +53,7 @@ class WeightedL2Cost(BaseCost):
     min_size = 1
 
     def __init__(self) -> None:
+        """Initialize empty weighted L2 cost accumulator."""
         self.signal = np.empty((0, 2), dtype=np.float64)
         self._weight_sum = np.zeros(1, dtype=np.float64)
         self._weighted_value_sum = np.zeros(1, dtype=np.float64)
@@ -143,31 +144,46 @@ def segment_contig(
     if not np.any(usable):
         return ()
 
-    signal = np.column_stack((np.where(usable, ratio_array, 0.0), weight_array))
-    breakpoints = _find_breakpoints(
-        signal=signal,
-        penalty=penalty,
-        algorithm=algorithm,
-        min_size=min_size,
-        jump=jump,
+    blocks = _split_blacklist_gaps(
+        0,
+        ratio_array.size,
+        starts=start_array,
+        ends=end_array,
+        usable=usable,
+        max_gap=max_blacklist_gap,
     )
 
     segments: list[Segment] = []
-    left = 0
-    for right in breakpoints:
-        split_ranges = _split_blacklist_gaps(
-            left,
-            right,
-            starts=start_array,
-            ends=end_array,
-            usable=usable,
-            max_gap=max_blacklist_gap,
+    for block_left, block_right in blocks:
+        if block_right <= block_left:
+            continue
+        valid_in_block = np.flatnonzero(usable[block_left:block_right])
+        if valid_in_block.size == 0:
+            continue
+        trim_left = block_left + int(valid_in_block[0])
+        trim_right = block_left + int(valid_in_block[-1]) + 1
+
+        block_usable = usable[trim_left:trim_right]
+        clean_ratios = np.where(block_usable, ratio_array[trim_left:trim_right], 0.0)
+        clean_weights = np.where(block_usable, weight_array[trim_left:trim_right], 0.0)
+        signal = np.column_stack((clean_ratios, clean_weights))
+
+        local_bps = _find_breakpoints(
+            signal=signal,
+            block_usable=block_usable,
+            penalty=penalty,
+            algorithm=algorithm,
+            min_size=min_size,
+            jump=jump,
         )
-        for split_left, split_right in split_ranges:
+
+        cur_left = trim_left
+        for bp in local_bps:
+            bp_global = trim_left + bp
             segment = _make_segment(
                 contig,
-                split_left,
-                split_right,
+                cur_left,
+                bp_global,
                 start_array,
                 end_array,
                 ratio_array,
@@ -176,7 +192,8 @@ def segment_contig(
             )
             if segment is not None:
                 segments.append(segment)
-        left = right
+            cur_left = bp_global
+
     return tuple(segments)
 
 
@@ -234,27 +251,43 @@ def segment_genome(
 
 
 def _cumulative(values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Prefix cumulative sum with leading zero."""
     return np.concatenate((np.zeros(1, dtype=np.float64), np.cumsum(values)))
 
 
 def _find_breakpoints(
     *,
     signal: NDArray[np.float64],
+    block_usable: NDArray[np.bool_],
     penalty: float,
     algorithm: Algorithm,
     min_size: int,
     jump: int,
 ) -> list[int]:
-    if signal.shape[0] < 2 * min_size:
-        return [signal.shape[0]]
-    cost = WeightedL2Cost()
+    """Detect change-point indices in a euchromatic block using ruptures."""
+    n_samples = signal.shape[0]
+    if n_samples < 2 * min_size:
+        return [n_samples]
+
+    values = signal[:, 0]
+    weights = signal[:, 1]
+
     if algorithm == "pelt":
-        detector = rpt.Pelt(custom_cost=cost, min_size=min_size, jump=jump)
-    elif algorithm == "binseg":
-        detector = rpt.Binseg(custom_cost=cost, min_size=min_size, jump=jump)
-    else:
-        raise ValueError(f"unknown segmentation algorithm: {algorithm}")
-    return detector.fit(signal).predict(pen=penalty)
+        if np.all(block_usable) and np.allclose(weights, weights[0]):
+            pos_w = float(weights[0])
+            if hasattr(rpt, "KernelCPD"):
+                detector = rpt.KernelCPD(  # type: ignore[attr-defined]
+                    kernel="linear", min_size=min_size, jump=jump
+                )
+                return detector.fit(values.reshape(-1, 1)).predict(pen=penalty / pos_w)
+        detector = rpt.Pelt(custom_cost=WeightedL2Cost(), min_size=min_size, jump=jump)
+        return detector.fit(signal).predict(pen=penalty)
+    if algorithm == "binseg":
+        detector = rpt.Binseg(
+            custom_cost=WeightedL2Cost(), min_size=min_size, jump=jump
+        )
+        return detector.fit(signal).predict(pen=penalty)
+    raise ValueError(f"unknown segmentation algorithm: {algorithm}")
 
 
 def _validate_inputs(
@@ -275,6 +308,7 @@ def _validate_inputs(
     NDArray[np.float64],
     NDArray[np.float64],
 ]:
+    """Validate input interval coordinates, numerical arrays, and segmentation parameters."""
     if not contig:
         raise ValueError("contig must not be empty")
     if contig_length <= 0:
@@ -322,6 +356,7 @@ def _split_blacklist_gaps(
     usable: NDArray[np.bool_],
     max_gap: int,
 ) -> Sequence[tuple[int, int]]:
+    """Partition interval range into contiguous euchromatic blocks split at large masked gaps."""
     splits: list[tuple[int, int]] = []
     cursor = left
     index = left
@@ -351,6 +386,7 @@ def _make_segment(
     weights: NDArray[np.float64],
     usable: NDArray[np.bool_],
 ) -> Segment | None:
+    """Create a Segment object with weighted mean ratio and total weight."""
     valid_indexes = np.flatnonzero(usable[left:right]) + left
     if valid_indexes.size == 0:
         return None

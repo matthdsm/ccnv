@@ -16,30 +16,64 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "fit_pca",
+    "optimal_svht_rank",
     "pca_irlba_numpy",
 ]
 
 
+def optimal_svht_rank(
+    data: NDArray[np.floating],
+    max_components: int = 10,
+) -> int:
+    """Select optimal PCA rank using Gavish-Donoho (2014) SVHT."""
+    data_arr = np.asarray(data, dtype=np.float64)
+    if data_arr.ndim != 2 or data_arr.size == 0:
+        return 1
+    samples = data_arr.T
+    s_dim, u_dim = samples.shape
+    if s_dim < 1 or u_dim < 1:
+        return 1
+    mean = np.mean(samples, axis=0)
+    centered = samples - mean
+    s = np.linalg.svd(centered, compute_uv=False)
+    if s.size == 0:
+        return 1
+    beta = min(s_dim, u_dim) / max(s_dim, u_dim)
+    omega = 0.56 * (beta**3) - 0.95 * (beta**2) + 1.82 * beta + 1.43
+    tau = omega * float(np.median(s))
+    n_above = int(np.count_nonzero(s > tau))
+    upper = min(max_components, s_dim, u_dim)
+    return int(np.clip(n_above, 1, upper))
+
+
 def fit_pca(
     masked_normalized: NDArray[np.floating],
-    n_components: int,
+    n_components: int | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """Fit a deterministic PCA model on samples-by-bins and correct coverage."""
     data = np.asarray(masked_normalized, dtype=np.float64)
     if data.ndim != 2 or data.size == 0:
         raise ReferenceError("PCA requires a non-empty bins-by-samples matrix")
     samples = data.T
-    n_components = min(n_components, samples.shape[0], samples.shape[1])
-    if n_components < 1:
+    if n_components is not None and n_components < 1:
         raise ReferenceError("PCA requires at least one sample and one unmasked bin")
+    max_k = min(
+        10 if n_components is None else n_components,
+        samples.shape[0],
+        samples.shape[1],
+    )
+    if max_k < 1:
+        raise ReferenceError("PCA requires at least one sample and one unmasked bin")
+    rank = optimal_svht_rank(data, max_components=max_k)
+    rank = min(rank, samples.shape[0], samples.shape[1])
     mean = np.mean(samples, axis=0)
     if np.allclose(samples, mean):
         return (
             np.ones(data.shape, dtype=np.float64),
             mean.astype(np.float64, copy=False),
-            np.zeros((n_components, samples.shape[1]), dtype=np.float64),
+            np.zeros((rank, samples.shape[1]), dtype=np.float64),
         )
-    pca = PCA(n_components=n_components, svd_solver="full")
+    pca = PCA(n_components=rank, svd_solver="full")
     pca.fit(samples)
     if (
         hasattr(pca, "explained_variance_ratio_")
@@ -48,7 +82,7 @@ def fit_pca(
         finite_vars = np.nan_to_num(pca.explained_variance_ratio_ * 100.0)
         logger.debug(
             "PCA fitted %d components: explained variance [%s] (total=%.2f%%)",
-            n_components,
+            rank,
             ", ".join(f"{v:.2f}%" for v in finite_vars),
             float(np.sum(finite_vars)),
         )

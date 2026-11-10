@@ -181,7 +181,7 @@ def render_genome_plot(
                 float(prenatal_result.ffy) if prenatal_result.ffy is not None else None
             ),
             "ffx": float(prenatal_result.ffx),
-            "preface": float(prenatal_result.preface),
+            "ffa": float(prenatal_result.ffa),
             "sca_call": prenatal_result.sca.call,
             "is_aneuploid": bool(prenatal_result.sca.is_aneuploid),
             "low_ff_warning": bool(prenatal_result.low_ff_warning),

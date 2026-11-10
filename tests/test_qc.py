@@ -220,7 +220,7 @@ class TestQCPredict(unittest.TestCase):
             active_ff_source="FFY",
             ffy=0.12,
             ffx=0.11,
-            preface=0.10,
+            ffa=0.10,
             chrx_ratio=0.94,
             chry_score=0.015,
             yfrac_threshold=0.002,

@@ -281,6 +281,28 @@ class TestSchemaContracts(unittest.TestCase):
         from_dict_meta = PrenatalModelMetadata.from_dict(as_dict)
         self.assertEqual(from_dict_meta, meta)
 
+    def test_prenatal_model_metadata_backward_compatibility_defaults(self) -> None:
+        meta = _make_prenatal_metadata()
+        as_dict = meta.to_dict()
+        # Remove the new fields to simulate legacy metadata
+        for k in (
+            "ffy_std",
+            "ffa_std",
+            "preface_std",
+            "ffx_std",
+            "ffa_logit_mode",
+            "preface_logit_mode",
+        ):
+            as_dict.pop(k, None)
+
+        legacy_loaded = PrenatalModelMetadata.from_dict(as_dict)
+        self.assertEqual(legacy_loaded.ffy_std, 0.01)
+        self.assertEqual(legacy_loaded.ffa_std, 0.02)
+        self.assertEqual(legacy_loaded.preface_std, 0.02)
+        self.assertEqual(legacy_loaded.ffx_std, 0.025)
+        self.assertFalse(legacy_loaded.ffa_logit_mode)
+        self.assertFalse(legacy_loaded.preface_logit_mode)
+
     def test_prenatal_model_metadata_rejects_missing_keys_or_empty_dict(self) -> None:
         with self.assertRaises(KeyError):
             PrenatalModelMetadata.from_dict({})

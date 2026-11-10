@@ -144,7 +144,7 @@ class TestClassifySCA(unittest.TestCase):
             fetal_sex="F",
             ffy=None,
             ffx=0.0,
-            preface=0.08,
+            ffa=0.08,
             chrx_ratio=1.0,
             prenatal_meta=self.meta,
         )
@@ -160,7 +160,7 @@ class TestClassifySCA(unittest.TestCase):
             fetal_sex="F",
             ffy=None,
             ffx=0.10,
-            preface=0.10,
+            ffa=0.10,
             chrx_ratio=0.95,
             prenatal_meta=self.meta,
         )
@@ -175,7 +175,7 @@ class TestClassifySCA(unittest.TestCase):
             fetal_sex="F",
             ffy=None,
             ffx=-0.10,
-            preface=0.10,
+            ffa=0.10,
             chrx_ratio=1.05,
             prenatal_meta=self.meta,
         )
@@ -184,12 +184,12 @@ class TestClassifySCA(unittest.TestCase):
         self.assertGreater(result.confidence, 0.7)
 
     def test_male_xy(self) -> None:
-        # Concordant male: ffy ~ 0.10, ffx ~ 0.10, preface ~ 0.10
+        # Concordant male: ffy ~ 0.10, ffx ~ 0.10, ffa ~ 0.10
         result = classify_sca(
             fetal_sex="M",
             ffy=0.10,
             ffx=0.10,
-            preface=0.10,
+            ffa=0.10,
             chrx_ratio=0.95,
             prenatal_meta=self.meta,
         )
@@ -205,7 +205,7 @@ class TestClassifySCA(unittest.TestCase):
             fetal_sex="M",
             ffy=0.10,
             ffx=0.0,
-            preface=0.10,
+            ffa=0.10,
             chrx_ratio=1.0,
             prenatal_meta=self.meta,
         )
@@ -214,7 +214,7 @@ class TestClassifySCA(unittest.TestCase):
         self.assertGreater(result.confidence, 0.7)
 
     def test_male_xyy(self) -> None:
-        # Jacob's syndrome (XYY): doubled Y dosage (ffy=0.20, preface=0.10, ffx=0.10)
+        # Jacob's syndrome (XYY): doubled Y dosage (ffy=0.20, ffa=0.10, ffx=0.10)
         # Z_XY = (0.10 - 0.20) / 0.02 = -5.0 <= -3.0
         # Z_Y_PREF = (0.20 - 0.10) / 0.015 = 6.67 >= 3.0
         # ffy / ffx = 0.20 / 0.10 = 2.0 > 1.5
@@ -222,7 +222,7 @@ class TestClassifySCA(unittest.TestCase):
             fetal_sex="M",
             ffy=0.20,
             ffx=0.10,
-            preface=0.10,
+            ffa=0.10,
             chrx_ratio=0.95,
             prenatal_meta=self.meta,
         )
@@ -231,18 +231,61 @@ class TestClassifySCA(unittest.TestCase):
         self.assertGreater(result.confidence, 0.7)
 
     def test_male_discordant_mixed(self) -> None:
-        # Discordant mixed: e.g. ffx much higher than ffy and preface
+        # Discordant mixed: e.g. ffx much higher than ffy and ffa
         # Z_XY = (0.30 - 0.05) / 0.02 = 12.5 >= 3.0
         result = classify_sca(
             fetal_sex="M",
             ffy=0.05,
             ffx=0.30,
-            preface=0.05,
+            ffa=0.05,
             chrx_ratio=0.85,
             prenatal_meta=self.meta,
         )
         self.assertEqual(result.call, "DISCORDANT_MIXED")
         self.assertTrue(result.is_aneuploid)
+
+    def test_classify_sca_bayesian_posterior_and_mahalanobis_discordant_gate(
+        self,
+    ) -> None:
+        # Verify all 7 phenotypes (XX, XY, XO, XXX, XXY, XYY, DISCORDANT_MIXED)
+        # return calibrated Bayesian posterior probabilities in (0.5, 1.0]
+        cases = [
+            ("F", None, 0.0, 0.10, 1.0, "XX", False),
+            ("M", 0.10, 0.10, 0.10, 0.95, "XY", False),
+            ("F", None, 0.10, 0.10, 0.95, "XO", True),
+            ("F", None, -0.10, 0.10, 1.05, "XXX", True),
+            ("M", 0.10, 0.0, 0.10, 1.0, "XXY", True),
+            ("M", 0.20, 0.10, 0.10, 0.95, "XYY", True),
+            ("M", 0.05, 0.30, 0.05, 0.85, "DISCORDANT_MIXED", True),
+        ]
+        for fsex, ffy, ffx, pref, rx, exp_call, exp_aneu in cases:
+            res = classify_sca(
+                fetal_sex=fsex,
+                ffy=ffy,
+                ffx=ffx,
+                ffa=pref,
+                chrx_ratio=rx,
+                prenatal_meta=self.meta,
+            )
+            self.assertEqual(res.call, exp_call, f"Failed call for {exp_call}")
+            self.assertEqual(
+                res.is_aneuploid, exp_aneu, f"Failed aneuploidy for {exp_call}"
+            )
+            self.assertGreater(
+                res.confidence, 0.5, f"Confidence too low for {exp_call}"
+            )
+            self.assertLessEqual(res.confidence, 1.0, f"Confidence > 1 for {exp_call}")
+
+        res_xy = classify_sca(
+            "M",
+            ffy=0.10,
+            ffx=0.10,
+            ffa=0.10,
+            chrx_ratio=0.95,
+            prenatal_meta=self.meta,
+        )
+        self.assertEqual(res_xy.call, "XY")
+        self.assertGreater(res_xy.confidence, 0.85)
 
 
 class TestAnnotatePrenatalSegments(unittest.TestCase):
@@ -260,7 +303,7 @@ class TestAnnotatePrenatalSegments(unittest.TestCase):
             active_ff_source="FFY",
             ffy=0.10,
             ffx=0.10,
-            preface=0.10,
+            ffa=0.10,
             chrx_ratio=0.95,
             chry_score=0.02,
             yfrac_threshold=0.005,
@@ -363,10 +406,10 @@ class TestAnnotatePrenatalSegments(unittest.TestCase):
         prenatal_xo = FetalFractionResult(
             fetal_sex="F",
             active_ff=0.10,
-            active_ff_source="PREFACE",
+            active_ff_source="FFA",
             ffy=None,
             ffx=0.10,
-            preface=0.10,
+            ffa=0.10,
             chrx_ratio=0.95,
             chry_score=0.001,
             yfrac_threshold=0.005,
@@ -486,7 +529,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         )
         self.assertEqual(res_female.fetal_sex, "F")
         self.assertIsNone(res_female.ffy)
-        self.assertEqual(res_female.active_ff_source, "PREFACE")
+        self.assertEqual(res_female.active_ff_source, "FFA")
 
     def test_predict_prenatal_olm_fallback(self) -> None:
         auto_tbl, ffy_tbl, meta, _ = fit_prenatal_models(
@@ -503,11 +546,12 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
             olm_bias=0.12,
             olm_skew_intercept=0.0,
             olm_skew_slope=1.0,
+            ffa_logit_mode=False,
         )
         female_sample = self.sample_tables[1]
         res = predict_prenatal(female_sample, ref_table, fallback_meta)
-        self.assertEqual(res.active_ff_source, "PREFACE")
-        self.assertAlmostEqual(res.preface, 0.12, places=1)
+        self.assertEqual(res.active_ff_source, "FFA")
+        self.assertAlmostEqual(res.ffa, 0.12, places=1)
 
     def test_fit_prenatal_models_validation_errors(self) -> None:
         with self.assertRaises(ValueError):
@@ -552,7 +596,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
     def test_annotate_prenatal_segments_edge_cases(self) -> None:
         sca = SCAResult("XX", False, 0.9, 0.0)
         ff_zero = FetalFractionResult(
-            "F", 0.0, "PREFACE", None, None, 0.0, 1.0, 0.001, 0.005, sca
+            "F", 0.0, "FFA", None, None, 0.0, 1.0, 0.001, 0.005, sca
         )
         # Empty segments
         self.assertEqual(annotate_prenatal_segments([], ff_zero), [])
@@ -634,7 +678,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
     def test_annotate_prenatal_segments_z_threshold_without_call(self) -> None:
         sca = SCAResult("XX", False, 0.9, 0.0)
         ff_active = FetalFractionResult(
-            "F", 0.10, "PREFACE", None, None, 0.10, 1.0, 0.001, 0.005, sca
+            "F", 0.10, "FFA", None, None, 0.10, 1.0, 0.001, 0.005, sca
         )
         seg = SegmentResult("chr1", 0, 1000, 0.01, 3.5, 1.0, 5, None)
         res = annotate_prenatal_segments([seg], ff_active, z_threshold=3.0)
@@ -801,7 +845,7 @@ class TestPrenatalEndToEndIntegration(unittest.TestCase):
                 "active_ff_source",
                 "sca",
                 "ffy",
-                "preface",
+                "ffa",
                 "ffx",
             ):
                 self.assertIn(key, p_qc)

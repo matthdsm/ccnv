@@ -18,9 +18,10 @@ The `ccnv.models` package defines pure domain models, configuration containers, 
 - `[src/ccnv/models/results.py:BinResult]`: Per-contig binned observed depth, expected baseline, normalized ratios, and Z-scores.
 - `[src/ccnv/models/results.py:SegmentResult]`: Segment change-point interval with weighted mean ratio, mean Z-score, gain/loss call, and prenatal annotations.
 - `[src/ccnv/models/results.py:PredictionOutputs]`: Comprehensive container of output paths and result data structures.
-- `[src/ccnv/models/results.py:FetalFractionResult]`: Multi-resolution fetal fraction estimates (`FFY`, `PREFACE`, `FFX`), active fetal fraction, and sex chromosome aneuploidy results.
+- `[src/ccnv/models/results.py:FetalFractionResult]`: Multi-resolution fetal fraction estimates (`FFY`, `FFA`, `FFX`), active fetal fraction, and sex chromosome aneuploidy results.
 - `[src/ccnv/models/schemas.py:SAMPLE_SCHEMA]`: PyArrow schema definition for binned sample read count tables.
 - `[src/ccnv/models/schemas.py:REFERENCE_SCHEMA]`: PyArrow schema definition for multi-branch reference model tables.
+- `[src/ccnv/models/schemas.py:PrenatalModelMetadata]`: Encapsulates serialized prenatal model hyperparameter metadata, estimator coefficients, and standard error bounds.
 - `[src/ccnv/models/schemas.py:validate_table]`: Validates Arrow tables against schema and metadata contracts.
 - `[src/ccnv/models/schemas.py:encode_metadata]`, `[src/ccnv/models/schemas.py:decode_metadata]`: JSON-serializes and deserializes structured metadata dictionaries for Arrow table footers.
 

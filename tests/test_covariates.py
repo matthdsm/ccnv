@@ -239,6 +239,38 @@ class TestCovariateRegression(unittest.TestCase):
         np.testing.assert_allclose(np.mean(feats, axis=0), [0.0, 0.0], atol=1e-12)
         np.testing.assert_allclose(np.std(feats, axis=0), [1.0, 1.0], atol=1e-12)
 
+    def test_build_joint_covariate_basis_captures_gc_mappability_interaction(
+        self,
+    ) -> None:
+        from ccnv.features.covariates import correct_covariate_bias
+        from ccnv.stats.regression import build_joint_covariate_basis
+
+        rng = np.random.default_rng(42)
+        n = 200
+        gc = rng.uniform(0.25, 0.75, size=n)
+        mapp = rng.uniform(0.55, 1.0, size=n)
+        basis = build_joint_covariate_basis(gc, mapp)
+        self.assertIsNotNone(basis)
+
+        # Simulate coupled non-linear GC + mappability + interaction bias with 10% CNV outliers
+        z_gc = (gc - np.mean(gc)) / np.std(gc)
+        z_map = (mapp - np.mean(mapp)) / np.std(mapp)
+        true_bias = np.exp(0.25 * np.sin(z_gc) + 0.15 * z_map + 0.12 * (z_gc * z_map))
+        raw = 100.0 * true_bias
+        raw[:15] *= 2.0  # 15 amplified CNV bins
+        usable = np.ones(n, dtype=np.bool_)
+
+        corrected = correct_covariate_bias(raw, usable, gc=gc, mappability=mapp)
+        diploid_cv_before = np.std(raw[15:]) / np.mean(raw[15:])
+        diploid_cv_after = np.std(corrected[15:]) / np.mean(corrected[15:])
+        self.assertLess(diploid_cv_after, diploid_cv_before * 0.25)
+        # CNV gain ratio on bins 0..14 must be preserved (~2.0x relative to diploid median)
+        self.assertAlmostEqual(
+            float(np.median(corrected[:15]) / np.median(corrected[15:])),
+            2.0,
+            delta=0.15,
+        )
+
 
 class TestEndToEndCovariatePipeline(unittest.TestCase):
     def test_cohort_reference_and_predict_with_gc_and_mappability(self) -> None:

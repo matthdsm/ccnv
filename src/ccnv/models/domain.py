@@ -16,6 +16,7 @@ class SamplesheetEntry:
     ff: float | None = None
 
     def __post_init__(self) -> None:
+        """Validate samplesheet entry attributes."""
         if not isinstance(self.filepath, Path):
             object.__setattr__(self, "filepath", Path(self.filepath))
         if self.sex is not None and self.sex not in ("M", "F"):
@@ -35,6 +36,7 @@ class Contig:
     role: str | None = None
 
     def __post_init__(self) -> None:
+        """Validate contig name and length invariants."""
         if not self.name:
             raise ValueError("contig name must not be empty")
         if self.length <= 0:
@@ -48,6 +50,7 @@ class GenomeProfile:
     contigs: tuple[Contig, ...]
 
     def __post_init__(self) -> None:
+        """Validate non-empty and unique contigs."""
         names = [contig.name for contig in self.contigs]
         if not names:
             raise ValueError("genome profile must contain at least one contig")
@@ -56,13 +59,16 @@ class GenomeProfile:
 
     @property
     def names(self) -> tuple[str, ...]:
+        """Ordered contig names."""
         return tuple(contig.name for contig in self.contigs)
 
     @property
     def lengths(self) -> tuple[int, ...]:
+        """Ordered contig lengths in base pairs."""
         return tuple(contig.length for contig in self.contigs)
 
     def length_map(self) -> dict[str, int]:
+        """Mapping from contig name to length in base pairs."""
         return {contig.name: contig.length for contig in self.contigs}
 
 

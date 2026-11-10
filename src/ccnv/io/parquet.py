@@ -87,6 +87,7 @@ def write_reference_parquet(
 
 
 def _read_sample_for_cohort(path: Path | str) -> pa.Table:
+    """Read and validate a single sample Parquet table for cohort aggregation."""
     p = Path(path)
     try:
         table = pq.read_table(p)
