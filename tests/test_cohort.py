@@ -271,6 +271,55 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             rebinned.column("frag_gc_sum").to_pylist(), [1.2, 1.4], rtol=1e-5
         )
 
+    def test_rebin_sample_table_drops_null_elements_in_fragment_lengths(self) -> None:
+        from ccnv.features.cohort import rebin_sample_table
+
+        # Coarsen 50 bp -> 100 bp with null element inside list
+        table = make_sample_table(
+            [10, 20],
+            contigs=["chr1", "chr1"],
+            starts=[0, 50],
+            ends=[50, 100],
+            contig_lengths={"chr1": 100},
+            bin_size=50,
+            fragment_lengths=[[120, 130], [140]],
+        )
+        rebinned = rebin_sample_table(table, 100)
+        self.assertEqual(
+            rebinned.column("fragment_lengths").to_pylist(),
+            [[120, 130, 140]],
+        )
+
+    def test_rebin_sample_table_non_nested_drops_fragmentomic_metadata_with_warning(
+        self,
+    ) -> None:
+        import json
+
+        from ccnv.features.cohort import rebin_sample_table
+        from ccnv.models.schemas import FRAGMENTOMICS_METADATA_KEY
+
+        table = make_sample_table(
+            [10, 20, 30],
+            contigs=["chr1", "chr1", "chr1"],
+            starts=[0, 20, 40],
+            ends=[20, 40, 60],
+            contig_lengths={"chr1": 60},
+            bin_size=20,
+        )
+        meta_dict = dict(table.schema.metadata)
+        meta_dict[FRAGMENTOMICS_METADATA_KEY] = json.dumps(
+            {"paired_end": True}
+        ).encode()
+        table_with_frag = table.replace_schema_metadata(meta_dict)
+
+        with self.assertLogs("ccnv.features.cohort", level="WARNING") as cm:
+            rebinned = rebin_sample_table(table_with_frag, 50)
+
+        self.assertTrue(
+            any("dropping fragmentomic metadata" in msg for msg in cm.output)
+        )
+        self.assertNotIn(FRAGMENTOMICS_METADATA_KEY, rebinned.schema.metadata or {})
+
     def test_cohort_rejects_mixed_single_and_paired_end(self) -> None:
         import json
 

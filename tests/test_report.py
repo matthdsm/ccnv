@@ -424,6 +424,10 @@ class TestReport(unittest.TestCase):
                 self.assertIn("##INFO=<ID=FRAG_SHORT_R", vcf_header_text)
                 self.assertIn("##INFO=<ID=FRAG_LLR", vcf_header_text)
                 self.assertIn("##INFO=<ID=ORIGIN", vcf_header_text)
+                self.assertIn(
+                    'Description="Fragmentomic origin call: FETAL_CONFIRMED, MATERNAL_CONFIRMED, or INDETERMINATE"',
+                    vcf_header_text,
+                )
                 self.assertIn("##FORMAT=<ID=EXP_LOG2R", vcf_header_text)
                 self.assertIn("##FORMAT=<ID=IMPLIED_FF", vcf_header_text)
 

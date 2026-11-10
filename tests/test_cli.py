@@ -174,6 +174,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
     def test_predict_help_shows_sex_choices_and_defaults(self) -> None:
         result = CliRunner().invoke(app, ["predict", "--help"])
         self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("BAM, CRAM, or sample Parquet input", _cli_text(result.output))
         self.assertIn("[default: autosomal]", _cli_text(result.output))
         self.assertRegex(_cli_text(result.output), r"<autosomal\|female.*\|male>")
         self.assertIn("--mode", _cli_text(result.output))

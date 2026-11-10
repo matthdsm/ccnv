@@ -173,6 +173,35 @@ class PrenatalModelMetadata:
             "ffa_logit_mode": bool(self.ffa_logit_mode),
             "preface_std": float(self.ffa_std),
             "preface_logit_mode": bool(self.ffa_logit_mode),
+            "p_fetal_density": (
+                [float(x) for x in self.p_fetal_density]
+                if self.p_fetal_density is not None
+                else None
+            ),
+            "p_maternal_density": (
+                [float(x) for x in self.p_maternal_density]
+                if self.p_maternal_density is not None
+                else None
+            ),
+            "ff_frag_weights": (
+                [float(x) for x in self.ff_frag_weights]
+                if self.ff_frag_weights is not None
+                else None
+            ),
+            "ff_frag_bias": (
+                float(self.ff_frag_bias) if self.ff_frag_bias is not None else None
+            ),
+            "ff_frag_feature_mean": (
+                [float(x) for x in self.ff_frag_feature_mean]
+                if self.ff_frag_feature_mean is not None
+                else None
+            ),
+            "ff_frag_feature_scale": (
+                [float(x) for x in self.ff_frag_feature_scale]
+                if self.ff_frag_feature_scale is not None
+                else None
+            ),
+            "ff_size_std": float(self.ff_size_std),
         }
 
     @classmethod
@@ -193,6 +222,13 @@ class PrenatalModelMetadata:
         ffa_logit_val = bool(
             data.get("ffa_logit_mode", data.get("preface_logit_mode", False))
         )
+        p_fet = data.get("p_fetal_density")
+        p_mat = data.get("p_maternal_density")
+        w_frag = data.get("ff_frag_weights")
+        b_frag = data.get("ff_frag_bias")
+        m_frag = data.get("ff_frag_feature_mean")
+        s_frag = data.get("ff_frag_feature_scale")
+        std_size = float(data.get("ff_size_std", 0.018))
         return cls(
             prenatal_bin_size=int(raw_bin_size),
             yfrac_threshold=float(data["yfrac_threshold"]),
@@ -216,6 +252,17 @@ class PrenatalModelMetadata:
             ffa_std=ffa_std_val,
             ffx_std=float(data.get("ffx_std", 0.025)),
             ffa_logit_mode=ffa_logit_val,
+            p_fetal_density=[float(x) for x in p_fet] if p_fet is not None else None,
+            p_maternal_density=[float(x) for x in p_mat] if p_mat is not None else None,
+            ff_frag_weights=[float(x) for x in w_frag] if w_frag is not None else None,
+            ff_frag_bias=float(b_frag) if b_frag is not None else None,
+            ff_frag_feature_mean=[float(x) for x in m_frag]
+            if m_frag is not None
+            else None,
+            ff_frag_feature_scale=[float(x) for x in s_frag]
+            if s_frag is not None
+            else None,
+            ff_size_std=std_size,
         )
 
     def encode(self) -> bytes:

@@ -23,7 +23,7 @@ flowchart LR
 
 ## 1. `extract`
 
-Streams alignments per contig, filters reads in deterministic precedence order, bins read starts (or paired-end dyad midpoints) with `numpy.bincount`, and writes `<prefix>.ccnv`. For paired-end libraries, also captures fragment length distributions ($30$–$600\text{ bp}$, configurable via `--min-frag-len` and `--max-frag-len`), $5'$ 4-mer motif codes, fragment GC content, and endpoint counts, serializing cohort fragmentomics under `ccnv.fragmentomics` Parquet metadata. Effective read counters (`effective_reads_examined`, `effective_reads_kept`, `autosomal_reads_kept`, `sex_reads_kept`) record metrics strictly across binned target contigs.
+Streams alignments per contig, filters reads in deterministic precedence order, bins read starts (or paired-end dyad midpoints) with `numpy.bincount`, and writes `<prefix>.ccnv`. For paired-end libraries, also captures fragment length distributions ($30$–$600\text{ bp}$), $5'$ 4-mer motif codes, fragment GC content, and endpoint counts, serializing cohort fragmentomics under `ccnv.fragmentomics` Parquet metadata. Effective read counters (`effective_reads_examined`, `effective_reads_kept`, `autosomal_reads_kept`, `sex_reads_kept`) record metrics strictly across binned target contigs.
 
 ```mermaid
 flowchart TD

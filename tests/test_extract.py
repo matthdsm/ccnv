@@ -807,6 +807,70 @@ class TestEffectiveReadMetrics(unittest.TestCase):
             self.assertEqual(qc["sex_reads_kept"], 1)
             self.assertEqual(set(qc), set(QC_COUNTERS))
 
+    def test_stream_contig_fragments_bounds_and_overflow_protection(self) -> None:
+        from ccnv.extract import _ContigTask, bin_contig_with_handle
+        from ccnv.io.alignments import stream_contig_fragments
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bam_path = Path(tmpdir) / "test.bam"
+            header = {
+                "HD": {"VN": "1.6", "SO": "coordinate"},
+                "SQ": [{"SN": "chr1", "LN": 100_000}],
+            }
+            r1 = _read("r1", 0, 100, 60)
+            r1.is_paired = True
+            r1.is_proper_pair = True
+            r1.template_length = 20
+
+            r2 = _read("r2", 0, 200, 60)
+            r2.is_paired = True
+            r2.is_proper_pair = True
+            r2.template_length = 167
+
+            r3 = _read("r3", 0, 300, 60)
+            r3.is_paired = True
+            r3.is_proper_pair = True
+            r3.template_length = 700
+
+            r4 = _read("r4", 0, 400, 60)
+            r4.is_paired = True
+            r4.is_proper_pair = True
+            r4.template_length = 70_000
+
+            _write_bam(bam_path, [r1, r2, r3, r4], header=header, index=True)
+
+            with pysam.AlignmentFile(str(bam_path), "rb") as handle:
+                frags = list(
+                    stream_contig_fragments(
+                        handle,
+                        "chr1",
+                        ReadFilters(),
+                        contig_length=100_000,
+                        min_frag_len=30,
+                        max_frag_len=600,
+                    )
+                )
+                lengths = [item[3] for item in frags]
+                self.assertEqual(lengths, [0, 167, 0, 0])
+                self.assertEqual(frags[3][1], 400)
+                self.assertEqual(frags[3][2], 70_400)
+                self.assertEqual(frags[3][0], 35_400)
+
+                task = _ContigTask(
+                    path=bam_path,
+                    fmt="bam",
+                    fasta=None,
+                    name="chr1",
+                    length=100_000,
+                    bin_size=1000,
+                    filters=ReadFilters(),
+                    decode_threads=0,
+                    min_frag_len=30,
+                    max_frag_len=600,
+                )
+                result = bin_contig_with_handle(handle, task)
+                self.assertEqual(result.counts.sum(), 4)
+
 
 class TestExtractPublishedCram(unittest.TestCase):
     def test_cli_extracts_published_chr21_cram(self) -> None:

@@ -176,16 +176,16 @@ def stream_contig_fragments(
                 if qc is not None:
                     qc["filter_no_start"] += 1
                 continue
-            length = tlen
+            length = tlen if (min_frag_len <= tlen <= min(max_frag_len, 65535)) else 0
             end = (
-                min(contig_length - 1, start + length)
+                min(contig_length - 1, start + tlen)
                 if contig_length is not None
-                else start + length
+                else start + tlen
             )
             midpoint = (
-                min(contig_length - 1, start + length // 2)
+                min(contig_length - 1, start + tlen // 2)
                 if contig_length is not None
-                else start + length // 2
+                else start + tlen // 2
             )
             is_paired = True
         else:

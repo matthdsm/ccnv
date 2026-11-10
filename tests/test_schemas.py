@@ -433,6 +433,55 @@ class TestSchemaContracts(unittest.TestCase):
         from_dict_meta = PrenatalModelMetadata.from_dict(as_dict)
         self.assertEqual(from_dict_meta, meta)
 
+    def test_prenatal_model_metadata_roundtrip_all_fragmentomic_fields(self) -> None:
+        meta = PrenatalModelMetadata(
+            prenatal_bin_size=100_000,
+            yfrac_threshold=0.0041,
+            ffy_intercept=0.0012,
+            ffy_slope=0.985,
+            mlp_w1=[[0.1, 0.2] for _ in range(50)],
+            mlp_b1=[0.12, -0.34],
+            mlp_w2=[[0.85], [-0.61]],
+            mlp_b2=[0.04],
+            mlp_skew_intercept=-0.002,
+            mlp_skew_slope=1.018,
+            olm_weights=[0.02 for _ in range(50)],
+            olm_bias=0.005,
+            olm_skew_intercept=-0.001,
+            olm_skew_slope=1.01,
+            ffx_intercept=1.0004,
+            ffx_slope=-0.498,
+            female_chrx_ratio_mean=1.0003,
+            female_chrx_ratio_std=0.0112,
+            p_fetal_density=[0.01] * 571,
+            p_maternal_density=[0.02] * 571,
+            ff_frag_weights=[0.5] * 36,
+            ff_frag_bias=-1.25,
+            ff_frag_feature_mean=[0.1] * 36,
+            ff_frag_feature_scale=[1.2] * 36,
+            ff_size_std=0.035,
+        )
+        as_dict = meta.to_dict()
+        for key in (
+            "p_fetal_density",
+            "p_maternal_density",
+            "ff_frag_weights",
+            "ff_frag_bias",
+            "ff_frag_feature_mean",
+            "ff_frag_feature_scale",
+            "ff_size_std",
+        ):
+            self.assertIn(key, as_dict)
+
+        restored = PrenatalModelMetadata.from_dict(as_dict)
+        self.assertEqual(restored, meta)
+        self.assertEqual(restored.ff_size_std, 0.035)
+
+        encoded = meta.encode()
+        decoded = PrenatalModelMetadata.decode(encoded)
+        self.assertEqual(decoded, meta)
+        self.assertEqual(decoded.ff_size_std, 0.035)
+
     def test_prenatal_model_metadata_backward_compatibility_defaults(self) -> None:
         meta = _make_prenatal_metadata()
         as_dict = meta.to_dict()

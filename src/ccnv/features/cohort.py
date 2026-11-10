@@ -16,6 +16,7 @@ import pyarrow as pa
 from numpy.typing import NDArray
 
 from ccnv.features.binning import bin_intervals, rebin_counts
+from ccnv.features.fragmentomics import extract_bin_fragmentomic_covariates
 from ccnv.models import (
     FRAGMENTOMICS_METADATA_KEY,
     ArtifactKind,
@@ -39,6 +40,8 @@ _ParsedSample = tuple[
     NDArray[np.int64],
     NDArray[np.int64],
     NDArray[np.float64],
+    NDArray[np.float64] | None,
+    NDArray[np.float64] | None,
 ]
 
 
@@ -55,6 +58,8 @@ class Cohort:
     identities: tuple[object, ...]
     paths: tuple[Path, ...]
     sample_metadata: tuple[dict[str, object], ...] = ()
+    mean_frag_len: NDArray[np.float64] | None = None
+    endpoint_ratio: NDArray[np.float64] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,7 +423,12 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
             ]
             if has_frag:
                 agg_exprs.append(
-                    pl.col("fragment_lengths").list.explode().alias("fragment_lengths")
+                    pl.col("fragment_lengths")
+                    .drop_nulls()
+                    .list.drop_nulls()
+                    .list.explode()
+                    .cast(pl.UInt16)
+                    .alias("fragment_lengths")
                 )
                 select_cols.append(pl.col("fragment_lengths"))
             if has_ep:
@@ -576,6 +586,17 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
         ),
     }
     n_rows = len(out_cols["contig"])
+    if has_frag or has_ep or has_gc:
+        logger.warning(
+            "dropping fragmentomic metadata during non-nested interval rebinning"
+        )
+        if new_schema.metadata:
+            meta_dict = dict(new_schema.metadata)
+            meta_dict.pop(FRAGMENTOMICS_METADATA_KEY, None)
+            meta_dict.pop(b"ccnv.fragmentomics", None)
+            meta_dict.pop(b"fragmentomics", None)
+            new_schema = new_schema.with_metadata(meta_dict)
+
     if has_frag:
         out_cols["fragment_lengths"] = pa.ListArray.from_arrays(
             np.zeros(n_rows + 1, dtype=np.int32),
@@ -633,8 +654,15 @@ def _parse_sample_table(
     counts = np.asarray(
         table.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
     )
+    frag_len: NDArray[np.float64] | None = None
+    ep_ratio: NDArray[np.float64] | None = None
+    if (
+        "fragment_lengths" in table.column_names
+        or "endpoint_count" in table.column_names
+    ):
+        frag_len, ep_ratio = extract_bin_fragmentomic_covariates(table)
     lengths = {str(k): int(v) for k, v in contig_lengths.items()}
-    return metadata, lengths, contigs, starts, ends, counts
+    return metadata, lengths, contigs, starts, ends, counts, frag_len, ep_ratio
 
 
 def _assemble_cohort(
@@ -650,10 +678,14 @@ def _assemble_cohort(
         expected_starts,
         expected_ends,
         _,
+        _,
+        _,
     ) = parsed[0]
     expected_bin_size = int(first_meta["bin_size"])
     counts_list: list[NDArray[np.float64]] = []
     identities: list[object] = []
+    frag_lens: list[NDArray[np.float64]] = []
+    ep_ratios: list[NDArray[np.float64]] = []
 
     def _is_paired(meta: Mapping[object, object] | None) -> bool:
         if not meta:
@@ -680,9 +712,10 @@ def _assemble_cohort(
 
     first_paired = _is_paired(first_meta)
 
-    for path, (metadata, lengths, contigs, starts, ends, counts) in zip(
-        paths, parsed, strict=True
-    ):
+    for path, sample_data in zip(paths, parsed, strict=True):
+        metadata, lengths, contigs, starts, ends, counts, frag_len, ep_ratio = (
+            sample_data
+        )
         if _is_paired(metadata) != first_paired:
             raise ReferenceError(
                 "mixed single-end and paired-end cohort controls are not supported"
@@ -709,6 +742,21 @@ def _assemble_cohort(
         )
         counts_list.append(counts)
         identities.append(metadata.get("source_identity", {"path": str(path)}))
+        if frag_len is not None:
+            frag_lens.append(frag_len)
+        if ep_ratio is not None:
+            ep_ratios.append(ep_ratio)
+
+    cohort_frag_len = (
+        np.mean(np.column_stack(frag_lens), axis=1)
+        if first_paired and frag_lens
+        else None
+    )
+    cohort_ep_ratio = (
+        np.mean(np.column_stack(ep_ratios), axis=1)
+        if first_paired and ep_ratios
+        else None
+    )
 
     return Cohort(
         counts=np.column_stack(counts_list),
@@ -720,6 +768,8 @@ def _assemble_cohort(
         identities=tuple(identities),
         paths=tuple(paths),
         sample_metadata=tuple(p[0] for p in parsed),
+        mean_frag_len=cohort_frag_len,
+        endpoint_ratio=cohort_ep_ratio,
     )
 
 

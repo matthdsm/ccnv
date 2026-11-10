@@ -525,8 +525,12 @@ def fit_prenatal_models(
             extract_sample_fragmentomics(m) for m in cohort_5k.sample_metadata
         ]
 
+    labeled_ff = np.array(
+        [entry.ff if entry.ff is not None else np.nan for entry in entries],
+        dtype=np.float64,
+    )
     frag_fit = fit_cohort_fragmentomics_model(
-        frag_metas, is_male_arr, final_ffy, target_ffa
+        frag_metas, is_male_arr, final_ffy, labeled_ff
     )
     if frag_fit is not None:
         p_fet, p_mat, w_frag, b_frag, m_frag, s_frag, std_size = frag_fit

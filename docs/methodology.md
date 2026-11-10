@@ -634,7 +634,7 @@ $$
 f_{\text{active}} = \frac{\sum_{m \in \mathcal{M}} \sigma_m^{-2} \hat{f}_m}{\sum_{m \in \mathcal{M}} \sigma_m^{-2}}, \qquad \sigma_{\text{active}}^2 = \left(\sum_{m \in \mathcal{M}} \sigma_m^{-2}\right)^{-1}
 $$
 
-where $\mathcal{M} = \lbrace \text{FFY}, \text{FFA}, \text{FFX}, \text{FF}_{\text{size}} \rbrace$ (or subset available), with default standard errors $(\sigma_Y, \sigma_A, \sigma_X, \sigma_{\text{size}}) = (0.01, 0.02, 0.025, 0.015)$. For female fetuses (`XX`), `active_ff` pools $\lbrace \text{FFA}, \text{FF}_{\text{size}} \rbrace$ when fragmentomics is available, falling back to pure $\hat{f}_{\text{FFA}}$. When multi-modal estimators fuse into the baseline, `active_ff_source` is designated `"FUSED"`.
+where $\mathcal{M} = \lbrace \text{FFY}, \text{FFA}, \text{FFX}, \text{FF}_{\text{size}} \rbrace$ (or subset available), with default standard errors $(\sigma_Y, \sigma_A, \sigma_X, \sigma_{\text{size}}) = (0.01, 0.02, 0.025, 0.018)$. For female fetuses (`XX`), `active_ff` pools $\lbrace \text{FFA}, \text{FF}_{\text{size}} \rbrace$ when fragmentomics is available, falling back to pure $\hat{f}_{\text{FFA}}$. When multi-modal estimators fuse into the baseline, `active_ff_source` is designated `"FUSED"`.
 
 #### 9.1.3 Fetal-Fraction-Parameterized Log-Likelihood Ratio ($`\mathrm{LLR}_{\text{fetal}}`$) Segment Discordance
 
@@ -664,7 +664,7 @@ In addition, each segment records the short fragment fraction $R_{\le 150} = \su
 ### 9.2 Constants & Hyperparameters
 
 - `SCA` Mahalanobis outlier threshold $\chi^2_{2, 0.999} = 13.8155$ (**Tier 2 — Published Literature & Reference Methodology**: Mazloom et al., 2013; Bianchi et al., 2015).
-- Default estimator standard errors `ffy_std = 0.01`, `ffa_std = 0.02`, `ffx_std = 0.025`, `ff_size_std = 0.015` in `PrenatalModelMetadata` (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- Default estimator standard errors `ffy_std = 0.01`, `ffa_std = 0.02`, `ffx_std = 0.025`, `ff_size_std = 0.018` in `PrenatalModelMetadata` (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
 - `origin_call` log-likelihood ratio threshold $\vert\mathrm{LLR}_{\text{size}}\vert \ge 2.0$ (`src/ccnv/features/fragmentomics.py:score_segment_origin`): Corresponds to odds ratio $\ge e^2 \approx 7.39:1$ (**Tier 1 — Statistical & Mathematical Theory**).
 - `min_fetal_fraction_warning = 0.04` (`src/ccnv/models/config.py:PredictConfig`): 4% clinical NIPT quantification lower limit (**Tier 2 — Published Literature & Reference Methodology** / **Tier 3 — Genomic Biology & Assembly Coordinates**).
 
@@ -739,7 +739,7 @@ Verdict escalation follows strict severity ordering $\texttt{PASS} (0) \lt \text
 | `ElasticNetCV` `l1_ratio` | `[0.01, 0.05, 0.1]` | `src/ccnv/stats/prenatal_math.py` | Tier 2 — Published Literature & Reference Methodology | Elastic Net grouping mixture for non-negative `FFY` estimation |
 | `FFA` logit bounds | `[0.005, 0.85]` | `src/ccnv/stats/prenatal_math.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Logit-link clipping bounds for convex `RidgeCV` + `ElasticNetCV` ensemble |
 | `SCA` Mahalanobis $\chi^2$ gate | `13.8155` | `src/ccnv/features/prenatal.py` | Tier 2 — Published Literature & Reference Methodology | $\chi^2_{2, 0.999}$ boundary identifying discordant mixed gonosome karyotypes |
-| Estimator SE defaults | `(0.01, 0.02, 0.025, 0.015)` | `src/ccnv/models/results.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Default standard errors for `FFY`, `FFA`, `FFX`, and `FF_size` in precision fusion |
+| Estimator SE defaults | `(0.01, 0.02, 0.025, 0.018)` | `src/ccnv/models/results.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Default standard errors for `FFY`, `FFA`, `FFX`, and `FF_size` in precision fusion |
 | `min_frag_len` / `max_frag_len` | `30` / `600` bp | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 3 — Genomic Biology & Assembly Coordinates | Physical cell-free DNA insert size bounds |
 | `origin_call` LLR threshold | `2.0` | `src/ccnv/features/fragmentomics.py` | Tier 1 — Statistical & Mathematical Theory | Threshold for fetal vs maternal origin confidence ($\text{OR} \ge e^2$) |
 | `min_fetal_fraction_warning` | `0.04` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 3 — Genomic Biology & Assembly Coordinates | Clinical 4% lower limit of fetal fraction warning threshold |

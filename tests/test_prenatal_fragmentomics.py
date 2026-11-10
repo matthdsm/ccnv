@@ -336,6 +336,57 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         self.assertGreater(weighted_counts[0], 0.0)
         self.assertGreater(weighted_counts[1], 0.0)
 
+    def test_prenatal_prediction_fisher_weighting_reference_scaling(self) -> None:
+        from ccnv.features.fragmentomics import align_reference_to_weighted_sample
+
+        sample_tbl = make_sample_table(
+            [10, 20],
+            starts=[0, 100],
+            ends=[100, 200],
+            fragment_lengths=[[140, 166], [166]],
+        )
+        grid = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
+        p_mat = norm.pdf(grid, loc=166.0, scale=12.0)
+        p_fet = norm.pdf(grid, loc=143.0, scale=10.0)
+        p_mat /= np.sum(p_mat)
+        p_fet /= np.sum(p_fet)
+        meta = _make_dummy_prenatal_metadata(
+            p_fetal_density=p_fet.tolist(),
+            p_maternal_density=p_mat.tolist(),
+        )
+        weighted_sample = apply_prenatal_fisher_weighting(sample_tbl, meta)
+        self.assertIsNot(weighted_sample, sample_tbl)
+
+        ref_table = pa.table(
+            {
+                "branch": pa.array(["autosomal", "autosomal"]),
+                "contig": pa.array(["chr1", "chr1"]),
+                "start": pa.array([0, 100], type=pa.int64()),
+                "end": pa.array([100, 200], type=pa.int64()),
+                "pca_mean": pa.array([10.0, 20.0], type=pa.float64()),
+                "null_mean": pa.array([10.0, 20.0], type=pa.float64()),
+            }
+        )
+        weighted_ref = align_reference_to_weighted_sample(
+            ref_table, sample_tbl, weighted_sample
+        )
+        u_counts = sample_tbl.column("count").to_numpy()
+        w_counts = weighted_sample.column("count").to_numpy()
+        expected_scales = w_counts / u_counts
+        np.testing.assert_allclose(
+            weighted_ref.column("pca_mean").to_numpy(),
+            [10.0 * expected_scales[0], 20.0 * expected_scales[1]],
+        )
+        np.testing.assert_allclose(
+            weighted_ref.column("null_mean").to_numpy(),
+            [10.0 * expected_scales[0], 20.0 * expected_scales[1]],
+        )
+
+        # Confirm unweighted fallback when fragment lengths unavailable
+        se_sample = make_sample_table([10, 20], starts=[0, 100], ends=[100, 200])
+        se_weighted = apply_prenatal_fisher_weighting(se_sample, meta)
+        self.assertIs(se_weighted, se_sample)
+
 
 if __name__ == "__main__":
     unittest.main()

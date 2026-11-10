@@ -415,6 +415,74 @@ class TestFragmentomicsKernels(unittest.TestCase):
         self.assertAlmostEqual(ep_ratios[1], 0.0)
         self.assertAlmostEqual(ep_ratios[2], 2.0)
 
+    def test_fit_cohort_fragmentomics_model_fewer_than_five_samples_skips_ensemble(
+        self,
+    ) -> None:
+        from ccnv.features.fragmentomics import fit_cohort_fragmentomics_model
+
+        meta = FragmentomicsMetadata(
+            paired_end=True,
+            total_paired_fragments=10_000,
+            chromatosome_mode_bp=167.0,
+            core_shoulder_bp=143.0,
+            sizing_shift_bp=0.0,
+            self_referenced_peak_ratio=0.35,
+            dinucleosome_fraction=0.08,
+            high_mw_fraction=0.01,
+            helical_10bp_amplitude=0.045,
+            helical_10bp_phase=1.2,
+            motif_diversity_score=0.91,
+            hist_autosomal=[100] * 571,
+            hist_chry=[10] * 571,
+            hist_chrx=[50] * 571,
+            end_motif_counts=[20] * 256,
+        )
+        frag_metas = [meta, meta, meta]
+        is_male = np.array([True, False, True], dtype=bool)
+        final_ffy = np.array([0.10, 0.0, 0.12], dtype=float)
+        target_ffa = np.array([0.10, 0.08, 0.12], dtype=float)
+
+        fit = fit_cohort_fragmentomics_model(frag_metas, is_male, final_ffy, target_ffa)
+        self.assertIsNotNone(fit)
+        assert fit is not None
+        p_fet, p_mat, w_frag, b_frag, m_frag, s_frag, loocv_std = fit
+        self.assertIsNotNone(p_fet)
+        self.assertEqual(len(p_fet), 571)
+        self.assertIsNotNone(p_mat)
+        self.assertEqual(len(p_mat), 571)
+        self.assertIsNone(w_frag)
+        self.assertIsNone(b_frag)
+        self.assertIsNone(m_frag)
+        self.assertIsNone(s_frag)
+        self.assertEqual(loocv_std, 0.018)
+
+    def test_align_reference_to_weighted_sample(self) -> None:
+        import pyarrow as pa
+        from helpers import make_sample_table
+
+        from ccnv.features.fragmentomics import align_reference_to_weighted_sample
+
+        ref_table = pa.table(
+            {
+                "branch": pa.array(["autosomal", "autosomal"]),
+                "contig": pa.array(["chr1", "chr1"]),
+                "start": pa.array([0, 100], type=pa.int64()),
+                "end": pa.array([100, 200], type=pa.int64()),
+                "pca_mean": pa.array([10.0, 20.0], type=pa.float64()),
+                "null_mean": pa.array([10.0, 20.0], type=pa.float64()),
+            }
+        )
+        u_sample = make_sample_table([10.0, 20.0], starts=[0, 100], ends=[100, 200])
+        w_sample = make_sample_table([15.0, 40.0], starts=[0, 100], ends=[100, 200])
+
+        aligned_ref = align_reference_to_weighted_sample(ref_table, u_sample, w_sample)
+        np.testing.assert_allclose(
+            aligned_ref.column("pca_mean").to_numpy(), [15.0, 40.0]
+        )
+        np.testing.assert_allclose(
+            aligned_ref.column("null_mean").to_numpy(), [15.0, 40.0]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

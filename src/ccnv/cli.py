@@ -535,7 +535,7 @@ def predict(
             file_okay=True,
             dir_okay=False,
             readable=True,
-            help="Sample Parquet input",
+            help="BAM, CRAM, or sample Parquet input",
         ),
     ],
     reference: Annotated[

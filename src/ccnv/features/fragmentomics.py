@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 
 import numpy as np
+import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 from numpy.typing import NDArray
@@ -31,6 +32,7 @@ from ccnv.stats.fragmentomics import (
 )
 
 __all__ = [
+    "align_reference_to_weighted_sample",
     "apply_prenatal_fisher_weighting",
     "evaluate_weighted_coverage",
     "extract_bin_fragmentomic_covariates",
@@ -274,7 +276,15 @@ def fit_cohort_fragmentomics_model(
     final_ffy: NDArray[np.floating],
     target_ffa: NDArray[np.floating],
 ) -> (
-    tuple[list[float], list[float], list[float], float, list[float], list[float], float]
+    tuple[
+        list[float],
+        list[float],
+        list[float] | None,
+        float | None,
+        list[float] | None,
+        list[float] | None,
+        float,
+    ]
     | None
 ):
     """Deconvolve cohort fragment length densities and fit FF_size regularized ensemble."""
@@ -305,9 +315,21 @@ def fit_cohort_fragmentomics_model(
         ffy_values=final_ffy,
     )
 
+    valid_mask = np.isfinite(target_ffa)
+    if int(np.sum(valid_mask)) < 5:
+        return (
+            [float(x) for x in p_fetal],
+            [float(x) for x in p_maternal],
+            None,
+            None,
+            None,
+            None,
+            0.018,
+        )
+
     w_frag, b_frag, m_frag, s_frag, loocv_std = fit_ff_fragmentomics_ensemble(
-        X_frag,
-        target_ffa,
+        X_frag[valid_mask],
+        target_ffa[valid_mask],
     )
 
     return (
@@ -321,6 +343,50 @@ def fit_cohort_fragmentomics_model(
     )
 
 
+def align_reference_to_weighted_sample(
+    reference: pa.Table,
+    sample: pa.Table,
+    weighted_sample: pa.Table,
+) -> pa.Table:
+    """Scale reference pca_mean and null_mean to match active Fisher-weighted sample counts."""
+    u_counts = np.asarray(
+        sample.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
+    )
+    w_counts = np.asarray(
+        weighted_sample.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
+    )
+    scale_factors = np.where(u_counts > 0, w_counts / np.maximum(u_counts, 1e-6), 1.0)
+    sm_coords = pl.DataFrame(
+        {
+            "contig": sample.column("contig").to_pylist(),
+            "start": sample.column("start").to_numpy(),
+            "end": sample.column("end").to_numpy(),
+            "scale_factor": scale_factors,
+        }
+    )
+    ref_df = pl.from_arrow(reference)
+    joined_ref = ref_df.join(sm_coords, on=["contig", "start", "end"], how="left")
+    ref_scales = joined_ref["scale_factor"].fill_null(1.0).to_numpy()
+    new_pca_mean = (
+        np.asarray(reference.column("pca_mean").to_numpy(), dtype=np.float64)
+        * ref_scales
+    )
+    pca_idx = reference.schema.get_field_index("pca_mean")
+    out_ref = reference.set_column(
+        pca_idx, "pca_mean", pa.array(new_pca_mean, type=pa.float64())
+    )
+    if "null_mean" in reference.schema.names:
+        new_null_mean = (
+            np.asarray(reference.column("null_mean").to_numpy(), dtype=np.float64)
+            * ref_scales
+        )
+        null_idx = reference.schema.get_field_index("null_mean")
+        out_ref = out_ref.set_column(
+            null_idx, "null_mean", pa.array(new_null_mean, type=pa.float64())
+        )
+    return out_ref
+
+
 def apply_prenatal_fisher_weighting(
     sample: pa.Table,
     prenatal_meta: PrenatalModelMetadata | None,
@@ -332,6 +398,10 @@ def apply_prenatal_fisher_weighting(
         or prenatal_meta.p_maternal_density is None
         or "fragment_lengths" not in sample.column_names
     ):
+        return sample
+
+    frag_col = sample.column("fragment_lengths").combine_chunks()
+    if isinstance(frag_col, pa.ListArray) and len(frag_col.values) == 0:
         return sample
 
     frag_meta = extract_sample_fragmentomics(decode_metadata(sample.schema.metadata))

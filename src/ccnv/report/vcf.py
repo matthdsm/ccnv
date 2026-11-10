@@ -122,7 +122,7 @@ def build_vcf_header(
             )
             header.add_line(
                 "##INFO=<ID=ORIGIN,Number=1,Type=String,"
-                'Description="Fragmentomic origin call: FETAL_CONFIRMED or MATERNAL_CONFIRMED">'
+                'Description="Fragmentomic origin call: FETAL_CONFIRMED, MATERNAL_CONFIRMED, or INDETERMINATE">'
             )
 
     header.add_sample(sample_name)
