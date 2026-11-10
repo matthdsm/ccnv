@@ -107,9 +107,9 @@ where $\mathcal{B}_{\text{GC}}$ has 5 quantile knots with degree 3 cubic splines
 
 For each sample $s$, the log2 relative depth $\tilde{y}_{i, s} = \log_2(\tilde{c}_{i, s} / \mathrm{median}(\tilde{\mathbf{c}}_{\mathcal{V}_s, s}))$ over positive bins $\mathcal{V}_s$ is fitted via robust Huber M-estimation (`sklearn.linear_model.HuberRegressor(epsilon=1.35, alpha=1e-4)`):
 
-$$\min_{\boldsymbol{\beta}, \sigma > 0} \sum_{i \in \mathcal{V}_s} \left(\sigma \cdot L_{\epsilon}\!\left(\frac{\tilde{y}_{i, s} - \mathbf{x}_i^\top \boldsymbol{\beta}}{\sigma}\right) + \sigma\right) + \alpha \|\boldsymbol{\beta}\|_2^2, \qquad \epsilon = 1.35, \; \alpha = 10^{-4}$$
+$$\min_{\boldsymbol{\beta}, \sigma > 0} \sum_{i \in \mathcal{V}_s} \left(\sigma \cdot L_{\epsilon}\!\left(\frac{\tilde{y}_{i, s} - \mathbf{x}_i^{\top} \boldsymbol{\beta}}{\sigma}\right) + \sigma\right) + \alpha \|\boldsymbol{\beta}\|_2^2, \qquad \epsilon = 1.35, \; \alpha = 10^{-4}$$
 
-where $L_{\epsilon}(r) = \frac{1}{2}r^2$ if $|r| \le \epsilon$, and $\epsilon |r| - \frac{1}{2}\epsilon^2$ otherwise. The evaluated multiplicative trend $\hat{t}_i = 2^{\mathbf{x}_i^\top \boldsymbol{\beta}}$ is clamped to $[0.20, 5.0]$ and divided out:
+where $L_{\epsilon}(r) = \frac{1}{2}r^2$ if $|r| \le \epsilon$, and $\epsilon |r| - \frac{1}{2}\epsilon^2$ otherwise. The evaluated multiplicative trend $\hat{t}_i = 2^{\mathbf{x}_i^{\top} \boldsymbol{\beta}}$ is clamped to $[0.20, 5.0]$ and divided out:
 
 $$y_i^{\text{corr}} = \frac{\tilde{c}_{i, s}}{\hat{t}_i} \cdot \frac{\sum_{j \in \mathcal{V}_s} \tilde{c}_{j, s}}{\sum_{j \in \mathcal{V}_s} (\tilde{c}_{j, s} / \hat{t}_j)}$$
 
@@ -146,15 +146,15 @@ For each sample $s \in \{1, \dots, S\}$, let $f_s = \left(\sum_{b \in \text{chrY
 
 #### Germline Mode: Order-Statistic Gap-MAD Classifier (`src/ccnv/features/cohort.py:infer_sample_sexes`)
 
-Requires $S \ge 2 \cdot m_{\text{sex}}$ samples (`min_sex_group_size`, default $5$). Let $f_{(0)} \le f_{(1)} \le \dots \le f_{(S-1)}$ be the sorted fractions. The optimal partition index $s^* \in \{m_{\text{sex}}, \dots, S - m_{\text{sex}}\}$ maximizes the adjacent order-statistic gap:
+Requires $S \ge 2 \cdot m_{\text{sex}}$ samples (`min_sex_group_size`, default $5$). Let $f_{(0)} \le f_{(1)} \le \dots \le f_{(S-1)}$ be the sorted fractions. The optimal partition index $s^{*} \in \{m_{\text{sex}}, \dots, S - m_{\text{sex}}\}$ maximizes the adjacent order-statistic gap:
 
-$$s^* = \arg\max_{m_{\text{sex}} \le s \le S - m_{\text{sex}}} \left(f_{(s)} - f_{(s-1)}\right), \quad \Delta_{\max} = f_{(s^*)} - f_{(s^*-1)}$$
+$$s^{*} = \arg\max_{m_{\text{sex}} \le s \le S - m_{\text{sex}}} \left(f_{(s)} - f_{(s-1)}\right), \quad \Delta_{\max} = f_{(s^{*})} - f_{(s^{*} - 1)}$$
 
-Let $\mathcal{L} = \{f_{(0)}, \dots, f_{(s^*-1)}\}$ (putative females) and $\mathcal{H} = \{f_{(s^*)}, \dots, f_{(S-1)}\}$ (putative males), with unscaled group MADs $\mathrm{MAD}(\mathcal{L})$ and $\mathrm{MAD}(\mathcal{H})$. The separation is accepted if and only if:
+Let $\mathcal{L} = \{f_{(0)}, \dots, f_{(s^{*} - 1)}\}$ (putative females) and $\mathcal{H} = \{f_{(s^{*})}, \dots, f_{(S-1)}\}$ (putative males), with unscaled group MADs $\mathrm{MAD}(\mathcal{L})$ and $\mathrm{MAD}(\mathcal{H})$. The separation is accepted if and only if:
 
 $$\Delta_{\max} > 0 \quad \text{and} \quad \Delta_{\max} \ge \max\!\left(\Delta_{\min}, 4.0 \cdot \max(\mathrm{MAD}(\mathcal{L}), \mathrm{MAD}(\mathcal{H}), 10^{-12})\right)$$
 
-If accepted, the decision threshold is placed at the midpoint $\tau_{\text{sex}} = \frac{1}{2}\left(f_{(s^*-1)} + f_{(s^*)}\right)$.
+If accepted, the decision threshold is placed at the midpoint $\tau_{\text{sex}} = \frac{1}{2}\left(f_{(s^{*} - 1)} + f_{(s^{*})}\right)$.
 
 #### Prenatal Mode: 1D Two-Component Gaussian Mixture Model with Brent's Root-Finding (`src/ccnv/stats/prenatal_math.py:infer_sex_gmm_1d`)
 
@@ -193,11 +193,11 @@ with fallback to the midpoint $\tau_Y = \frac{1}{2}(\mu_{k_{\text{F}}} + \mu_{k_
 
 #### 4.1.1 Gavish-Donoho Optimal Singular Value Hard Thresholding (SVHT)
 
-Let $\mathbf{Y} \in \mathbb{R}^{U \times S}$ be the covariate-corrected, depth-normalized coverage matrix over $U$ unmasked bins and $S$ cohort samples, and let $\mathbf{X} = \mathbf{Y}^\top \in \mathbb{R}^{S \times U}$ be the samples-by-bins matrix (`src/ccnv/stats/pca.py:fit_pca`, `src/ccnv/stats/pca.py:optimal_svht_rank`). The empirical cohort mean vector is:
+Let $\mathbf{Y} \in \mathbb{R}^{U \times S}$ be the covariate-corrected, depth-normalized coverage matrix over $U$ unmasked bins and $S$ cohort samples, and let $\mathbf{X} = \mathbf{Y}^{\top} \in \mathbb{R}^{S \times U}$ be the samples-by-bins matrix (`src/ccnv/stats/pca.py:fit_pca`, `src/ccnv/stats/pca.py:optimal_svht_rank`). The empirical cohort mean vector is:
 
 $$\boldsymbol{\mu} = \frac{1}{S} \sum_{s=1}^S \mathbf{X}_{s, :} \in \mathbb{R}^U$$
 
-Singular Value Decomposition (SVD) decomposes the centered matrix $\tilde{\mathbf{X}} = \mathbf{X} - \mathbf{1}_S \boldsymbol{\mu}^\top = \mathbf{U} \boldsymbol{\Sigma} \mathbf{V}^\top$, yielding singular values $s_1 \ge s_2 \ge \dots \ge s_{\min(S, U)}$.
+Singular Value Decomposition (SVD) decomposes the centered matrix $\tilde{\mathbf{X}} = \mathbf{X} - \mathbf{1}_S \boldsymbol{\mu}^{\top} = \mathbf{U} \boldsymbol{\Sigma} \mathbf{V}^{\top}$, yielding singular values $s_1 \ge s_2 \ge \dots \ge s_{\min(S, U)}$.
 
 Rather than fixing PCA rank to an arbitrary constant, `ccnv` determines the optimal subspace rank $P$ via Gavish-Donoho Optimal Singular Value Hard Thresholding (Gavish & Donoho, 2014) when noise variance $\sigma^2$ is unknown:
 
@@ -209,7 +209,7 @@ Gavish & Donoho (2014) proved that $\tau_{\text{SVHT}}$ minimizes asymptotic Mea
 
 Sign ambiguity of singular vectors ($\mathbf{v}_p \leftrightarrow -\mathbf{v}_p$) is resolved deterministically via `sklearn.utils.extmath.svd_flip`. The rank-$P$ reconstruction is:
 
-$$\hat{\mathbf{X}} = (\tilde{\mathbf{X}} \mathbf{V}_P) \mathbf{V}_P^\top + \mathbf{1}_S \boldsymbol{\mu}^\top$$
+$$\hat{\mathbf{X}} = (\tilde{\mathbf{X}} \mathbf{V}_P) \mathbf{V}_P^{\top} + \mathbf{1}_S \boldsymbol{\mu}^{\top}$$
 
 Multiplicative systemic bias is divided out element-wise to produce the PCA-corrected reference matrix $\mathbf{Y}^{\text{corr}} \in \mathbb{R}^{U \times S}$:
 
@@ -221,7 +221,7 @@ During single-sample prediction (`src/ccnv/predict.py:project_coverage`), a test
 
 Ordinary least squares (`lstsq`) projection minimizes $L_2$ error, causing large aneuploidies (e.g., Trisomy 21 or large focal duplications) to tilt the projection coefficients $\mathbf{c}$, absorbing the true CNV into the background and leaking compensating ghost waves onto euploid chromosomes (Candès et al., 2011). `ccnv` solves the projection via robust Huber M-estimation (`sklearn.linear_model.HuberRegressor(fit_intercept=False, epsilon=1.35)`):
 
-$$\hat{\mathbf{c}} = \arg\min_{\mathbf{c} \in \mathbb{R}^P, \sigma > 0} \sum_{i \in \mathcal{A}} \left(\sigma \cdot L_{1.35}\!\left(\frac{(y_i - \mu_i) - \mathbf{V}_{P, i}^\top \mathbf{c}}{\sigma}\right) + \sigma\right)$$
+$$\hat{\mathbf{c}} = \arg\min_{\mathbf{c} \in \mathbb{R}^P, \sigma > 0} \sum_{i \in \mathcal{A}} \left(\sigma \cdot L_{1.35}\!\left(\frac{(y_i - \mu_i) - \mathbf{V}_{P, i}^{\top} \mathbf{c}}{\sigma}\right) + \sigma\right)$$
 
 reconstructing expected baseline $\hat{\mathbf{y}} = \mathbf{V}_P \hat{\mathbf{c}} + \boldsymbol{\mu}$ and dividing out the systemic component:
 
@@ -432,7 +432,7 @@ $$u_s = \mathrm{logit}\!\left(\mathrm{clip}(y_s, 0.005, 0.85)\right) = \ln\!\lef
 
 $$\mathbf{w}_{\text{ens}} = \frac{1}{2}\left(\hat{\mathbf{w}}_{\text{RidgeCV}} + \hat{\mathbf{w}}_{\text{ElasticNetCV}}\right), \quad b_{\text{ens}} = \frac{1}{2}\left(\hat{b}_{\text{RidgeCV}} + \hat{b}_{\text{ElasticNetCV}}\right)$$
 
-$$\hat{f}_{\text{FFA}}(\mathbf{z}) = \mathrm{expit}\!\left(\mathbf{z}^\top \mathbf{w}_{\text{ens}} + b_{\text{ens}}\right)$$
+$$\hat{f}_{\text{FFA}}(\mathbf{z}) = \mathrm{expit}\!\left(\mathbf{z}^{\top} \mathbf{w}_{\text{ens}} + b_{\text{ens}}\right)$$
 
 This convex formulation eliminates non-convex local minima and saturating tail artifacts of Sigmoid MLPs, guaranteeing monotonic predictions strictly within $(0, 1)$ with analytic LOOCV standard error $\sigma_{\text{ffa}}$.
 
@@ -459,17 +459,17 @@ falling back to theoretical $(2.0, -2.0)$ when fewer than 2 male controls exist.
 
 #### 9.1.1 2D Stoichiometric Gaussian Bayes SCA Classifier
 
-In `src/ccnv/features/prenatal.py:classify_sca`, sex chromosome aneuploidy classification evaluates the joint observation vector $\mathbf{x} = (\Delta_X, f_Y)^\top = (R_X - 1, \hat{f}_{\text{FFY}})^\top$ against the 6 stoichiometric karyotypes $k \in \{\text{XX}, \text{XY}, \text{XO}, \text{XXX}, \text{XXY}, \text{XYY}\}$ anchored at reference fetal fraction $\hat{f}_0$:
+In `src/ccnv/features/prenatal.py:classify_sca`, sex chromosome aneuploidy classification evaluates the joint observation vector $\mathbf{x} = (\Delta_X, f_Y)^{\top} = (R_X - 1, \hat{f}_{\text{FFY}})^{\top}$ against the 6 stoichiometric karyotypes $k \in \{\text{XX}, \text{XY}, \text{XO}, \text{XXX}, \text{XXY}, \text{XYY}\}$ anchored at reference fetal fraction $\hat{f}_0$:
 
-$$\boldsymbol{\mu}_{\text{XX}} = (0, 0)^\top, \quad \boldsymbol{\mu}_{\text{XY}} = \left(-\tfrac{1}{2}\hat{f}_0, \hat{f}_0\right)^\top, \quad \boldsymbol{\mu}_{\text{XO}} = \left(-\tfrac{1}{2}\hat{f}_0, 0\right)^\top$$
+$$\boldsymbol{\mu}_{\text{XX}} = (0, 0)^{\top}, \quad \boldsymbol{\mu}_{\text{XY}} = \left(-\tfrac{1}{2}\hat{f}_0, \hat{f}_0\right)^{\top}, \quad \boldsymbol{\mu}_{\text{XO}} = \left(-\tfrac{1}{2}\hat{f}_0, 0\right)^{\top}$$
 
-$$\boldsymbol{\mu}_{\text{XXX}} = \left(+\tfrac{1}{2}\hat{f}_0, 0\right)^\top, \quad \boldsymbol{\mu}_{\text{XXY}} = \left(0, \hat{f}_0\right)^\top, \quad \boldsymbol{\mu}_{\text{XYY}} = \left(-\tfrac{1}{2}\hat{f}_0, 2\hat{f}_0\right)^\top$$
+$$\boldsymbol{\mu}_{\text{XXX}} = \left(+\tfrac{1}{2}\hat{f}_0, 0\right)^{\top}, \quad \boldsymbol{\mu}_{\text{XXY}} = \left(0, \hat{f}_0\right)^{\top}, \quad \boldsymbol{\mu}_{\text{XYY}} = \left(-\tfrac{1}{2}\hat{f}_0, 2\hat{f}_0\right)^{\top}$$
 
 Using diagonal covariance $\boldsymbol{\Sigma}_k = \mathrm{diag}(\sigma_X^2, \sigma_Y^2)$, calibrated Bayesian posterior probabilities are evaluated:
 
 $$P(C = k \mid \mathbf{x}) = \frac{\pi_k \, \mathcal{N}(\mathbf{x} \mid \boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k)}{\sum_{j} \pi_j \, \mathcal{N}(\mathbf{x} \mid \boldsymbol{\mu}_j, \boldsymbol{\Sigma}_j)}$$
 
-Samples exceeding the 2D Mahalanobis outlier gate $d_M^2(\mathbf{x}, \boldsymbol{\mu}_{k^*}) > \chi^2_{2, 0.999} = 13.8155$ are classified as `DISCORDANT_MIXED` (e.g., maternal mosaicism or vanishing twin; Mazloom et al., 2013; Bianchi et al., 2015).
+Samples exceeding the 2D Mahalanobis outlier gate $d_M^2(\mathbf{x}, \boldsymbol{\mu}_{k^{*}}) > \chi^2_{2, 0.999} = 13.8155$ are classified as `DISCORDANT_MIXED` (e.g., maternal mosaicism or vanishing twin; Mazloom et al., 2013; Bianchi et al., 2015).
 
 #### 9.1.2 Inverse-Variance Precision Fusion for `active_ff`
 

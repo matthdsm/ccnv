@@ -100,6 +100,12 @@ class TestDocsMarkdown(unittest.TestCase):
                     f"{file_path.relative_to(self.repo_root)}:{lineno} "
                     r"disallowed \operatorname macro found; use \mathrm or \text instead"
                 )
+            for m in re.finditer(r"\^(\*|\\top|\w+-\d+)", stripped_content):
+                lineno = content[: m.start()].count("\n") + 1
+                errors.append(
+                    f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                    f"unbraced superscript '^{m.group(1)}' found; wrap in {{...}}"
+                )
         self.assertEqual(
             errors, [], "Disallowed LaTeX macros found:\n" + "\n".join(errors)
         )
