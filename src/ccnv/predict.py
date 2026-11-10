@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import warnings
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final, Literal
 
@@ -23,8 +23,11 @@ from ccnv.features.covariates import (
     mask_covariates,
     validate_min_mappability,
 )
+from ccnv.features.fragmentomics import (
+    apply_prenatal_fisher_weighting,
+)
 from ccnv.features.prenatal import annotate_prenatal_segments, predict_prenatal
-from ccnv.io.parquet import read_reference_parquet, read_sample_parquet
+from ccnv.io.parquet import load_sample_or_extract, read_reference_parquet
 from ccnv.io.tracks import load_cytobands_track, load_gc_track, load_mappability_track
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
@@ -109,8 +112,28 @@ def run(config: PredictConfig) -> PredictionOutputs:
         logger.warning("--cytobands is ignored when --no-plot is set")
     logger.debug("loading sample %s and reference %s", config.sample, config.reference)
     inputs = load_inputs(
-        config.sample, config.reference, sex=config.sex, mode=config.mode
+        config.sample,
+        config.reference,
+        sex=config.sex,
+        mode=config.mode,
+        fasta=config.fasta,
     )
+    prenatal_meta: PrenatalModelMetadata | None = None
+    prenatal_result: FetalFractionResult | None = None
+    if config.mode == "prenatal":
+        prenatal_meta = PrenatalModelMetadata.from_table(inputs.reference)
+        if prenatal_meta is None:
+            raise PredictError("reference is missing prenatal metadata (ccnv.prenatal)")
+        prenatal_result = predict_prenatal(
+            inputs.sample,
+            inputs.reference,
+            prenatal_meta,
+            min_ff_warning=config.min_fetal_fraction_warning,
+        )
+        inputs = replace(
+            inputs, sample=apply_prenatal_fisher_weighting(inputs.sample, prenatal_meta)
+        )
+
     bin_results = tuple(
         normalize_branch(build_branch_model(inputs, branch), config)
         for branch in inputs.branches
@@ -123,20 +146,14 @@ def run(config: PredictConfig) -> PredictionOutputs:
         ratio_threshold=config.ratio_threshold,
         max_blacklist_gap=config.max_blacklist_gap,
     )
-    prenatal_result: FetalFractionResult | None = None
-    if config.mode == "prenatal":
-        metadata = PrenatalModelMetadata.from_table(inputs.reference)
-        if metadata is None:
-            raise PredictError("reference is missing prenatal metadata (ccnv.prenatal)")
-        prenatal_result = predict_prenatal(
-            inputs.sample,
-            inputs.reference,
-            metadata,
-            min_ff_warning=config.min_fetal_fraction_warning,
-        )
+    if config.mode == "prenatal" and prenatal_result is not None:
         segments = tuple(
             annotate_prenatal_segments(
-                segments, prenatal_result, z_threshold=config.z_threshold
+                segments,
+                prenatal_result,
+                z_threshold=config.z_threshold,
+                sample_table=inputs.sample,
+                prenatal_meta=prenatal_meta,
             )
         )
     qc_json_path = Path(f"{config.prefix}_qc.json")
@@ -176,21 +193,25 @@ def load_inputs(
     *,
     sex: Literal["autosomal", "female", "male"] = "autosomal",
     mode: AnalysisMode = "germline",
+    fasta: Path | None = None,
 ) -> PredictionInput:
     """Load and validate sample and reference tables against each other."""
-    try:
-        sample = read_sample_parquet(sample_path)
-    except Exception as err:
-        raise PredictError(f"failed to read sample {sample_path}: {err}") from err
     try:
         reference = read_reference_parquet(reference_path)
     except Exception as err:
         raise PredictError(f"failed to read reference {reference_path}: {err}") from err
 
-    sample_meta, ref_meta = (
-        decode_metadata(sample.schema.metadata),
-        decode_metadata(reference.schema.metadata),
+    ref_meta = decode_metadata(reference.schema.metadata)
+    ref_model = ref_meta.get("model", {})
+    ref_bin_size = (
+        int(ref_model.get("bin_size", 5000)) if isinstance(ref_model, Mapping) else 5000
     )
+    try:
+        sample = load_sample_or_extract(sample_path, fasta=fasta, bin_size=ref_bin_size)
+    except Exception as err:
+        raise PredictError(f"failed to read sample {sample_path}: {err}") from err
+
+    sample_meta = decode_metadata(sample.schema.metadata)
     ref_model = ref_meta.get("model", {})
     ref_mode = (
         ref_model.get("mode", "germline")

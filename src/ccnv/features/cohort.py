@@ -54,6 +54,7 @@ class Cohort:
     bin_size: int
     identities: tuple[object, ...]
     paths: tuple[Path, ...]
+    sample_metadata: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -708,6 +709,7 @@ def _assemble_cohort(
         bin_size=expected_bin_size,
         identities=tuple(identities),
         paths=tuple(paths),
+        sample_metadata=tuple(p[0] for p in parsed),
     )
 
 
@@ -782,6 +784,7 @@ def rebin_cohort(cohort: Cohort, target_bin_size: int) -> Cohort:
             identities=cohort.identities,
             bin_size=target_bin_size,
             paths=cohort.paths,
+            sample_metadata=cohort.sample_metadata,
         )
 
     contig_arr = np.asarray(cohort.contigs)
@@ -856,6 +859,7 @@ def rebin_cohort(cohort: Cohort, target_bin_size: int) -> Cohort:
         identities=cohort.identities,
         bin_size=target_bin_size,
         paths=cohort.paths,
+        sample_metadata=cohort.sample_metadata,
     )
 
 

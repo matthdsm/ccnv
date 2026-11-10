@@ -21,11 +21,17 @@ from ccnv.features.cohort import (
     rebin_sample_table,
     validate_cohort,
 )
+from ccnv.features.fragmentomics import (
+    extract_sample_fragmentomics,
+    extract_segment_fragment_lengths,
+    fit_cohort_fragmentomics_model,
+    fuse_active_fetal_fraction,
+    score_segment_origin,
+)
 from ccnv.models import (
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
     REFERENCE_SCHEMA,
-    ActiveFFSource,
     FetalFractionResult,
     FetalSex,
     PrenatalModelMetadata,
@@ -33,9 +39,11 @@ from ccnv.models import (
     SCACall,
     SCAResult,
     SegmentResult,
+    decode_metadata,
     is_autosome_name,
     normalize_chr,
 )
+from ccnv.stats.fragmentomics import predict_ff_fragmentomics
 from ccnv.stats.pca import pca_irlba_numpy
 from ccnv.stats.prenatal_math import (
     fit_elasticnet_ffy,
@@ -507,6 +515,32 @@ def fit_prenatal_models(
     else:
         ffx_int, ffx_slope = 2.0, -2.0
 
+    if isinstance(sample_tables, Sequence):
+        frag_metas = [
+            extract_sample_fragmentomics(decode_metadata(t.schema.metadata))
+            for t in sample_tables
+        ]
+    else:
+        frag_metas = [
+            extract_sample_fragmentomics(m) for m in cohort_5k.sample_metadata
+        ]
+
+    frag_fit = fit_cohort_fragmentomics_model(
+        frag_metas, is_male_arr, final_ffy, target_ffa
+    )
+    if frag_fit is not None:
+        p_fet, p_mat, w_frag, b_frag, m_frag, s_frag, std_size = frag_fit
+    else:
+        p_fet, p_mat, w_frag, b_frag, m_frag, s_frag = (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        std_size = 0.018
+
     # 6. Build PrenatalModelMetadata
     prenatal_meta = PrenatalModelMetadata(
         prenatal_bin_size=prenatal_bin_size,
@@ -531,6 +565,13 @@ def fit_prenatal_models(
         ffa_std=float(sigma_ffa),
         ffx_std=0.025,
         ffa_logit_mode=True,
+        p_fetal_density=p_fet,
+        p_maternal_density=p_mat,
+        ff_frag_weights=w_frag,
+        ff_frag_bias=b_frag,
+        ff_frag_feature_mean=m_frag,
+        ff_frag_feature_scale=s_frag,
+        ff_size_std=float(std_size),
     )
 
     # 7. Construct Arrow Reference Tables
@@ -771,32 +812,24 @@ def predict_prenatal(
     )
 
     # 7. Active Fetal Fraction selection
-    tolerance = 0.05
-    if fetal_sex == "M" and sca_result.call in ("XY", "XXY"):
-        if ffy is not None:
-            if abs(ffy - ffa) <= tolerance:
-                # Precision fusion via inverse-variance weighting
-                var_ffy = max(float(prenatal_meta.ffy_std), 1e-4) ** 2
-                var_ffa = max(float(prenatal_meta.ffa_std), 1e-4) ** 2
-                w_ffy = 1.0 / var_ffy
-                w_ffa = 1.0 / var_ffa
-                sum_w = w_ffy + w_ffa
-                sum_prod = w_ffy * ffy + w_ffa * ffa
-                if ffx > 0 and abs(ffx - ffy) <= tolerance:
-                    var_ffx = max(float(prenatal_meta.ffx_std), 1e-4) ** 2
-                    w_ffx = 1.0 / var_ffx
-                    sum_w += w_ffx
-                    sum_prod += w_ffx * ffx
-                active_ff = float(max(0.0, sum_prod / sum_w))
-            else:
-                active_ff = float(max(0.0, ffy))
-            active_ff_source: ActiveFFSource = "FFY"
-        else:
-            active_ff = float(max(0.0, ffa))
-            active_ff_source = "FFA"
-    else:
-        active_ff = float(max(0.0, ffa))
-        active_ff_source = "FFA"
+    sample_frag_meta = extract_sample_fragmentomics(
+        decode_metadata(sample_table.schema.metadata)
+    )
+    ff_size = (
+        predict_ff_fragmentomics(sample_frag_meta, prenatal_meta)
+        if sample_frag_meta is not None
+        else None
+    )
+
+    active_ff, active_ff_source = fuse_active_fetal_fraction(
+        fetal_sex=fetal_sex,
+        sca_call=sca_result.call,
+        ffy=ffy,
+        ffa=ffa,
+        ffx=ffx,
+        ff_size=ff_size,
+        prenatal_meta=prenatal_meta,
+    )
 
     low_ff_warning = bool(active_ff < min_ff_warning)
     warnings: list[str] = []
@@ -814,6 +847,7 @@ def predict_prenatal(
         ffy=ffy,
         ffx=ffx,
         ffa=ffa,
+        ff_size=ff_size,
         chrx_ratio=chrx_ratio,
         chry_score=chry_score,
         yfrac_threshold=prenatal_meta.yfrac_threshold,
@@ -827,10 +861,25 @@ def annotate_prenatal_segments(
     segments: Sequence[SegmentResult],
     prenatal_result: FetalFractionResult,
     z_threshold: float = 3.0,
+    sample_table: pa.Table | None = None,
+    prenatal_meta: PrenatalModelMetadata | None = None,
 ) -> list[SegmentResult]:
-    """Annotate segments with expected ratio, implied FF, and discordance status."""
+    """Annotate segments with expected ratio, implied FF, discordance status, and origin."""
     active_ff = max(0.0, float(prenatal_result.active_ff))
     annotated: list[SegmentResult] = []
+
+    shift_bp = 0.0
+    p_fetal = None
+    p_maternal = None
+    if sample_table is not None:
+        frag_meta = extract_sample_fragmentomics(
+            decode_metadata(sample_table.schema.metadata)
+        )
+        if frag_meta is not None:
+            shift_bp = frag_meta.sizing_shift_bp
+    if prenatal_meta is not None:
+        p_fetal = prenatal_meta.p_fetal_density
+        p_maternal = prenatal_meta.p_maternal_density
 
     for seg in segments:
         if active_ff <= 0.0:
@@ -860,6 +909,24 @@ def annotate_prenatal_segments(
             discordant = True
             reason = "SUPER_FETAL_RATIO"
 
+        frag_short_ratio = None
+        frag_llr_size = None
+        origin_call = None
+        if sample_table is not None and p_fetal is not None and p_maternal is not None:
+            lengths = extract_segment_fragment_lengths(
+                sample_table, seg.contig, seg.start, seg.end
+            )
+            is_gain = seg.call == "GAIN" if seg.call is not None else (seg.ratio >= 0)
+            frag_short_ratio, frag_llr_size, origin_call = score_segment_origin(
+                lengths,
+                shift_bp,
+                p_fetal,
+                p_maternal,
+                active_ff=active_ff,
+                is_gain=is_gain,
+                has_call=has_call,
+            )
+
         annotated.append(
             replace(
                 seg,
@@ -867,6 +934,9 @@ def annotate_prenatal_segments(
                 implied_ff=float(implied_ff),
                 discordant=discordant,
                 discordance_reason=reason,
+                frag_short_ratio=frag_short_ratio,
+                frag_llr_size=frag_llr_size,
+                origin_call=origin_call,
             )
         )
 

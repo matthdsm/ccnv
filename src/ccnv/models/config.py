@@ -137,6 +137,7 @@ class PredictConfig:
     cytobands: Path | None = None
     mappability: Path | None = None
     gc: Path | None = None
+    fasta: Path | None = None
     min_mappability: float = DEFAULT_MIN_MAPPABILITY
     mode: AnalysisMode = "germline"
     min_fetal_fraction_warning: float = 0.04

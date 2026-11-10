@@ -92,9 +92,9 @@ class FetalFractionResult:
         """Validate fetal sex and active FF source invariants."""
         if self.fetal_sex not in ("M", "F"):
             raise ValueError(f"fetal_sex must be 'M' or 'F', got {self.fetal_sex!r}")
-        if self.active_ff_source not in ("FFY", "FFA"):
+        if self.active_ff_source not in ("FFY", "FFA", "FF_SIZE", "FUSED"):
             raise ValueError(
-                f"active_ff_source must be 'FFY' or 'FFA', "
+                f"active_ff_source must be 'FFY', 'FFA', 'FF_SIZE', or 'FUSED', "
                 f"got {self.active_ff_source!r}"
             )
         if not isinstance(self.warnings, tuple):

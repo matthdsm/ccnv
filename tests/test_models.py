@@ -344,7 +344,7 @@ class TestFetalFractionResult(unittest.TestCase):
                 sca=sca,
             )
         with self.assertRaisesRegex(
-            ValueError, "active_ff_source must be 'FFY' or 'FFA'"
+            ValueError, "active_ff_source must be 'FFY', 'FFA', 'FF_SIZE', or 'FUSED'"
         ):
             FetalFractionResult(
                 fetal_sex="F",

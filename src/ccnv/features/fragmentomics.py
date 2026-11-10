@@ -2,19 +2,43 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping, Sequence
+
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 from numpy.typing import NDArray
 
+from ccnv.models.results import ActiveFFSource
+from ccnv.models.schemas import (
+    FRAGMENTOMICS_METADATA_KEY,
+    FragmentomicsMetadata,
+    PrenatalModelMetadata,
+    decode_metadata,
+)
 from ccnv.stats.fragmentomics import (
     CANONICAL_CHROMATOSOME_BP,
     FRAG_MAX_LEN,
     FRAG_MIN_LEN,
+    FRAG_NUM_BINS,
+    align_histogram,
+    build_fragmentomic_feature_vector,
+    deconvolve_fetal_maternal_densities,
+    fisher_optimal_weights,
+    fit_ff_fragmentomics_ensemble,
+    segment_fragment_llr,
 )
 
 __all__ = [
+    "apply_prenatal_fisher_weighting",
     "evaluate_weighted_coverage",
     "extract_bin_fragmentomic_covariates",
+    "extract_sample_fragmentomics",
+    "extract_segment_fragment_lengths",
+    "fit_cohort_fragmentomics_model",
+    "fuse_active_fetal_fraction",
+    "score_segment_origin",
 ]
 
 
@@ -104,3 +128,219 @@ def extract_bin_fragmentomic_covariates(
         ep_ratios = np.zeros(n_rows, dtype=np.float64)
 
     return mean_lens, ep_ratios
+
+
+def extract_sample_fragmentomics(
+    metadata: Mapping[object, object] | None,
+) -> FragmentomicsMetadata | None:
+    """Extract FragmentomicsMetadata from decoded metadata mapping or schema metadata."""
+    if not metadata:
+        return None
+    for k in ("fragmentomics", "ccnv.fragmentomics", FRAGMENTOMICS_METADATA_KEY):
+        val = metadata.get(k)
+        if val is None and isinstance(k, str) and k.encode() in metadata:
+            val = metadata[k.encode()]
+        elif val is None and isinstance(k, bytes) and k.decode() in metadata:
+            val = metadata[k.decode()]
+        if val is not None:
+            if isinstance(val, FragmentomicsMetadata):
+                return val
+            if isinstance(val, (bytes, str)):
+                try:
+                    loaded = json.loads(val)
+                    if isinstance(loaded, dict):
+                        return FragmentomicsMetadata(**loaded)
+                except json.JSONDecodeError, UnicodeDecodeError, TypeError:
+                    continue
+            if isinstance(val, dict):
+                try:
+                    return FragmentomicsMetadata(**val)
+                except TypeError:
+                    continue
+    return None
+
+
+def extract_segment_fragment_lengths(
+    table: pa.Table,
+    contig: str,
+    start: int,
+    end: int,
+) -> NDArray[np.uint16]:
+    """Extract and concatenate fragment lengths within [start, end) on contig."""
+    if "fragment_lengths" not in table.column_names:
+        return np.empty(0, dtype=np.uint16)
+    c_arr = table.column("contig")
+    s_arr = table.column("start")
+    e_arr = table.column("end")
+    mask = pc.and_(
+        pc.equal(c_arr, contig),
+        pc.and_(pc.greater(e_arr, start), pc.less(s_arr, end)),
+    )
+    sub_table = table.filter(mask)
+    if sub_table.num_rows == 0:
+        return np.empty(0, dtype=np.uint16)
+    frag_col = sub_table.column("fragment_lengths").combine_chunks()
+    if not isinstance(frag_col, pa.ListArray):
+        return np.empty(0, dtype=np.uint16)
+    return np.asarray(frag_col.values, dtype=np.uint16)
+
+
+def fuse_active_fetal_fraction(
+    fetal_sex: str,
+    sca_call: str,
+    ffy: float | None,
+    ffa: float,
+    ffx: float,
+    ff_size: float | None,
+    prenatal_meta: PrenatalModelMetadata,
+    tolerance: float = 0.05,
+) -> tuple[float, ActiveFFSource]:
+    """Fuse FFY, FFA, FFX, and FF_size via Bates-Granger precision pooling."""
+    if fetal_sex == "M" and sca_call in ("XY", "XXY"):
+        if ffy is not None:
+            var_ffy = max(float(prenatal_meta.ffy_std), 1e-4) ** 2
+            candidates: list[tuple[float, float, ActiveFFSource]] = [
+                (ffy, var_ffy, "FFY")
+            ]
+
+            if abs(ffa - ffy) <= tolerance:
+                var_ffa = max(float(prenatal_meta.ffa_std), 1e-4) ** 2
+                candidates.append((ffa, var_ffa, "FFA"))
+
+            if ffx > 0 and abs(ffx - ffy) <= tolerance:
+                var_ffx = max(float(prenatal_meta.ffx_std), 1e-4) ** 2
+                candidates.append((ffx, var_ffx, "FFX"))
+
+            has_size = False
+            if ff_size is not None and abs(ff_size - ffy) <= tolerance:
+                var_size = max(float(prenatal_meta.ff_size_std), 1e-4) ** 2
+                candidates.append((ff_size, var_size, "FF_SIZE"))
+                has_size = True
+
+            sum_w = sum(1.0 / v for _, v, _ in candidates)
+            sum_p = sum(val / v for val, v, _ in candidates)
+            active_ff = float(max(0.0, sum_p / sum_w))
+            source: ActiveFFSource = "FUSED" if has_size else "FFY"
+            return active_ff, source
+        return float(max(0.0, ffa)), "FFA"
+
+    # Female (XX) or other SCA
+    if ff_size is not None and abs(ffa - ff_size) <= tolerance:
+        var_ffa = max(float(prenatal_meta.ffa_std), 1e-4) ** 2
+        var_size = max(float(prenatal_meta.ff_size_std), 1e-4) ** 2
+        w_ffa = 1.0 / var_ffa
+        w_size = 1.0 / var_size
+        fused = (w_ffa * ffa + w_size * ff_size) / (w_ffa + w_size)
+        return float(max(0.0, fused)), "FUSED"
+
+    return float(max(0.0, ffa)), "FFA"
+
+
+def score_segment_origin(
+    lengths: Sequence[int] | NDArray[np.integer],
+    shift_bp: float,
+    p_fetal: Sequence[float] | NDArray[np.floating],
+    p_maternal: Sequence[float] | NDArray[np.floating],
+    active_ff: float,
+    is_gain: bool,
+    has_call: bool,
+) -> tuple[float | None, float | None, str | None]:
+    """Calculate segment short-fragment ratio, LLR_size, and origin classification."""
+    if len(lengths) == 0:
+        return None, None, None
+    sr, llr = segment_fragment_llr(
+        lengths,
+        shift_bp,
+        p_fetal=p_fetal,
+        p_maternal=p_maternal,
+        active_ff=active_ff,
+        is_gain=is_gain,
+    )
+    if has_call:
+        if llr > 2.0:
+            origin = "FETAL_CONFIRMED"
+        elif llr < -2.0:
+            origin = "MATERNAL_CONFIRMED"
+        else:
+            origin = "INDETERMINATE"
+    else:
+        origin = None
+    return float(sr), float(llr), origin
+
+
+def fit_cohort_fragmentomics_model(
+    frag_metas: Sequence[FragmentomicsMetadata | None],
+    is_male_arr: NDArray[np.bool_],
+    final_ffy: NDArray[np.floating],
+    target_ffa: NDArray[np.floating],
+) -> (
+    tuple[list[float], list[float], list[float], float, list[float], list[float], float]
+    | None
+):
+    """Deconvolve cohort fragment length densities and fit FF_size regularized ensemble."""
+    n_samples = len(frag_metas)
+    if n_samples == 0 or not all(m is not None and m.paired_end for m in frag_metas):
+        return None
+
+    auto_aligned = np.zeros((n_samples, FRAG_NUM_BINS), dtype=np.float64)
+    chry_aligned = np.zeros((n_samples, FRAG_NUM_BINS), dtype=np.float64)
+    X_frag = np.zeros((n_samples, 36), dtype=np.float64)
+
+    for i, meta in enumerate(frag_metas):
+        assert meta is not None
+        auto_aligned[i] = align_histogram(
+            np.asarray(meta.hist_autosomal, dtype=np.float64),
+            meta.sizing_shift_bp,
+        )
+        chry_aligned[i] = align_histogram(
+            np.asarray(meta.hist_chry, dtype=np.float64),
+            meta.sizing_shift_bp,
+        )
+        X_frag[i] = build_fragmentomic_feature_vector(meta)
+
+    p_fetal, p_maternal = deconvolve_fetal_maternal_densities(
+        auto_aligned,
+        chry_aligned,
+        male_mask=is_male_arr,
+        ffy_values=final_ffy,
+    )
+
+    w_frag, b_frag, m_frag, s_frag, loocv_std = fit_ff_fragmentomics_ensemble(
+        X_frag,
+        target_ffa,
+    )
+
+    return (
+        [float(x) for x in p_fetal],
+        [float(x) for x in p_maternal],
+        [float(x) for x in w_frag],
+        float(b_frag),
+        [float(x) for x in m_frag],
+        [float(x) for x in s_frag],
+        float(loocv_std),
+    )
+
+
+def apply_prenatal_fisher_weighting(
+    sample: pa.Table,
+    prenatal_meta: PrenatalModelMetadata | None,
+) -> pa.Table:
+    """Evaluate Fisher-optimal weighted coverage and replace the count column."""
+    if (
+        prenatal_meta is None
+        or prenatal_meta.p_fetal_density is None
+        or prenatal_meta.p_maternal_density is None
+        or "fragment_lengths" not in sample.column_names
+    ):
+        return sample
+
+    frag_meta = extract_sample_fragmentomics(decode_metadata(sample.schema.metadata))
+    shift_bp = frag_meta.sizing_shift_bp if frag_meta is not None else 0.0
+    weights = fisher_optimal_weights(
+        prenatal_meta.p_fetal_density,
+        prenatal_meta.p_maternal_density,
+        target_ff=0.10,
+    )
+    w_counts = evaluate_weighted_coverage(sample, weights, shift_bp=shift_bp)
+    count_idx = sample.schema.get_field_index("count")
+    return sample.set_column(count_idx, "count", pa.array(w_counts, type=pa.float64()))

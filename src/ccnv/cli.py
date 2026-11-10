@@ -151,6 +151,17 @@ MinMappabilityOption = Annotated[
     ),
 ]
 
+FastaOption = Annotated[
+    Path | None,
+    typer.Option(
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        help="Reference FASTA required for CRAM inputs",
+    ),
+]
+
 
 class SampleInputError(ValueError):
     """Raised when reference sample arguments cannot be expanded."""
@@ -201,16 +212,7 @@ def extract(
     bin_size: Annotated[
         int, typer.Option(min=1, help="Target bin size in bases")
     ] = DEFAULT_BIN_SIZE,
-    fasta: Annotated[
-        Path | None,
-        typer.Option(
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            readable=True,
-            help="Reference FASTA required for CRAM inputs",
-        ),
-    ] = None,
+    fasta: FastaOption = None,
     min_mapq: Annotated[
         int,
         typer.Option("--min-mapq", min=0, help="Minimum mapping quality to keep"),
@@ -617,6 +619,7 @@ def predict(
             "--vcf/--no-vcf", help="Write VCFv4.2 outputs for bins and segments"
         ),
     ] = True,
+    fasta: FastaOption = None,
     mappability: MappabilityOption = None,
     gc: GcOption = None,
     min_mappability: MinMappabilityOption = DEFAULT_MIN_MAPPABILITY,
@@ -652,6 +655,7 @@ def predict(
                 cytobands=cytobands,
                 mappability=mappability,
                 gc=gc,
+                fasta=fasta,
                 min_mappability=min_mappability,
                 mode=cast(AnalysisModeLiteral, mode.value),
             )

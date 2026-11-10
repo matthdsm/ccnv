@@ -27,6 +27,11 @@ from ccnv.features.covariates import (
 from ccnv.features.fragmentomics import (
     evaluate_weighted_coverage,
     extract_bin_fragmentomic_covariates,
+    extract_sample_fragmentomics,
+    extract_segment_fragment_lengths,
+    fit_cohort_fragmentomics_model,
+    fuse_active_fetal_fraction,
+    score_segment_origin,
 )
 from ccnv.features.prenatal import (
     annotate_prenatal_segments,
@@ -49,7 +54,11 @@ __all__ = [
     "covariate_features",
     "evaluate_weighted_coverage",
     "extract_bin_fragmentomic_covariates",
+    "extract_sample_fragmentomics",
+    "extract_segment_fragment_lengths",
+    "fit_cohort_fragmentomics_model",
     "fit_prenatal_models",
+    "fuse_active_fetal_fraction",
     "infer_sample_sexes",
     "mask_covariates",
     "mask_low_coverage",
@@ -58,6 +67,7 @@ __all__ = [
     "rebin_cohort",
     "rebin_counts",
     "rebin_sample_table",
+    "score_segment_origin",
     "validate_cohort",
     "validate_min_mappability",
 ]
