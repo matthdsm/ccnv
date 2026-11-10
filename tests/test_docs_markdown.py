@@ -84,6 +84,26 @@ class TestDocsMarkdown(unittest.TestCase):
             errors, [], "Mermaid syntax issues found:\n" + "\n".join(errors)
         )
 
+    def test_no_disallowed_latex_macros(self) -> None:
+        r"""Verify no disallowed LaTeX macros like \operatorname exist in markdown files."""
+        errors: list[str] = []
+        for file_path in self.tracked_md_files:
+            if not file_path.exists():
+                continue
+            content = file_path.read_text(encoding="utf-8")
+            # Strip inline code spans and code blocks before checking math macros
+            stripped_content = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
+            stripped_content = re.sub(r"`[^`\n]*`", "", stripped_content)
+            for m in re.finditer(r"\\operatorname\*?\{", stripped_content):
+                lineno = content[: m.start()].count("\n") + 1
+                errors.append(
+                    f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                    r"disallowed \operatorname macro found; use \mathrm or \text instead"
+                )
+        self.assertEqual(
+            errors, [], "Disallowed LaTeX macros found:\n" + "\n".join(errors)
+        )
+
     def test_inline_math_no_padding(self) -> None:
         """Verify inline math delimiters do not have leading or trailing space padding outside code spans."""
         errors: list[str] = []

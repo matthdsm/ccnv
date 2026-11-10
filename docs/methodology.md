@@ -78,15 +78,15 @@ Given a raw counts matrix $\mathbf{C} \in \mathbb{R}_{\ge 0}^{B \times S}$ acros
 1. Compute the geometric mean pseudo-reference for each bin across all $S$ samples:
    $$g_i = \exp\left(\frac{1}{S}\sum_{s=1}^S \ln C_{i, s}\right) \quad \forall i \in \mathcal{I}_{+}$$
 2. For each sample $s \in \{1, \dots, S\}$, calculate its raw size factor as the median ratio against the pseudo-reference:
-   $$\hat{s}_s = \operatorname{median}_{i \in \mathcal{I}_{+}}\left(\frac{C_{i, s}}{g_i}\right)$$
+   $$\hat{s}_s = \mathrm{median}_{i \in \mathcal{I}_{+}}\left(\frac{C_{i, s}}{g_i}\right)$$
 3. Scale raw factors so that the median sample's total depth is preserved, aligning counts with standard sequencing depth:
-   $$s_s = \hat{s}_s \cdot \operatorname{median}_{s'}\left(\frac{\sum_{i \in \mathcal{U}} C_{i, s'}}{\hat{s}_{s'}}\right), \qquad \tilde{c}_{i, s} = \frac{C_{i, s}}{s_s}$$
+   $$s_s = \hat{s}_s \cdot \mathrm{median}_{s'}\left(\frac{\sum_{i \in \mathcal{U}} C_{i, s'}}{\hat{s}_{s'}}\right), \qquad \tilde{c}_{i, s} = \frac{C_{i, s}}{s_s}$$
 
 When $|\mathcal{I}_{+}| < 2$ or $S < 2$ (e.g., in single-sample prediction without a cohort), the normalization smoothly falls back to positive-median scaling or total-sum division over usable bins $\mathcal{U}$.
 
 Cohort-level low-coverage masking (`src/ccnv/features/cohort.py:mask_low_coverage`) sums normalized coverage across samples $T_b = \sum_{s=1}^S \tilde{c}_{b, s}$ and retains bins exceeding a fraction $\alpha_{\text{cov}} = 0.05$ of the positive median bin sum:
 
-$$\text{usable}_{\text{cov}}(b) \iff T_b > 0.05 \cdot \operatorname{median}_{i : T_i > 0}(T_i)$$
+$$\text{usable}_{\text{cov}}(b) \iff T_b > 0.05 \cdot \mathrm{median}_{i : T_i > 0}(T_i)$$
 
 #### 2.1.2 Covariate Masking
 
@@ -105,7 +105,7 @@ $$\mathbf{X}_{\text{cov}} = \left[\mathbf{1}, \; \mathcal{B}_{\text{GC}}^{(k=5, 
 
 where $\mathcal{B}_{\text{GC}}$ has 5 quantile knots with degree 3 cubic splines, $\mathcal{B}_{\text{map}}$ has 4 quantile knots with degree 2 quadratic splines, and $z(\cdot)$ denotes standardization.
 
-For each sample $s$, the log2 relative depth $\tilde{y}_{i, s} = \log_2(\tilde{c}_{i, s} / \operatorname{median}(\tilde{\mathbf{c}}_{\mathcal{V}_s, s}))$ over positive bins $\mathcal{V}_s$ is fitted via robust Huber M-estimation (`sklearn.linear_model.HuberRegressor(epsilon=1.35, alpha=1e-4)`):
+For each sample $s$, the log2 relative depth $\tilde{y}_{i, s} = \log_2(\tilde{c}_{i, s} / \mathrm{median}(\tilde{\mathbf{c}}_{\mathcal{V}_s, s}))$ over positive bins $\mathcal{V}_s$ is fitted via robust Huber M-estimation (`sklearn.linear_model.HuberRegressor(epsilon=1.35, alpha=1e-4)`):
 
 $$\min_{\boldsymbol{\beta}, \sigma > 0} \sum_{i \in \mathcal{V}_s} \left(\sigma \cdot L_{\epsilon}\!\left(\frac{\tilde{y}_{i, s} - \mathbf{x}_i^\top \boldsymbol{\beta}}{\sigma}\right) + \sigma\right) + \alpha \|\boldsymbol{\beta}\|_2^2, \qquad \epsilon = 1.35, \; \alpha = 10^{-4}$$
 
@@ -150,9 +150,9 @@ Requires $S \ge 2 \cdot m_{\text{sex}}$ samples (`min_sex_group_size`, default $
 
 $$s^* = \arg\max_{m_{\text{sex}} \le s \le S - m_{\text{sex}}} \left(f_{(s)} - f_{(s-1)}\right), \quad \Delta_{\max} = f_{(s^*)} - f_{(s^*-1)}$$
 
-Let $\mathcal{L} = \{f_{(0)}, \dots, f_{(s^*-1)}\}$ (putative females) and $\mathcal{H} = \{f_{(s^*)}, \dots, f_{(S-1)}\}$ (putative males), with unscaled group MADs $\operatorname{MAD}(\mathcal{L})$ and $\operatorname{MAD}(\mathcal{H})$. The separation is accepted if and only if:
+Let $\mathcal{L} = \{f_{(0)}, \dots, f_{(s^*-1)}\}$ (putative females) and $\mathcal{H} = \{f_{(s^*)}, \dots, f_{(S-1)}\}$ (putative males), with unscaled group MADs $\mathrm{MAD}(\mathcal{L})$ and $\mathrm{MAD}(\mathcal{H})$. The separation is accepted if and only if:
 
-$$\Delta_{\max} > 0 \quad \text{and} \quad \Delta_{\max} \ge \max\!\left(\Delta_{\min}, 4.0 \cdot \max(\operatorname{MAD}(\mathcal{L}), \operatorname{MAD}(\mathcal{H}), 10^{-12})\right)$$
+$$\Delta_{\max} > 0 \quad \text{and} \quad \Delta_{\max} \ge \max\!\left(\Delta_{\min}, 4.0 \cdot \max(\mathrm{MAD}(\mathcal{L}), \mathrm{MAD}(\mathcal{H}), 10^{-12})\right)$$
 
 If accepted, the decision threshold is placed at the midpoint $\tau_{\text{sex}} = \frac{1}{2}\left(f_{(s^*-1)} + f_{(s^*)}\right)$.
 
@@ -201,9 +201,9 @@ Singular Value Decomposition (SVD) decomposes the centered matrix $\tilde{\mathb
 
 Rather than fixing PCA rank to an arbitrary constant, `ccnv` determines the optimal subspace rank $P$ via Gavish-Donoho Optimal Singular Value Hard Thresholding (Gavish & Donoho, 2014) when noise variance $\sigma^2$ is unknown:
 
-$$\beta = \frac{\min(S, U)}{\max(S, U)}, \qquad \omega(\beta) = 0.56\beta^3 - 0.95\beta^2 + 1.82\beta + 1.43, \qquad \tau_{\text{SVHT}} = \omega(\beta)\operatorname{median}_{k}(s_k)$$
+$$\beta = \frac{\min(S, U)}{\max(S, U)}, \qquad \omega(\beta) = 0.56\beta^3 - 0.95\beta^2 + 1.82\beta + 1.43, \qquad \tau_{\text{SVHT}} = \omega(\beta)\mathrm{median}_{k}(s_k)$$
 
-$$P = \operatorname{clip}\!\left(\#\{k : s_k > \tau_{\text{SVHT}}\}, \; 1, \; \min(P_{\max}, S, U)\right)$$
+$$P = \mathrm{clip}\!\left(\#\{k : s_k > \tau_{\text{SVHT}}\}, \; 1, \; \min(P_{\max}, S, U)\right)$$
 
 Gavish & Donoho (2014) proved that $\tau_{\text{SVHT}}$ minimizes asymptotic Mean Squared Error by cleanly separating low-rank systemic signals from the Marchenko-Pastur bulk noise distribution (Marchenko & Pastur, 1967).
 
@@ -253,7 +253,7 @@ Following the foundational insight of WISECONDOR (Straver et al., 2014), `ccnv` 
 
 #### 5.1.1 Low-Dimensional Signal-Subspace $\mathbb{R}^{P+2}$ `KDTree` Neighbor Search
 
-In high dimensions ($S \approx 50\text{–}500$), pairwise Euclidean distances over raw PCA residuals concentrate around their mean ($\operatorname{Var}(D)/\mathbb{E}[D] \to 0$), degrading neighbor selection quality (Beyer et al., 1999). Two genomic bins are optimal reference partners if and only if they share identical sensitivity to latent technical factors and identical sequence properties.
+In high dimensions ($S \approx 50\text{–}500$), pairwise Euclidean distances over raw PCA residuals concentrate around their mean ($\mathrm{Var}(D)/\mathbb{E}[D] \to 0$), degrading neighbor selection quality (Beyer et al., 1999). Two genomic bins are optimal reference partners if and only if they share identical sensitivity to latent technical factors and identical sequence properties.
 
 `ccnv` maps each bin $i$ into a $(P+2)$-dimensional signal subspace (`src/ccnv/stats/neighbors.py:build_signal_space_features`, `src/ccnv/stats/neighbors.py:select_nearest_bins`):
 
@@ -267,7 +267,7 @@ For each chromosome $c$, a C-compiled $k$-d tree (`scipy.spatial.KDTree`) is bui
 
 Across all neighbor distances $\mathcal{D} = \{d^2(\mathbf{f}_i, \mathbf{f}_j)\}$, a 3-pass iterative clipping loop runs (`src/ccnv/stats/neighbors.py:distance_cutoff`):
 
-$$\mathcal{D}^{(r)} = \left\{ u \in \mathcal{D} : u < \tau_{\text{dist}}^{(r-1)} \right\}, \quad \tau_{\text{dist}}^{(r)} = \operatorname{mean}\!\left(\mathcal{D}^{(r)}\right) + 3.0 \cdot \operatorname{std}\!\left(\mathcal{D}^{(r)}\right) \quad (r = 1, 2, 3)$$
+$$\mathcal{D}^{(r)} = \left\{ u \in \mathcal{D} : u < \tau_{\text{dist}}^{(r-1)} \right\}, \quad \tau_{\text{dist}}^{(r)} = \mathrm{mean}\!\left(\mathcal{D}^{(r)}\right) + 3.0 \cdot \mathrm{std}\!\left(\mathcal{D}^{(r)}\right) \quad (r = 1, 2, 3)$$
 
 Neighbors exceeding $\tau_{\text{dist}}^{(3)}$ are pruned, recording each bin's surviving neighbor set $\mathcal{N}_i$ and mean unsquared distance $\bar{d}_i$.
 
@@ -275,11 +275,11 @@ Neighbors exceeding $\tau_{\text{dist}}^{(3)}$ are pruned, recording each bin's 
 
 Using $S_{\text{null}} = \min(S, 100)$ control samples, per-bin log2 ratios are evaluated:
 
-$$R_{i, s} = \log_2\!\left(\frac{Y_{i, s}^{\text{corr}}}{\operatorname{median}_{j \in \mathcal{N}_i}\!\left(Y_{j, s}^{\text{corr}}\right)}\right)$$
+$$R_{i, s} = \log_2\!\left(\frac{Y_{i, s}^{\text{corr}}}{\mathrm{median}_{j \in \mathcal{N}_i}\!\left(Y_{j, s}^{\text{corr}}\right)}\right)$$
 
 Because $P$ principal components were removed from $Y_{i, s}^{\text{corr}}$, the effective residual degrees of freedom are reduced from $S_{\text{null}} - 1$ to $d = \max(1, S_{\text{null}} - 1 - P)$. The sample variance is adjusted for degrees of freedom:
 
-$$s_{i, \text{DOF}}^2 = \frac{S_{\text{null}} - 1}{d} \cdot \operatorname{Var}_{s}(R_{i, s})$$
+$$s_{i, \text{DOF}}^2 = \frac{S_{\text{null}} - 1}{d} \cdot \mathrm{Var}_{s}(R_{i, s})$$
 
 To prevent noisy variance estimates from small cohorts from creating unstable inverse-variance weights, `ccnv` implements Smyth's Empirical Bayes variance shrinkage (`limma::squeezeVar`, Smyth, 2004; Phipson et al., 2016) in pure NumPy/SciPy (`src/ccnv/stats/neighbors.py:squeeze_var`). Under a scaled inverse-$\chi^2$ prior, log-variances $z_i = \ln(s_{i, \text{DOF}}^2)$ have theoretical expectation and variance involving digamma $\psi$ and trigamma $\psi_1$ functions:
 
@@ -287,7 +287,7 @@ $$z_i = \ln(s_{i, \text{DOF}}^2) - \psi(d/2) + \ln(d/2)$$
 
 After Winsorizing $z_i$ at quantiles `winsor_tail_p = (0.05, 0.10)` to protect against hypervariable outliers, the prior degrees of freedom $d_0$ and prior scale $s_0^2$ are solved via `scipy.optimize.brentq`:
 
-$$\psi_1(d_0 / 2) = \operatorname{Var}_{\text{winsor}}(z_i) - \psi_1(d / 2)$$
+$$\psi_1(d_0 / 2) = \mathrm{Var}_{\text{winsor}}(z_i) - \psi_1(d / 2)$$
 
 $$s_0^2 = \exp\!\left(\bar{z}_{\text{winsor}} + \psi(d_0/2) - \ln(d_0/2)\right)$$
 
@@ -325,16 +325,16 @@ Let $\mathbf{y}^{\text{corr}} \in \mathbb{R}^U$ be the test sample's PCA-project
 In each iteration $t$:
 1. Eligible bins are filtered: $\mathcal{E}^{(t-1)} = \{i : \text{finite}(y_i^{\text{corr}}) \land |Z_i^{(t-1)}| < \tau_{\text{mask}}\}$, where $\tau_{\text{mask}} = \Phi^{-1}(0.99) = 2.326347874$.
 2. For each bin, its within-sample baseline is computed across eligible surviving neighbors:
-   $$b_i^{(t)} = \operatorname{nanmedian}_{j \in \mathcal{N}_i \cap \mathcal{E}^{(t-1)}}\!\left(y_j^{\text{corr}}\right), \quad r_i^{(t)} = \log_2\!\left(\frac{y_i^{\text{corr}}}{b_i^{(t)}}\right)$$
+   $$b_i^{(t)} = \mathrm{nanmedian}_{j \in \mathcal{N}_i \cap \mathcal{E}^{(t-1)}}\!\left(y_j^{\text{corr}}\right), \quad r_i^{(t)} = \log_2\!\left(\frac{y_i^{\text{corr}}}{b_i^{(t)}}\right)$$
    $$Z_i^{(t)} = \frac{r_i^{(t)} - \mu_{\text{null}, i}}{\tilde{\sigma}_{\text{null}, i}}$$
 
-After $M$ iterations, global median centering removes residual genome-wide baseline shift: $\tilde{r}_i = r_i^{(M)} - \operatorname{median}(r^{(M)})$.
+After $M$ iterations, global median centering removes residual genome-wide baseline shift: $\tilde{r}_i = r_i^{(M)} - \mathrm{median}(r^{(M)})$.
 
 #### Empirical Bayes Inverse-Variance Precision Weights
 
 Each valid bin is assigned an Empirical Bayes inverse-variance precision weight:
 
-$$w_i = \begin{cases} \operatorname{clip}\!\left(\dfrac{s_0^2}{\tilde{\sigma}_{\text{null}, i}^2}, \; 0.05, \; 20.0\right) & \text{if } \tilde{\sigma}_{\text{null}, i} > 0 \text{ and } |\mathcal{N}_i^{(M)}| \ge m_{\text{ref}} \\ \dfrac{1}{\max(\bar{d}_i, 10^{-12})} & \text{if } \tilde{\sigma}_{\text{null}, i} = 0 \text{ (flat FASTA reference)} \\ 0.0 & \text{otherwise} \end{cases}$$
+$$w_i = \begin{cases} \mathrm{clip}\!\left(\dfrac{s_0^2}{\tilde{\sigma}_{\text{null}, i}^2}, \; 0.05, \; 20.0\right) & \text{if } \tilde{\sigma}_{\text{null}, i} > 0 \text{ and } |\mathcal{N}_i^{(M)}| \ge m_{\text{ref}} \\ \dfrac{1}{\max(\bar{d}_i, 10^{-12})} & \text{if } \tilde{\sigma}_{\text{null}, i} = 0 \text{ (flat FASTA reference)} \\ 0.0 & \text{otherwise} \end{cases}$$
 
 Under weighted least squares, setting $w_i \propto \tilde{\sigma}_{\text{null}, i}^{-2}$ makes the weighted sum-of-squares cost function proportional to the negative log-likelihood of a Gaussian observation model (Aitken, 1935; Killick et al., 2012).
 
@@ -363,7 +363,7 @@ Rather than segmenting across entire chromosomes and splitting post-hoc, `src/cc
 
 For an euchromatic block with log2 ratios $\mathbf{y}$ and precision weights $\mathbf{w}$, the weighted sum-of-squared-errors cost is:
 
-$$\operatorname{cost}(s, e) = \sum_{i=s}^{e-1} w_i \left(y_i - \bar{y}_{s:e}\right)^2, \quad \bar{y}_{s:e} = \frac{\sum_{i=s}^{e-1} w_i y_i}{\sum_{i=s}^{e-1} w_i}$$
+$$\mathrm{cost}(s, e) = \sum_{i=s}^{e-1} w_i \left(y_i - \bar{y}_{s:e}\right)^2, \quad \bar{y}_{s:e} = \frac{\sum_{i=s}^{e-1} w_i y_i}{\sum_{i=s}^{e-1} w_i}$$
 
 `WeightedL2Cost` precomputes prefix sums of $w_i$, $w_i y_i$, and $w_i y_i^2$, allowing $O(1)$ interval cost evaluations. Solvers are dispatched based on algorithm and weight profile:
 - **`algorithm == "pelt"` with uniform weights**: Dispatches to C-compiled `ruptures.KernelCPD(kernel="linear", min_size=min_size, jump=jump)` executing exact linear-time PELT in compiled C (Killick et al., 2012; Truong et al., 2020).
@@ -377,7 +377,7 @@ In `src/ccnv/predict.py:segment_and_call`, segments are summarized via Polars ex
 `ccnv` implements the Stouffer precision-weighted combination (Stouffer et al., 1949; Lipták, 1958; Whitlock, 2005) with Newey-West / AR(1) spatial autocorrelation correction (Diskin et al., 2008; Newey & West, 1987):
 
 1. Estimate per-contig lag-1 autocorrelation natively in Polars:
-   $$\hat{\rho}_{1, c} = \operatorname{clip}\!\left(\operatorname{Corr}_{i \in \mathcal{U}_c}(Z_i, Z_{i-1}), \; 0.0, \; 0.95\right)$$
+   $$\hat{\rho}_{1, c} = \mathrm{clip}\!\left(\mathrm{Corr}_{i \in \mathcal{U}_c}(Z_i, Z_{i-1}), \; 0.0, \; 0.95\right)$$
 2. For each segment $S_m$ with $N_m$ usable bins, evaluate the autocorrelation-adjusted Stouffer Z-score:
    $$Z_{\text{seg}}(S_m) = \frac{\sum_{i \in S_m \cap \mathcal{U}} w_i Z_i}{\sqrt{\left(\sum_{i \in S_m \cap \mathcal{U}} w_i^2\right)\left(1 + \frac{2(N_m - 1)}{N_m}\hat{\rho}_{1, c}\right)}}$$
 
@@ -387,7 +387,7 @@ Stouffer weighting scales detection sensitivity with $\sqrt{N_m}$ while the AR(1
 
 A segment is classified as:
 
-$$\operatorname{call} = \begin{cases} \texttt{"gain"} & \text{if } Z_{\text{seg}} > \tau_Z \text{ (or } \bar{r}_{\text{seg}} > \tau_r \text{)} \\ \texttt{"loss"} & \text{if } Z_{\text{seg}} < -\tau_Z \text{ (or } \bar{r}_{\text{seg}} < -\tau_r \text{)} \\ \texttt{None} & \text{otherwise} \end{cases}$$
+$$\mathrm{call} = \begin{cases} \texttt{"gain"} & \text{if } Z_{\text{seg}} > \tau_Z \text{ (or } \bar{r}_{\text{seg}} > \tau_r \text{)} \\ \texttt{"loss"} & \text{if } Z_{\text{seg}} < -\tau_Z \text{ (or } \bar{r}_{\text{seg}} < -\tau_r \text{)} \\ \texttt{None} & \text{otherwise} \end{cases}$$
 
 ### 7.3 Constants & Hyperparameters
 
@@ -406,7 +406,7 @@ In `--mode prenatal`, `ccnv` calibrates and evaluates three complementary fetal 
 
 Autosomal density excludes chromosomes 13, 18, and 21 (`_EXCLUDED_PRENATAL_AUTOSOMES = {13, 18, 21}`):
 
-$$\rho_{\text{auto}} = \operatorname{mean}_{b \in \mathcal{A}_{\text{pre}}, c_b > 0}\!\left(\frac{c_b}{w_b}\right)$$
+$$\rho_{\text{auto}} = \mathrm{mean}_{b \in \mathcal{A}_{\text{pre}}, c_b > 0}\!\left(\frac{c_b}{w_b}\right)$$
 
 Prenatal fetal sex inference fits a 1D 2-GMM with Brent's root-finding (`infer_sex_gmm_1d`) on `chrY` read fractions, establishing the decision boundary $\tau_Y$ separating female and male fetuses.
 
@@ -428,11 +428,11 @@ Autosomal counts are coarsened in memory to $100\text{ kb}$ (`prenatal_bin_size 
 
 `ccnv` implements a convex logit-space `SeqFF`/`PREFACE`-style ensemble (`src/ccnv/stats/prenatal_math.py:fit_ffa_logit_ensemble`, Kim et al., 2015; Raman et al., 2019b; Golub, Heath, & Wahba, 1979):
 
-$$u_s = \operatorname{logit}\!\left(\operatorname{clip}(y_s, 0.005, 0.85)\right) = \ln\!\left(\frac{\tilde{y}_s}{1 - \tilde{y}_s}\right)$$
+$$u_s = \mathrm{logit}\!\left(\mathrm{clip}(y_s, 0.005, 0.85)\right) = \ln\!\left(\frac{\tilde{y}_s}{1 - \tilde{y}_s}\right)$$
 
 $$\mathbf{w}_{\text{ens}} = \frac{1}{2}\left(\hat{\mathbf{w}}_{\text{RidgeCV}} + \hat{\mathbf{w}}_{\text{ElasticNetCV}}\right), \quad b_{\text{ens}} = \frac{1}{2}\left(\hat{b}_{\text{RidgeCV}} + \hat{b}_{\text{ElasticNetCV}}\right)$$
 
-$$\hat{f}_{\text{FFA}}(\mathbf{z}) = \operatorname{expit}\!\left(\mathbf{z}^\top \mathbf{w}_{\text{ens}} + b_{\text{ens}}\right)$$
+$$\hat{f}_{\text{FFA}}(\mathbf{z}) = \mathrm{expit}\!\left(\mathbf{z}^\top \mathbf{w}_{\text{ens}} + b_{\text{ens}}\right)$$
 
 This convex formulation eliminates non-convex local minima and saturating tail artifacts of Sigmoid MLPs, guaranteeing monotonic predictions strictly within $(0, 1)$ with analytic LOOCV standard error $\sigma_{\text{ffa}}$.
 
@@ -465,7 +465,7 @@ $$\boldsymbol{\mu}_{\text{XX}} = (0, 0)^\top, \quad \boldsymbol{\mu}_{\text{XY}}
 
 $$\boldsymbol{\mu}_{\text{XXX}} = \left(+\tfrac{1}{2}\hat{f}_0, 0\right)^\top, \quad \boldsymbol{\mu}_{\text{XXY}} = \left(0, \hat{f}_0\right)^\top, \quad \boldsymbol{\mu}_{\text{XYY}} = \left(-\tfrac{1}{2}\hat{f}_0, 2\hat{f}_0\right)^\top$$
 
-Using diagonal covariance $\boldsymbol{\Sigma}_k = \operatorname{diag}(\sigma_X^2, \sigma_Y^2)$, calibrated Bayesian posterior probabilities are evaluated:
+Using diagonal covariance $\boldsymbol{\Sigma}_k = \mathrm{diag}(\sigma_X^2, \sigma_Y^2)$, calibrated Bayesian posterior probabilities are evaluated:
 
 $$P(C = k \mid \mathbf{x}) = \frac{\pi_k \, \mathcal{N}(\mathbf{x} \mid \boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k)}{\sum_{j} \pi_j \, \mathcal{N}(\mathbf{x} \mid \boldsymbol{\mu}_j, \boldsymbol{\Sigma}_j)}$$
 
@@ -479,11 +479,11 @@ $$f_{\text{active}} = \frac{\sum_{m \in \{\text{FFY}, \text{FFA}, \text{FFX}\}} 
 
 yielding an estimator with strictly lower variance than any individual component. For female fetuses (`XX`), `active_ff` routes to $\hat{f}_{\text{FFA}}$.
 
-#### 9.1.3 Fetal-Fraction-Parameterized Log-Likelihood Ratio ($\operatorname{LLR}_{\text{fetal}}$) Segment Discordance
+#### 9.1.3 Fetal-Fraction-Parameterized Log-Likelihood Ratio ($\mathrm{LLR}_{\text{fetal}}$) Segment Discordance
 
-In `src/ccnv/features/prenatal.py:annotate_prenatal_segments`, segments are evaluated using the Gaussian log-likelihood ratio (Adalsteinsson et al., 2017) comparing the fetal single-copy hypothesis $\mu_1 = \operatorname{sign}(\bar{r}_m)\log_2(1 \pm 0.5 f_{\text{active}})$ against maternal CNVs ($\mu_{\text{mat}} = \pm 0.585$) and diploid noise ($\mu_0 = 0$):
+In `src/ccnv/features/prenatal.py:annotate_prenatal_segments`, segments are evaluated using the Gaussian log-likelihood ratio (Adalsteinsson et al., 2017) comparing the fetal single-copy hypothesis $\mu_1 = \mathrm{sign}(\bar{r}_m)\log_2(1 \pm 0.5 f_{\text{active}})$ against maternal CNVs ($\mu_{\text{mat}} = \pm 0.585$) and diploid noise ($\mu_0 = 0$):
 
-$$\operatorname{LLR}_{\text{fetal}}(S_m) = \frac{1}{2}\sum_{i \in S_m} w_i \left[ r_i^2 - (r_i - \mu_1)^2 \right]$$
+$$\mathrm{LLR}_{\text{fetal}}(S_m) = \frac{1}{2}\sum_{i \in S_m} w_i \left[ r_i^2 - (r_i - \mu_1)^2 \right]$$
 
 Discordance rules flag calls as `SCA_DISCORDANT`, `SUB_FETAL_RATIO` ($|r_{\text{seg}}| < 0.5 |r_{\text{exp}}|$), or `SUPER_FETAL_RATIO` ($f_{\text{implied}} > \max(2.5 f_{\text{active}}, f_{\text{active}} + 0.15)$).
 
@@ -503,7 +503,7 @@ Discordance rules flag calls as `SCA_DISCORDANT`, `SUB_FETAL_RATIO` ($|r_{\text{
 
 For a branch with unmasked valid bins $\mathcal{V}$, let:
 
-$$\mu_{\bar{d}} = \operatorname{mean}_{i \in \mathcal{V}}(\bar{d}_i), \quad \sigma_{\bar{d}} = \operatorname{std}_{i \in \mathcal{V}}(\bar{d}_i), \quad \tau_{\text{out}} = \mu_{\bar{d}} + 3.0 \cdot \sigma_{\bar{d}}$$
+$$\mu_{\bar{d}} = \mathrm{mean}_{i \in \mathcal{V}}(\bar{d}_i), \quad \sigma_{\bar{d}} = \mathrm{std}_{i \in \mathcal{V}}(\bar{d}_i), \quad \tau_{\text{out}} = \mu_{\bar{d}} + 3.0 \cdot \sigma_{\bar{d}}$$
 
 The outlier bin percentage is $p_{\text{out}} = \frac{100}{|\mathcal{V}|} \sum_{i \in \mathcal{V}} \mathbb{I}(\bar{d}_i \ge \tau_{\text{out}})$, and the low-reference bin count is $n_{\text{low}} = \sum_{i \in \mathcal{V}} \mathbb{I}(|\mathcal{N}_i| < m_{\text{qc}})$, where $m_{\text{qc}} = \min(150, \max(1, \lfloor k / 2 \rfloor))$.
 
