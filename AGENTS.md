@@ -8,7 +8,7 @@ Copynumber-CNV (`ccnv`) is a bioinformatics toolkit for Copy Number Variation (C
 
 ### Core Stack
 
-- **Language:** Python 3.12+
+- **Language:** Python 3.14+
 - **CLI Framework:** Typer
 - **Data Science:** NumPy, SciPy, Polars, Scikit-learn, PyArrow, Ruptures
 - **Bioinformatics:** Pysam, pyBigWig

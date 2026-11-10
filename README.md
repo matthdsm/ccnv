@@ -1,6 +1,6 @@
 # Copynumber-CNV (`ccnv`) Blueprint
 
-`ccnv` is an independent Python 3.12+ bioinformatics toolkit for copy-number variation (CNV) detection in shallow whole-genome sequencing (sWGS) data, inspired by the published statistical methodology of WISECONDOR (Straver et al., *Nucleic Acids Research*, 2014) and WisecondorX (Raman et al., *Nucleic Acids Research*, 2019).
+`ccnv` is an independent Python 3.14+ bioinformatics toolkit for copy-number variation (CNV) detection in shallow whole-genome sequencing (sWGS) data, inspired by the published statistical methodology of WISECONDOR (Straver et al., *Nucleic Acids Research*, 2014) and WisecondorX (Raman et al., *Nucleic Acids Research*, 2019).
 
 - **Versioned Parquet Storage (`1.0.0`)**: Sample bin counts and reference models are stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC, provenance, and optional prenatal model metadata.
 - **Constitutional & Prenatal Analysis Modes**: Supports standard germline CNV profiling (`--mode germline`) as well as cell-free DNA (cfDNA) non-invasive prenatal screening (`--mode prenatal`) with multi-modal fetal fraction estimation (`FFY`, `FFX`, `FFA`, and regularized fragmentomic `FF_size`), depth-conserving Fisher-optimal read weighting, fragmentomic origin discrimination (`origin_call`), 2D stoichiometric Bayesian sex chromosome aneuploidy calling, and discordance filtering.
