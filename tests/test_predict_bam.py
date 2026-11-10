@@ -123,7 +123,7 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
                 zscore=4.5,
                 weight=1.0,
                 bin_count=1,
-                call="GAIN",
+                call="gain",
             ),
             SegmentResult(
                 contig="chr1",
@@ -133,7 +133,7 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
                 zscore=4.5,
                 weight=1.0,
                 bin_count=1,
-                call="GAIN",
+                call="gain",
             ),
         ]
 

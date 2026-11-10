@@ -212,7 +212,6 @@ def load_inputs(
         raise PredictError(f"failed to read sample {sample_path}: {err}") from err
 
     sample_meta = decode_metadata(sample.schema.metadata)
-    ref_model = ref_meta.get("model", {})
     ref_mode = (
         ref_model.get("mode", "germline")
         if isinstance(ref_model, Mapping)

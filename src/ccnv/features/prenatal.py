@@ -916,7 +916,9 @@ def annotate_prenatal_segments(
             lengths = extract_segment_fragment_lengths(
                 sample_table, seg.contig, seg.start, seg.end
             )
-            is_gain = seg.call == "GAIN" if seg.call is not None else (seg.ratio >= 0)
+            is_gain = (
+                seg.call.lower() == "gain" if seg.call is not None else (seg.ratio >= 0)
+            )
             frag_short_ratio, frag_llr_size, origin_call = score_segment_origin(
                 lengths,
                 shift_bp,

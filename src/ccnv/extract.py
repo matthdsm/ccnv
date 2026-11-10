@@ -70,6 +70,18 @@ class _ContigTask:
     max_frag_len: int = 600
 
 
+@dataclass(slots=True)
+class _ContigBinResult:
+    counts: np.ndarray
+    frag_arr: pa.Array
+    ep_counts: np.ndarray
+    gc_sums: np.ndarray
+    qc: dict[str, int]
+    hist: np.ndarray
+    motifs: np.ndarray
+    is_paired: bool
+
+
 _WORKER_HANDLES: dict[tuple[str, str, str | None, int], pysam.AlignmentFile] = {}
 
 
@@ -100,32 +112,14 @@ def _worker_handle(task: _ContigTask) -> pysam.AlignmentFile:
 
 def _bin_contig(
     task: _ContigTask,
-) -> tuple[
-    np.ndarray,
-    pa.Array,
-    np.ndarray,
-    np.ndarray,
-    dict[str, int],
-    np.ndarray,
-    np.ndarray,
-    bool,
-]:
+) -> _ContigBinResult:
     """Bin reads for a contig task using a cached worker alignment handle."""
     return bin_contig_with_handle(_worker_handle(task), task)
 
 
 def bin_contig_with_handle(
     handle: pysam.AlignmentFile, task: _ContigTask
-) -> tuple[
-    np.ndarray,
-    pa.Array,
-    np.ndarray,
-    np.ndarray,
-    dict[str, int],
-    np.ndarray,
-    np.ndarray,
-    bool,
-]:
+) -> _ContigBinResult:
     """Stream and bin reads for a contig using an open alignment handle."""
     starts, _ = bin_intervals(task.length, task.bin_size)
     qc = empty_qc()
@@ -169,35 +163,22 @@ def bin_contig_with_handle(
         n_bins=starts.size,
         bin_size=task.bin_size,
     )
-    return (
-        counts,
-        frag_arr,
-        ep_counts,
-        gc_sums,
-        qc,
-        contig_hist,
-        contig_motifs,
-        paired_detected,
+    return _ContigBinResult(
+        counts=counts,
+        frag_arr=frag_arr,
+        ep_counts=ep_counts,
+        gc_sums=gc_sums,
+        qc=qc,
+        hist=contig_hist,
+        motifs=contig_motifs,
+        is_paired=paired_detected,
     )
 
 
 @contextmanager
 def _binned_contigs(
     tasks: Sequence[_ContigTask], workers: int, handle: pysam.AlignmentFile
-) -> Iterator[
-    Iterator[
-        tuple[
-            np.ndarray,
-            pa.Array,
-            np.ndarray,
-            np.ndarray,
-            dict[str, int],
-            np.ndarray,
-            np.ndarray,
-            bool,
-        ]
-    ]
-]:
+) -> Iterator[Iterator[_ContigBinResult]]:
     """Yield an iterator of binned contig counts across single-process or worker pool."""
     if workers <= 1 or len(tasks) < 2:
         yield (bin_contig_with_handle(handle, task) for task in tasks)
@@ -286,17 +267,8 @@ def extract_sample_table(
         any_paired = False
 
         with _binned_contigs(tasks, workers, bam) as results:
-            for task, (
-                counts,
-                frag_arr,
-                ep_counts,
-                gc_sums,
-                contig_qc,
-                contig_hist,
-                contig_motifs,
-                paired_detected,
-            ) in zip(tasks, results, strict=True):
-                for counter, value in contig_qc.items():
+            for task, res in zip(tasks, results, strict=True):
+                for counter, value in res.qc.items():
                     qc[counter] += value
                 norm_chr = normalize_chr(task.name)
                 key = (
@@ -307,16 +279,16 @@ def extract_sample_table(
                     else None
                 )
                 if key:
-                    qc[key] += contig_qc["reads_kept"]
+                    qc[key] += res.qc["reads_kept"]
 
                 if norm_chr.isdigit():
-                    hist_autosomal += contig_hist
+                    hist_autosomal += res.hist
                 elif norm_chr == "Y":
-                    hist_chry += contig_hist
+                    hist_chry += res.hist
                 elif norm_chr == "X":
-                    hist_chrx += contig_hist
-                global_motifs += contig_motifs
-                if paired_detected:
+                    hist_chrx += res.hist
+                global_motifs += res.motifs
+                if res.is_paired:
                     any_paired = True
 
                 starts, ends = bin_intervals(task.length, config.bin_size)
@@ -325,25 +297,25 @@ def extract_sample_table(
                     task.name,
                     task.length,
                     starts.size,
-                    contig_qc["reads_kept"],
+                    res.qc["reads_kept"],
                 )
                 logger.debug(
                     "contig %s filter drops: %d unmapped, %d low_mapq, "
                     "%d duplicates, %d secondary, %d supplementary",
                     task.name,
-                    contig_qc["filter_unmapped"],
-                    contig_qc["filter_mapq"],
-                    contig_qc["filter_duplicate"],
-                    contig_qc["filter_secondary"],
-                    contig_qc["filter_supplementary"],
+                    res.qc["filter_unmapped"],
+                    res.qc["filter_mapq"],
+                    res.qc["filter_duplicate"],
+                    res.qc["filter_secondary"],
+                    res.qc["filter_supplementary"],
                 )
                 contig_arrays.append(np.full(starts.size, task.name, dtype=object))
                 start_arrays.append(starts)
                 end_arrays.append(ends)
-                count_arrays.append(counts)
-                frag_arrays.append(frag_arr)
-                ep_arrays.append(ep_counts)
-                gc_arrays.append(gc_sums)
+                count_arrays.append(res.counts)
+                frag_arrays.append(res.frag_arr)
+                ep_arrays.append(res.ep_counts)
+                gc_arrays.append(res.gc_sums)
     finally:
         bam.close()
 

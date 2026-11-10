@@ -56,6 +56,23 @@ def build_1d_basis(
     return np.asarray(spline.fit_transform(val_arr.reshape(-1, 1)), dtype=np.float64)
 
 
+def _fit_spline_terms(
+    values: NDArray[np.float64],
+    degree: int,
+    max_knots: int,
+) -> NDArray[np.float64]:
+    """Fit quantile B-spline terms without intercept."""
+    k = min(max_knots, max(2, int(np.unique(values).size)))
+    spline = SplineTransformer(
+        n_knots=k,
+        degree=degree,
+        knots="quantile",
+        extrapolation="linear",
+        include_bias=False,
+    )
+    return np.asarray(spline.fit_transform(values.reshape(-1, 1)), dtype=np.float64)
+
+
 def build_joint_covariate_basis(
     gc: NDArray[np.float64] | None,
     mappability: NDArray[np.float64] | None,
@@ -99,29 +116,8 @@ def build_joint_covariate_basis(
             return None
 
         n_rows = gc_arr.size
-        k_gc = min(5, max(2, int(np.unique(gc_arr).size)))
-        spline_gc = SplineTransformer(
-            n_knots=k_gc,
-            degree=3,
-            knots="quantile",
-            extrapolation="linear",
-            include_bias=False,
-        )
-        b_gc = np.asarray(
-            spline_gc.fit_transform(gc_arr.reshape(-1, 1)), dtype=np.float64
-        )
-
-        k_map = min(4, max(2, int(np.unique(map_arr).size)))
-        spline_map = SplineTransformer(
-            n_knots=k_map,
-            degree=2,
-            knots="quantile",
-            extrapolation="linear",
-            include_bias=False,
-        )
-        b_map = np.asarray(
-            spline_map.fit_transform(map_arr.reshape(-1, 1)), dtype=np.float64
-        )
+        b_gc = _fit_spline_terms(gc_arr, degree=3, max_knots=5)
+        b_map = _fit_spline_terms(map_arr, degree=2, max_knots=4)
 
         z_gc = np.asarray(scipy.stats.zscore(gc_arr, ddof=0), dtype=np.float64)
         z_map = np.asarray(scipy.stats.zscore(map_arr, ddof=0), dtype=np.float64)
@@ -145,17 +141,7 @@ def build_joint_covariate_basis(
     if len_ok:
         assert len_arr is not None
         if len_arr.size == n_rows:
-            k_len = min(4, max(2, int(np.unique(len_arr).size)))
-            spline_len = SplineTransformer(
-                n_knots=k_len,
-                degree=3,
-                knots="quantile",
-                extrapolation="linear",
-                include_bias=False,
-            )
-            b_len = np.asarray(
-                spline_len.fit_transform(len_arr.reshape(-1, 1)), dtype=np.float64
-            )
+            b_len = _fit_spline_terms(len_arr, degree=3, max_knots=4)
             extra_cols.append(b_len)
             if gc_ok:
                 assert gc_arr is not None
@@ -168,17 +154,7 @@ def build_joint_covariate_basis(
     if ep_ok:
         assert ep_arr is not None
         if ep_arr.size == n_rows:
-            k_ep = min(4, max(2, int(np.unique(ep_arr).size)))
-            spline_ep = SplineTransformer(
-                n_knots=k_ep,
-                degree=3,
-                knots="quantile",
-                extrapolation="linear",
-                include_bias=False,
-            )
-            b_ep = np.asarray(
-                spline_ep.fit_transform(ep_arr.reshape(-1, 1)), dtype=np.float64
-            )
+            b_ep = _fit_spline_terms(ep_arr, degree=3, max_knots=4)
             extra_cols.append(b_ep)
 
     return np.hstack(extra_cols, dtype=np.float64)

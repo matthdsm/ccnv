@@ -12,6 +12,7 @@ from helpers import make_sample_table
 from scipy.stats import norm
 
 from ccnv.features.fragmentomics import (
+    apply_prenatal_fisher_weighting,
     extract_sample_fragmentomics,
     extract_segment_fragment_lengths,
     fuse_active_fetal_fraction,
@@ -30,6 +31,36 @@ from ccnv.stats.fragmentomics import (
     FRAG_MIN_LEN,
     FRAG_NUM_BINS,
 )
+
+
+def _make_dummy_prenatal_metadata(
+    **overrides: object,
+) -> PrenatalModelMetadata:
+    defaults: dict[str, object] = {
+        "prenatal_bin_size": 100000,
+        "yfrac_threshold": 0.001,
+        "ffy_intercept": 0.0,
+        "ffy_slope": 1.0,
+        "mlp_w1": [],
+        "mlp_b1": [],
+        "mlp_w2": [],
+        "mlp_b2": [],
+        "mlp_skew_intercept": 0.0,
+        "mlp_skew_slope": 1.0,
+        "olm_weights": [],
+        "olm_bias": 0.0,
+        "olm_skew_intercept": 0.0,
+        "olm_skew_slope": 1.0,
+        "ffx_intercept": 2.0,
+        "ffx_slope": -2.0,
+        "female_chrx_ratio_mean": 1.0,
+        "female_chrx_ratio_std": 0.01,
+        "ffy_std": 0.01,
+        "ffa_std": 0.02,
+        "ff_size_std": 0.018,
+    }
+    defaults.update(overrides)
+    return PrenatalModelMetadata(**defaults)  # type: ignore[arg-type]
 
 
 def _make_mock_fragmentomics_metadata(
@@ -158,29 +189,7 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         self.assertEqual(empty.size, 0)
 
     def test_fuse_active_fetal_fraction_male_and_female(self) -> None:
-        meta = PrenatalModelMetadata(
-            prenatal_bin_size=100000,
-            yfrac_threshold=0.001,
-            ffy_intercept=0.0,
-            ffy_slope=1.0,
-            mlp_w1=[],
-            mlp_b1=[],
-            mlp_w2=[],
-            mlp_b2=[],
-            mlp_skew_intercept=0.0,
-            mlp_skew_slope=1.0,
-            olm_weights=[],
-            olm_bias=0.0,
-            olm_skew_intercept=0.0,
-            olm_skew_slope=1.0,
-            ffx_intercept=2.0,
-            ffx_slope=-2.0,
-            female_chrx_ratio_mean=1.0,
-            female_chrx_ratio_std=0.01,
-            ffy_std=0.01,
-            ffa_std=0.02,
-            ff_size_std=0.018,
-        )
+        meta = _make_dummy_prenatal_metadata()
 
         # Male: FFY=0.10, FFA=0.105, FFX=0.098, FF_size=0.102 -> all match tolerance -> FUSED
         fused_ff, source = fuse_active_fetal_fraction(
@@ -303,6 +312,29 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         self.assertEqual(res_female.fetal_sex, "F")
         self.assertIsNotNone(res_female.ff_size)
         self.assertIn(res_female.active_ff_source, ("FUSED", "FFA"))
+
+    def test_apply_prenatal_fisher_weighting_replaces_counts(self) -> None:
+        # 1. No-op when prenatal_meta is None
+        sample_tbl = make_sample_table([10, 20], fragment_lengths=[[140, 166], [166]])
+        out_noop = apply_prenatal_fisher_weighting(sample_tbl, None)
+        self.assertEqual(out_noop.column("count").to_pylist(), [10.0, 20.0])
+
+        # 2. Replaces counts when densities provided
+        grid = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
+        p_mat = norm.pdf(grid, loc=166.0, scale=12.0)
+        p_fet = norm.pdf(grid, loc=143.0, scale=10.0)
+        p_mat /= np.sum(p_mat)
+        p_fet /= np.sum(p_fet)
+
+        meta = _make_dummy_prenatal_metadata(
+            p_fetal_density=p_fet.tolist(),
+            p_maternal_density=p_mat.tolist(),
+        )
+        out_weighted = apply_prenatal_fisher_weighting(sample_tbl, meta)
+        weighted_counts = out_weighted.column("count").to_numpy()
+        self.assertEqual(len(weighted_counts), 2)
+        self.assertGreater(weighted_counts[0], 0.0)
+        self.assertGreater(weighted_counts[1], 0.0)
 
 
 if __name__ == "__main__":

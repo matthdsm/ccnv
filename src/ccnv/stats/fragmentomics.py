@@ -316,14 +316,17 @@ def deconvolve_fetal_maternal_densities(
 def fisher_optimal_weights(
     p_fetal: NDArray[np.number],
     p_maternal: NDArray[np.number],
-    f0: float = 0.10,
+    target_ff: float = 0.10,
+    *,
+    f0: float | None = None,
     clip_bounds: tuple[float, float] = (0.25, 3.0),
 ) -> NDArray[np.float64]:
     """Calculate parameter-free Fisher-score optimal coverage weights w*(L; f0)."""
+    effective_f0 = f0 if f0 is not None else target_ff
     pf = np.asarray(p_fetal, dtype=np.float64)
     pm = np.asarray(p_maternal, dtype=np.float64)
 
-    p_mix = f0 * pf + (1.0 - f0) * pm
+    p_mix = effective_f0 * pf + (1.0 - effective_f0) * pm
     p_mix_safe = np.maximum(p_mix, 1e-12)
 
     raw_weights = pf / p_mix_safe

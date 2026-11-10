@@ -577,8 +577,9 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
     }
     n_rows = len(out_cols["contig"])
     if has_frag:
-        out_cols["fragment_lengths"] = pa.array(
-            [[]] * n_rows, type=pa.list_(pa.uint16())
+        out_cols["fragment_lengths"] = pa.ListArray.from_arrays(
+            np.zeros(n_rows + 1, dtype=np.int32),
+            np.empty(0, dtype=np.uint16),
         )
     if has_ep:
         out_cols["endpoint_count"] = pa.array(
@@ -654,18 +655,27 @@ def _assemble_cohort(
     counts_list: list[NDArray[np.float64]] = []
     identities: list[object] = []
 
-    def _is_paired(meta: dict[str, object]) -> bool:
+    def _is_paired(meta: Mapping[object, object] | None) -> bool:
+        if not meta:
+            return False
         for k in ("fragmentomics", "ccnv.fragmentomics", FRAGMENTOMICS_METADATA_KEY):
-            frag = meta.get(k)
-            if isinstance(frag, dict):
-                return bool(frag.get("paired_end", False))
-            if isinstance(frag, (bytes, str)):
-                try:
-                    loaded = json.loads(frag)
-                    if isinstance(loaded, dict):
-                        return bool(loaded.get("paired_end", False))
-                except json.JSONDecodeError, UnicodeDecodeError, TypeError:
-                    continue
+            val = meta.get(k)
+            if val is None and isinstance(k, str) and k.encode() in meta:
+                val = meta[k.encode()]
+            elif val is None and isinstance(k, bytes) and k.decode() in meta:
+                val = meta[k.decode()]
+            if val is not None:
+                if hasattr(val, "paired_end"):
+                    return bool(val.paired_end)
+                if isinstance(val, dict):
+                    return bool(val.get("paired_end", False))
+                if isinstance(val, (bytes, str)):
+                    try:
+                        loaded = json.loads(val)
+                        if isinstance(loaded, dict):
+                            return bool(loaded.get("paired_end", False))
+                    except json.JSONDecodeError, UnicodeDecodeError, TypeError:
+                        continue
         return False
 
     first_paired = _is_paired(first_meta)
