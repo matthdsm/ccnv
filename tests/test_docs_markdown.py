@@ -144,6 +144,65 @@ class TestDocsMarkdown(unittest.TestCase):
                     )
         self.assertEqual(errors, [], "Math spacing issues found:\n" + "\n".join(errors))
 
+    def test_math_delimiters_and_syntax(self) -> None:
+        """Verify no percent comments, bare < or > inequalities, or single-line display math blocks exist in LaTeX math."""
+        errors: list[str] = []
+        for file_path in self.tracked_md_files:
+            if not file_path.exists():
+                continue
+            content = file_path.read_text(encoding="utf-8")
+            # Mask code blocks and inline spans while preserving newline offsets
+            stripped_content = re.sub(
+                r"```.*?```",
+                lambda m: "\n" * m.group(0).count("\n"),
+                content,
+                flags=re.DOTALL,
+            )
+            stripped_content = re.sub(
+                r"`[^`\n]*`", lambda m: " " * len(m.group(0)), stripped_content
+            )
+
+            # Check for single-line display math blocks ($$...$$ on same line)
+            for m in re.finditer(r"(?m)^[ \t]*\$\$(.+?)\$\$[ \t]*$", stripped_content):
+                lineno = stripped_content[: m.start()].count("\n") + 1
+                errors.append(
+                    f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                    "single-line display math block found; place $$ on separate lines"
+                )
+
+            # Check block math for %, bare < or >
+            for m in re.finditer(r"\$\$(.*?)\$\$", stripped_content, flags=re.DOTALL):
+                inner = m.group(1)
+                lineno = stripped_content[: m.start()].count("\n") + 1
+                if "%" in inner:
+                    errors.append(
+                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                        r"percent symbol '%' in display math triggers TeX comment hazard; move outside math"
+                    )
+                if re.search(r"(?<!\\)[<>]", inner):
+                    errors.append(
+                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                        r"bare '<' or '>' in display math triggers HTML parsing conflicts; use \lt or \gt"
+                    )
+
+            # Check inline math for %, bare < or >
+            for m in re.finditer(r"(?<!\\)\$(?!\$)(.*?)(?<!\\)\$", stripped_content):
+                inner = m.group(1)
+                lineno = stripped_content[: m.start()].count("\n") + 1
+                if "%" in inner:
+                    errors.append(
+                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                        r"percent symbol '%' in inline math triggers TeX comment hazard; move outside math"
+                    )
+                if re.search(r"(?<!\\)[<>]", inner):
+                    errors.append(
+                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                        r"bare '<' or '>' in inline math triggers HTML parsing conflicts; use \lt or \gt"
+                    )
+        self.assertEqual(
+            errors, [], "Math delimiter and syntax issues found:\n" + "\n".join(errors)
+        )
+
     def test_no_local_filesystem_urls(self) -> None:
         """Verify no local file:/// URLs exist in tracked markdown files outside inline code/docs."""
         errors: list[str] = []

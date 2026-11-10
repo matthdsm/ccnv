@@ -90,6 +90,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Fixed GitHub Markdown and MathJax formula rendering failures in `README.md` and `docs/methodology.md` (Sections 2.1.1, 3.1, 5.1.2) by removing `%` TeX comment characters from math spans, converting bare `<` and `>` inequalities to `\lt` and `\gt`, resolving prime subscript syntax errors, and standardizing display math blocks on separate-line `$$` delimiters.
+- Extended Markdown automated integrity contract test `tests/test_docs_markdown.py` to enforce clean display math delimiters, absence of `%` within math environments, and `\lt`/`\gt` inequality operators across all 18 repository documentation files.
 - Fixed broken table column splitting in `docs/methodology.md` caused by unescaped pipe characters in inline math.
 - Prevented zero-division and missing Z-score degradation in `predict.normalize_branch` by guarding against machine-epsilon `null_std` values and falling back to sample ratio standard deviation when empirical median absolute deviation degenerates to zero.
 - Resolved `UnboundLocalError` for `fasta` variable in `ccnv reference` CLI command.

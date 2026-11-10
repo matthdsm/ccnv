@@ -28,7 +28,7 @@ The `ccnv.models` package defines pure domain models, configuration containers, 
 ## Invariants
 
 - `[src/ccnv/models/schemas.py:validate_table]`: All tables must strictly conform to `SAMPLE_SCHEMA` or `REFERENCE_SCHEMA` under Arrow schema version `2.0.0` with `0-based-half-open` intervals.
-- `[src/ccnv/models/schemas.py:validate_metadata]`: Metadata requires non-empty `contig_lengths` mapping identifiers to positive integers; row coordinates must satisfy $0 \le \text{start} < \text{end} \le \text{length}$.
+- `[src/ccnv/models/schemas.py:validate_metadata]`: Metadata requires non-empty `contig_lengths` mapping identifiers to positive integers; row coordinates must satisfy $0 \le \text{start} \lt \text{end} \le \text{length}$.
 - `[src/ccnv/models/config.py:ReadFilters]`: Minimum mapping quality (`min_mapq`) must be a non-negative integer; flag booleans must be strictly typed.
 - `[src/ccnv/models/domain.py:natural_sort_key]`: Human karyotype ordering places autosomes 1-22 in numerical order, followed by gonosomes X, Y, and mitochondrial M.
 
