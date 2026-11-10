@@ -7,6 +7,7 @@ from pathlib import Path
 import pysam
 
 from ccnv.models import ExtractError, ReadFilters
+from ccnv.stats.fragmentomics import encode_kmer_4
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,7 @@ __all__ = [
     "open_alignment",
     "read_alignment_header",
     "rejection_reason",
+    "stream_contig_fragments",
     "stream_contig_reads",
 ]
 
@@ -143,3 +145,91 @@ def stream_contig_reads(
         if qc is not None:
             qc["reads_kept"] += 1
         yield start
+
+
+def stream_contig_fragments(
+    handle: pysam.AlignmentFile,
+    contig: str,
+    filters: ReadFilters,
+    *,
+    contig_length: int | None = None,
+    min_frag_len: int = 30,
+    max_frag_len: int = 600,
+    qc: dict[str, int] | None = None,
+) -> Iterator[tuple[int, int, int, int, float, int, bool]]:
+    """Stream filtered fragments for a contig, yielding (midpoint, start, end, length, gc, motif, is_paired)."""
+    for read in handle.fetch(contig):
+        if qc is not None:
+            qc["reads_seen"] += 1
+        reason = rejection_reason(read, filters)
+        if reason is not None:
+            if qc is not None:
+                qc[reason] += 1
+            continue
+
+        if read.is_paired:
+            tlen = int(read.template_length)
+            if tlen <= 0:
+                continue
+            start = int(read.reference_start)
+            if contig_length is not None and start >= contig_length:
+                if qc is not None:
+                    qc["filter_no_start"] += 1
+                continue
+            length = tlen
+            end = (
+                min(contig_length - 1, start + length)
+                if contig_length is not None
+                else start + length
+            )
+            midpoint = (
+                min(contig_length - 1, start + length // 2)
+                if contig_length is not None
+                else start + length // 2
+            )
+            is_paired = True
+        else:
+            start = int(read.reference_start)
+            if contig_length is not None and start >= contig_length:
+                if qc is not None:
+                    qc["filter_no_start"] += 1
+                continue
+            midpoint = start
+            read_end = (
+                int(read.reference_end)
+                if read.reference_end is not None
+                else start + (read.query_length or 100)
+            )
+            end = (
+                min(contig_length - 1, read_end)
+                if contig_length is not None
+                else read_end
+            )
+            length = 0
+            is_paired = False
+
+        seq = read.query_sequence
+        if seq:
+            gc_count = seq.count("G") + seq.count("g") + seq.count("C") + seq.count("c")
+            gc_frac = float(gc_count / len(seq))
+        else:
+            gc_frac = 0.4
+
+        motif_code = -1
+        cig = read.cigartuples
+        if seq and len(seq) >= 4 and cig:
+            if not read.is_reverse:
+                if cig[0][0] in (0, 7, 8):
+                    kmer = encode_kmer_4(seq[:4])
+                    if kmer is not None:
+                        motif_code = kmer
+            else:
+                if cig[-1][0] in (0, 7, 8):
+                    kmer = encode_kmer_4(seq[-4:], reverse_complement=True)
+                    if kmer is not None:
+                        motif_code = kmer
+
+        if qc is not None:
+            qc["reads_kept"] += 1
+
+        yield (midpoint, start, end, length, gc_frac, motif_code, is_paired)

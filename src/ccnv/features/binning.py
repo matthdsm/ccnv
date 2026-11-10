@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import numpy as np
+import pyarrow as pa
 from numpy.typing import NDArray
 
 __all__ = [
+    "bin_contig_fragments",
     "bin_counts",
     "bin_intervals",
     "rebin_counts",
@@ -73,3 +75,60 @@ def rebin_counts(
     target_cum = np.interp(target_knots, source_knots, source_cum)
     target_counts = np.diff(target_cum)
     return np.maximum(target_counts, 0.0)
+
+
+def bin_contig_fragments(
+    midpoints: NDArray[np.int64],
+    starts: NDArray[np.int64],
+    ends: NDArray[np.int64],
+    lengths: NDArray[np.uint16 | np.int64],
+    gc_fracs: NDArray[np.floating],
+    *,
+    is_paired: bool,
+    n_bins: int,
+    bin_size: int,
+) -> tuple[NDArray[np.uint64], pa.Array, NDArray[np.uint32], NDArray[np.float32]]:
+    """Assemble fragment count, ListArray fragment lengths, endpoint count, and GC sums for a contig."""
+    if n_bins <= 0:
+        raise ValueError("n_bins must be positive")
+    if bin_size <= 0:
+        raise ValueError("bin_size must be a positive integer")
+
+    if midpoints.size == 0:
+        counts = np.zeros(n_bins, dtype=np.uint64)
+        endpoint_counts = np.zeros(n_bins, dtype=np.uint32)
+        frag_gc_sums = np.zeros(n_bins, dtype=np.float32)
+        offsets = np.zeros(n_bins + 1, dtype=np.int32)
+        empty_vals = np.empty(0, dtype=np.uint16)
+        frag_arr = pa.ListArray.from_arrays(offsets, empty_vals)
+        return counts, frag_arr, endpoint_counts, frag_gc_sums
+
+    bin_indices = np.clip(midpoints // bin_size, 0, n_bins - 1).astype(np.int64)
+
+    # 1. Fragment counts
+    counts = np.bincount(bin_indices, minlength=n_bins).astype(np.uint64)
+
+    # 2. Endpoints (both start and end)
+    ep_s = np.clip(starts // bin_size, 0, n_bins - 1).astype(np.int64)
+    ep_e = np.clip(ends // bin_size, 0, n_bins - 1).astype(np.int64)
+    ep_combined = np.concatenate([ep_s, ep_e])
+    endpoint_counts = np.bincount(ep_combined, minlength=n_bins).astype(np.uint32)
+
+    # 3. Fragment GC sums
+    frag_gc_sums = np.bincount(bin_indices, weights=gc_fracs, minlength=n_bins).astype(
+        np.float32
+    )
+
+    # 4. Vectorized PyArrow ListArray
+    if not is_paired:
+        offsets = np.zeros(n_bins + 1, dtype=np.int32)
+        empty_vals = np.empty(0, dtype=np.uint16)
+        frag_arr = pa.ListArray.from_arrays(offsets, empty_vals)
+    else:
+        sort_order = np.argsort(bin_indices, kind="stable")
+        sorted_lens = lengths[sort_order].astype(np.uint16)
+        offsets = np.zeros(n_bins + 1, dtype=np.int32)
+        np.cumsum(counts, out=offsets[1:])
+        frag_arr = pa.ListArray.from_arrays(offsets, sorted_lens)
+
+    return counts, frag_arr, endpoint_counts, frag_gc_sums

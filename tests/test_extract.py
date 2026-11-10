@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from dataclasses import asdict
@@ -31,9 +32,11 @@ from ccnv.features.cohort import rebin_sample_table
 from ccnv.io.alignments import rejection_reason
 from ccnv.io.parquet import read_sample_parquet
 from ccnv.models import (
+    FRAGMENTOMICS_METADATA_KEY,
     Contig,
     ExtractConfig,
     ExtractError,
+    FragmentomicsMetadata,
     GenomeProfile,
     ReadFilters,
     is_canonical_contig,
@@ -169,6 +172,9 @@ class TestRebin(unittest.TestCase):
                 "start": pa.array([0, 100], type=pa.int64()),
                 "end": pa.array([100, 200], type=pa.int64()),
                 "count": pa.array([10, 20], type=pa.uint64()),
+                "fragment_lengths": pa.array([[], []], type=pa.list_(pa.uint16())),
+                "endpoint_count": pa.array([0, 0], type=pa.uint32()),
+                "frag_gc_sum": pa.array([0.0, 0.0], type=pa.float32()),
             },
             schema=SAMPLE_SCHEMA.with_metadata(metadata),
         )
@@ -833,10 +839,26 @@ class TestExtractPublishedCram(unittest.TestCase):
             self.assertEqual(metadata["contig_lengths"], {"chr21": CHR21_LENGTH})
             self.assertEqual(metadata["bin_size"], PUBLISHED_BIN_SIZE)
             self.assertEqual(metadata["source_identity"]["format"], "cram")
-            self.assertEqual(metadata["qc"]["reads_kept"], 1_049_534)
-            self.assertEqual(metadata["qc"]["effective_reads_kept"], 1_049_534)
-            self.assertEqual(metadata["qc"]["autosomal_reads_kept"], 1_049_534)
+            self.assertEqual(metadata["qc"]["reads_kept"], 524_785)
+            self.assertEqual(metadata["qc"]["effective_reads_kept"], 524_785)
+            self.assertEqual(metadata["qc"]["autosomal_reads_kept"], 524_785)
             self.assertEqual(metadata["qc"]["sex_reads_kept"], 0)
+
+            # Fragmentomics schema and metadata assertions
+            self.assertIn("fragment_lengths", table.column_names)
+            self.assertIn("endpoint_count", table.column_names)
+            self.assertIn("frag_gc_sum", table.column_names)
+            self.assertIn(FRAGMENTOMICS_METADATA_KEY, table.schema.metadata)
+            frag_meta = FragmentomicsMetadata(
+                **json.loads(
+                    table.schema.metadata[FRAGMENTOMICS_METADATA_KEY].decode("utf-8")
+                )
+            )
+            self.assertTrue(frag_meta.paired_end)
+            self.assertGreater(frag_meta.total_paired_fragments, 0)
+            self.assertGreater(frag_meta.chromatosome_mode_bp, 50)
+            self.assertGreater(sum(table.column("endpoint_count").to_pylist()), 0)
+            self.assertGreater(sum(table.column("frag_gc_sum").to_pylist()), 0.0)
 
 
 def _read(
