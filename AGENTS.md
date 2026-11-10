@@ -94,4 +94,10 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 - **GitHub Actions:** Ensure github actions are using the latest version at all times, updating the workflow files as needed. Reverting to older versions is strictly forbidden.
 - **Surgical Updates:** When fixing bugs, prioritize small, targeted changes and adding a corresponding test case.
 - **Documentation:** Update this document and README if you make changes that affect the overall architecture or development workflow. Keep all WisecondorX comparisons strictly inside `docs/benchmark.md`.
-- **Markdown Formatting:** Do not hard-wrap lines in Markdown files; rely on editor soft-wrapping for line length. Keep paragraphs and list items on a single logical line. Avoid unnecessary newlines, redundant blank lines, and empty lines inside Mermaid diagram blocks.
+- **Markdown Formatting & GitHub Rendering:** All Markdown documentation must render cleanly and accurately on GitHub (GitHub Flavored Markdown / GFM).
+  - Do not hard-wrap lines in Markdown files; rely on editor soft-wrapping for line length. Keep paragraphs and list items on a single logical line.
+  - Avoid unnecessary newlines, redundant blank lines, and empty lines inside Mermaid diagram blocks. Quote node labels containing special characters (parentheses, brackets).
+  - Escape all pipe characters inside Markdown tables, including within LaTeX math expressions (use `\|` or `\vert` instead of bare `|`), because GitHub parses table cell boundaries before evaluating math blocks.
+  - Ensure LaTeX math expressions use standard KaTeX syntax supported by GitHub, avoid leading or trailing whitespace inside delimiters (`$x$` rather than `$ x $`), and use `\operatorname{...}` or `\text{...}` for multi-letter operator names.
+  - Maintain clean block-level element spacing: ensure headings, tables, blockquotes, code blocks, lists, and display math `$$` blocks are separated from surrounding prose by blank lines.
+  - Use valid repository-relative links for internal files and anchors; never include absolute local filesystem paths or `file:///` URLs.

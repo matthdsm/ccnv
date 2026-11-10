@@ -34,6 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Codified GitHub Flavored Markdown (GFM) rendering standards in `AGENTS.md`, requiring escaped pipes in tables, single-logical-line paragraphs, clean block element spacing, and standard KaTeX syntax.
 - Refactored prenatal `PREFACE` variables, metrics, and output keys to `FFA` (fetal fraction autosomal) across models, prediction results, QC payloads, interactive HTML reports, and documentation, preserving backward-compatibility aliases (`fit_preface_logit_ensemble`, `PrenatalModelMetadata.preface_std`, `PrenatalModelMetadata.preface_logit_mode`, `FetalFractionResult.preface`, `classify_sca(preface=...)`).
 - NumPy, SciPy, and scikit-learn prenatal math kernels (`src/ccnv/prenatal_math.py`): implemented 1D 2-component Gaussian mixture model (`infer_sex_gmm_1d` via `sklearn.mixture.GaussianMixture` and `scipy.optimize.brentq`), non-negative Lasso regression (`fit_lasso_fista` via `sklearn.linear_model.Lasso` and `scipy.optimize.nnls`), centered unscaled truncated PCA (`pca_irlba_numpy` via `sklearn.impute.SimpleImputer`, `sklearn.decomposition.PCA`, and `sklearn.utils.extmath.svd_flip`), L-BFGS-B Sigmoid neural network (`fit_rprop_mlp` via `scipy.optimize.minimize`), Ordinary Linear Model (`train_olm` via `sklearn.linear_model.LinearRegression`), OLS skew correction (`ols_fit` via `scipy.stats.linregress`), and robust Huber regression (`rlm_huber` via `sklearn.linear_model.HuberRegressor`), replacing PyTorch and ONNX Runtime dependencies.
 - Prenatal reference and prediction orchestration (`src/ccnv/prenatal.py`): in-memory multi-resolution coarsening from 5 kb to 100 kb (`--prenatal-binsize`, default 100000 bp), full prenatal reference fitting (`fit_prenatal_models`), single-sample prenatal inference (`predict_prenatal`), active fetal fraction selection, and segment discordance annotation (`annotate_prenatal_segments`).
@@ -89,6 +90,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Fixed broken table column splitting in `docs/methodology.md` caused by unescaped pipe characters in inline math.
 - Prevented zero-division and missing Z-score degradation in `predict.normalize_branch` by guarding against machine-epsilon `null_std` values and falling back to sample ratio standard deviation when empirical median absolute deviation degenerates to zero.
 - Resolved `UnboundLocalError` for `fasta` variable in `ccnv reference` CLI command.
 - Scaled depth normalization strictly over unmasked bins in reference build and prediction coverage, and guarded PCA reconstruction against underdetermined active bin rank.
