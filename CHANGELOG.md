@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Cell-free DNA (cffDNA vs maternal cfDNA) fragmentomic feature extraction and size distribution modeling across `extract`, `reference`, and `predict`:
+  - `ccnv extract`: Single-pass paired-end alignment streaming with dyad midpoint binning, extracting insert length ($30$–$600\text{ bp}$, configurable via `--min-frag-len` and `--max-frag-len`), unclipped $5'$ 4-mer motif codes, fragment GC content, and endpoint counts, serializing cohort fragmentomics under `ccnv.fragmentomics` Parquet metadata.
+  - Sizing shift cross-correlation alignment ($\Delta_{\text{bp}} \in [-15, 15]$) standardizing platform- and run-specific sizing calibration offsets across cohorts.
+  - Multi-modal regularized `FF_size` linear ensemble incorporating mode-aligned length bands, $10.4\text{ bp}$ helical Fourier cleavage power, and 256-dimensional $5'$ 4-mer motifs (Motif Diversity Score MDS).
+  - Cohort fragment length deconvolution estimating pure fetal $\hat{p}_F(L)$ and maternal $\hat{p}_M(L)$ probability densities from female controls and high-confidence male samples.
+  - Depth-conserving Fisher-optimal read weighting $w^{\ast}(L)$ evaluated via bracketed root-finding with $\mathbb{E}_{L \sim p_M}[w^{\ast}(L)] = 1.0$, boosting prenatal CNV signal while strictly preserving diploid coverage.
+  - Multi-channel 4-feature rebinning (`count`, `fragment_lengths`, `endpoint_count`, `frag_gc_sum`) supporting arbitrary target bin grids.
+  - Augmented Huber B-spline regression and $\mathbb{R}^{P+4}$ KDTree off-contig neighbor matching incorporating mean fragment length $\bar{L}_i$ and endpoint density ratio $E_i / \max(C_i, 1.0)$.
+  - Multi-modal precision fusion combining `FFY`, `FFA`, `FFX`, and `FF_size` into optimal Bates-Granger `active_ff`.
+  - Segment-level fragmentomic log-likelihood ratio scoring ($\mathrm{LLR}_{\text{size}}$) and biological origin classification (`FETAL_CONFIRMED`, `MATERNAL_CONFIRMED`, `INDETERMINATE`).
+  - Polymorphic alignment ingestion in `ccnv predict`: directly accepts `.bam`, `.cram` (with `--fasta`), and `.parquet`/`.ccnv` sample files.
+  - Deliverables: annotated `frag_short_ratio`, `frag_llr_size`, and `origin_call` in BED tables, VCF INFO tags (`FRAG_SHORT_R`, `FRAG_LLR`, `ORIGIN`), `<prefix>_qc.json` fragmentomics metrics with high leukocyte DNA warnings, and interactive HTML viewer tooltips and `FF (Y/A/X/Size)` badge.
+- Standardized Parquet Arrow schema version to `1.0.0` (`SCHEMA_VERSION = "1.0.0"`).
 - Autocorrelation-corrected Stouffer precision Z-score calling (`F1`) in `src/ccnv/predict.py` with Polars `.join_asof()` and `pl.corr().over("contig")` Newey-West AR(1) spatial autocorrelation correction.
 - Non-negative Elastic Net with built-in cross-validation (`F2`) via `sklearn.linear_model.ElasticNetCV(positive=True)` in `src/ccnv/stats/prenatal_math.py:fit_elasticnet_ffy`, eliminating $p \gg n$ pure Lasso saturation on 5 kb `chrY` bins.
 - Exact Smyth (2004) / Phipson et al. (2016) Empirical Bayes variance shrinkage (`F3`) in `src/ccnv/stats/neighbors.py:squeeze_var` under a conjugate scaled inverse-$`\chi^2`$ prior with Winsorized log-variance moments and `scipy.optimize.brentq` root-finding.

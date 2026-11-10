@@ -144,6 +144,22 @@ def render_genome_plot(
                         else None
                     ),
                     s.discordance_reason,
+                    (
+                        round(float(s.frag_short_ratio), 4)
+                        if (
+                            s.frag_short_ratio is not None
+                            and np.isfinite(s.frag_short_ratio)
+                        )
+                        else None
+                    ),
+                    (
+                        round(float(s.frag_llr_size), 3)
+                        if (
+                            s.frag_llr_size is not None and np.isfinite(s.frag_llr_size)
+                        )
+                        else None
+                    ),
+                    s.origin_call,
                 ]
             )
         seg_rows.append(row)
@@ -182,6 +198,11 @@ def render_genome_plot(
             ),
             "ffx": float(prenatal_result.ffx),
             "ffa": float(prenatal_result.ffa),
+            "ff_size": (
+                float(prenatal_result.ff_size)
+                if prenatal_result.ff_size is not None
+                else None
+            ),
             "sca_call": prenatal_result.sca.call,
             "is_aneuploid": bool(prenatal_result.sca.is_aneuploid),
             "low_ff_warning": bool(prenatal_result.low_ff_warning),

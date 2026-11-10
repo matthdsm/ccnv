@@ -134,7 +134,7 @@ $$
 \min_{\boldsymbol{\beta}, \sigma \gt 0} \sum_{i \in \mathcal{V}_s} \left(\sigma \cdot L_{\epsilon}\left(\frac{\tilde{y}_{i, s} - \mathbf{x}_i^{\top} \boldsymbol{\beta}}{\sigma}\right) + \sigma\right) + \alpha \Vert\boldsymbol{\beta}\Vert_2^2, \qquad \epsilon = 1.35, \quad \alpha = 10^{-4}
 $$
 
-where $`L_{\epsilon}(r) = \frac{1}{2}r^2`$ if $`\vert r \vert \le \epsilon`$, and $`\epsilon \vert r \vert - \frac{1}{2}\epsilon^2`$ otherwise. The evaluated multiplicative trend $`\hat{t}_i = 2^{\mathbf{x}_i^{\top} \boldsymbol{\beta}}`$ is clamped to $[0.20, 5.0]$ and divided out:
+where $`L_{\epsilon}(r) = \frac{1}{2}r^2`$ if $`\vert r \vert \le \epsilon`$, and $`\epsilon \vert r \vert - \frac{1}{2}\epsilon^2`$ otherwise. When paired-end fragmentomic features are extracted, `src/ccnv/stats/regression.py:build_joint_covariate_basis` augments the basis with natural cubic B-splines for mean fragment length $\bar{L}_i$ (`SplineTransformer(n_knots=5, degree=3)`) and endpoint density ratio $E_i / \max(C_i, 1.0)$ (`SplineTransformer(n_knots=4, degree=2)`), plus an explicit standardized $\text{GC} \times \bar{L}$ interaction term $z(\mathbf{g}) \odot z(\bar{\mathbf{L}})$. The evaluated multiplicative trend $`\hat{t}_i = 2^{\mathbf{x}_i^{\top} \boldsymbol{\beta}}`$ is clamped to $[0.20, 5.0]$ and divided out:
 
 $$
 y_i^{\text{corr}} = \frac{\tilde{c}_{i, s}}{\hat{t}_i} \cdot \frac{\sum_{j \in \mathcal{V}_s} \tilde{c}_{j, s}}{\sum_{j \in \mathcal{V}_s} (\tilde{c}_{j, s} / \hat{t}_j)}
@@ -304,13 +304,13 @@ Following the foundational insight of WISECONDOR (Straver et al., 2014), `ccnv` 
 
 In high dimensions ($S \approx 50\text{–}500$), pairwise Euclidean distances over raw PCA residuals concentrate around their mean ($\mathrm{Var}(D)/\mathbb{E}[D] \to 0$), degrading neighbor selection quality (Beyer et al., 1999). Two genomic bins are optimal reference partners if and only if they share identical sensitivity to latent technical factors and identical sequence properties.
 
-`ccnv` maps each bin $i$ into a $`(P+2)`$-dimensional signal subspace (`src/ccnv/stats/neighbors.py:build_signal_space_features`, `src/ccnv/stats/neighbors.py:select_nearest_bins`):
+`ccnv` maps each bin $i$ into a $`(P+2)`$-dimensional (or $`(P+4)`$-dimensional when fragmentomics data is present) signal subspace (`src/ccnv/stats/neighbors.py:build_signal_space_features`, `src/ccnv/stats/neighbors.py:select_nearest_bins`):
 
 $$
-\mathbf{f}_i = \left[s_1 V_{1, i}, \dots, s_P V_{P, i}, \quad z(\text{GC}_i), \quad z(\text{map}_i)\right] \in \mathbb{R}^{P+2}
+\mathbf{f}_i = \left[s_1 V_{1, i}, \dots, s_P V_{P, i}, \quad z(\text{GC}_i), \quad z(\text{map}_i), \quad z(\bar{L}_i), \quad z(E_i / \max(C_i, 1.0))\right] \in \mathbb{R}^{P+4}
 $$
 
-where $`s_p V_{p, i}`$ are singular-value-scaled PCA loadings and $`z(\cdot)`$ are standardized sequence covariates.
+where $`s_p V_{p, i}`$ are singular-value-scaled PCA loadings, $`z(\cdot)`$ are standardized sequence and fragmentomic covariates, $\bar{L}_i$ is the bin-level mean fragment length, and $E_i / \max(C_i, 1.0)$ is the endpoint-to-coverage ratio.
 
 For each chromosome $c$, a C-compiled $`k`$-d tree (`scipy.spatial.KDTree`) is built over all off-contig bins $`\mathcal{C}_{\ne c} = \lbrace j : \text{contig}_j \ne c \rbrace`$. For each query bin on contig $c$, querying the tree with `tree.query(..., k=k, workers=threads)` finds the $k$ nearest off-contig neighbors in $`O(U \log U)`$ time and returns squared Euclidean distances $`d^2(\mathbf{f}_i, \mathbf{f}_j)`$ (Bentley, 1975; Maneewongvatana & Mount, 1999).
 
@@ -540,12 +540,65 @@ $$
 
 falling back to theoretical $(2.0, -2.0)$ when fewer than 2 male controls exist.
 
-### 8.5 Constants & Hyperparameters
+### 8.5 Multi-Modal Regularized $\text{FF}_{\text{size}}$ Fragmentomics Ensemble
+
+Paired-end sequencing captures cell-free DNA fragment lengths $L \in [30, 600]\text{ bp}$, $5'$ 4-mer motif sequences, and cleavage periodicity. Fetal cffDNA fragments are systematically shorter than maternal background (modal length $143\text{ bp}$ vs. $166\text{ bp}$, with pronounced $10.4\text{ bp}$ periodicity reflecting apoptotic nucleosomal pitch; Lo et al., 2010; Straver et al., 2016).
+
+To account for platform- and run-specific sizing calibration offsets, `ccnv` cross-correlates the sample fragment length histogram against an idealized canonical 166 bp chromatosome profile (`src/ccnv/stats/fragmentomics.py:align_histogram`) to compute a deterministic integer shift $\Delta_{\text{bp}} \in [-15, 15]\text{ bp}$. Bins are aligned as $h_{\text{aligned}}(L) = h_{\text{raw}}(L + \Delta_{\text{bp}})$, standardizing the chromatosome mode across cohorts.
+
+A 16-dimensional fragmentomic feature vector $\mathbf{x}_{\text{size}}$ is constructed:
+1. Mode-aligned density bands across intervals $[60, 110)$, $[110, 140)$, $[140, 155)$, $[155, 175)$, $[175, 200)$, $[200, 250)$, and $[250, 600)\text{ bp}$.
+2. Fragment ratios: short-to-long ratio $R_{143/166} = \sum_{60}^{150} h(L) / \sum_{155}^{180} h(L)$, sub-nucleosomal fraction $\sum_{30}^{140} h(L) / \sum_{30}^{600} h(L)$, dinucleosome fraction $\sum_{280}^{360} h(L) / \sum_{30}^{600} h(L)$, and high-molecular-weight leukocyte DNA fraction $\sum_{400}^{600} h(L) / \sum_{30}^{600} h(L)$.
+3. Helical cleavage periodicity amplitude evaluated via discrete Fourier transform of the detrended histogram at frequency $f = 1/10.4\text{ bp}^{-1}$.
+4. Motif Diversity Score (MDS) computed from the normalized Shannon entropy of 256-dimensional $5'$ 4-mer motif frequencies: $H_{\text{motif}} = -\sum_{m=1}^{256} p_m \log_{256}(p_m)$.
+
+The multi-modal regularized ensemble fits non-negative regularized linear models (`RidgeCV` and `ElasticNetCV`) mapping $\mathbf{x}_{\text{size}}$ to cohort fetal fraction targets:
+
+$$
+\hat{f}_{\text{size}} = \mathrm{clip}\left(\mathbf{x}_{\text{size}}^{\top} \mathbf{w}_{\text{size}} + b_{\text{size}}, 0.0, 0.50\right)
+$$
+
+### 8.6 Cohort Cell-Free DNA Fragment Length Deconvolution
+
+In prenatal cohort references with paired-end controls, `ccnv` deconvolves pure fetal $\hat{p}_F(L)$ and maternal $\hat{p}_M(L)$ fragment length distributions over $L \in [30, 600]\text{ bp}$ (`src/ccnv/stats/fragmentomics.py:deconvolve_fetal_maternal_densities`). Maternal density $\hat{p}_M(L)$ is estimated directly from female controls ($f = 0$):
+
+$$
+\hat{p}_M(L) = \frac{1}{\vert\mathcal{S}_{\text{female}}\vert}\sum_{s \in \mathcal{S}_{\text{female}}} h_s(L)
+$$
+
+Using high-confidence male samples with fetal fraction $f_{Y, s} \ge 0.08$, composite male density $\bar{h}_{\text{male}}(L) = (1 - \bar{f})\hat{p}_M(L) + \bar{f}\hat{p}_F(L)$ is deconvolved:
+
+$$
+\hat{p}_F(L) = \frac{\max\left(0, \bar{h}_{\text{male}}(L) - (1 - \bar{f})\hat{p}_M(L)\right)}{\sum_{l=30}^{600}\max\left(0, \bar{h}_{\text{male}}(l) - (1 - \bar{f})\hat{p}_M(l)\right)}
+$$
+
+where $\bar{f} = \mathrm{mean}_{s \in \mathcal{S}_{\text{male}}}(f_{Y, s})$.
+
+### 8.7 Depth-Conserving Fisher-Optimal Read Weighting
+
+To maximize signal-to-noise in prenatal CNV calling without distorting baseline sequencing depth, reads of length $L$ receive locally optimal Fisher score weights (`src/ccnv/stats/fragmentomics.py:fisher_optimal_weights`):
+
+$$
+w^{\ast}(L) = 1 + \lambda^{\ast} \left(\frac{\hat{p}_F(L)}{\hat{p}_M(L)} - 1\right)
+$$
+
+where tuning parameter $\lambda^{\ast} \ge 0$ is resolved via bracketed root-finding (`scipy.optimize.brentq`) enforcing the exact expectation constraint:
+
+$$
+\mathbb{E}_{L \sim p_M}[w^{\ast}(L)] = \sum_{L=30}^{600} \hat{p}_M(L) w^{\ast}(L) = 1.0
+$$
+
+guaranteeing depth conservation across maternal diploid regions. Per-bin weighted coverage is evaluated via cumulative histogram lookups in under $20\text{ ms}$ per sample.
+
+### 8.8 Constants & Hyperparameters
 
 - `_PAR1_START = 2_781_479`, `_YQ12_END = 28_800_000` (`src/ccnv/features/prenatal.py`): Euchromatic `chrY` bounds (**Tier 3 — Genomic Biology & Assembly Coordinates**).
 - `_EXCLUDED_PRENATAL_AUTOSOMES = {13, 18, 21}` (`src/ccnv/features/prenatal.py`): Autosomal exclusions (**Tier 2 — Published Literature & Reference Methodology** / **Tier 3 — Genomic Biology & Assembly Coordinates**).
 - `ElasticNetCV` `l1_ratio = [0.01, 0.05, 0.1]` for `FFY` (**Tier 2 — Published Literature & Reference Methodology**: Zou & Hastie, 2005; Kim et al., 2015).
 - `FFA` logit clip bounds `[0.005, 0.85]` and `RidgeCV` alpha grid $10^{-2} \dots 10^4$ (**Tier 2 — Published Literature & Reference Methodology** / **Tier 4 — Empirical Engineering & Numerical Guardrails**: Kim et al., 2015; Golub et al., 1979).
+- `min_frag_len = 30`, `max_frag_len = 600` (`src/ccnv/models/config.py:ExtractConfig`): Standard cell-free DNA physical size range (**Tier 2 — Published Literature & Reference Methodology** / **Tier 3 — Genomic Biology & Assembly Coordinates**: Lo et al., 2010; Straver et al., 2016).
+- Sizing shift search window `[-15, 15]` bp (`src/ccnv/stats/fragmentomics.py:align_histogram`): Maximum platform sizing offset (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- Fetal deconvolution male threshold $f_Y \ge 0.08$ (`src/ccnv/features/fragmentomics.py:fit_cohort_fragmentomics_model`): Requires sufficient fetal fraction to avoid noise amplification during deconvolution (**Tier 1 — Statistical & Mathematical Theory** / **Tier 4 — Empirical Engineering & Numerical Guardrails**).
 
 ---
 
@@ -573,15 +626,15 @@ $$
 
 Samples exceeding the 2D Mahalanobis outlier gate $`d_M^2(\mathbf{x}, \boldsymbol{\mu}_{k^{\ast}}) \gt \chi^2_{2, 0.999} = 13.8155`$ are classified as `DISCORDANT_MIXED` (e.g., maternal mosaicism or vanishing twin; Mazloom et al., 2013; Bianchi et al., 2015).
 
-#### 9.1.2 Inverse-Variance Precision Fusion for `active_ff`
+#### 9.1.2 Multi-Modal Inverse-Variance Precision Fusion for `active_ff`
 
-In concordant `XY` pregnancies, independent estimators are combined via optimal Bates-Granger (1969) precision pooling (`src/ccnv/features/prenatal.py:predict_prenatal`):
+In concordant `XY` pregnancies, independent estimators are combined via optimal Bates-Granger (1969) precision pooling (`src/ccnv/features/prenatal.py:predict_prenatal`, `src/ccnv/features/fragmentomics.py:fuse_active_fetal_fraction`):
 
 $$
-f_{\text{active}} = \frac{\sum_{m \in \lbrace \text{FFY}, \text{FFA}, \text{FFX} \rbrace} \sigma_m^{-2} \hat{f}_m}{\sum_{m \in \lbrace \text{FFY}, \text{FFA}, \text{FFX} \rbrace} \sigma_m^{-2}}, \qquad \sigma_{\text{active}}^2 = \left(\sum_{m} \sigma_m^{-2}\right)^{-1}
+f_{\text{active}} = \frac{\sum_{m \in \mathcal{M}} \sigma_m^{-2} \hat{f}_m}{\sum_{m \in \mathcal{M}} \sigma_m^{-2}}, \qquad \sigma_{\text{active}}^2 = \left(\sum_{m \in \mathcal{M}} \sigma_m^{-2}\right)^{-1}
 $$
 
-yielding an estimator with strictly lower variance than any individual component. For female fetuses (`XX`), `active_ff` routes to $`\hat{f}_{\text{FFA}}`$.
+where $\mathcal{M} = \lbrace \text{FFY}, \text{FFA}, \text{FFX}, \text{FF}_{\text{size}} \rbrace$ (or subset available), with default standard errors $(\sigma_Y, \sigma_A, \sigma_X, \sigma_{\text{size}}) = (0.01, 0.02, 0.025, 0.015)$. For female fetuses (`XX`), `active_ff` pools $\lbrace \text{FFA}, \text{FF}_{\text{size}} \rbrace$ when fragmentomics is available, falling back to pure $\hat{f}_{\text{FFA}}$. When multi-modal estimators fuse into the baseline, `active_ff_source` is designated `"FUSED"`.
 
 #### 9.1.3 Fetal-Fraction-Parameterized Log-Likelihood Ratio ($`\mathrm{LLR}_{\text{fetal}}`$) Segment Discordance
 
@@ -593,10 +646,26 @@ $$
 
 Discordance rules flag calls as `SCA_DISCORDANT`, `SUB_FETAL_RATIO` ($`\vert r_{\text{seg}} \vert \lt 0.5 \vert r_{\text{exp}} \vert`$), or `SUPER_FETAL_RATIO` ($`f_{\text{implied}} \gt \max(2.5 f_{\text{active}}, f_{\text{active}} + 0.15)`$).
 
+#### 9.1.4 Segment-Level Fragmentomic Origin Discrimination ($\mathrm{LLR}_{\text{size}}$)
+
+For paired-end samples, `src/ccnv/features/fragmentomics.py:score_segment_origin` evaluates fragment lengths $L_k$ within each segment's genomic bounds against reference deconvolved fetal $\hat{p}_F(L)$ and maternal $\hat{p}_M(L)$ probability densities:
+
+$$
+\mathrm{LLR}_{\text{size}}(S) = \sum_{k \in S} \ln\left(\frac{\hat{p}_F(L_k)}{\hat{p}_M(L_k)}\right)
+$$
+
+Segments are categorized into biological origin calls:
+- `FETAL_CONFIRMED`: $\mathrm{LLR}_{\text{size}} \ge +2.0$ (statistically significant enrichment of short fetal fragments).
+- `MATERNAL_CONFIRMED`: $\mathrm{LLR}_{\text{size}} \le -2.0$ (concordant with maternal fragment size distribution).
+- `INDETERMINATE`: $\vert\mathrm{LLR}_{\text{size}}\vert \lt 2.0$ or single-end sequencing.
+
+In addition, each segment records the short fragment fraction $R_{\le 150} = \sum_{k \in S} \mathbb{I}(L_k \le 150) / \vert S \vert$.
+
 ### 9.2 Constants & Hyperparameters
 
 - `SCA` Mahalanobis outlier threshold $\chi^2_{2, 0.999} = 13.8155$ (**Tier 2 — Published Literature & Reference Methodology**: Mazloom et al., 2013; Bianchi et al., 2015).
-- Default estimator standard errors `ffy_std = 0.01`, `ffa_std = 0.02`, `ffx_std = 0.025` in `PrenatalModelMetadata` (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- Default estimator standard errors `ffy_std = 0.01`, `ffa_std = 0.02`, `ffx_std = 0.025`, `ff_size_std = 0.015` in `PrenatalModelMetadata` (**Tier 4 — Empirical Engineering & Numerical Guardrails**).
+- `origin_call` log-likelihood ratio threshold $\vert\mathrm{LLR}_{\text{size}}\vert \ge 2.0$ (`src/ccnv/features/fragmentomics.py:score_segment_origin`): Corresponds to odds ratio $\ge e^2 \approx 7.39:1$ (**Tier 1 — Statistical & Mathematical Theory**).
 - `min_fetal_fraction_warning = 0.04` (`src/ccnv/models/config.py:PredictConfig`): 4% clinical NIPT quantification lower limit (**Tier 2 — Published Literature & Reference Methodology** / **Tier 3 — Genomic Biology & Assembly Coordinates**).
 
 ---
@@ -670,7 +739,9 @@ Verdict escalation follows strict severity ordering $\texttt{PASS} (0) \lt \text
 | `ElasticNetCV` `l1_ratio` | `[0.01, 0.05, 0.1]` | `src/ccnv/stats/prenatal_math.py` | Tier 2 — Published Literature & Reference Methodology | Elastic Net grouping mixture for non-negative `FFY` estimation |
 | `FFA` logit bounds | `[0.005, 0.85]` | `src/ccnv/stats/prenatal_math.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Logit-link clipping bounds for convex `RidgeCV` + `ElasticNetCV` ensemble |
 | `SCA` Mahalanobis $\chi^2$ gate | `13.8155` | `src/ccnv/features/prenatal.py` | Tier 2 — Published Literature & Reference Methodology | $\chi^2_{2, 0.999}$ boundary identifying discordant mixed gonosome karyotypes |
-| Estimator SE defaults | `(0.01, 0.02, 0.025)` | `src/ccnv/models/results.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Default standard errors for `FFY`, `FFA`, and `FFX` in precision fusion |
+| Estimator SE defaults | `(0.01, 0.02, 0.025, 0.015)` | `src/ccnv/models/results.py` | Tier 4 — Empirical Engineering & Numerical Guardrails | Default standard errors for `FFY`, `FFA`, `FFX`, and `FF_size` in precision fusion |
+| `min_frag_len` / `max_frag_len` | `30` / `600` bp | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 3 — Genomic Biology & Assembly Coordinates | Physical cell-free DNA insert size bounds |
+| `origin_call` LLR threshold | `2.0` | `src/ccnv/features/fragmentomics.py` | Tier 1 — Statistical & Mathematical Theory | Threshold for fetal vs maternal origin confidence ($\text{OR} \ge e^2$) |
 | `min_fetal_fraction_warning` | `0.04` | `src/ccnv/models/config.py` | Tier 2 — Published Literature & Reference Methodology / Tier 3 — Genomic Biology & Assembly Coordinates | Clinical 4% lower limit of fetal fraction warning threshold |
 | `DEFAULT_MIN_REF_BINS` | `150` | `src/ccnv/qc/reference.py` | Tier 2 — Published Literature & Reference Methodology / Tier 4 — Empirical Engineering & Numerical Guardrails | Ref-QC warning threshold at 50% of default $k=300$ neighbor pool |
 
@@ -706,7 +777,8 @@ Verdict escalation follows strict severity ordering $\texttt{PASS} (0) \lt \text
 24. **Killick, R., Fearnhead, P., & Eckley, I. A. (2012).** Optimal detection of changepoints with a linear computational cost. *Journal of the American Statistical Association*, 107(500), 1590–1598. https://doi.org/10.1080/01621459.2012.737745
 25. **Kim, S. K., Hannum, G., Geis, J., Tynan, J., Hogg, G., Zhao, C., Jensen, T. J., & Ehrich, M. (2015).** Determination of fetal DNA fraction from the plasma of pregnant women using sequence read counts. *Prenatal Diagnosis*, 35(8), 810–815. https://doi.org/10.1002/pd.4615
 26. **Lipták, T. (1958).** On the combination of independent tests. *Magyar Tudományos Akadémia Matematikai Kutató Intézetének Közleményei*, 3, 171–197.
-27. **Love, M. I., Huber, W., & Anders, S. (2014).** Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. *Genome Biology*, 15(12), 550. https://doi.org/10.1186/s13059-014-0550-8
+27. **Lo, Y. M. D., Chan, K. C. A., Sun, H., Chen, E. Z., Jiang, P., Lun, F. M. F., Zheng, Y. W., Leung, T. Y., Lau, T. K., Cantor, C. R., & Chiu, R. W. (2010).** Maternal plasma DNA sequencing reveals genome-wide genetic and mutational profiles of the fetus. *Science Translational Medicine*, 2(61), 61ra91. https://doi.org/10.1126/scitranslmed.3001720
+28. **Love, M. I., Huber, W., & Anders, S. (2014).** Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. *Genome Biology*, 15(12), 550. https://doi.org/10.1186/s13059-014-0550-8
 28. **Maneewongvatana, S., & Mount, D. M. (1999).** Analysis of approximate nearest neighbor searching with clustered point sets. *Data Structures, Near Neighbor Searches, and Methodology: Fifth and Sixth DIMACS Implementation Challenges*, 59, 105–123.
 29. **Marchenko, V. A., & Pastur, L. A. (1967).** Distribution of eigenvalues for some sets of random matrices. *Mathematics of the USSR-Sbornik*, 1(4), 457–483. https://doi.org/10.1070/SM1967v001n04ABEH001994
 30. **Mazloom, A. R., Džakula, Ž., Oeth, P., Wang, H., Jensen, T., Tynan, J., McCullough, R., Saldivar, J. S., Ehrich, M., van den Boom, D., Bombard, A., & Deciu, C. (2013).** Noninvasive prenatal detection of sex chromosomal aneuploidies by sequencing circulating cell-free DNA from maternal plasma. *Prenatal Diagnosis*, 33(6), 591–597. https://doi.org/10.1002/pd.4127

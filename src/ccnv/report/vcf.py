@@ -112,6 +112,18 @@ def build_vcf_header(
                 "##FORMAT=<ID=IMPLIED_FF,Number=1,Type=Float,"
                 'Description="Implied fetal fraction based on segment ratio">'
             )
+            header.add_line(
+                "##INFO=<ID=FRAG_SHORT_R,Number=1,Type=Float,"
+                'Description="Fraction of short cell-free DNA fragments <= 150 bp">'
+            )
+            header.add_line(
+                "##INFO=<ID=FRAG_LLR,Number=1,Type=Float,"
+                'Description="Fragment length log-likelihood ratio for fetal vs maternal origin">'
+            )
+            header.add_line(
+                "##INFO=<ID=ORIGIN,Number=1,Type=String,"
+                'Description="Fragmentomic origin call: FETAL_CONFIRMED or MATERNAL_CONFIRMED">'
+            )
 
     header.add_sample(sample_name)
     return header
@@ -192,10 +204,17 @@ def write_segments_vcf(
             )
             rec.info["SVTYPE"] = svtype
             rec.info["IMPRECISE"] = True
-            if is_prenatal and item.discordant:
-                rec.info["DISCORDANT"] = True
-                if item.discordance_reason:
-                    rec.info["DISC_REASON"] = item.discordance_reason
+            if is_prenatal:
+                if item.discordant:
+                    rec.info["DISCORDANT"] = True
+                    if item.discordance_reason:
+                        rec.info["DISC_REASON"] = item.discordance_reason
+                if item.frag_short_ratio is not None:
+                    rec.info["FRAG_SHORT_R"] = vcf_float(item.frag_short_ratio)
+                if item.frag_llr_size is not None:
+                    rec.info["FRAG_LLR"] = vcf_float(item.frag_llr_size)
+                if item.origin_call is not None:
+                    rec.info["ORIGIN"] = item.origin_call
             sample = rec.samples[sample_name]
             sample["LOG2R"] = vcf_float(item.ratio)
             sample["ZSCORE"] = vcf_float(item.zscore)

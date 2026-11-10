@@ -114,6 +114,7 @@ class TestPredictQC(unittest.TestCase):
             ffy=0.12,
             ffx=0.115,
             ffa=0.118,
+            ff_size=0.122,
             chrx_ratio=0.94,
             chry_score=0.006,
             yfrac_threshold=0.004,
@@ -167,6 +168,7 @@ class TestPredictQC(unittest.TestCase):
         self.assertEqual(prenatal["ffy"], 0.12)
         self.assertEqual(prenatal["ffx"], 0.115)
         self.assertEqual(prenatal["ffa"], 0.118)
+        self.assertEqual(prenatal["ff_size"], 0.122)
         self.assertFalse(prenatal["low_ff_warning"])
 
         sca_dict = prenatal["sca"]
