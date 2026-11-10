@@ -78,9 +78,13 @@ ruff = "*"
 pip = ">=26.2.1"
 python-build = ">=1.5.0,<2"
 
+[tool.pixi.feature.docs.dependencies]
+zensical = "*"
+
 [tool.pixi.environments]
 default = { features = ["dev"], solve-group = "default" }
 prod = { solve-group = "default" }
+docs = { features = ["docs"], solve-group = "default" }
 
 [tool.pixi.tasks]
 format = "ruff check --fix . && ruff format ."
