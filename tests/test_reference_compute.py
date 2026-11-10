@@ -93,6 +93,78 @@ class TestParallelReferenceCompute(unittest.TestCase):
         np.testing.assert_allclose(mean_seq, mean_par, rtol=1e-12, atol=1e-12)
         np.testing.assert_allclose(std_seq, std_par, rtol=1e-12, atol=1e-12)
 
+    def test_augmented_joint_covariate_basis_with_fragmentomics(self) -> None:
+        from ccnv.stats.regression import build_joint_covariate_basis
+
+        rng = np.random.default_rng(42)
+        n = 500
+        gc = rng.uniform(0.3, 0.6, size=n)
+        mappability = rng.uniform(0.7, 1.0, size=n)
+        mean_frag_len = rng.uniform(140.0, 180.0, size=n)
+        endpoint_ratio = rng.uniform(0.5, 3.0, size=n)
+
+        # Baseline GC + Mappability basis
+        basis_base = build_joint_covariate_basis(gc, mappability)
+        self.assertIsNotNone(basis_base)
+        n_cols_base = basis_base.shape[1]
+
+        # Augmented with mean_frag_len and endpoint_ratio
+        basis_aug = build_joint_covariate_basis(
+            gc,
+            mappability,
+            mean_frag_len=mean_frag_len,
+            endpoint_ratio=endpoint_ratio,
+        )
+        self.assertIsNotNone(basis_aug)
+        self.assertGreater(basis_aug.shape[1], n_cols_base)
+        self.assertEqual(basis_aug.shape[0], n)
+
+        # Constant fragmentomics fall back gracefully to base number of columns
+        basis_const = build_joint_covariate_basis(
+            gc,
+            mappability,
+            mean_frag_len=np.full(n, 166.0),
+            endpoint_ratio=np.zeros(n),
+        )
+        self.assertIsNotNone(basis_const)
+        self.assertEqual(basis_const.shape[1], n_cols_base)
+
+    def test_covariate_features_and_r_p_plus_4_kdtree_features(self) -> None:
+        from ccnv.features.covariates import covariate_features
+        from ccnv.stats.neighbors import build_signal_space_features
+
+        rng = np.random.default_rng(42)
+        n = 500
+        usable = np.ones(n, dtype=bool)
+        gc = rng.uniform(0.3, 0.6, size=n)
+        mappability = rng.uniform(0.7, 1.0, size=n)
+        mean_frag_len = rng.uniform(140.0, 180.0, size=n)
+        endpoint_ratio = rng.uniform(0.5, 3.0, size=n)
+
+        # 4 covariates -> 4 columns
+        cov_mat_4 = covariate_features(
+            usable,
+            gc=gc,
+            mappability=mappability,
+            mean_frag_len=mean_frag_len,
+            endpoint_ratio=endpoint_ratio,
+        )
+        self.assertIsNotNone(cov_mat_4)
+        self.assertEqual(cov_mat_4.shape, (n, 4))
+
+        # PCA loadings with P=5 components
+        P = 5
+        pca_loadings = rng.standard_normal((P, n))
+        s_vals = np.linspace(10.0, 1.0, P)
+
+        # Build R^{P+4} features for KDTree
+        feats_p4 = build_signal_space_features(
+            pca_loadings,
+            singular_values=s_vals,
+            covariate_mat=cov_mat_4,
+        )
+        self.assertEqual(feats_p4.shape, (n, P + 4))
+
 
 if __name__ == "__main__":
     unittest.main()

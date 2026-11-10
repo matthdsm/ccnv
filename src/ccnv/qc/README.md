@@ -2,33 +2,28 @@
 
 ## Overview
 
-The `ccnv.qc` package implements quality control accounting, reference model auditing, usability verdict evaluation (`PASS`, `WARN`, `FAIL`), and structured JSON report persistence. It tracks read filtering drop counters on binned target contigs, computes neighbor distance distributions and usable bin percentages for reference branches, and compiles single-sample prediction summaries including prenatal metrics and discordance flags.
+The `ccnv.qc` package implements sample read accounting, reference model usability auditing (`PASS`, `WARN`, `FAIL`), and structured JSON payload assembly (`<prefix>_qc.json`). It records deterministic read filtering counters on target contigs, evaluates reference branch neighbor distance dispersion and usable `chrY` fractions (plus prenatal `prenatal_autosomal`/`prenatal_ffy` model summaries), and compiles single-sample prediction payloads covering read metrics, CNV call counts, fragmentomic pre-analytical metrics, and prenatal findings.
 
 ## Interface
 
-- `[src/ccnv/qc/sample.py:QC_COUNTERS]`: Tuple of standardized read filtering counter identifiers.
-- `[src/ccnv/qc/sample.py:empty_qc]`: Initializes a zeroed counter dictionary for worker process streaming.
-- `[src/ccnv/qc/sample.py:build_sample_qc]`: Compiles and verifies read count totals and drop reasons on target contigs.
-- `[src/ccnv/qc/sample.py:sanitize_qc_payload]`: Recursively converts NumPy scalars and non-standard types to JSON-serializable primitives.
-- `[src/ccnv/qc/reference.py:compute_branch_qc]`: Computes usable bin counts, masked fractions, and neighbor Euclidean distance statistics for a reference branch.
-- `[src/ccnv/qc/reference.py:evaluate_autosomal_or_female_verdict]`: Determines the reference usability verdict (`PASS`, `WARN`, `FAIL`) for autosomal and female reference models.
-- `[src/ccnv/qc/reference.py:evaluate_male_verdict]`: Determines the reference usability verdict for male sex reference branches.
-- `[src/ccnv/qc/reference.py:run_reference_qc_on_table]`: Executes full reference auditing across all active branches.
-- `[src/ccnv/qc/reference.py:write_reference_qc_json]`: Writes `<prefix>_qc.json` reference audit summaries to disk.
-- `[src/ccnv/qc/predict.py:build_predict_qc_payload]`: Compiles sample prediction statistics, segmentation parameters, and prenatal findings into a unified payload.
-- `[src/ccnv/qc/predict.py:write_predict_qc_json]`: Writes `<prefix>_qc.json` sample prediction quality summaries to disk.
+- [`sample.py:QC_COUNTERS`](./sample.py), [`empty_qc`](./sample.py), [`build_sample_qc`](./sample.py), & [`sanitize_qc_payload`](./sample.py): Deterministic 16-counter read/filter map builders (`header_mapped`, `reads_seen`, `reads_kept`, `effective_reads_examined`, `effective_reads_kept`, `autosomal_reads_kept`, `sex_reads_kept`, and `filter_*` drop reasons) and recursive NumPy/float JSON sanitizers.
+- [`reference.py:DEFAULT_MIN_REF_BINS`](./reference.py) (`150`), [`OUTLIER_N_SIGMA`](./reference.py) (`3.0`), [`CHRY_MIN_USABLE_PCT_WARN`](./reference.py) (`50.0`), [`CHRY_MIN_USABLE_PCT_FAIL`](./reference.py) (`20.0`), [`CHRY_MEAN_DIST_WARN`](./reference.py) (`5.0`), & [`CHRY_MEAN_DIST_FAIL`](./reference.py) (`100.0`): Reference quality threshold constants alongside `VERDICT_SEVERITY` and `SEVERITY_TO_VERDICT`.
+- [`reference.py:compute_branch_qc`](./reference.py) & [`compute_signal_contig_metrics`](./reference.py): Compute unmasked usable bin counts, neighbor count summaries, ``$`3\sigma`$`` outlier bin percentages, and sex-signal contig (`chrY`) metrics per reference branch.
+- [`reference.py:evaluate_autosomal_or_female_verdict`](./reference.py) & [`evaluate_male_verdict`](./reference.py): Escalate branch usability verdicts across `PASS < WARN < FAIL` based on `std_of_means` (`autosomal`/`female_sex`), `mean_of_means` and `chrY` coverage (`male_sex`), ``$`3\sigma`$`` outlier rates (`> 1.0%`), and low-reference bin counts.
+- [`reference.py:run_reference_qc_on_table`](./reference.py) & [`write_reference_qc_json`](./reference.py): Audit an in-memory reference Arrow table (including `prenatal` metadata/branch summaries and flat-FASTA `WARN` escalation), optionally write `<prefix>_qc.json`, and emit human-readable verdict summaries to `stderr`.
+- [`predict.py:build_predict_qc_payload`](./predict.py) & [`write_predict_qc_json`](./predict.py): Construct and persist prediction QC JSON (`schema_version`, `mode`, `sample`, `read_metrics`, `cnv_summary`, `fragmentomics` with `"WARN_HIGH_LEUKOCYTE_DNA"` when `high_mw_fraction > 0.05`, and `prenatal`).
 
 ## Invariants
 
-- `[src/ccnv/qc/sample.py:build_sample_qc]`: Read counters must be non-negative integers satisfying balance identity $\text{examined} = \text{kept} + \sum \text{filtered}$.
-- `[src/ccnv/qc/reference.py:evaluate_autosomal_or_female_verdict]`: Severity ranks $\text{PASS} \lt \text{WARN} \lt \text{FAIL}$; triggers failure when usable bin fraction falls below 60% or mean neighbor distance exceeds the 3-sigma outlier threshold.
-- `[src/ccnv/qc/predict.py:build_predict_qc_payload]`: Predict QC payload requires valid execution configuration, contig statistics, and well-typed prenatal blocks when analysis mode is prenatal.
+- [`sample.py:sanitize_qc_payload`](./sample.py): Replaces non-finite floats (`NaN`, `Inf`) with `None` and rounds finite floats to 6 decimal places for deterministic JSON output.
+- [`reference.py:run_reference_qc_on_table`](./reference.py): Enforces monotonic severity escalation (`PASS (0) < WARN (1) < FAIL (2)`) across audited branches and caps flat FASTA references (`source == "fasta"`) at `WARN`.
+- [`predict.py:build_predict_qc_payload`](./predict.py): Populates `prenatal` strictly when `mode == "prenatal"` and `prenatal_result` is provided, and `fragmentomics` whenever sample metadata contains `ccnv.fragmentomics`.
 
 ## Side Effects
 
-- `[src/ccnv/qc/reference.py:write_reference_qc_json]`: Serializes `<prefix>_qc.json` to disk.
-- `[src/ccnv/qc/predict.py:write_predict_qc_json]`: Serializes `<prefix>_qc.json` to disk.
+- [`reference.py:run_reference_qc_on_table`](./reference.py) & [`write_reference_qc_json`](./reference.py): Write `<prefix>_qc.json` when `json_path` is supplied and print formatted reference QC verdicts to `sys.stderr` when `emit_stderr=True`.
+- [`predict.py:write_predict_qc_json`](./predict.py): Creates parent directories and writes `<prefix>_qc.json` to disk.
 
 ## Verification
 
-- Run: `pytest`
+- Run: `pixi run test`

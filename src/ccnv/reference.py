@@ -252,6 +252,8 @@ def build_reference_table(
         "flat": config.fasta is not None,
         "gc_corrected": (config.gc is not None) or (config.fasta is not None),
         "mappability_corrected": config.mappability is not None,
+        "fragmentomics_corrected": (cohort.mean_frag_len is not None)
+        or (cohort.endpoint_ratio is not None),
         "min_mappability": config.min_mappability,
         "mode": config.mode,
         **(
@@ -442,11 +444,19 @@ def _build_branch_table(
         usable.size,
         np.count_nonzero(usable) / usable.size * 100 if usable.size else 0.0,
     )
+    branch_frag_len = (
+        cohort.mean_frag_len[selected] if cohort.mean_frag_len is not None else None
+    )
+    branch_ep_ratio = (
+        cohort.endpoint_ratio[selected] if cohort.endpoint_ratio is not None else None
+    )
     normalized = correct_covariate_bias(
         normalize_depth(counts, mask=usable),
         usable,
         gc=branch_gc,
         mappability=branch_map,
+        mean_frag_len=branch_frag_len,
+        endpoint_ratio=branch_ep_ratio,
     )
     corrected, pca_mean, pca_loadings = fit_pca(
         normalized[usable], config.pca_components
@@ -455,7 +465,13 @@ def _build_branch_table(
     _, contig_ids = np.unique(
         np.asarray(contig_subset[usable], dtype=str), return_inverse=True
     )
-    cov_mat = covariate_features(usable, gc=branch_gc, mappability=branch_map)
+    cov_mat = covariate_features(
+        usable,
+        gc=branch_gc,
+        mappability=branch_map,
+        mean_frag_len=branch_frag_len,
+        endpoint_ratio=branch_ep_ratio,
+    )
     scaled_loadings = (
         pca_loadings * np.sqrt(pca_loadings.shape[1])
         if pca_loadings.size > 0

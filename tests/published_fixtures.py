@@ -78,7 +78,17 @@ def extract_published_samples(root: Path) -> tuple[Path, Path]:
     ):
         cram = ensure_published_file(cached, url)
         cached_sample = cache_dir / f"sample{index}.ccnv"
-        if not cached_sample.is_file() or cached_sample.stat().st_size == 0:
+        valid = False
+        if cached_sample.is_file() and cached_sample.stat().st_size > 0:
+            try:
+                from ccnv.io.parquet import read_sample_parquet
+                from ccnv.models.exceptions import CcnvError
+
+                read_sample_parquet(cached_sample)
+                valid = True
+            except CcnvError, OSError:
+                valid = False
+        if not valid:
             extract(
                 ExtractConfig(
                     cram,

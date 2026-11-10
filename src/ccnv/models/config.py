@@ -43,6 +43,8 @@ class ExtractConfig:
     filters: ReadFilters = ReadFilters()
     threads: int = 1
     all_contigs: bool = False
+    min_frag_len: int = 30
+    max_frag_len: int = 600
 
     def __post_init__(self) -> None:
         """Validate extraction configuration invariants."""
@@ -50,6 +52,8 @@ class ExtractConfig:
             raise ValueError("bin_size must be a positive integer")
         if self.threads <= 0:
             raise ValueError("threads must be a positive integer")
+        if self.min_frag_len <= 0 or self.max_frag_len <= self.min_frag_len:
+            raise ValueError("invalid min_frag_len / max_frag_len range")
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +137,7 @@ class PredictConfig:
     cytobands: Path | None = None
     mappability: Path | None = None
     gc: Path | None = None
+    fasta: Path | None = None
     min_mappability: float = DEFAULT_MIN_MAPPABILITY
     mode: AnalysisMode = "germline"
     min_fetal_fraction_warning: float = 0.04

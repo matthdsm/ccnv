@@ -12,11 +12,12 @@ import pyarrow as pa
 from ccnv.models.config import DEFAULT_BIN_SIZE, DEFAULT_MIN_MAPPABILITY, AnalysisMode
 from ccnv.models.exceptions import SchemaError
 
-SCHEMA_VERSION: Final[str] = "2.0.0"
-SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset({"2.0.0"})
+SCHEMA_VERSION: Final[str] = "1.0.0"
+SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset({"1.0.0"})
 COORDINATE_SYSTEM: Final[str] = "0-based-half-open"
 METADATA_PREFIX: Final[str] = "ccnv."
 PRENATAL_METADATA_KEY: Final[bytes] = b"ccnv.prenatal"
+FRAGMENTOMICS_METADATA_KEY: Final[bytes] = b"ccnv.fragmentomics"
 
 BRANCH_AUTOSOMAL: Final[str] = "autosomal"
 BRANCH_FEMALE_SEX: Final[str] = "female_sex"
@@ -48,6 +49,46 @@ class ArtifactKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class FragmentomicsMetadata:
+    """Sample-level multi-modal fragmentomic metrics serialized under ccnv.fragmentomics."""
+
+    paired_end: bool
+    total_paired_fragments: int
+    chromatosome_mode_bp: float
+    core_shoulder_bp: float
+    sizing_shift_bp: float
+    self_referenced_peak_ratio: float
+    dinucleosome_fraction: float
+    high_mw_fraction: float
+    helical_10bp_amplitude: float
+    helical_10bp_phase: float
+    motif_diversity_score: float
+    hist_autosomal: list[int]
+    hist_chry: list[int]
+    hist_chrx: list[int]
+    end_motif_counts: list[int]
+
+    def __post_init__(self) -> None:
+        """Validate fragmentomics vector dimensions."""
+        if len(self.hist_autosomal) != 571:
+            raise ValueError(
+                f"hist_autosomal must contain 571 elements, got {len(self.hist_autosomal)}"
+            )
+        if len(self.hist_chry) != 571:
+            raise ValueError(
+                f"hist_chry must contain 571 elements, got {len(self.hist_chry)}"
+            )
+        if len(self.hist_chrx) != 571:
+            raise ValueError(
+                f"hist_chrx must contain 571 elements, got {len(self.hist_chrx)}"
+            )
+        if len(self.end_motif_counts) != 256:
+            raise ValueError(
+                f"end_motif_counts must contain 256 elements, got {len(self.end_motif_counts)}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class PrenatalModelMetadata:
     """Scalar parameters for prenatal models serialized under ccnv.prenatal."""
 
@@ -73,6 +114,13 @@ class PrenatalModelMetadata:
     ffa_std: float = 0.02
     ffx_std: float = 0.025
     ffa_logit_mode: bool = False
+    p_fetal_density: list[float] | None = None
+    p_maternal_density: list[float] | None = None
+    ff_frag_weights: list[float] | None = None
+    ff_frag_bias: float | None = None
+    ff_frag_feature_mean: list[float] | None = None
+    ff_frag_feature_scale: list[float] | None = None
+    ff_size_std: float = 0.018
 
     @property
     def preface_std(self) -> float:
@@ -125,6 +173,35 @@ class PrenatalModelMetadata:
             "ffa_logit_mode": bool(self.ffa_logit_mode),
             "preface_std": float(self.ffa_std),
             "preface_logit_mode": bool(self.ffa_logit_mode),
+            "p_fetal_density": (
+                [float(x) for x in self.p_fetal_density]
+                if self.p_fetal_density is not None
+                else None
+            ),
+            "p_maternal_density": (
+                [float(x) for x in self.p_maternal_density]
+                if self.p_maternal_density is not None
+                else None
+            ),
+            "ff_frag_weights": (
+                [float(x) for x in self.ff_frag_weights]
+                if self.ff_frag_weights is not None
+                else None
+            ),
+            "ff_frag_bias": (
+                float(self.ff_frag_bias) if self.ff_frag_bias is not None else None
+            ),
+            "ff_frag_feature_mean": (
+                [float(x) for x in self.ff_frag_feature_mean]
+                if self.ff_frag_feature_mean is not None
+                else None
+            ),
+            "ff_frag_feature_scale": (
+                [float(x) for x in self.ff_frag_feature_scale]
+                if self.ff_frag_feature_scale is not None
+                else None
+            ),
+            "ff_size_std": float(self.ff_size_std),
         }
 
     @classmethod
@@ -145,6 +222,13 @@ class PrenatalModelMetadata:
         ffa_logit_val = bool(
             data.get("ffa_logit_mode", data.get("preface_logit_mode", False))
         )
+        p_fet = data.get("p_fetal_density")
+        p_mat = data.get("p_maternal_density")
+        w_frag = data.get("ff_frag_weights")
+        b_frag = data.get("ff_frag_bias")
+        m_frag = data.get("ff_frag_feature_mean")
+        s_frag = data.get("ff_frag_feature_scale")
+        std_size = float(data.get("ff_size_std", 0.018))
         return cls(
             prenatal_bin_size=int(raw_bin_size),
             yfrac_threshold=float(data["yfrac_threshold"]),
@@ -168,6 +252,17 @@ class PrenatalModelMetadata:
             ffa_std=ffa_std_val,
             ffx_std=float(data.get("ffx_std", 0.025)),
             ffa_logit_mode=ffa_logit_val,
+            p_fetal_density=[float(x) for x in p_fet] if p_fet is not None else None,
+            p_maternal_density=[float(x) for x in p_mat] if p_mat is not None else None,
+            ff_frag_weights=[float(x) for x in w_frag] if w_frag is not None else None,
+            ff_frag_bias=float(b_frag) if b_frag is not None else None,
+            ff_frag_feature_mean=[float(x) for x in m_frag]
+            if m_frag is not None
+            else None,
+            ff_frag_feature_scale=[float(x) for x in s_frag]
+            if s_frag is not None
+            else None,
+            ff_size_std=std_size,
         )
 
     def encode(self) -> bytes:
@@ -233,6 +328,7 @@ class ReferenceMetadata:
     flat: bool = False
     gc_corrected: bool = False
     mappability_corrected: bool = False
+    fragmentomics_corrected: bool = False
     min_mappability: float = DEFAULT_MIN_MAPPABILITY
     schema_version: str = SCHEMA_VERSION
     coordinate_system: str = COORDINATE_SYSTEM
@@ -286,6 +382,7 @@ class ReferenceMetadata:
             "flat": self.flat,
             "gc_corrected": self.gc_corrected,
             "mappability_corrected": self.mappability_corrected,
+            "fragmentomics_corrected": self.fragmentomics_corrected,
             "min_mappability": self.min_mappability,
         }
         values: dict[str, object] = {
@@ -396,6 +493,7 @@ class ReferenceMetadata:
             flat=bool(model.get("flat", False)),
             gc_corrected=bool(model.get("gc_corrected", False)),
             mappability_corrected=bool(model.get("mappability_corrected", False)),
+            fragmentomics_corrected=bool(model.get("fragmentomics_corrected", False)),
             min_mappability=float(
                 model.get("min_mappability", DEFAULT_MIN_MAPPABILITY)
             ),
@@ -421,6 +519,9 @@ SAMPLE_SCHEMA: Final[pa.Schema] = pa.schema(
         pa.field("start", pa.int64(), nullable=False),
         pa.field("end", pa.int64(), nullable=False),
         pa.field("count", pa.uint64(), nullable=False),
+        pa.field("fragment_lengths", pa.list_(pa.uint16()), nullable=False),
+        pa.field("endpoint_count", pa.uint32(), nullable=False),
+        pa.field("frag_gc_sum", pa.float32(), nullable=False),
     ]
 )
 
@@ -838,13 +939,13 @@ def validate_table(table: pa.Table, kind: ArtifactKind) -> None:
 
 
 def validate_sample_table(table: pa.Table) -> None:
-    """Validate sample schema, version 2.0.0 metadata, and coordinate intervals."""
+    """Validate sample schema, version 1.0.0 metadata, and coordinate intervals."""
 
     validate_table(table, ArtifactKind.SAMPLE)
 
 
 def validate_reference_table(table: pa.Table) -> None:
-    """Validate reference schema, version 2.0.0 metadata, branches, and bin spacing."""
+    """Validate reference schema, version 1.0.0 metadata, branches, and bin spacing."""
 
     validate_table(table, ArtifactKind.REFERENCE)
 
@@ -857,6 +958,7 @@ __all__ = [
     "BRANCH_PRENATAL_FFY",
     "CNV_REFERENCE_BRANCHES",
     "COORDINATE_SYSTEM",
+    "FRAGMENTOMICS_METADATA_KEY",
     "KNOWN_REFERENCE_BRANCHES",
     "METADATA_PREFIX",
     "PRENATAL_METADATA_KEY",
@@ -865,6 +967,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_VERSIONS",
     "ArtifactKind",
+    "FragmentomicsMetadata",
     "PrenatalModelMetadata",
     "ReferenceMetadata",
     "SchemaError",

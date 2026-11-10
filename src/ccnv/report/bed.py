@@ -70,6 +70,9 @@ PRENATAL_SEGMENTS_BED_HEADER: Final[tuple[str, ...]] = (
     "implied_ff",
     "discordant",
     "discordance_reason",
+    "frag_short_ratio",
+    "frag_llr_size",
+    "origin_call",
 )
 PRENATAL_CALLS_BED_HEADER: Final[tuple[str, ...]] = (
     "#contig",
@@ -82,6 +85,9 @@ PRENATAL_CALLS_BED_HEADER: Final[tuple[str, ...]] = (
     "implied_ff",
     "discordant",
     "discordance_reason",
+    "frag_short_ratio",
+    "frag_llr_size",
+    "origin_call",
 )
 
 
@@ -172,16 +178,27 @@ def bin_bed_rows(results: tuple[BinResult, ...]) -> Iterator[tuple[object, ...]]
 
 
 def prenatal_bed_fields(item: SegmentResult) -> tuple[object, ...]:
-    """Return prenatal discordance annotations for a segment."""
+    """Return prenatal discordance and fragmentomic origin annotations for a segment."""
     ratio_str = (
         format_bed_float(item.expected_ratio) if item.expected_ratio is not None else ""
     )
     ff_str = format_bed_float(item.implied_ff) if item.implied_ff is not None else ""
+    sr_str = (
+        format_bed_float(item.frag_short_ratio)
+        if item.frag_short_ratio is not None
+        else ""
+    )
+    llr_str = (
+        format_bed_float(item.frag_llr_size) if item.frag_llr_size is not None else ""
+    )
     return (
         ratio_str,
         ff_str,
         "true" if item.discordant else "false",
         item.discordance_reason or "",
+        sr_str,
+        llr_str,
+        item.origin_call or "",
     )
 
 

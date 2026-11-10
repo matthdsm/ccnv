@@ -452,6 +452,9 @@ def run_reference_qc_on_table(
             "sex_source": model.get("sex_source"),
             "gc_corrected": bool(model.get("gc_corrected", False)),
             "mappability_corrected": bool(model.get("mappability_corrected", False)),
+            "fragmentomics_corrected": bool(
+                model.get("fragmentomics_corrected", False)
+            ),
             "min_mappability": model.get("min_mappability"),
         },
         "cohort": {

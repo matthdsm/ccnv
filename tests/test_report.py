@@ -340,6 +340,9 @@ class TestReport(unittest.TestCase):
                 expected_ratio=0.084,
                 implied_ff=0.115,
                 discordant=False,
+                frag_short_ratio=0.35,
+                frag_llr_size=2.45,
+                origin_call="FETAL_CONFIRMED",
             ),
             SegmentResult(
                 "chr1",
@@ -354,6 +357,9 @@ class TestReport(unittest.TestCase):
                 implied_ff=0.014,
                 discordant=True,
                 discordance_reason="SUB_FETAL_RATIO",
+                frag_short_ratio=0.15,
+                frag_llr_size=-3.2,
+                origin_call="MATERNAL_CONFIRMED",
             ),
         )
         sca = SCAResult("XY", False, 0.98, -0.2)
@@ -364,6 +370,7 @@ class TestReport(unittest.TestCase):
             ffy=0.12,
             ffx=0.115,
             ffa=0.118,
+            ff_size=0.125,
             chrx_ratio=0.94,
             chry_score=0.006,
             yfrac_threshold=0.004,
@@ -389,9 +396,15 @@ class TestReport(unittest.TestCase):
             row_non_disc = seg_lines[1].split("\t")
             self.assertEqual(row_non_disc[10], "false")
             self.assertEqual(row_non_disc[11], "")
+            self.assertEqual(row_non_disc[12], "0.35")
+            self.assertEqual(row_non_disc[13], "2.45")
+            self.assertEqual(row_non_disc[14], "FETAL_CONFIRMED")
             row_disc = seg_lines[2].split("\t")
             self.assertEqual(row_disc[10], "true")
             self.assertEqual(row_disc[11], "SUB_FETAL_RATIO")
+            self.assertEqual(row_disc[12], "0.15")
+            self.assertEqual(row_disc[13], "-3.2")
+            self.assertEqual(row_disc[14], "MATERNAL_CONFIRMED")
 
             with gzip.open(outputs.calls_bed, "rt") as h:
                 calls_lines = h.read().splitlines()
@@ -408,12 +421,38 @@ class TestReport(unittest.TestCase):
                 self.assertIn("##scaCall=XY", vcf_header_text)
                 self.assertIn("##INFO=<ID=DISCORDANT", vcf_header_text)
                 self.assertIn("##INFO=<ID=DISC_REASON", vcf_header_text)
+                self.assertIn("##INFO=<ID=FRAG_SHORT_R", vcf_header_text)
+                self.assertIn("##INFO=<ID=FRAG_LLR", vcf_header_text)
+                self.assertIn("##INFO=<ID=ORIGIN", vcf_header_text)
+                self.assertIn(
+                    'Description="Fragmentomic origin call: FETAL_CONFIRMED, MATERNAL_CONFIRMED, or INDETERMINATE"',
+                    vcf_header_text,
+                )
                 self.assertIn("##FORMAT=<ID=EXP_LOG2R", vcf_header_text)
                 self.assertIn("##FORMAT=<ID=IMPLIED_FF", vcf_header_text)
 
                 recs = list(vf.fetch("chr1"))
                 self.assertEqual(len(recs), 2)
                 self.assertNotIn("DISCORDANT", recs[0].info)
+                self.assertAlmostEqual(recs[0].info["FRAG_SHORT_R"], 0.35, places=2)
+                self.assertAlmostEqual(recs[0].info["FRAG_LLR"], 2.45, places=2)
+                self.assertEqual(recs[0].info["ORIGIN"], "FETAL_CONFIRMED")
+                self.assertAlmostEqual(
+                    recs[0].samples["prenatal_sample"]["EXP_LOG2R"],
+                    0.084,
+                    places=3,
+                )
+                self.assertAlmostEqual(
+                    recs[0].samples["prenatal_sample"]["IMPLIED_FF"],
+                    0.115,
+                    places=3,
+                )
+
+                self.assertTrue(recs[1].info["DISCORDANT"])
+                self.assertEqual(recs[1].info["DISC_REASON"], "SUB_FETAL_RATIO")
+                self.assertAlmostEqual(recs[1].info["FRAG_SHORT_R"], 0.15, places=2)
+                self.assertAlmostEqual(recs[1].info["FRAG_LLR"], -3.2, places=1)
+                self.assertEqual(recs[1].info["ORIGIN"], "MATERNAL_CONFIRMED")
                 self.assertAlmostEqual(
                     recs[0].samples["prenatal_sample"]["EXP_LOG2R"],
                     0.084,
@@ -509,7 +548,7 @@ class TestReport(unittest.TestCase):
         self.assertEqual(prenatal_dict["active_ff"], 0.10)
         seg_rows = payload["segments"]
         assert isinstance(seg_rows, list)
-        self.assertEqual(len(seg_rows[0]), 10)
+        self.assertEqual(len(seg_rows[0]), 13)
         self.assertTrue(seg_rows[0][6])
         self.assertEqual(seg_rows[0][9], "SUB_FETAL_RATIO")
 

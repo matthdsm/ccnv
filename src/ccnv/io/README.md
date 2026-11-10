@@ -2,47 +2,39 @@
 
 ## Overview
 
-The `ccnv.io` package manages external format ingestion, track extraction, and versioned Apache Arrow/Parquet persistence for `ccnv`. It handles streaming reads from BAM and CRAM alignments with automatic indexing, loading GC and mappability tracks from FASTA, BigWig, and BED files, validating samplesheets against JSON schemas, and reading/writing zstd-compressed Parquet tables under strict coordinate and schema contracts.
+The `ccnv.io` package manages external format ingestion, genomic track loading, samplesheet validation, and versioned Apache Arrow/Parquet (`1.0.0`) persistence for `ccnv`. It streams single-end and paired-end templates from BAM and CRAM alignments with automatic indexing, extracts GC, mappability, and cytoband tracks from FASTA, BigWig, and tabular files, validates YAML/JSON samplesheets against `samplesheet.schema.json`, and reads/writes Zstandard-compressed `.ccnv` Parquet tables.
 
 ## Interface
 
-- `[src/ccnv/io/alignments.py:alignment_format]`: Inspects alignment headers to identify `"BAM"` or `"CRAM"` formats.
-- `[src/ccnv/io/alignments.py:ensure_index]`: Checks for index files and calls `pysam.index` to generate `.bai` or `.crai` when missing.
-- `[src/ccnv/io/alignments.py:open_alignment]`: Context manager opening `pysam.AlignmentFile` handles with reference FASTA support.
-- `[src/ccnv/io/alignments.py:read_alignment_header]`: Extracts ordered contig identifiers, lengths, and raw metadata from alignment headers.
-- `[src/ccnv/io/alignments.py:stream_contig_reads]`: Streams filtered 5' read start positions for a target contig.
-- `[src/ccnv/io/alignments.py:rejection_reason]`: Categorizes read filter failures for quality control accounting.
-- `[src/ccnv/io/parquet.py:write_sample_parquet]`: Serializes binned counts and sample QC metadata into zstd-compressed Parquet.
-- `[src/ccnv/io/parquet.py:read_sample_parquet]`: Reads and validates sample tables against the `SAMPLE_SCHEMA` specification.
-- `[src/ccnv/io/parquet.py:read_sample_tables]`: Loads multiple sample Parquet tables into memory.
-- `[src/ccnv/io/parquet.py:write_reference_parquet]`: Serializes multi-branch reference models and scalar metadata into Parquet.
-- `[src/ccnv/io/parquet.py:read_reference_parquet]`: Reads and validates reference tables against the `REFERENCE_SCHEMA` specification.
-- `[src/ccnv/io/parquet.py:is_sample_parquet]`: Audits an on-disk Parquet file to verify whether it matches sample schema requirements.
-- `[src/ccnv/io/parquet.py:load_cohort]`: Ingests a collection of sample Parquet paths into a structured cohort.
-- `[src/ccnv/io/samplesheet.py:load_samplesheet]`: Ingests and validates YAML/JSON cohort samplesheets against `samplesheet.schema.json`.
-- `[src/ccnv/io/tracks.py:load_gc_track]`: Loads per-bin GC proportions from FASTA, BigWig, or BED/TSV files.
-- `[src/ccnv/io/tracks.py:load_mappability_track]`: Loads per-bin mappability scores from BigWig tracks.
-- `[src/ccnv/io/tracks.py:load_cytobands_track]`: Ingests cytoband annotations for interactive genome visualization.
-- `[src/ccnv/io/tracks.py:read_fasta_contigs]`: Extracts contig names and lengths from reference FASTA files via `pysam.FastaFile`.
+- [`alignments.py:alignment_format`](./alignments.py): Maps `.bam` / `.cram` file suffixes to lowercase `"bam"` or `"cram"` (raising `ValueError` otherwise).
+- [`alignments.py:ensure_index`](./alignments.py): Checks for existing `.bai` / `.crai` indices and invokes `pysam.index` when missing.
+- [`alignments.py:open_alignment`](./alignments.py): Opens a `pysam.AlignmentFile` handle with htslib thread allocation and mandatory FASTA validation for CRAM inputs.
+- [`alignments.py:read_alignment_header`](./alignments.py): Extracts `(contig_names, contig_lengths)` tuples from an alignment header.
+- [`alignments.py:rejection_reason`](./alignments.py): Returns the deterministic QC drop counter key for filtered reads, or `None` when kept.
+- [`alignments.py:stream_contig_reads`](./alignments.py) & [`stream_contig_fragments`](./alignments.py): Stream filtered 1D read starts or full paired-end/single-end fragmentomic tuples (dyad midpoints, clamped `uint16` insert lengths, endpoints, GC fractions, ``$`5'`$`` 4-mer motifs, and 1-bp histograms) across a contig.
+- [`parquet.py:write_sample_parquet`](./parquet.py) & [`read_sample_parquet`](./parquet.py): Persist and validate 7-column `SAMPLE_SCHEMA` `.ccnv` Parquet files (`count`, `fragment_lengths`, `endpoint_count`, `frag_gc_sum`, plus `ccnv.*` metadata).
+- [`parquet.py:read_sample_tables`](./parquet.py) & [`load_cohort`](./parquet.py): Load and validate multiple sample Parquet tables into a synchronized `Cohort` (parallelized across processes when `threads > 1`).
+- [`parquet.py:is_sample_parquet`](./parquet.py) & [`load_sample_or_extract`](./parquet.py): Inspect Parquet footer metadata (`ccnv.table_kind == "sample"`) and transparently load `.ccnv`/`.parquet` samples or extract `.bam`/`.cram` alignments via a temporary workspace.
+- [`parquet.py:write_reference_parquet`](./parquet.py) & [`read_reference_parquet`](./parquet.py): Persist and validate 14-column multi-branch `REFERENCE_SCHEMA` `.ccnv` Parquet files.
+- [`samplesheet.py:load_samplesheet`](./samplesheet.py): Parses root-list YAML/JSON samplesheets and validates entries (`filepath`, optional `sex` in `{"F", "M"}`, optional `ff` in `(0.0, 1.0]`) against `samplesheet.schema.json`.
+- [`tracks.py:read_fasta_contigs`](./tracks.py): Reads ordered `(name, length)` pairs from an indexed FASTA file via `pysam.FastaFile`.
+- [`tracks.py:load_gc_track`](./tracks.py): Loads per-bin `(gc, high_n_mask)` arrays from `.fa`/`.fasta`/`.fna`, `.bw`/`.bigWig`, `.bed`/`.bed.gz`, `.bedgraph`/`.bedgraph.gz`, `.wig`/`.wig.gz`, or `.tsv`/`.txt` tracks (rescaling `[0, 100]` percentages to `[0, 1]` and setting masked/missing bins to `NaN`).
+- [`tracks.py:load_mappability_track`](./tracks.py): Loads per-bin mappability scores from BigWig tracks (setting missing/non-finite intervals to `NaN` and validating finite values lie in `[0.0, 1.0]`).
+- [`tracks.py:load_cytobands_track`](./tracks.py): Loads UCSC cytoband intervals and Giemsa stain labels from `.txt`/`.bed`/`.tsv` (plain or `.gz`) files.
 
 ## Invariants
 
-- `[src/ccnv/io/alignments.py:open_alignment]`: File format must be BAM or CRAM; CRAM files strictly require a valid reference FASTA path.
-- `[src/ccnv/io/parquet.py:read_sample_parquet]`: Parquet files must conform to Arrow schema version `2.0.0` with `SAMPLE_SCHEMA` layout and `0-based-half-open` intervals.
-- `[src/ccnv/io/parquet.py:read_reference_parquet]`: Parquet files must conform to Arrow schema version `2.0.0` with `REFERENCE_SCHEMA` layout.
-- `[src/ccnv/io/samplesheet.py:load_samplesheet]`: Samplesheet files must validate against `samplesheet.schema.json` with unique, non-empty sample IDs.
-- `[src/ccnv/io/tracks.py:load_gc_track]`: GC proportions must be finite floating-point values in $[0.0, 1.0]$.
-- `[src/ccnv/io/tracks.py:load_mappability_track]`: Mappability scores must be finite floating-point values in $[0.0, 1.0]$.
+- [`alignments.py:open_alignment`](./alignments.py): CRAM alignments require an existing reference FASTA file; non-positive thread counts raise `ValueError`.
+- [`parquet.py:read_sample_parquet`](./parquet.py) & [`read_reference_parquet`](./parquet.py): Enforce `SCHEMA_VERSION = "1.0.0"` (`SUPPORTED_SCHEMA_VERSIONS = {"1.0.0"}`) and `0-based-half-open` coordinates.
+- [`samplesheet.py:load_samplesheet`](./samplesheet.py): Rejects empty lists, duplicate resolved sample paths, non-existent sample files, and schema violations with `ReferenceError`.
+- [`tracks.py:load_gc_track`](./tracks.py) & [`load_mappability_track`](./tracks.py): Finite unmasked track proportions must lie within ``$`[0.0, 1.0]`$``; bins without valid sequence or coverage receive `NaN` for downstream masking.
 
 ## Side Effects
 
-- `[src/ccnv/io/alignments.py:ensure_index]`: Generates missing BAM (`.bai`) or CRAM (`.crai`) index files on disk via `pysam.index`.
-- `[src/ccnv/io/tracks.py:read_fasta_contigs]`: Generates missing FASTA index files (`.fai`) on disk via `pysam.faidx`.
-- `[src/ccnv/io/parquet.py:write_sample_parquet]`: Creates target directory hierarchies and writes zstd-compressed Parquet files to disk.
-- `[src/ccnv/io/parquet.py:write_reference_parquet]`: Creates target directory hierarchies and writes zstd-compressed reference Parquet files to disk.
-- `[src/ccnv/io/alignments.py:stream_contig_reads]`: Opens BAM/CRAM file descriptors and streams alignment records from disk.
-- `[src/ccnv/io/tracks.py:load_mappability_track]`: Reads BigWig track files via `pyBigWig`.
+- [`alignments.py:ensure_index`](./alignments.py) & [`tracks.py:read_fasta_contigs`](./tracks.py): Create missing `.bai`/`.crai` and `.fai` index files on disk via `pysam`.
+- [`parquet.py:write_sample_parquet`](./parquet.py) & [`write_reference_parquet`](./parquet.py): Create parent directories and write Zstandard-compressed Parquet files.
+- [`parquet.py:load_cohort`](./parquet.py) & [`load_sample_or_extract`](./parquet.py): Spawn `ProcessPoolExecutor` workers for parallel sample loading/rebinning (`threads > 1`) and create/remove temporary directories when extracting `.bam`/`.cram` inputs on the fly.
 
 ## Verification
 
-- Run: `pytest`
+- Run: `pixi run test`

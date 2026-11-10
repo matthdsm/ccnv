@@ -2,35 +2,27 @@
 
 ## Overview
 
-The `ccnv.models` package defines pure domain models, configuration containers, result dataclasses, versioned Apache Arrow schema specifications, and custom exception hierarchies for `ccnv`. It establishes the central architectural contracts across all pipeline stages, guaranteeing strict 0-based half-open interval validation, metadata serialization, and type integrity.
+The `ccnv.models` package defines pure domain types, frozen configuration containers, result dataclasses, versioned Apache Arrow/Parquet (`1.0.0`) schemas, metadata serializers, and stage-specific exception classes for `ccnv`.
 
 ## Interface
 
-- `[src/ccnv/models/config.py:ExtractConfig]`, `[src/ccnv/models/config.py:ReferenceConfig]`, `[src/ccnv/models/config.py:PredictConfig]`, `[src/ccnv/models/config.py:ReferenceQCConfig]`: Strongly-typed configuration containers for CLI orchestrators.
-- `[src/ccnv/models/config.py:ReadFilters]`: Dataclass governing BAM/CRAM read filtering criteria (MAPQ, duplicates, secondary, supplementary).
-- `[src/ccnv/models/config.py:parquet_path]`: Resolves the canonical `.ccnv` artifact path from a prefix.
-- `[src/ccnv/models/domain.py:Contig]`: Structural contig representation holding name, length, and index.
-- `[src/ccnv/models/domain.py:Cytoband]`: Cytoband chromosome interval and Giemsa staining annotation.
-- `[src/ccnv/models/domain.py:SamplesheetEntry]`: Structured record for cohort samplesheet rows.
-- `[src/ccnv/models/domain.py:natural_sort_key]`: Deterministic natural sorting comparator for human and organism contig naming schemes.
-- `[src/ccnv/models/domain.py:select_layout]`: Resolves and validates target contigs and header ordering.
-- `[src/ccnv/models/exceptions.py:CcnvError]`: Root exception for all toolkit errors, subclassed by stage-specific exceptions (`ExtractError`, `ReferenceError`, `PredictError`, `SchemaError`).
-- `[src/ccnv/models/results.py:BinResult]`: Per-contig binned observed depth, expected baseline, normalized ratios, and Z-scores.
-- `[src/ccnv/models/results.py:SegmentResult]`: Segment change-point interval with weighted mean ratio, mean Z-score, gain/loss call, and prenatal annotations.
-- `[src/ccnv/models/results.py:PredictionOutputs]`: Comprehensive container of output paths and result data structures.
-- `[src/ccnv/models/results.py:FetalFractionResult]`: Multi-resolution fetal fraction estimates (`FFY`, `FFA`, `FFX`), active fetal fraction, and sex chromosome aneuploidy results.
-- `[src/ccnv/models/schemas.py:SAMPLE_SCHEMA]`: PyArrow schema definition for binned sample read count tables.
-- `[src/ccnv/models/schemas.py:REFERENCE_SCHEMA]`: PyArrow schema definition for multi-branch reference model tables.
-- `[src/ccnv/models/schemas.py:PrenatalModelMetadata]`: Encapsulates serialized prenatal model hyperparameter metadata, estimator coefficients, and standard error bounds.
-- `[src/ccnv/models/schemas.py:validate_table]`: Validates Arrow tables against schema and metadata contracts.
-- `[src/ccnv/models/schemas.py:encode_metadata]`, `[src/ccnv/models/schemas.py:decode_metadata]`: JSON-serializes and deserializes structured metadata dictionaries for Arrow table footers.
+- [`config.py:ExtractConfig`](./config.py), [`ReferenceConfig`](./config.py), [`ReferenceQCConfig`](./config.py), [`PredictConfig`](./config.py): Frozen configuration dataclasses for CLI and programmatic entry points, alongside `DEFAULT_BIN_SIZE` (`5000`), `DEFAULT_MIN_MAPPABILITY` (`0.5`), `AnalysisMode`, and `parquet_path`.
+- [`config.py:ReadFilters`](./config.py): Alignment filtering rules (`min_mapping_quality = 1`, `exclude_duplicates = True`, `exclude_secondary = True`, `exclude_supplementary = True`, `require_proper_pair = True`).
+- [`domain.py:Contig`](./domain.py), [`Cytoband`](./domain.py), [`SamplesheetEntry`](./domain.py): Immutable genomic layout records (`Contig` stores `name`, `length`, and `role` in `{"autosomal", "sex_baseline", "sex_signal"}`).
+- [`domain.py:select_layout`](./domain.py), [`is_canonical_contig`](./domain.py), [`normalize_chr`](./domain.py), [`natural_sort_key`](./domain.py): Canonical chromosome selection, prefix normalization, and natural contig sorting.
+- [`exceptions.py:CcnvError`](./exceptions.py): Base toolkit error subclassed by `ExtractError`, `ReferenceError`, `ReferenceQCError`, `PredictError`, `CovariateError`, and `SchemaError`.
+- [`results.py:BinResult`](./results.py) & [`GenomeProfile`](./results.py): Per-branch normalized bin arrays (`contigs`, `starts`, `ends`, `ratios`, `zscores`, `weights`, `reference_sizes`, `masked`, `branch`) and multi-branch genome profile containers.
+- [`results.py:SegmentResult`](./results.py): Segmented interval record holding weighted `ratio`, autocorrelation-adjusted Stouffer `zscore`, `weight`, `bin_count`, `call` (`"gain"` / `"loss"` / `None`), prenatal ratio/discordance fields, and fragmentomic origin fields (`frag_short_ratio`, `frag_llr_size`, `origin_call`).
+- [`results.py:SCAResult`](./results.py), [`FetalFractionResult`](./results.py), [`PredictionOutputs`](./results.py), [`ReferenceQCOutputs`](./results.py): Prenatal sex chromosome aneuploidy, multi-modal fetal fraction (`ffy`, `ffa`, `ffx`, `ff_size`, `active_ff`, `active_ff_source`), and pipeline deliverable containers.
+- [`schemas.py:SAMPLE_SCHEMA`](./schemas.py) & [`REFERENCE_SCHEMA`](./schemas.py): PyArrow table schemas under `SCHEMA_VERSION = "1.0.0"` (`SUPPORTED_SCHEMA_VERSIONS = {"1.0.0"}`), plus branch constants (`autosomal`, `female_sex`, `male_sex`, `prenatal_autosomal`, `prenatal_ffy`).
+- [`schemas.py:FragmentomicsMetadata`](./schemas.py), [`PrenatalModelMetadata`](./schemas.py), [`ReferenceMetadata`](./schemas.py): Serializable metadata dataclasses for sample fragmentomic landmarks/histograms, prenatal model weights/densities/standard errors, and reference provenance.
+- [`schemas.py:encode_metadata`](./schemas.py), [`decode_metadata`](./schemas.py), [`validate_table`](./schemas.py), [`validate_metadata`](./schemas.py), [`validate_bin_intervals`](./schemas.py), [`validate_reference_columns`](./schemas.py): Arrow footer metadata codecs and structural schema/coordinate validators.
 
 ## Invariants
 
-- `[src/ccnv/models/schemas.py:validate_table]`: All tables must strictly conform to `SAMPLE_SCHEMA` or `REFERENCE_SCHEMA` under Arrow schema version `2.0.0` with `0-based-half-open` intervals.
-- `[src/ccnv/models/schemas.py:validate_metadata]`: Metadata requires non-empty `contig_lengths` mapping identifiers to positive integers; row coordinates must satisfy $0 \le \text{start} \lt \text{end} \le \text{length}$.
-- `[src/ccnv/models/config.py:ReadFilters]`: Minimum mapping quality (`min_mapq`) must be a non-negative integer; flag booleans must be strictly typed.
-- `[src/ccnv/models/domain.py:natural_sort_key]`: Human karyotype ordering places autosomes 1-22 in numerical order, followed by gonosomes X, Y, and mitochondrial M.
+- [`schemas.py:validate_table`](./schemas.py): Enforces exact `SAMPLE_SCHEMA` (7 columns) or `REFERENCE_SCHEMA` (14 columns) field types, `SCHEMA_VERSION = "1.0.0"`, and `0-based-half-open` coordinate bounds ``$`0 \le \text{start} \lt \text{end} \le \text{length}`$``.
+- [`config.py:ReadFilters`](./config.py): `min_mapping_quality` is an integer threshold and flag filters are strict booleans.
+- [`domain.py:natural_sort_key`](./domain.py): Tokenizes stripped chromosome names so numeric chunks sort before case-folded text chunks (`1..22` before `M`, `X`, `Y`).
 
 ## Side Effects
 
@@ -38,4 +30,4 @@ The `ccnv.models` package defines pure domain models, configuration containers, 
 
 ## Verification
 
-- Run: `pytest`
+- Run: `pixi run test`

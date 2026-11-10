@@ -18,6 +18,7 @@ from ccnv.models import (
 __all__ = [
     "is_sample_parquet",
     "load_cohort",
+    "load_sample_or_extract",
     "read_reference_parquet",
     "read_sample_parquet",
     "read_sample_tables",
@@ -42,6 +43,32 @@ def read_sample_parquet(path: Path | str) -> pa.Table:
     table = pq.read_table(p)
     validate_table(table, ArtifactKind.SAMPLE)
     return table
+
+
+def load_sample_or_extract(
+    path: Path | str,
+    *,
+    fasta: Path | str | None = None,
+    bin_size: int = 5000,
+    threads: int = 1,
+) -> pa.Table:
+    """Load a sample Parquet table from disk or extract directly in memory from BAM/CRAM."""
+    p = Path(path)
+    if p.suffix.lower() in {".bam", ".cram"}:
+        from ccnv.extract import extract_sample_table
+        from ccnv.models import ExtractConfig
+
+        fasta_path = Path(fasta) if fasta is not None else None
+        config = ExtractConfig(
+            alignment=p,
+            prefix=p.with_suffix(""),
+            fasta=fasta_path,
+            bin_size=bin_size,
+            threads=threads,
+        )
+        table, _ = extract_sample_table(config)
+        return table
+    return read_sample_parquet(p)
 
 
 def write_sample_parquet(table: pa.Table, path: Path | str) -> Path:

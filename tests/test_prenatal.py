@@ -104,12 +104,20 @@ def _build_synthetic_sample(
         },
     )
 
+    n_rows = len(contig_list)
     return pa.table(
         {
             "contig": pa.array(contig_list, type=pa.string()),
             "start": pa.array(starts_list, type=pa.int64()),
             "end": pa.array(ends_list, type=pa.int64()),
             "count": pa.array(counts_list, type=pa.uint64()),
+            "fragment_lengths": pa.array([[]] * n_rows, type=pa.list_(pa.uint16())),
+            "endpoint_count": pa.array(
+                np.zeros(n_rows, dtype=np.uint32), type=pa.uint32()
+            ),
+            "frag_gc_sum": pa.array(
+                np.zeros(n_rows, dtype=np.float32), type=pa.float32()
+            ),
         },
         schema=SAMPLE_SCHEMA.with_metadata(metadata),
     )
@@ -854,7 +862,7 @@ class TestPrenatalEndToEndIntegration(unittest.TestCase):
             self.assertEqual(p_qc["active_ff_source"], "FFY")
             self.assertTrue(any(s.discordant for s in outputs.segments))
 
-            # 2. Assert <prefix>_segments.bed.gz (12 columns with #contig header)
+            # 2. Assert <prefix>_segments.bed.gz (15 columns with #contig header)
             self.assertTrue(outputs.segments_bed.is_file())
             with gzip.open(outputs.segments_bed, "rt") as f:
                 bed_lines = [
@@ -862,16 +870,19 @@ class TestPrenatalEndToEndIntegration(unittest.TestCase):
                 ]
             self.assertGreater(len(bed_lines), 1)
             self.assertEqual(tuple(bed_lines[0]), PRENATAL_SEGMENTS_BED_HEADER)
-            self.assertEqual(len(bed_lines[0]), 12)
+            self.assertEqual(len(bed_lines[0]), 15)
             for expected_col in (
                 "expected_ratio",
                 "implied_ff",
                 "discordant",
                 "discordance_reason",
+                "frag_short_ratio",
+                "frag_llr_size",
+                "origin_call",
             ):
                 self.assertIn(expected_col, bed_lines[0])
             for row in bed_lines[1:]:
-                self.assertEqual(len(row), 12)
+                self.assertEqual(len(row), 15)
             disc_rows = [r for r in bed_lines[1:] if r[10] == "true"]
             self.assertGreaterEqual(len(disc_rows), 1)
             disc_reasons = {r[11] for r in disc_rows}
@@ -882,7 +893,15 @@ class TestPrenatalEndToEndIntegration(unittest.TestCase):
             self.assertTrue(outputs.segments_vcf.is_file())
             with pysam.VariantFile(str(outputs.segments_vcf)) as vf:
                 vcf_header_text = str(vf.header)
-                for tag in ("EXP_LOG2R", "IMPLIED_FF", "DISCORDANT", "DISC_REASON"):
+                for tag in (
+                    "EXP_LOG2R",
+                    "IMPLIED_FF",
+                    "DISCORDANT",
+                    "DISC_REASON",
+                    "FRAG_SHORT_R",
+                    "FRAG_LLR",
+                    "ORIGIN",
+                ):
                     self.assertIn(f"ID={tag}", vcf_header_text)
                 records = list(vf.fetch("chr1"))
                 self.assertTrue(any(rec.info.get("DISCORDANT") for rec in records))

@@ -1,6 +1,6 @@
-# Extract / reference functional fixtures
+# Extract / Reference Functional Fixtures
 
-`test_extract.py`, `test_reference.py`, and `test_predict.py` download these published chr21 files on first run and cache them here. They are gitignored.
+[`tests/published_fixtures.py`](../../published_fixtures.py) downloads these published `chr21` CRAM and FASTA fixtures on first run (skipping tests if offline) for [`test_cohort.py`](../../test_cohort.py), [`test_extract.py`](../../test_extract.py), [`test_predict.py`](../../test_predict.py), [`test_predict_bam.py`](../../test_predict_bam.py), and [`test_reference.py`](../../test_reference.py), caching extracted `.ccnv` sample tables under `.cache_extracted/`. Downloaded fixtures and cached `.ccnv` files are gitignored.
 
 - CRAM: https://raw.githubusercontent.com/nf-cmgg/test-datasets/wisecondorx/data/genomics/homo_sapiens/illumina/cram/test.cram
 - CRAM: https://raw.githubusercontent.com/nf-cmgg/test-datasets/wisecondorx/data/genomics/homo_sapiens/illumina/cram/test2.cram

@@ -66,14 +66,22 @@ def correct_covariate_bias(
     usable: NDArray[np.bool_],
     gc: NDArray[np.floating] | None = None,
     mappability: NDArray[np.floating] | None = None,
+    *,
+    mean_frag_len: NDArray[np.floating] | None = None,
+    endpoint_ratio: NDArray[np.floating] | None = None,
 ) -> NDArray[np.float64]:
-    """Remove per-sample multiplicative GC and mappability trends on usable bins."""
+    """Remove per-sample multiplicative GC, mappability, and fragmentomic trends on usable bins."""
     data = np.asarray(normalized, dtype=np.float64)
     mask = np.asarray(usable, dtype=np.bool_)
     if data.ndim not in (1, 2):
         raise CovariateError("normalized coverage array must be 1D or 2D")
     n_usable = int(np.count_nonzero(mask))
-    if n_usable < 4 or (gc is None and mappability is None):
+    if n_usable < 4 or (
+        gc is None
+        and mappability is None
+        and mean_frag_len is None
+        and endpoint_ratio is None
+    ):
         return data.copy()
 
     gc_sub = np.asarray(gc, dtype=np.float64)[mask] if gc is not None else None
@@ -82,7 +90,22 @@ def correct_covariate_bias(
         if mappability is not None
         else None
     )
-    joint_design = build_joint_covariate_basis(gc_sub, map_sub)
+    len_sub = (
+        np.asarray(mean_frag_len, dtype=np.float64)[mask]
+        if mean_frag_len is not None
+        else None
+    )
+    ep_sub = (
+        np.asarray(endpoint_ratio, dtype=np.float64)[mask]
+        if endpoint_ratio is not None
+        else None
+    )
+    joint_design = build_joint_covariate_basis(
+        gc_sub,
+        map_sub,
+        mean_frag_len=len_sub,
+        endpoint_ratio=ep_sub,
+    )
     if joint_design is None:
         return data.copy()
 
@@ -97,15 +120,17 @@ def covariate_features(
     usable: NDArray[np.bool_],
     gc: NDArray[np.floating] | None = None,
     mappability: NDArray[np.floating] | None = None,
+    mean_frag_len: NDArray[np.floating] | None = None,
+    endpoint_ratio: NDArray[np.floating] | None = None,
 ) -> NDArray[np.float64] | None:
-    """Return standardized (GC, mappability) feature matrix for unmasked bins."""
+    """Return standardized (GC, mappability, fragmentomics) feature matrix for unmasked bins."""
     mask = np.asarray(usable, dtype=np.bool_)
     n_usable = int(np.count_nonzero(mask))
     if n_usable == 0:
         return None
 
     features: list[NDArray[np.float64]] = []
-    for arr in (gc, mappability):
+    for arr in (gc, mappability, mean_frag_len, endpoint_ratio):
         if arr is None:
             continue
         sub = np.asarray(arr, dtype=np.float64)[mask]

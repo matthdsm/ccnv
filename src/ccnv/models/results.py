@@ -10,7 +10,7 @@ from numpy.typing import NDArray
 CallType = Literal["gain", "loss"]
 SCACall = Literal["XX", "XY", "XO", "XXX", "XXY", "XYY", "DISCORDANT_MIXED"]
 FetalSex = Literal["M", "F"]
-ActiveFFSource = Literal["FFY", "FFA"]
+ActiveFFSource = Literal["FFY", "FFA", "FF_SIZE", "FUSED"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +44,9 @@ class SegmentResult:
     implied_ff: float | None = None
     discordant: bool = False
     discordance_reason: str | None = None
+    frag_short_ratio: float | None = None
+    frag_llr_size: float | None = None
+    origin_call: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +79,7 @@ class FetalFractionResult:
     chry_score: float
     yfrac_threshold: float
     sca: SCAResult
+    ff_size: float | None = None
     low_ff_warning: bool = False
     warnings: tuple[str, ...] = ()
 
@@ -88,9 +92,9 @@ class FetalFractionResult:
         """Validate fetal sex and active FF source invariants."""
         if self.fetal_sex not in ("M", "F"):
             raise ValueError(f"fetal_sex must be 'M' or 'F', got {self.fetal_sex!r}")
-        if self.active_ff_source not in ("FFY", "FFA"):
+        if self.active_ff_source not in ("FFY", "FFA", "FF_SIZE", "FUSED"):
             raise ValueError(
-                f"active_ff_source must be 'FFY' or 'FFA', "
+                f"active_ff_source must be 'FFY', 'FFA', 'FF_SIZE', or 'FUSED', "
                 f"got {self.active_ff_source!r}"
             )
         if not isinstance(self.warnings, tuple):

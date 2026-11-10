@@ -15,6 +15,7 @@ from time import perf_counter
 from typing import Literal
 
 import numpy as np
+import polars as pl
 import ruptures as rpt
 from numpy.typing import ArrayLike, NDArray
 from ruptures.base import BaseCost
@@ -29,6 +30,8 @@ __all__ = [
     "Algorithm",
     "Segment",
     "WeightedL2Cost",
+    "compute_contig_rho1",
+    "evaluate_stouffer_segment_scores",
     "segment_contig",
     "segment_genome",
 ]
@@ -402,4 +405,100 @@ def _make_segment(
         mean=mean,
         weight=total_weight,
         bin_count=int(valid_indexes.size),
+    )
+
+
+def compute_contig_rho1(z_contig: NDArray[np.float64]) -> float:
+    """Compute per-contig lag-1 autocorrelation on finite diploid-clipped z-scores."""
+    mask = np.isfinite(z_contig) & (np.abs(z_contig) <= 2.5)
+    z_clip = z_contig[mask]
+    if z_clip.size < 3:
+        return 0.0
+    x = z_clip[:-1]
+    y = z_clip[1:]
+    std_x = float(np.std(x))
+    std_y = float(np.std(y))
+    if std_x < 1e-12 or std_y < 1e-12:
+        return 0.0
+    corr = float(np.corrcoef(x, y)[0, 1])
+    if not np.isfinite(corr):
+        return 0.0
+    return float(np.clip(corr, 0.0, 0.95))
+
+
+def evaluate_stouffer_segment_scores(
+    bins_df: pl.DataFrame,
+    segs_df: pl.DataFrame,
+) -> pl.DataFrame:
+    """Evaluate autocorrelation-corrected Stouffer Z-scores via asof interval join."""
+    bins_sorted = bins_df.sort(["contig", "start"])
+    segs_sorted = segs_df.sort(["contig", "seg_start"])
+
+    joined = bins_sorted.join_asof(
+        segs_sorted.select(["seg_id", "contig", "seg_start", "seg_end"]),
+        left_on="start",
+        right_on="seg_start",
+        by="contig",
+        strategy="backward",
+        check_sortedness=False,
+    ).filter(pl.col("end") <= pl.col("seg_end"))
+
+    usable = joined.filter(pl.col("zscore").is_finite() & (pl.col("weight") > 0))
+
+    if usable.height == 0:
+        return segs_df.with_columns(
+            [
+                pl.lit(0).alias("n_usable"),
+                pl.lit(0.0).alias("zscore"),
+            ]
+        ).sort("seg_id")
+
+    stats = (
+        usable.group_by("seg_id")
+        .agg(
+            [
+                pl.len().alias("n_usable"),
+                (pl.col("weight") * pl.col("zscore")).sum().alias("sum_w_z"),
+                (pl.col("weight") * pl.col("weight")).sum().alias("sum_w_sq"),
+                pl.col("rho1").first().alias("rho1"),
+            ]
+        )
+        .with_columns(
+            (
+                pl.col("sum_w_sq")
+                * (
+                    1.0
+                    + pl.when(pl.col("n_usable") > 1)
+                    .then(
+                        2.0
+                        * (pl.col("n_usable") - 1)
+                        / pl.col("n_usable")
+                        * pl.col("rho1")
+                    )
+                    .otherwise(0.0)
+                )
+            )
+            .sqrt()
+            .alias("denom")
+        )
+        .with_columns(
+            pl.when(pl.col("denom") > 1e-12)
+            .then(pl.col("sum_w_z") / pl.col("denom"))
+            .otherwise(0.0)
+            .alias("zscore")
+        )
+    )
+    return (
+        segs_df.join(
+            stats.select(["seg_id", "n_usable", "zscore"]),
+            on="seg_id",
+            how="left",
+        )
+        .with_columns(
+            [
+                pl.col("n_usable").fill_null(0),
+                pl.col("zscore").fill_null(0.0),
+            ]
+        )
+        .sort("seg_id")
     )

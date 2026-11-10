@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pyarrow as pa
 
+from ccnv.features.fragmentomics import extract_sample_fragmentomics
 from ccnv.models import (
     SCHEMA_VERSION,
     AnalysisMode,
@@ -115,6 +116,11 @@ def build_predict_qc_payload(
             ),
             "ffx": float(prenatal_result.ffx),
             "ffa": float(prenatal_result.ffa),
+            "ff_size": (
+                float(prenatal_result.ff_size)
+                if prenatal_result.ff_size is not None
+                else None
+            ),
             "chrx_ratio": float(prenatal_result.chrx_ratio),
             "chry_score": float(prenatal_result.chry_score),
             "yfrac_threshold": float(prenatal_result.yfrac_threshold),
@@ -133,12 +139,32 @@ def build_predict_qc_payload(
             "warnings": list(prenatal_result.warnings),
         }
 
+    frag_meta = extract_sample_fragmentomics(sample_meta)
+    frag_data: dict[str, object] | None = None
+    if frag_meta is not None:
+        frag_data = {
+            "paired_end": frag_meta.paired_end,
+            "total_paired_fragments": int(frag_meta.total_paired_fragments),
+            "chromatosome_mode_bp": float(frag_meta.chromatosome_mode_bp),
+            "core_shoulder_bp": float(frag_meta.core_shoulder_bp),
+            "sizing_shift_bp": float(frag_meta.sizing_shift_bp),
+            "self_referenced_peak_ratio": float(frag_meta.self_referenced_peak_ratio),
+            "dinucleosome_fraction": float(frag_meta.dinucleosome_fraction),
+            "high_mw_fraction": float(frag_meta.high_mw_fraction),
+            "helical_10bp_amplitude": float(frag_meta.helical_10bp_amplitude),
+            "motif_diversity_score": float(frag_meta.motif_diversity_score),
+            "warnings": (
+                ["WARN_HIGH_LEUKOCYTE_DNA"] if frag_meta.high_mw_fraction > 0.05 else []
+            ),
+        }
+
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": str(mode),
         "sample": sample_name,
         "read_metrics": read_metrics,
         "cnv_summary": cnv_summary,
+        "fragmentomics": frag_data,
         "prenatal": prenatal_data,
     }
 

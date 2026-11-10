@@ -27,6 +27,9 @@ def make_sample_table(
     contig_lengths: Mapping[str, int] | None = None,
     bin_size: int = 100,
     identity: object | None = None,
+    fragment_lengths: Sequence[Sequence[int]] | None = None,
+    endpoint_counts: Sequence[int] | np.ndarray | None = None,
+    frag_gc_sums: Sequence[float] | np.ndarray | None = None,
 ) -> pa.Table:
     n_bins = len(counts)
     if starts is None:
@@ -69,12 +72,32 @@ def make_sample_table(
             "filters": asdict(ReadFilters()),
         },
     )
+    if fragment_lengths is None:
+        frag_arr = pa.array([[]] * n_bins, type=pa.list_(pa.uint16()))
+    else:
+        frag_arr = pa.array(fragment_lengths, type=pa.list_(pa.uint16()))
+
+    if endpoint_counts is None:
+        ep_arr = pa.array(np.zeros(n_bins, dtype=np.uint32), type=pa.uint32())
+    else:
+        ep_arr = pa.array(
+            np.asarray(endpoint_counts, dtype=np.uint32), type=pa.uint32()
+        )
+
+    if frag_gc_sums is None:
+        gc_arr = pa.array(np.zeros(n_bins, dtype=np.float32), type=pa.float32())
+    else:
+        gc_arr = pa.array(np.asarray(frag_gc_sums, dtype=np.float32), type=pa.float32())
+
     return pa.table(
         {
             "contig": pa.array(contig_list, type=pa.string()),
             "start": pa.array(starts_arr, type=pa.int64()),
             "end": pa.array(ends_arr, type=pa.int64()),
             "count": pa.array(np.asarray(counts, dtype=np.uint64), type=pa.uint64()),
+            "fragment_lengths": frag_arr,
+            "endpoint_count": ep_arr,
+            "frag_gc_sum": gc_arr,
         },
         schema=SAMPLE_SCHEMA.with_metadata(metadata),
     )

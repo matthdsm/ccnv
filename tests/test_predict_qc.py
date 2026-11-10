@@ -12,7 +12,12 @@ import pyarrow as pa
 
 from ccnv.models import ReadFilters
 from ccnv.models.results import FetalFractionResult, SCAResult, SegmentResult
-from ccnv.models.schemas import SAMPLE_SCHEMA, ArtifactKind, metadata_for
+from ccnv.models.schemas import (
+    SAMPLE_SCHEMA,
+    SCHEMA_VERSION,
+    ArtifactKind,
+    metadata_for,
+)
 from ccnv.qc.predict import build_predict_qc_payload, write_predict_qc_json
 
 
@@ -47,6 +52,9 @@ def _make_sample_table() -> pa.Table:
             "start": pa.array([0, 100, 0, 0], type=pa.int64()),
             "end": pa.array([100, 200, 100, 100], type=pa.int64()),
             "count": pa.array([250, 250, 300, 50], type=pa.uint64()),
+            "fragment_lengths": pa.array([[], [], [], []], type=pa.list_(pa.uint16())),
+            "endpoint_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
+            "frag_gc_sum": pa.array([0.0, 0.0, 0.0, 0.0], type=pa.float32()),
         },
         schema=SAMPLE_SCHEMA.with_metadata(metadata),
     )
@@ -62,7 +70,7 @@ class TestPredictQC(unittest.TestCase):
         )
         payload = build_predict_qc_payload("germline", table, segments)
 
-        self.assertEqual(payload["schema_version"], "2.0.0")
+        self.assertEqual(payload["schema_version"], SCHEMA_VERSION)
         self.assertEqual(payload["mode"], "germline")
         self.assertEqual(payload["sample"], "test_sample")
         self.assertIsNone(payload["prenatal"])
@@ -106,6 +114,7 @@ class TestPredictQC(unittest.TestCase):
             ffy=0.12,
             ffx=0.115,
             ffa=0.118,
+            ff_size=0.122,
             chrx_ratio=0.94,
             chry_score=0.006,
             yfrac_threshold=0.004,
@@ -159,6 +168,7 @@ class TestPredictQC(unittest.TestCase):
         self.assertEqual(prenatal["ffy"], 0.12)
         self.assertEqual(prenatal["ffx"], 0.115)
         self.assertEqual(prenatal["ffa"], 0.118)
+        self.assertEqual(prenatal["ff_size"], 0.122)
         self.assertFalse(prenatal["low_ff_warning"])
 
         sca_dict = prenatal["sca"]
@@ -180,7 +190,7 @@ class TestPredictQC(unittest.TestCase):
             with open(json_path, encoding="utf-8") as f:
                 loaded = json.load(f)
 
-            self.assertEqual(loaded["schema_version"], "2.0.0")
+            self.assertEqual(loaded["schema_version"], SCHEMA_VERSION)
             self.assertEqual(loaded["mode"], "germline")
             self.assertEqual(loaded["sample"], "test_sample")
             self.assertIn("read_metrics", loaded)

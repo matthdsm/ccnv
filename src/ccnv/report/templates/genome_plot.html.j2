@@ -203,9 +203,10 @@
     const ffaVal = (p.ffa !== null && p.ffa !== undefined) ? p.ffa : p.preface;
     const ffaStr = ffaVal !== null && ffaVal !== undefined ? `${(ffaVal * 100).toFixed(1)}%` : "N/A";
     const ffxStr = p.ffx !== null && p.ffx !== undefined ? `${(p.ffx * 100).toFixed(1)}%` : "N/A";
+    const ffSizeStr = p.ff_size !== null && p.ff_size !== undefined ? `${(p.ff_size * 100).toFixed(1)}%` : "N/A";
     badgeEl.innerHTML = `<span><strong>Fetal Sex:</strong> ${p.fetal_sex}</span>` +
       `<span>|</span><span><strong>Active FF:</strong> ${ffPct}% (${p.active_ff_source})</span>` +
-      `<span>|</span><span><strong>FF (Y/A/X):</strong> ${ffyStr} / ${ffaStr} / ${ffxStr}</span>` +
+      `<span>|</span><span><strong>FF (Y/A/X/Size):</strong> ${ffyStr} / ${ffaStr} / ${ffxStr} / ${ffSizeStr}</span>` +
       `<span>|</span><span><strong>SCA:</strong> ${p.sca_call}</span>`;
     badgeEl.style.display = "inline-flex";
     if (discLegend) discLegend.style.display = "inline";
@@ -373,12 +374,19 @@
       const impliedFF = seg[7];
       const expR = seg[8];
       const discReason = seg[9];
+      const fragShortRatio = seg[10];
+      const fragLLR = seg[11];
+      const originCall = seg[12];
 
       const c = classify(r, z, zT, rT);
       const x0 = offsets[ci] + s;
       const x1 = offsets[ci] + e;
       const yClip = clampY(r);
       let h = `${D.contigs[ci]}:${s.toLocaleString()}-${e.toLocaleString()} (${bc} bins)<br>Segment Log2R: ${r.toFixed(3)} | Z: ${z.toFixed(2)}`;
+      if (fragShortRatio !== null && fragShortRatio !== undefined) {
+        h += `<br>Short Frag: ${(Number(fragShortRatio) * 100).toFixed(1)}% | LLR_size: ${Number(fragLLR).toFixed(2)}`;
+        if (originCall) h += ` (${originCall})`;
+      }
       if (isDisc) {
         h += `<br>Discordant: ${discReason || "YES"}`;
         if (expR !== null && expR !== undefined) h += ` | Expected: ${Number(expR).toFixed(3)}`;
