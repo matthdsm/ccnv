@@ -14,6 +14,7 @@ class TestDocsMarkdown(unittest.TestCase):
             cls.repo_root / "README.md",
             cls.repo_root / "docs" / "benchmark.md",
             cls.repo_root / "docs" / "cli.md",
+            cls.repo_root / "docs" / "index.md",
             cls.repo_root / "docs" / "methodology.md",
             cls.repo_root / "docs" / "pipeline.md",
             cls.repo_root / "src" / "README.md",

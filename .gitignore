@@ -15,4 +15,7 @@ dist/
 *vcf.gz*
 *html
 docs/superpowers
+docs/designs
 RESEARCH.md
+# zensical site
+site/
