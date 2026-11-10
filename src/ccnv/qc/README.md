@@ -21,7 +21,7 @@ The `ccnv.qc` package implements quality control accounting, reference model aud
 ## Invariants
 
 - `[src/ccnv/qc/sample.py:build_sample_qc]`: Read counters must be non-negative integers satisfying balance identity $\text{examined} = \text{kept} + \sum \text{filtered}$.
-- `[src/ccnv/qc/reference.py:evaluate_autosomal_or_female_verdict]`: Severity ranks $\text{PASS} < \text{WARN} < \text{FAIL}$; triggers failure when usable bin fraction falls below 60% or mean neighbor distance exceeds the 3-sigma outlier threshold.
+- `[src/ccnv/qc/reference.py:evaluate_autosomal_or_female_verdict]`: Severity ranks $\text{PASS} \lt \text{WARN} \lt \text{FAIL}$; triggers failure when usable bin fraction falls below 60% or mean neighbor distance exceeds the 3-sigma outlier threshold.
 - `[src/ccnv/qc/predict.py:build_predict_qc_payload]`: Predict QC payload requires valid execution configuration, contig statistics, and well-typed prenatal blocks when analysis mode is prenatal.
 
 ## Side Effects

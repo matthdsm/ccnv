@@ -32,13 +32,13 @@ The `ccnv.features` package provides feature extraction, dynamic genomic rebinni
 - `[src/ccnv/features/cohort.py:validate_cohort]`: Input cohort sample tables must share identical contig layouts, identical contig lengths, and matching bin coordinates.
 - `[src/ccnv/features/cohort.py:rebin_sample_table]`: Outputs `float64` counts, utilizing a Polars integer fast-path when target bin size is an exact multiple of source bin size.
 - `[src/ccnv/features/covariates.py:validate_min_mappability]`: Minimum mappability threshold must be a finite float in $[0.0, 1.0]$.
-- `[src/ccnv/features/covariates.py:correct_covariate_bias]`: Bins with non-positive valid bases, ambiguous base fraction $N > 0.5$, or mappability below `--min-mappability` are masked; multiplicative bias trend is clamped to $[0.20, 5.0]$.
+- `[src/ccnv/features/covariates.py:correct_covariate_bias]`: Bins with non-positive valid bases, ambiguous base fraction $N \gt 0.5$, or mappability below `--min-mappability` are masked; multiplicative bias trend is clamped to $[0.20, 5.0]$.
 - `[src/ccnv/features/prenatal.py:fit_prenatal_models]`: Cohort must contain both female and male control samples to calibrate gonosome models and prenatal reference branches.
 
 ## Side Effects
 
 - `[src/ccnv/features/cohort.py:cohort_from_fasta]`: Generates FASTA index file (`.fai`) on disk via `pysam.faidx` when missing.
-- `[src/ccnv/features/cohort.py:rebin_cohort]`: Spawns worker process pool via `concurrent.futures.ProcessPoolExecutor` when cohort contains multiple samples and threads $> 1$.
+- `[src/ccnv/features/cohort.py:rebin_cohort]`: Spawns worker process pool via `concurrent.futures.ProcessPoolExecutor` when cohort contains multiple samples and threads $\gt 1$.
 
 ## Verification
 
