@@ -70,6 +70,8 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 - `pixi run test`: Run the test suite.
 - `pixi run hooks`: Run pre-commit hooks (managed by `prek`).
 - `pixi run docker-build`: Build the Docker image for `linux/amd64` and `linux/arm64` (Buildx cache; not loaded into the local daemon).
+- `pixi run docs-build`: Build the documentation site with Zensical (`zensical build --clean --strict`).
+- `pixi run docs-serve`: Serve the documentation site locally with Zensical (`zensical serve`).
 
 ### Code Style
 
@@ -93,7 +95,7 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 - **Environment Awareness:** Always prefer `pixi run <command>` over direct execution if a pixi task exists.
 - **GitHub Actions:** Ensure github actions are using the latest version at all times, updating the workflow files as needed. Reverting to older versions is strictly forbidden.
 - **Surgical Updates:** When fixing bugs, prioritize small, targeted changes and adding a corresponding test case.
-- **Documentation:** Update this document and README if you make changes that affect the overall architecture or development workflow. Keep all WisecondorX comparisons strictly inside `docs/benchmark.md`.
+- **Documentation:** Update this document, README, and the documentation site in `docs/` if you make changes that affect the overall architecture, CLI, or development workflow. Keep all WisecondorX comparisons strictly inside `docs/benchmark.md`. All documentation amendments must be integrated into the site (`docs/`), registered in `zensical.toml` navigation where appropriate, and verified for strict Zensical build compatibility (`pixi run docs-build` or `pixi run -e docs zensical build --clean --strict`).
 - **Markdown Formatting & GitHub Rendering:** All Markdown documentation must render cleanly and accurately on GitHub (GitHub Flavored Markdown / GFM).
   - Do not hard-wrap lines in Markdown files; rely on editor soft-wrapping for line length. Keep paragraphs and list items on a single logical line.
   - Avoid unnecessary newlines, redundant blank lines, and empty lines inside Mermaid diagram blocks. Quote node labels containing special characters (parentheses, brackets).

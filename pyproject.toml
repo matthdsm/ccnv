@@ -78,9 +78,13 @@ ruff = "*"
 pip = ">=26.2.1"
 python-build = ">=1.5.0,<2"
 
+[tool.pixi.feature.docs.dependencies]
+zensical = "*"
+
 [tool.pixi.environments]
 default = { features = ["dev"], solve-group = "default" }
 prod = { solve-group = "default" }
+docs = { features = ["docs"], solve-group = "default" }
 
 [tool.pixi.tasks]
 format = "ruff check --fix . && ruff format ."
@@ -88,6 +92,8 @@ lint = "ruff check ."
 test = "pytest"
 hooks = "prek run --all-files"
 docker-build = "docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/matthdsm/copynumber-cnv:dev ."
+docs-build = "pixi run -e docs zensical build --clean --strict"
+docs-serve = "pixi run -e docs zensical serve"
 
 [tool.pytest.ini_options]
 addopts = "-ra"
