@@ -1,174 +1,80 @@
+# Copynumber-CNV (`ccnv`)
+
+Copynumber-CNV (`ccnv`) is an independent Python 3.12+ bioinformatics toolkit for copy-number variation (CNV) detection in shallow whole-genome sequencing (sWGS) data, inspired by the published statistical methodology of WISECONDOR (Straver et al., *Nucleic Acids Research*, 2014) and WisecondorX (Raman et al., *Nucleic Acids Research*, 2019).
+
+> [!NOTE]
+> Copynumber-CNV (`ccnv`) is in active pre-1.0 alpha development (`0.1.0dev`). CLI interfaces, data models, and schemas may evolve before the initial stable release.
+
 ---
-icon: lucide/rocket
+
+## Key Features
+
+- **Versioned Parquet Storage (`2.0.0`)**: Sample bin counts and reference models are stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC, provenance, and optional prenatal model metadata.
+- **Constitutional & Prenatal Analysis Modes**: Supports standard germline CNV profiling (`--mode germline`) as well as cell-free DNA (cfDNA) non-invasive prenatal screening (`--mode prenatal`) with pure NumPy/SciPy/scikit-learn fetal fraction estimation (`FFY`, `FFX`, `FFA`), 2D stoichiometric Bayesian sex chromosome aneuploidy calling, and discordance filtering.
+- **Organism-Agnostic & 0-Based Half-Open Coordinates**: Contig names, order, and lengths are read directly from alignment or FASTA headers without assuming a fixed 24-chromosome layout. All intervals are 0-based half-open `[start, end)`.
+- **Pure-Python & DataFrame-Native Execution**: Uses `polars`, `pysam`, `pyBigWig`, `numpy`, `scipy`, `pyarrow`, `scikit-learn`, and weighted `ruptures` segmentation without heavy ML container dependencies.
+
 ---
 
-# Get started
+## Pipeline Overview
 
-For full documentation visit [zensical.org](https://zensical.org/docs/).
+The pipeline formalizes CNV identification across shallow whole-genome sequencing datasets into four discrete functional stages: read ingestion and binning (`extract`), cohort reference synthesis with covariate correction (`reference`), reference audit and quality verification (`ref-qc`), and single-sample projection and change-point segmentation (`predict`).
 
-## Commands
-
-* [`zensical new`][new] - Create a new project
-* [`zensical serve`][serve] - Start local web server
-* [`zensical build`][build] - Build your site
-
-  [new]: https://zensical.org/docs/usage/new/
-  [serve]: https://zensical.org/docs/usage/preview/
-  [build]: https://zensical.org/docs/usage/build/
-
-## Examples
-
-### Admonitions
-
-> Go to [documentation](https://zensical.org/docs/authoring/admonitions/)
-
-!!! note
-
-    This is a **note** admonition. Use it to provide helpful information.
-
-!!! warning
-
-    This is a **warning** admonition. Be careful!
-
-### Details
-
-> Go to [documentation](https://zensical.org/docs/authoring/admonitions/#collapsible-blocks)
-
-??? info "Click to expand for more info"
-
-    This content is hidden until you click to expand it.
-    Great for FAQs or long explanations.
-
-## Code Blocks
-
-> Go to [documentation](https://zensical.org/docs/authoring/code-blocks/)
-
-``` python hl_lines="2" title="Code blocks"
-def greet(name):
-    print(f"Hello, {name}!")  # (1)!
-
-
-greet("Python")
+```mermaid
+flowchart LR
+    subgraph S1["1. Extract"]
+        BAM["BAM / CRAM Alignment"] --> C["Sample Parquet (.ccnv)"]
+    end
+    subgraph S2["2. Reference"]
+        SS["Samplesheet / FASTA"] --> REF["Reference Parquet (.ccnv)"]
+        GC["GC / Mappability Tracks"] --> REF
+        REF --> QC["Reference QC (.json)"]
+    end
+    subgraph S3["3. Ref-QC"]
+        REF --> AUDIT["Quality Audit (PASS / WARN / FAIL)"]
+    end
+    subgraph S4["4. Predict"]
+        C --> P["Segment & Call"]
+        REF --> P
+        P --> PQC["Predict QC (.json)"]
+        P --> BED["BED Tables (.bed.gz)"]
+        P --> VCF["VCFv4.2 (.vcf.gz)"]
+        P --> HTML["Plotly Viewer (.html)"]
+    end
 ```
 
-1.  > Go to [documentation](https://zensical.org/docs/authoring/code-blocks/#code-annotations)
+---
 
-    Code annotations allow to attach notes to lines of code.
+## Documentation Sections
 
-Code can also be highlighted inline: `#!python print("Hello, Python!")`.
+- [Pipeline Architecture](pipeline.md): Comprehensive data flow, coordinate contracts, and algorithmic stages.
+- [CLI Reference](cli.md): Complete command-line options, defaults, input requirements, and exit codes.
+- [Mathematical Methodology](methodology.md): Formal mathematical formulations, statistical assumptions, model selections, and constant provenance.
+- [Benchmarks](benchmark.md): Performance, runtime, storage efficiency, and comparison against WisecondorX.
 
-## Content tabs
+---
 
-> Go to [documentation](https://zensical.org/docs/authoring/content-tabs/)
+## Quickstart
 
-=== "Python"
+```console
+# 1. Extract BAM or CRAM alignments into binned sample Parquet (.ccnv)
+ccnv extract sample.bam --prefix sample --bin-size 5000
 
-    ``` python
-    print("Hello from Python!")
-    ```
+# 2a. Build a germline reference model from a cohort samplesheet
+ccnv reference -s cohort.yaml --prefix reference --bin-size 5000 --gc genome.fa --mappability mappability.bw
 
-=== "Rust"
+# 2b. Or build a flat uniform-depth germline reference from a FASTA
+ccnv reference --fasta genome.fa --prefix reference --bin-size 5000 --mappability mappability.bw
 
-    ``` rs
-    println!("Hello from Rust!");
-    ```
+# 2c. Or build a unified prenatal reference from a maternal cfDNA cohort samplesheet
+ccnv reference -s cohort.yaml --mode prenatal --prefix prenatal_ref --bin-size 5000
 
-## Diagrams
+# 3. Audit reference quality control metrics
+ccnv ref-qc reference.ccnv
 
-> Go to [documentation](https://zensical.org/docs/authoring/diagrams/)
+# 4a. Predict copy-number gains and losses in constitutional/germline mode
+ccnv predict sample.ccnv reference.ccnv --prefix results/sample
 
-``` mermaid
-graph LR
-  A[Start] --> B{Error?};
-  B -->|Yes| C[Hmm...];
-  C --> D[Debug];
-  D --> B;
-  B ---->|No| E[Yay!];
+# 4b. Or run prenatal prediction with fetal fraction estimation and sex chromosome analysis
+ccnv predict sample.ccnv prenatal_ref.ccnv --mode prenatal --prefix results/sample_prenatal
 ```
-
-## Footnotes
-
-> Go to [documentation](https://zensical.org/docs/authoring/footnotes/)
-
-Here's a sentence with a footnote.[^1]
-
-Hover it, to see a tooltip.
-
-[^1]: This is the footnote.
-
-
-## Formatting
-
-> Go to [documentation](https://zensical.org/docs/authoring/formatting/)
-
-- ==This was marked (highlight)==
-- ^^This was inserted (underline)^^
-- ~~This was deleted (strikethrough)~~
-- H~2~O
-- A^T^A
-- ++ctrl+alt+del++
-
-## Icons, Emojis
-
-> Go to [documentation](https://zensical.org/docs/authoring/icons-emojis/)
-
-* :sparkles: `:sparkles:`
-* :rocket: `:rocket:`
-* :tada: `:tada:`
-* :memo: `:memo:`
-* :eyes: `:eyes:`
-
-## Maths
-
-> Go to [documentation](https://zensical.org/docs/authoring/math/)
-
-$$
-\cos x=\sum_{k=0}^{\infty}\frac{(-1)^k}{(2k)!}x^{2k}
-$$
-
-!!! warning "Needs configuration"
-    Note that MathJax is included via a `script` tag on this page and is not
-    configured in the generated default configuration to avoid including it
-    in a pages that do not need it. See the documentation for details on how
-    to configure it on all your pages if they are more Maths-heavy than these
-    simple starter pages.
-
-<script id="MathJax-script" src="https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js"></script>
-<script>
-  window.MathJax = {
-    tex: {
-      inlineMath: [["\\(", "\\)"]],
-      displayMath: [["\\[", "\\]"]],
-      processEscapes: true,
-      processEnvironments: true
-    },
-    options: {
-      ignoreHtmlClass: ".*|",
-      processHtmlClass: "arithmatex"
-    }
-  };
-
-  document$.subscribe(() => {
-    MathJax.startup.output.clearCache()
-    MathJax.typesetClear()
-    MathJax.texReset()
-    MathJax.typesetPromise()
-  })
-</script>
-
-## Task Lists
-
-> Go to [documentation](https://zensical.org/docs/authoring/lists/#using-task-lists)
-
-* [x] Install Zensical
-* [x] Configure `zensical.toml`
-* [x] Write amazing documentation
-* [ ] Deploy anywhere
-
-## Tooltips
-
-> Go to [documentation](https://zensical.org/docs/authoring/tooltips/)
-
-[Hover me][example]
-
-  [example]: https://example.com "I'm a tooltip!"

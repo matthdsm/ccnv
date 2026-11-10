@@ -92,6 +92,8 @@ lint = "ruff check ."
 test = "pytest"
 hooks = "prek run --all-files"
 docker-build = "docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/matthdsm/copynumber-cnv:dev ."
+docs-build = "pixi run -e docs zensical build --clean --strict"
+docs-serve = "pixi run -e docs zensical serve"
 
 [tool.pytest.ini_options]
 addopts = "-ra"
