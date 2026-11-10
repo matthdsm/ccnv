@@ -59,60 +59,129 @@ def build_1d_basis(
 def build_joint_covariate_basis(
     gc: NDArray[np.float64] | None,
     mappability: NDArray[np.float64] | None,
+    *,
+    mean_frag_len: NDArray[np.float64] | None = None,
+    endpoint_ratio: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64] | None:
-    """Build joint B-spline covariate basis capturing GC, mappability, and interaction."""
+    """Build joint B-spline covariate basis capturing GC, mappability, fragmentomics, and interactions."""
     gc_arr = np.asarray(gc, dtype=np.float64) if gc is not None else None
     map_arr = (
         np.asarray(mappability, dtype=np.float64) if mappability is not None else None
     )
+    len_arr = (
+        np.asarray(mean_frag_len, dtype=np.float64)
+        if mean_frag_len is not None
+        else None
+    )
+    ep_arr = (
+        np.asarray(endpoint_ratio, dtype=np.float64)
+        if endpoint_ratio is not None
+        else None
+    )
 
     gc_ok = _is_valid_covariate(gc_arr)
     map_ok = _is_valid_covariate(map_arr)
+    len_ok = _is_valid_covariate(len_arr)
+    ep_ok = _is_valid_covariate(ep_arr)
 
-    if not gc_ok and not map_ok:
+    if not gc_ok and not map_ok and not len_ok and not ep_ok:
         return None
 
     if gc_ok and not map_ok:
         assert gc_arr is not None
-        return build_1d_basis(gc_arr, degree=3, n_knots=5)
-
-    if map_ok and not gc_ok:
+        base_design = build_1d_basis(gc_arr, degree=3, n_knots=5)
+    elif map_ok and not gc_ok:
         assert map_arr is not None
-        return build_1d_basis(map_arr, degree=2, n_knots=4)
+        base_design = build_1d_basis(map_arr, degree=2, n_knots=4)
+    elif gc_ok and map_ok:
+        assert gc_arr is not None and map_arr is not None
+        if gc_arr.size != map_arr.size:
+            return None
 
-    assert gc_arr is not None and map_arr is not None
-    if gc_arr.size != map_arr.size:
-        return None
+        n_rows = gc_arr.size
+        k_gc = min(5, max(2, int(np.unique(gc_arr).size)))
+        spline_gc = SplineTransformer(
+            n_knots=k_gc,
+            degree=3,
+            knots="quantile",
+            extrapolation="linear",
+            include_bias=False,
+        )
+        b_gc = np.asarray(
+            spline_gc.fit_transform(gc_arr.reshape(-1, 1)), dtype=np.float64
+        )
 
-    n_rows = gc_arr.size
-    k_gc = min(5, max(2, int(np.unique(gc_arr).size)))
-    spline_gc = SplineTransformer(
-        n_knots=k_gc,
-        degree=3,
-        knots="quantile",
-        extrapolation="linear",
-        include_bias=False,
-    )
-    b_gc = np.asarray(spline_gc.fit_transform(gc_arr.reshape(-1, 1)), dtype=np.float64)
+        k_map = min(4, max(2, int(np.unique(map_arr).size)))
+        spline_map = SplineTransformer(
+            n_knots=k_map,
+            degree=2,
+            knots="quantile",
+            extrapolation="linear",
+            include_bias=False,
+        )
+        b_map = np.asarray(
+            spline_map.fit_transform(map_arr.reshape(-1, 1)), dtype=np.float64
+        )
 
-    k_map = min(4, max(2, int(np.unique(map_arr).size)))
-    spline_map = SplineTransformer(
-        n_knots=k_map,
-        degree=2,
-        knots="quantile",
-        extrapolation="linear",
-        include_bias=False,
-    )
-    b_map = np.asarray(
-        spline_map.fit_transform(map_arr.reshape(-1, 1)), dtype=np.float64
-    )
+        z_gc = np.asarray(scipy.stats.zscore(gc_arr, ddof=0), dtype=np.float64)
+        z_map = np.asarray(scipy.stats.zscore(map_arr, ddof=0), dtype=np.float64)
+        interaction = (z_gc * z_map)[:, np.newaxis]
+        ones = np.ones((n_rows, 1), dtype=np.float64)
 
-    z_gc = np.asarray(scipy.stats.zscore(gc_arr, ddof=0), dtype=np.float64)
-    z_map = np.asarray(scipy.stats.zscore(map_arr, ddof=0), dtype=np.float64)
-    interaction = (z_gc * z_map)[:, np.newaxis]
-    ones = np.ones((n_rows, 1), dtype=np.float64)
+        base_design = np.hstack([ones, b_gc, b_map, interaction], dtype=np.float64)
+    else:
+        first_valid = len_arr if len_ok else ep_arr
+        assert first_valid is not None
+        n_rows = first_valid.size
+        base_design = np.ones((n_rows, 1), dtype=np.float64)
 
-    return np.hstack([ones, b_gc, b_map, interaction], dtype=np.float64)
+    if not len_ok and not ep_ok:
+        return base_design
+
+    assert base_design is not None
+    extra_cols: list[NDArray[np.float64]] = [base_design]
+    n_rows = base_design.shape[0]
+
+    if len_ok:
+        assert len_arr is not None
+        if len_arr.size == n_rows:
+            k_len = min(4, max(2, int(np.unique(len_arr).size)))
+            spline_len = SplineTransformer(
+                n_knots=k_len,
+                degree=3,
+                knots="quantile",
+                extrapolation="linear",
+                include_bias=False,
+            )
+            b_len = np.asarray(
+                spline_len.fit_transform(len_arr.reshape(-1, 1)), dtype=np.float64
+            )
+            extra_cols.append(b_len)
+            if gc_ok:
+                assert gc_arr is not None
+                z_gc = np.asarray(scipy.stats.zscore(gc_arr, ddof=0), dtype=np.float64)
+                z_len = np.asarray(
+                    scipy.stats.zscore(len_arr, ddof=0), dtype=np.float64
+                )
+                extra_cols.append((z_gc * z_len)[:, np.newaxis])
+
+    if ep_ok:
+        assert ep_arr is not None
+        if ep_arr.size == n_rows:
+            k_ep = min(4, max(2, int(np.unique(ep_arr).size)))
+            spline_ep = SplineTransformer(
+                n_knots=k_ep,
+                degree=3,
+                knots="quantile",
+                extrapolation="linear",
+                include_bias=False,
+            )
+            b_ep = np.asarray(
+                spline_ep.fit_transform(ep_arr.reshape(-1, 1)), dtype=np.float64
+            )
+            extra_cols.append(b_ep)
+
+    return np.hstack(extra_cols, dtype=np.float64)
 
 
 def fit_sample_trend(
