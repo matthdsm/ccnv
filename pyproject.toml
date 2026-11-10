@@ -8,7 +8,7 @@ version = "0.1.0dev"
 description = "Copy-number analysis for shallow whole-genome sequencing"
 readme = "README.md"
 requires-python = ">=3.14"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 license-files = ["LICENSE.md"]
 authors = [
     { name = "Matthias De Smet" },

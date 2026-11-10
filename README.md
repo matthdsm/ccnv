@@ -101,4 +101,4 @@ All changes must be submitted via pull request and recorded in [CHANGELOG.md](CH
 
 ## License
 
-Licensed under the MIT License. See [LICENSE.md](LICENSE.md).
+Licensed under the GNU Affero General Public License v3 or later (AGPL-3.0-or-later). See [LICENSE.md](LICENSE.md).
