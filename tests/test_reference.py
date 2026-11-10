@@ -94,12 +94,20 @@ def _sample_table(
             "filters": asdict(ReadFilters()),
         },
     )
+    n_rows = len(contigs)
     return pa.table(
         {
             "contig": contigs,
             "start": pa.array(starts, type=pa.int64()),
             "end": pa.array(ends, type=pa.int64()),
             "count": pa.array(counts, type=pa.uint64()),
+            "fragment_lengths": pa.array([[]] * n_rows, type=pa.list_(pa.uint16())),
+            "endpoint_count": pa.array(
+                np.zeros(n_rows, dtype=np.uint32), type=pa.uint32()
+            ),
+            "frag_gc_sum": pa.array(
+                np.zeros(n_rows, dtype=np.float32), type=pa.float32()
+            ),
         },
         schema=SAMPLE_SCHEMA.with_metadata(metadata),
     )

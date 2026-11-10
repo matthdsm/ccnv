@@ -198,7 +198,10 @@ class TestParquetIO(unittest.TestCase):
                     "contig": pa.array(["chr1", "chr1"], type=pa.string()),
                     "start": pa.array([0, 100], type=pa.int64()),
                     "end": pa.array([100, 200], type=pa.int64()),
-                    "count": pa.array([10.0, 20.0], type=pa.float64()),
+                    "count": pa.array([10, 20], type=pa.uint64()),
+                    "fragment_lengths": pa.array([[], []], type=pa.list_(pa.uint16())),
+                    "endpoint_count": pa.array([0, 0], type=pa.uint32()),
+                    "frag_gc_sum": pa.array([0.0, 0.0], type=pa.float32()),
                 },
                 schema=SAMPLE_SCHEMA.with_metadata(metadata),
             )

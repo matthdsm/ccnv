@@ -104,12 +104,20 @@ def _build_synthetic_sample(
         },
     )
 
+    n_rows = len(contig_list)
     return pa.table(
         {
             "contig": pa.array(contig_list, type=pa.string()),
             "start": pa.array(starts_list, type=pa.int64()),
             "end": pa.array(ends_list, type=pa.int64()),
             "count": pa.array(counts_list, type=pa.uint64()),
+            "fragment_lengths": pa.array([[]] * n_rows, type=pa.list_(pa.uint16())),
+            "endpoint_count": pa.array(
+                np.zeros(n_rows, dtype=np.uint32), type=pa.uint32()
+            ),
+            "frag_gc_sum": pa.array(
+                np.zeros(n_rows, dtype=np.float32), type=pa.float32()
+            ),
         },
         schema=SAMPLE_SCHEMA.with_metadata(metadata),
     )

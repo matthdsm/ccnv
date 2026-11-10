@@ -236,6 +236,100 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             [[25.0, 50.0], [45.0, 90.0], [20.0, 40.0]],
         )
 
+    def test_rebin_sample_table_preserves_fragmentomic_columns(self) -> None:
+        from ccnv.features.cohort import rebin_sample_table
+
+        # Coarsen 50 bp -> 100 bp
+        table = make_sample_table(
+            [10, 20, 30, 40],
+            contigs=["chr1", "chr1", "chr1", "chr1"],
+            starts=[0, 50, 100, 150],
+            ends=[50, 100, 150, 200],
+            contig_lengths={"chr1": 200},
+            bin_size=50,
+            fragment_lengths=[[120, 130], [140], [150, 160], [170]],
+            endpoint_counts=[2, 1, 2, 1],
+            frag_gc_sums=[0.8, 0.4, 0.9, 0.5],
+        )
+
+        rebinned = rebin_sample_table(table, 100)
+        self.assertEqual(rebinned.num_rows, 2)
+        self.assertEqual(rebinned.column("start").to_pylist(), [0, 100])
+        self.assertEqual(rebinned.column("end").to_pylist(), [100, 200])
+
+        # Counts summed
+        np.testing.assert_allclose(rebinned.column("count").to_pylist(), [30.0, 70.0])
+        # Fragment lengths concatenated
+        self.assertEqual(
+            rebinned.column("fragment_lengths").to_pylist(),
+            [[120, 130, 140], [150, 160, 170]],
+        )
+        # Endpoint counts summed
+        self.assertEqual(rebinned.column("endpoint_count").to_pylist(), [3, 3])
+        # Frag GC sums summed
+        np.testing.assert_allclose(
+            rebinned.column("frag_gc_sum").to_pylist(), [1.2, 1.4], rtol=1e-5
+        )
+
+    def test_cohort_rejects_mixed_single_and_paired_end(self) -> None:
+        import json
+
+        from ccnv.features.cohort import validate_cohort
+        from ccnv.models.schemas import FRAGMENTOMICS_METADATA_KEY
+
+        # Sample 1: paired-end
+        s1 = make_sample_table([10, 20], contig_lengths={"chr1": 200}, bin_size=100)
+        s1_meta = dict(s1.schema.metadata)
+        s1_meta[FRAGMENTOMICS_METADATA_KEY] = json.dumps({"paired_end": True}).encode(
+            "utf-8"
+        )
+        s1 = s1.replace_schema_metadata(s1_meta)
+
+        # Sample 2: single-end
+        s2 = make_sample_table([10, 20], contig_lengths={"chr1": 200}, bin_size=100)
+        s2_meta = dict(s2.schema.metadata)
+        s2_meta[FRAGMENTOMICS_METADATA_KEY] = json.dumps({"paired_end": False}).encode(
+            "utf-8"
+        )
+        s2 = s2.replace_schema_metadata(s2_meta)
+
+        with self.assertRaisesRegex(
+            ReferenceError,
+            "mixed single-end and paired-end cohort controls are not supported",
+        ):
+            validate_cohort([s1, s2])
+
+    def test_load_sample_or_extract_parquet_and_bam(self) -> None:
+        import tempfile
+
+        from published_fixtures import (
+            PUBLISHED_BIN_SIZE,
+            PUBLISHED_CRAM,
+            PUBLISHED_CRAM_URL,
+            ensure_published_fasta,
+            ensure_published_file,
+        )
+
+        from ccnv.io.parquet import load_sample_or_extract, write_sample_parquet
+
+        table = make_sample_table([5, 10], contig_lengths={"chr1": 200}, bin_size=100)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "sample.parquet"
+            write_sample_parquet(table, p)
+            loaded = load_sample_or_extract(p)
+            self.assertEqual(loaded.num_rows, table.num_rows)
+            self.assertEqual(loaded.column("count").to_pylist(), [5, 10])
+
+        cram = ensure_published_file(PUBLISHED_CRAM, PUBLISHED_CRAM_URL)
+        fasta = ensure_published_fasta()
+        cram_table = load_sample_or_extract(
+            cram, fasta=fasta, bin_size=PUBLISHED_BIN_SIZE
+        )
+        self.assertEqual(cram_table.num_rows, 468)
+        self.assertIn("fragment_lengths", cram_table.column_names)
+        self.assertIn("endpoint_count", cram_table.column_names)
+        self.assertIn("frag_gc_sum", cram_table.column_names)
+
 
 if __name__ == "__main__":
     unittest.main()

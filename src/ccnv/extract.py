@@ -327,6 +327,16 @@ def extract_sample_table(
                     starts.size,
                     contig_qc["reads_kept"],
                 )
+                logger.debug(
+                    "contig %s filter drops: %d unmapped, %d low_mapq, "
+                    "%d duplicates, %d secondary, %d supplementary",
+                    task.name,
+                    contig_qc["filter_unmapped"],
+                    contig_qc["filter_mapq"],
+                    contig_qc["filter_duplicate"],
+                    contig_qc["filter_secondary"],
+                    contig_qc["filter_supplementary"],
+                )
                 contig_arrays.append(np.full(starts.size, task.name, dtype=object))
                 start_arrays.append(starts)
                 end_arrays.append(ends)
@@ -338,6 +348,16 @@ def extract_sample_table(
         bam.close()
 
     qc = build_sample_qc(qc)
+    logger.debug(
+        "extract QC summary: %d reads examined, %d kept (%.1f%%), %d duplicate, "
+        "%d low_mapq, %d unmapped",
+        qc["reads_seen"],
+        qc["reads_kept"],
+        (qc["reads_kept"] / qc["reads_seen"] * 100) if qc["reads_seen"] else 0.0,
+        qc["filter_duplicate"],
+        qc["filter_mapq"],
+        qc["filter_unmapped"],
+    )
     ref_id = {
         "n_contigs": len(profile.names),
         "contig_order": list(profile.names),

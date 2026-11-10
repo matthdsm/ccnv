@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from collections.abc import Mapping, Sequence
@@ -16,6 +17,7 @@ from numpy.typing import NDArray
 
 from ccnv.features.binning import bin_intervals, rebin_counts
 from ccnv.models import (
+    FRAGMENTOMICS_METADATA_KEY,
     ArtifactKind,
     ReferenceError,
     SchemaError,
@@ -360,14 +362,26 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
         contig_lengths={str(k): int(v) for k, v in contig_lengths.items()},
         values=meta_values,
     )
-    new_schema = pa.schema(
-        [
-            pa.field("contig", pa.string(), nullable=False),
-            pa.field("start", pa.int64(), nullable=False),
-            pa.field("end", pa.int64(), nullable=False),
-            pa.field("count", pa.float64(), nullable=False),
-        ]
-    ).with_metadata(new_metadata)
+    has_frag = "fragment_lengths" in table.column_names
+    has_ep = "endpoint_count" in table.column_names
+    has_gc = "frag_gc_sum" in table.column_names
+
+    schema_fields = [
+        pa.field("contig", pa.string(), nullable=False),
+        pa.field("start", pa.int64(), nullable=False),
+        pa.field("end", pa.int64(), nullable=False),
+        pa.field("count", pa.float64(), nullable=False),
+    ]
+    if has_frag:
+        schema_fields.append(
+            pa.field("fragment_lengths", pa.list_(pa.uint16()), nullable=False)
+        )
+    if has_ep:
+        schema_fields.append(pa.field("endpoint_count", pa.uint32(), nullable=False))
+    if has_gc:
+        schema_fields.append(pa.field("frag_gc_sum", pa.float32(), nullable=False))
+
+    new_schema = pa.schema(schema_fields).with_metadata(new_metadata)
 
     intervals_contained = False
     if (
@@ -393,37 +407,94 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
         df = pl.from_arrow(table)
         assert isinstance(df, pl.DataFrame)
         if df.height > 0:
-            agg_df = (
-                df.select(
-                    [
-                        pl.col("contig").cast(pl.String),
-                        ((pl.col("start") // target_bin_size) * target_bin_size)
-                        .cast(pl.Int64)
-                        .alias("start"),
-                        pl.col("count").cast(pl.Float64),
-                    ]
+            agg_exprs = [pl.col("count").sum().alias("count")]
+            select_cols = [
+                pl.col("contig").cast(pl.String),
+                ((pl.col("start") // target_bin_size) * target_bin_size)
+                .cast(pl.Int64)
+                .alias("start"),
+                pl.col("count").cast(pl.Float64),
+            ]
+            if has_frag:
+                agg_exprs.append(
+                    pl.col("fragment_lengths").list.explode().alias("fragment_lengths")
                 )
+                select_cols.append(pl.col("fragment_lengths"))
+            if has_ep:
+                agg_exprs.append(
+                    pl.col("endpoint_count")
+                    .sum()
+                    .cast(pl.UInt32)
+                    .alias("endpoint_count")
+                )
+                select_cols.append(pl.col("endpoint_count"))
+            if has_gc:
+                agg_exprs.append(
+                    pl.col("frag_gc_sum").sum().cast(pl.Float32).alias("frag_gc_sum")
+                )
+                select_cols.append(pl.col("frag_gc_sum"))
+
+            agg_df = (
+                df.select(select_cols)
                 .group_by(["contig", "start"], maintain_order=True)
-                .agg(pl.col("count").sum().alias("count"))
-            )
-            result_df = target_grid.join(
-                agg_df, on=["contig", "start"], how="left"
-            ).with_columns(pl.col("count").fill_null(0.0).cast(pl.Float64))
-        else:
-            result_df = target_grid.with_columns(
-                pl.lit(0.0, dtype=pl.Float64).alias("count")
+                .agg(agg_exprs)
             )
 
+            with_cols = [pl.col("count").fill_null(0.0).cast(pl.Float64)]
+            if has_frag:
+                with_cols.append(
+                    pl.col("fragment_lengths").fill_null(
+                        pl.lit([], dtype=pl.List(pl.UInt16))
+                    )
+                )
+            if has_ep:
+                with_cols.append(pl.col("endpoint_count").fill_null(0).cast(pl.UInt32))
+            if has_gc:
+                with_cols.append(pl.col("frag_gc_sum").fill_null(0.0).cast(pl.Float32))
+
+            result_df = target_grid.join(
+                agg_df, on=["contig", "start"], how="left"
+            ).with_columns(with_cols)
+        else:
+            with_cols = [pl.lit(0.0, dtype=pl.Float64).alias("count")]
+            if has_frag:
+                with_cols.append(
+                    pl.lit([], dtype=pl.List(pl.UInt16)).alias("fragment_lengths")
+                )
+            if has_ep:
+                with_cols.append(pl.lit(0, dtype=pl.UInt32).alias("endpoint_count"))
+            if has_gc:
+                with_cols.append(pl.lit(0.0, dtype=pl.Float32).alias("frag_gc_sum"))
+            result_df = target_grid.with_columns(with_cols)
+
         arrow_table = result_df.to_arrow()
-        return pa.Table.from_arrays(
-            [
-                arrow_table.column("contig"),
-                arrow_table.column("start"),
-                arrow_table.column("end"),
-                arrow_table.column("count"),
-            ],
-            schema=new_schema,
-        )
+        table_cols = {
+            "contig": pa.array(
+                arrow_table.column("contig").to_pylist(), type=pa.string()
+            ),
+            "start": pa.array(arrow_table.column("start").to_numpy(), type=pa.int64()),
+            "end": pa.array(arrow_table.column("end").to_numpy(), type=pa.int64()),
+            "count": pa.array(
+                arrow_table.column("count").to_numpy(), type=pa.float64()
+            ),
+        }
+        if has_frag:
+            table_cols["fragment_lengths"] = pa.array(
+                arrow_table.column("fragment_lengths").to_pylist(),
+                type=pa.list_(pa.uint16()),
+            )
+        if has_ep:
+            table_cols["endpoint_count"] = pa.array(
+                arrow_table.column("endpoint_count").to_numpy(),
+                type=pa.uint32(),
+            )
+        if has_gc:
+            table_cols["frag_gc_sum"] = pa.array(
+                arrow_table.column("frag_gc_sum").to_numpy(),
+                type=pa.float32(),
+            )
+
+        return pa.table(table_cols, schema=new_schema)
 
     contig_arr = np.asarray(table.column("contig"))
     start_col = np.asarray(
@@ -484,27 +555,40 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
     empty_str = np.array([], dtype=object)
     empty_i64 = np.empty(0, dtype=np.int64)
     empty_f64 = np.empty(0, dtype=np.float64)
-    return pa.table(
-        {
-            "contig": pa.array(
-                np.concatenate(new_contigs) if new_contigs else empty_str,
-                type=pa.string(),
-            ),
-            "start": pa.array(
-                np.concatenate(new_starts) if new_starts else empty_i64,
-                type=pa.int64(),
-            ),
-            "end": pa.array(
-                np.concatenate(new_ends) if new_ends else empty_i64,
-                type=pa.int64(),
-            ),
-            "count": pa.array(
-                np.concatenate(new_counts) if new_counts else empty_f64,
-                type=pa.float64(),
-            ),
-        },
-        schema=new_schema,
-    )
+
+    out_cols = {
+        "contig": pa.array(
+            np.concatenate(new_contigs) if new_contigs else empty_str,
+            type=pa.string(),
+        ),
+        "start": pa.array(
+            np.concatenate(new_starts) if new_starts else empty_i64,
+            type=pa.int64(),
+        ),
+        "end": pa.array(
+            np.concatenate(new_ends) if new_ends else empty_i64,
+            type=pa.int64(),
+        ),
+        "count": pa.array(
+            np.concatenate(new_counts) if new_counts else empty_f64,
+            type=pa.float64(),
+        ),
+    }
+    n_rows = len(out_cols["contig"])
+    if has_frag:
+        out_cols["fragment_lengths"] = pa.array(
+            [[]] * n_rows, type=pa.list_(pa.uint16())
+        )
+    if has_ep:
+        out_cols["endpoint_count"] = pa.array(
+            np.zeros(n_rows, dtype=np.uint32), type=pa.uint32()
+        )
+    if has_gc:
+        out_cols["frag_gc_sum"] = pa.array(
+            np.zeros(n_rows, dtype=np.float32), type=pa.float32()
+        )
+
+    return pa.table(out_cols, schema=new_schema)
 
 
 def _parse_sample_table(
@@ -569,9 +653,29 @@ def _assemble_cohort(
     counts_list: list[NDArray[np.float64]] = []
     identities: list[object] = []
 
+    def _is_paired(meta: dict[str, object]) -> bool:
+        for k in ("fragmentomics", "ccnv.fragmentomics", FRAGMENTOMICS_METADATA_KEY):
+            frag = meta.get(k)
+            if isinstance(frag, dict):
+                return bool(frag.get("paired_end", False))
+            if isinstance(frag, (bytes, str)):
+                try:
+                    loaded = json.loads(frag)
+                    if isinstance(loaded, dict):
+                        return bool(loaded.get("paired_end", False))
+                except json.JSONDecodeError, UnicodeDecodeError, TypeError:
+                    continue
+        return False
+
+    first_paired = _is_paired(first_meta)
+
     for path, (metadata, lengths, contigs, starts, ends, counts) in zip(
         paths, parsed, strict=True
     ):
+        if _is_paired(metadata) != first_paired:
+            raise ReferenceError(
+                "mixed single-end and paired-end cohort controls are not supported"
+            )
         bin_size = int(metadata["bin_size"])
         if lengths != expected_lengths:
             raise ReferenceError(f"{path}: contig_lengths do not match the cohort")

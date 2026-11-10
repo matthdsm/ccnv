@@ -60,12 +60,16 @@ def _sample_table(*, include_chr2: bool = True) -> pa.Table:
             "filters": asdict(ReadFilters()),
         },
     )
+    n_bins = len(contigs)
     return pa.table(
         {
             "contig": contigs,
-            "start": pa.array([0] * len(contigs), type=pa.int64()),
-            "end": pa.array([100, 80][: len(contigs)], type=pa.int64()),
-            "count": pa.array([10, 10][: len(contigs)], type=pa.uint64()),
+            "start": pa.array([0] * n_bins, type=pa.int64()),
+            "end": pa.array([100, 80][:n_bins], type=pa.int64()),
+            "count": pa.array([10, 10][:n_bins], type=pa.uint64()),
+            "fragment_lengths": pa.array([[]] * n_bins, type=pa.list_(pa.uint16())),
+            "endpoint_count": pa.array([0] * n_bins, type=pa.uint32()),
+            "frag_gc_sum": pa.array([0.0] * n_bins, type=pa.float32()),
         },
         schema=SAMPLE_SCHEMA.with_metadata(metadata),
     )
@@ -271,12 +275,20 @@ def _prenatal_sample_table() -> pa.Table:
             cnt = 5 if c == "chrY" else 100
             counts.append(cnt)
 
+    n_bins = len(contigs)
     return pa.table(
         {
             "contig": contigs,
             "start": pa.array(starts, type=pa.int64()),
             "end": pa.array(ends, type=pa.int64()),
             "count": pa.array(counts, type=pa.uint64()),
+            "fragment_lengths": pa.array([[]] * n_bins, type=pa.list_(pa.uint16())),
+            "endpoint_count": pa.array(
+                np.zeros(n_bins, dtype=np.uint32), type=pa.uint32()
+            ),
+            "frag_gc_sum": pa.array(
+                np.zeros(n_bins, dtype=np.float32), type=pa.float32()
+            ),
         },
         schema=SAMPLE_SCHEMA.with_metadata(metadata),
     )
@@ -593,6 +605,11 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
                     "start": pa.array([0, 50, 0, 50], type=pa.int64()),
                     "end": pa.array([50, 100, 50, 80], type=pa.int64()),
                     "count": pa.array([5, 5, 6, 4], type=pa.uint64()),
+                    "fragment_lengths": pa.array(
+                        [[], [], [], []], type=pa.list_(pa.uint16())
+                    ),
+                    "endpoint_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
+                    "frag_gc_sum": pa.array([0.0, 0.0, 0.0, 0.0], type=pa.float32()),
                 },
                 schema=SAMPLE_SCHEMA.with_metadata(sample_metadata),
             )
@@ -638,6 +655,11 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
                     "start": pa.array([0, 100, 0], type=pa.int64()),
                     "end": pa.array([100, 150, 80], type=pa.int64()),
                     "count": pa.array([10, 5, 10], type=pa.uint64()),
+                    "fragment_lengths": pa.array(
+                        [[], [], []], type=pa.list_(pa.uint16())
+                    ),
+                    "endpoint_count": pa.array([0, 0, 0], type=pa.uint32()),
+                    "frag_gc_sum": pa.array([0.0, 0.0, 0.0], type=pa.float32()),
                 },
                 schema=SAMPLE_SCHEMA.with_metadata(sample_metadata),
             )
@@ -657,6 +679,9 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
                 "start": pa.array([0], type=pa.int64()),
                 "end": pa.array([100], type=pa.int64()),
                 "count": pa.array([10], type=pa.uint64()),
+                "fragment_lengths": pa.array([[]], type=pa.list_(pa.uint16())),
+                "endpoint_count": pa.array([0], type=pa.uint32()),
+                "frag_gc_sum": pa.array([0.0], type=pa.float32()),
             },
             schema=SAMPLE_SCHEMA.with_metadata(
                 metadata_for(
@@ -822,7 +847,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
             with open(qc_json, encoding="utf-8") as f:
                 qc_data = json.load(f)
             self.assertEqual(qc_data["mode"], "germline")
-            self.assertEqual(qc_data["schema_version"], "2.0.0")
+            self.assertEqual(qc_data["schema_version"], "1.0.0")
 
             with gzip.open(bins_bed, "rt") as h:
                 bin_lines = h.read().splitlines()

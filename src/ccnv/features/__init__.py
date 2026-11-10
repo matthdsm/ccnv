@@ -24,6 +24,10 @@ from ccnv.features.covariates import (
     mask_covariates,
     validate_min_mappability,
 )
+from ccnv.features.fragmentomics import (
+    evaluate_weighted_coverage,
+    extract_bin_fragmentomic_covariates,
+)
 from ccnv.features.prenatal import (
     annotate_prenatal_segments,
     classify_sca,
@@ -43,6 +47,8 @@ __all__ = [
     "cohort_from_fasta",
     "correct_covariate_bias",
     "covariate_features",
+    "evaluate_weighted_coverage",
+    "extract_bin_fragmentomic_covariates",
     "fit_prenatal_models",
     "infer_sample_sexes",
     "mask_covariates",

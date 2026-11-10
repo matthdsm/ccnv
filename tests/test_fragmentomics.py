@@ -344,6 +344,77 @@ class TestFragmentomicsKernels(unittest.TestCase):
         )
         self.assertEqual(empty_res, (0.0, 0.0))
 
+    def test_evaluate_weighted_coverage(self) -> None:
+        from helpers import make_sample_table
+
+        from ccnv.features.fragmentomics import evaluate_weighted_coverage
+
+        # 3 bins: bin 0 has lengths [100, 150], bin 1 is empty, bin 2 has length [200]
+        frag_lens = [[100, 150], [], [200]]
+        table = make_sample_table(
+            [2, 0, 1],
+            contigs=["chr1", "chr1", "chr1"],
+            starts=[0, 100, 200],
+            ends=[100, 200, 300],
+            fragment_lengths=frag_lens,
+        )
+
+        weights_571 = np.ones(571, dtype=np.float64)
+        # Weight for length 100: index 100 - 30 = 70 -> weight 2.0
+        # Weight for length 150: index 150 - 30 = 120 -> weight 0.5
+        # Weight for length 200: index 200 - 30 = 170 -> weight 3.0
+        weights_571[100 - 30] = 2.0
+        weights_571[150 - 30] = 0.5
+        weights_571[200 - 30] = 3.0
+
+        eff_cov = evaluate_weighted_coverage(table, weights_571, shift_bp=0.0)
+        self.assertEqual(len(eff_cov), 3)
+        self.assertAlmostEqual(eff_cov[0], 2.0 + 0.5)
+        self.assertAlmostEqual(eff_cov[1], 0.0)
+        self.assertAlmostEqual(eff_cov[2], 3.0)
+
+        # Fallback to count when fragment_lengths is empty (single-end)
+        table_se = make_sample_table(
+            [5, 10, 15],
+            contigs=["chr1", "chr1", "chr1"],
+            starts=[0, 100, 200],
+            ends=[100, 200, 300],
+            fragment_lengths=[[], [], []],
+        )
+        eff_se = evaluate_weighted_coverage(table_se, weights_571)
+        np.testing.assert_allclose(eff_se, [5.0, 10.0, 15.0])
+
+    def test_extract_bin_fragmentomic_covariates(self) -> None:
+        from helpers import make_sample_table
+
+        from ccnv.features.fragmentomics import extract_bin_fragmentomic_covariates
+
+        frag_lens = [[120, 140], [], [180]]
+        table = make_sample_table(
+            [2, 0, 1],
+            contigs=["chr1", "chr1", "chr1"],
+            starts=[0, 100, 200],
+            ends=[100, 200, 300],
+            fragment_lengths=frag_lens,
+            endpoint_counts=[4, 0, 2],
+        )
+
+        mean_lens, ep_ratios = extract_bin_fragmentomic_covariates(table)
+        self.assertEqual(len(mean_lens), 3)
+        self.assertEqual(len(ep_ratios), 3)
+
+        # Bin 0: mean(120, 140) = 130.0
+        self.assertAlmostEqual(mean_lens[0], 130.0)
+        # Bin 2: 180.0
+        self.assertAlmostEqual(mean_lens[2], 180.0)
+        # Bin 1 (empty): imputed to median of non-empty bins = median([130, 180]) = 155.0
+        self.assertAlmostEqual(mean_lens[1], 155.0)
+
+        # Endpoint ratios: 4/2 = 2.0, 0/1 = 0.0, 2/1 = 2.0
+        self.assertAlmostEqual(ep_ratios[0], 2.0)
+        self.assertAlmostEqual(ep_ratios[1], 0.0)
+        self.assertAlmostEqual(ep_ratios[2], 2.0)
+
 
 if __name__ == "__main__":
     unittest.main()
