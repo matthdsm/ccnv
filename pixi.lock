@@ -7756,7 +7756,7 @@ packages:
   - jinja2
   - jsonschema>=4.20.0
   - numpy
-  - polars
+  - polars>=2,<3
   - polars-runtime-compat
   - pyarrow
   - pybigwig
