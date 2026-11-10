@@ -91,17 +91,24 @@ class TestDocsMarkdown(unittest.TestCase):
             if not file_path.exists():
                 continue
             content = file_path.read_text(encoding="utf-8")
-            # Strip inline code spans and code blocks before checking math macros
-            stripped_content = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
-            stripped_content = re.sub(r"`[^`\n]*`", "", stripped_content)
+            # Mask code blocks and inline spans while preserving newline offsets
+            stripped_content = re.sub(
+                r"```.*?```",
+                lambda m: "\n" * m.group(0).count("\n"),
+                content,
+                flags=re.DOTALL,
+            )
+            stripped_content = re.sub(
+                r"`[^`\n]*`", lambda m: " " * len(m.group(0)), stripped_content
+            )
             for m in re.finditer(r"\\operatorname\*?\{", stripped_content):
-                lineno = content[: m.start()].count("\n") + 1
+                lineno = stripped_content[: m.start()].count("\n") + 1
                 errors.append(
                     f"{file_path.relative_to(self.repo_root)}:{lineno} "
                     r"disallowed \operatorname macro found; use \mathrm or \text instead"
                 )
             for m in re.finditer(r"\^(\*|\\top|\w+-\d+)", stripped_content):
-                lineno = content[: m.start()].count("\n") + 1
+                lineno = stripped_content[: m.start()].count("\n") + 1
                 errors.append(
                     f"{file_path.relative_to(self.repo_root)}:{lineno} "
                     f"unbraced superscript '^{m.group(1)}' found; wrap in {{...}}"
@@ -117,13 +124,20 @@ class TestDocsMarkdown(unittest.TestCase):
             if not file_path.exists():
                 continue
             content = file_path.read_text(encoding="utf-8")
-            # Strip inline code spans `...` and code blocks ```...``` before checking math
-            stripped_content = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
-            stripped_content = re.sub(r"`[^`\n]*`", "", stripped_content)
+            # Mask code blocks and inline spans while preserving newline offsets
+            stripped_content = re.sub(
+                r"```.*?```",
+                lambda m: "\n" * m.group(0).count("\n"),
+                content,
+                flags=re.DOTALL,
+            )
+            stripped_content = re.sub(
+                r"`[^`\n]*`", lambda m: " " * len(m.group(0)), stripped_content
+            )
             for m in re.finditer(r"(?<!\\)\$(?!\$)(.*?)(?<!\\)\$", stripped_content):
                 inner = m.group(1)
                 if inner.startswith(" ") or inner.endswith(" "):
-                    lineno = content[: m.start()].count("\n") + 1
+                    lineno = stripped_content[: m.start()].count("\n") + 1
                     errors.append(
                         f"{file_path.relative_to(self.repo_root)}:{lineno} "
                         f"space-padded inline math: '${inner}'"

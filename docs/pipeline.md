@@ -8,7 +8,7 @@ flowchart LR
     C["Control BAMs / CRAMs"] -->|ccnv extract| D["Control Parquets (<ctrl>.ccnv)"]
     D -->|ccnv reference| E["Reference Parquet (<reference>.ccnv)"]
     D -->|ccnv reference| H["Reference QC (<reference>_qc.json)"]
-    F["Reference FASTA"] -.->|ccnv reference (flat)| E
+    F["Reference FASTA"] -.->|"ccnv reference (flat)"| E
     E -->|ccnv ref-qc| H
     B -->|ccnv predict| G["Prediction Artifacts (BED.gz, VCF.gz, HTML)"]
     E -->|ccnv predict| G

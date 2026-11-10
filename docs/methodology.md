@@ -76,10 +76,15 @@ Given a raw counts matrix $\mathbf{C} \in \mathbb{R}_{\ge 0}^{B \times S}$ acros
 `ccnv` implements the DESeq2 Median-of-Ratios normalization (Anders & Huber, 2010; Love et al., 2014) in pure NumPy/Polars with a $50\%$ outlier breakdown point. For the usable bin mask $\mathcal{U} \subseteq \{0, \dots, B-1\}$ and bins with positive counts in all samples $\mathcal{I}_{+} = \{i \in \mathcal{U} : \prod_{s=1}^S C_{i, s} > 0\}$:
 
 1. Compute the geometric mean pseudo-reference for each bin across all $S$ samples:
+
    $$g_i = \exp\left(\frac{1}{S}\sum_{s=1}^S \ln C_{i, s}\right) \quad \forall i \in \mathcal{I}_{+}$$
+
 2. For each sample $s \in \{1, \dots, S\}$, calculate its raw size factor as the median ratio against the pseudo-reference:
+
    $$\hat{s}_s = \mathrm{median}_{i \in \mathcal{I}_{+}}\left(\frac{C_{i, s}}{g_i}\right)$$
+
 3. Scale raw factors so that the median sample's total depth is preserved, aligning counts with standard sequencing depth:
+
    $$s_s = \hat{s}_s \cdot \mathrm{median}_{s'}\left(\frac{\sum_{i \in \mathcal{U}} C_{i, s'}}{\hat{s}_{s'}}\right), \qquad \tilde{c}_{i, s} = \frac{C_{i, s}}{s_s}$$
 
 When $|\mathcal{I}_{+}| < 2$ or $S < 2$ (e.g., in single-sample prediction without a cohort), the normalization smoothly falls back to positive-median scaling or total-sum division over usable bins $\mathcal{U}$.
@@ -93,7 +98,9 @@ $$\text{usable}_{\text{cov}}(b) \iff T_b > 0.05 \cdot \mathrm{median}_{i : T_i >
 When GC content $\mathbf{g} \in [0, 1]^B$, ambiguous base indicator $\mathbf{n}_{\text{mask}} \in \{\text{true}, \text{false}\}^B$, and mappability $\mathbf{m} \in [0, 1]^B$ tracks are provided (`src/ccnv/io/tracks.py`, `src/ccnv/features/covariates.py:mask_covariates`), a bin $b$ is masked if:
 
 1. From FASTA GC extraction (`src/ccnv/io/tracks.py:load_gc_track`), the bin contains zero A/C/G/T/U bases or an ambiguous (`N`) base fraction exceeding $\tau_N = 0.5$:
+
    $$\frac{n_{\text{total}}(b) - \left(n_{\text{GC}}(b) + n_{\text{AT}}(b)\right)}{n_{\text{total}}(b)} > 0.5$$
+
 2. Its mappability score falls below $\tau_{\text{map}}$ (`min_mappability`, default $0.5$): $m_b < \tau_{\text{map}}$.
 3. Its GC proportion is non-finite or outside $[0, 1]$.
 
@@ -203,7 +210,7 @@ Rather than fixing PCA rank to an arbitrary constant, `ccnv` determines the opti
 
 $$\beta = \frac{\min(S, U)}{\max(S, U)}, \qquad \omega(\beta) = 0.56\beta^3 - 0.95\beta^2 + 1.82\beta + 1.43, \qquad \tau_{\text{SVHT}} = \omega(\beta)\mathrm{median}_{k}(s_k)$$
 
-$$P = \mathrm{clip}\!\left(\#\{k : s_k > \tau_{\text{SVHT}}\}, \; 1, \; \min(P_{\max}, S, U)\right)$$
+$$P = \mathrm{clip}\!\left(|\{k : s_k > \tau_{\text{SVHT}}\}|, \; 1, \; \min(P_{\max}, S, U)\right)$$
 
 Gavish & Donoho (2014) proved that $\tau_{\text{SVHT}}$ minimizes asymptotic Mean Squared Error by cleanly separating low-rank systemic signals from the Marchenko-Pastur bulk noise distribution (Marchenko & Pastur, 1967).
 
@@ -325,7 +332,9 @@ Let $\mathbf{y}^{\text{corr}} \in \mathbb{R}^U$ be the test sample's PCA-project
 In each iteration $t$:
 1. Eligible bins are filtered: $\mathcal{E}^{(t-1)} = \{i : \text{finite}(y_i^{\text{corr}}) \land |Z_i^{(t-1)}| < \tau_{\text{mask}}\}$, where $\tau_{\text{mask}} = \Phi^{-1}(0.99) = 2.326347874$.
 2. For each bin, its within-sample baseline is computed across eligible surviving neighbors:
+
    $$b_i^{(t)} = \mathrm{nanmedian}_{j \in \mathcal{N}_i \cap \mathcal{E}^{(t-1)}}\!\left(y_j^{\text{corr}}\right), \quad r_i^{(t)} = \log_2\!\left(\frac{y_i^{\text{corr}}}{b_i^{(t)}}\right)$$
+
    $$Z_i^{(t)} = \frac{r_i^{(t)} - \mu_{\text{null}, i}}{\tilde{\sigma}_{\text{null}, i}}$$
 
 After $M$ iterations, global median centering removes residual genome-wide baseline shift: $\tilde{r}_i = r_i^{(M)} - \mathrm{median}(r^{(M)})$.
@@ -377,8 +386,11 @@ In `src/ccnv/predict.py:segment_and_call`, segments are summarized via Polars ex
 `ccnv` implements the Stouffer precision-weighted combination (Stouffer et al., 1949; Lipták, 1958; Whitlock, 2005) with Newey-West / AR(1) spatial autocorrelation correction (Diskin et al., 2008; Newey & West, 1987):
 
 1. Estimate per-contig lag-1 autocorrelation natively in Polars:
+
    $$\hat{\rho}_{1, c} = \mathrm{clip}\!\left(\mathrm{Corr}_{i \in \mathcal{U}_c}(Z_i, Z_{i-1}), \; 0.0, \; 0.95\right)$$
+
 2. For each segment $S_m$ with $N_m$ usable bins, evaluate the autocorrelation-adjusted Stouffer Z-score:
+
    $$Z_{\text{seg}}(S_m) = \frac{\sum_{i \in S_m \cap \mathcal{U}} w_i Z_i}{\sqrt{\left(\sum_{i \in S_m \cap \mathcal{U}} w_i^2\right)\left(1 + \frac{2(N_m - 1)}{N_m}\hat{\rho}_{1, c}\right)}}$$
 
 Stouffer weighting scales detection sensitivity with $\sqrt{N_m}$ while the AR(1) factor $1 + \frac{2(N_m - 1)}{N_m}\hat{\rho}_{1, c}$ prevents false-positive inflation from local genomic correlation waves.
@@ -418,7 +430,7 @@ In the $p \gg n$ regime ($B_Y \approx 2{,}000$ bins vs. $S \approx 20\text{--}10
 
 `ccnv` fits non-negative Elastic Net with cross-validation (`src/ccnv/stats/prenatal_math.py:fit_elasticnet_ffy`, `sklearn.linear_model.ElasticNetCV(positive=True)`):
 
-$$\min_{\mathbf{w} \ge \mathbf{0}} \frac{1}{2S}\left\|\mathbf{y}_{\text{FF}} - \mathbf{X}_Y \mathbf{w}\right\|_2^2 + \alpha \rho \|\mathbf{w}\|_1 + \frac{\alpha(1 - \rho)}{2}\|\mathbf{w}\|_2^2, \qquad \rho \in \{0.01, 0.05, 0.10\}$$
+$$\min_{\mathbf{w} \ge \mathbf{0}} \frac{1}{2S}\left\Vert\mathbf{y}_{\text{FF}} - \mathbf{X}_Y \mathbf{w}\right\Vert_2^2 + \alpha \rho \|\mathbf{w}\|_1 + \frac{\alpha(1 - \rho)}{2}\|\mathbf{w}\|_2^2, \qquad \rho \in \{0.01, 0.05, 0.10\}$$
 
 The $L_2$ penalty enforces the grouping effect, retaining all co-varying euchromatic `chrY` bins and eliminating out-of-sample overfit bias.
 
