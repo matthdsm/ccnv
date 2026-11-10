@@ -12,11 +12,12 @@ import pyarrow as pa
 from ccnv.models.config import DEFAULT_BIN_SIZE, DEFAULT_MIN_MAPPABILITY, AnalysisMode
 from ccnv.models.exceptions import SchemaError
 
-SCHEMA_VERSION: Final[str] = "2.0.0"
-SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset({"2.0.0"})
+SCHEMA_VERSION: Final[str] = "1.0.0"
+SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset({"1.0.0"})
 COORDINATE_SYSTEM: Final[str] = "0-based-half-open"
 METADATA_PREFIX: Final[str] = "ccnv."
 PRENATAL_METADATA_KEY: Final[bytes] = b"ccnv.prenatal"
+FRAGMENTOMICS_METADATA_KEY: Final[bytes] = b"ccnv.fragmentomics"
 
 BRANCH_AUTOSOMAL: Final[str] = "autosomal"
 BRANCH_FEMALE_SEX: Final[str] = "female_sex"
@@ -48,6 +49,46 @@ class ArtifactKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class FragmentomicsMetadata:
+    """Sample-level multi-modal fragmentomic metrics serialized under ccnv.fragmentomics."""
+
+    paired_end: bool
+    total_paired_fragments: int
+    chromatosome_mode_bp: float
+    core_shoulder_bp: float
+    sizing_shift_bp: float
+    self_referenced_peak_ratio: float
+    dinucleosome_fraction: float
+    high_mw_fraction: float
+    helical_10bp_amplitude: float
+    helical_10bp_phase: float
+    motif_diversity_score: float
+    hist_autosomal: list[int]
+    hist_chry: list[int]
+    hist_chrx: list[int]
+    end_motif_counts: list[int]
+
+    def __post_init__(self) -> None:
+        """Validate fragmentomics vector dimensions."""
+        if len(self.hist_autosomal) != 571:
+            raise ValueError(
+                f"hist_autosomal must contain 571 elements, got {len(self.hist_autosomal)}"
+            )
+        if len(self.hist_chry) != 571:
+            raise ValueError(
+                f"hist_chry must contain 571 elements, got {len(self.hist_chry)}"
+            )
+        if len(self.hist_chrx) != 571:
+            raise ValueError(
+                f"hist_chrx must contain 571 elements, got {len(self.hist_chrx)}"
+            )
+        if len(self.end_motif_counts) != 256:
+            raise ValueError(
+                f"end_motif_counts must contain 256 elements, got {len(self.end_motif_counts)}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class PrenatalModelMetadata:
     """Scalar parameters for prenatal models serialized under ccnv.prenatal."""
 
@@ -73,6 +114,13 @@ class PrenatalModelMetadata:
     ffa_std: float = 0.02
     ffx_std: float = 0.025
     ffa_logit_mode: bool = False
+    p_fetal_density: list[float] | None = None
+    p_maternal_density: list[float] | None = None
+    ff_frag_weights: list[float] | None = None
+    ff_frag_bias: float | None = None
+    ff_frag_feature_mean: list[float] | None = None
+    ff_frag_feature_scale: list[float] | None = None
+    ff_size_std: float = 0.018
 
     @property
     def preface_std(self) -> float:
@@ -421,6 +469,9 @@ SAMPLE_SCHEMA: Final[pa.Schema] = pa.schema(
         pa.field("start", pa.int64(), nullable=False),
         pa.field("end", pa.int64(), nullable=False),
         pa.field("count", pa.uint64(), nullable=False),
+        pa.field("fragment_lengths", pa.list_(pa.uint16()), nullable=False),
+        pa.field("endpoint_count", pa.uint32(), nullable=False),
+        pa.field("frag_gc_sum", pa.float32(), nullable=False),
     ]
 )
 
@@ -857,6 +908,7 @@ __all__ = [
     "BRANCH_PRENATAL_FFY",
     "CNV_REFERENCE_BRANCHES",
     "COORDINATE_SYSTEM",
+    "FRAGMENTOMICS_METADATA_KEY",
     "KNOWN_REFERENCE_BRANCHES",
     "METADATA_PREFIX",
     "PRENATAL_METADATA_KEY",
@@ -865,6 +917,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_VERSIONS",
     "ArtifactKind",
+    "FragmentomicsMetadata",
     "PrenatalModelMetadata",
     "ReferenceMetadata",
     "SchemaError",

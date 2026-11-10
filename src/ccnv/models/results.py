@@ -10,7 +10,7 @@ from numpy.typing import NDArray
 CallType = Literal["gain", "loss"]
 SCACall = Literal["XX", "XY", "XO", "XXX", "XXY", "XYY", "DISCORDANT_MIXED"]
 FetalSex = Literal["M", "F"]
-ActiveFFSource = Literal["FFY", "FFA"]
+ActiveFFSource = Literal["FFY", "FFA", "FF_SIZE", "FUSED"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +44,9 @@ class SegmentResult:
     implied_ff: float | None = None
     discordant: bool = False
     discordance_reason: str | None = None
+    frag_short_ratio: float | None = None
+    frag_llr_size: float | None = None
+    origin_call: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +79,7 @@ class FetalFractionResult:
     chry_score: float
     yfrac_threshold: float
     sca: SCAResult
+    ff_size: float | None = None
     low_ff_warning: bool = False
     warnings: tuple[str, ...] = ()
 

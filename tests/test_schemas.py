@@ -1,10 +1,13 @@
 import json
 import unittest
 from dataclasses import asdict
+from pathlib import Path
 
 import pyarrow as pa
 
 from ccnv.models import ReadFilters
+from ccnv.models.config import ExtractConfig
+from ccnv.models.results import FetalFractionResult, SCAResult, SegmentResult
 from ccnv.models.schemas import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
@@ -12,6 +15,7 @@ from ccnv.models.schemas import (
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
     COORDINATE_SYSTEM,
+    FRAGMENTOMICS_METADATA_KEY,
     KNOWN_REFERENCE_BRANCHES,
     PRENATAL_METADATA_KEY,
     REFERENCE_SCHEMA,
@@ -19,6 +23,7 @@ from ccnv.models.schemas import (
     SCHEMA_VERSION,
     SUPPORTED_SCHEMA_VERSIONS,
     ArtifactKind,
+    FragmentomicsMetadata,
     PrenatalModelMetadata,
     ReferenceMetadata,
     SchemaError,
@@ -56,10 +61,144 @@ def _make_prenatal_metadata() -> PrenatalModelMetadata:
 
 
 class TestSchemaContracts(unittest.TestCase):
-    def test_schema_version_is_2_0_0(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, "2.0.0")
-        self.assertEqual(SUPPORTED_SCHEMA_VERSIONS, frozenset({"2.0.0"}))
+    def test_schema_version_is_1_0_0(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, "1.0.0")
+        self.assertEqual(SUPPORTED_SCHEMA_VERSIONS, frozenset({"1.0.0"}))
         self.assertEqual(PRENATAL_METADATA_KEY, b"ccnv.prenatal")
+        self.assertEqual(FRAGMENTOMICS_METADATA_KEY, b"ccnv.fragmentomics")
+
+    def test_sample_schema_has_fragmentomics_columns(self) -> None:
+        expected_fields = [
+            ("contig", pa.string()),
+            ("start", pa.int64()),
+            ("end", pa.int64()),
+            ("count", pa.uint64()),
+            ("fragment_lengths", pa.list_(pa.uint16())),
+            ("endpoint_count", pa.uint32()),
+            ("frag_gc_sum", pa.float32()),
+        ]
+        self.assertEqual(SAMPLE_SCHEMA.names, [f[0] for f in expected_fields])
+        for name, expected_type in expected_fields:
+            field = SAMPLE_SCHEMA.field(name)
+            self.assertEqual(field.type, expected_type, f"Field {name} type mismatch")
+            self.assertFalse(field.nullable, f"Field {name} must be non-nullable")
+
+    def test_fragmentomics_metadata_dataclass_and_serialization(self) -> None:
+        meta = FragmentomicsMetadata(
+            paired_end=True,
+            total_paired_fragments=123_456,
+            chromatosome_mode_bp=166.2,
+            core_shoulder_bp=143.1,
+            sizing_shift_bp=0.2,
+            self_referenced_peak_ratio=0.35,
+            dinucleosome_fraction=0.08,
+            high_mw_fraction=0.012,
+            helical_10bp_amplitude=0.045,
+            helical_10bp_phase=1.23,
+            motif_diversity_score=0.92,
+            hist_autosomal=[1] * 571,
+            hist_chry=[0] * 571,
+            hist_chrx=[2] * 571,
+            end_motif_counts=[10] * 256,
+        )
+        self.assertTrue(meta.paired_end)
+        self.assertEqual(len(meta.hist_autosomal), 571)
+        self.assertEqual(len(meta.end_motif_counts), 256)
+        # Round trip via asdict / json
+        encoded = json.dumps(asdict(meta))
+        decoded = json.loads(encoded)
+        restored = FragmentomicsMetadata(**decoded)
+        self.assertEqual(meta, restored)
+
+    def test_prenatal_model_metadata_with_fragmentomics_fields(self) -> None:
+        p_fetal = [0.001] * 571
+        p_maternal = [0.002] * 571
+        weights = [0.1] * 36
+        meta = PrenatalModelMetadata(
+            prenatal_bin_size=100_000,
+            yfrac_threshold=0.0041,
+            ffy_intercept=0.0012,
+            ffy_slope=0.985,
+            mlp_w1=[[0.1, 0.2] for _ in range(50)],
+            mlp_b1=[0.12, -0.34],
+            mlp_w2=[[0.85], [-0.61]],
+            mlp_b2=[0.04],
+            mlp_skew_intercept=-0.002,
+            mlp_skew_slope=1.018,
+            olm_weights=[0.02 for _ in range(50)],
+            olm_bias=0.005,
+            olm_skew_intercept=-0.001,
+            olm_skew_slope=1.01,
+            ffx_intercept=1.0004,
+            ffx_slope=-0.498,
+            female_chrx_ratio_mean=1.0003,
+            female_chrx_ratio_std=0.0112,
+            p_fetal_density=p_fetal,
+            p_maternal_density=p_maternal,
+            ff_frag_weights=weights,
+            ff_frag_bias=-1.25,
+            ff_frag_feature_mean=[0.0] * 36,
+            ff_frag_feature_scale=[1.0] * 36,
+            ff_size_std=0.018,
+        )
+        self.assertEqual(meta.p_fetal_density, p_fetal)
+        self.assertEqual(meta.ff_size_std, 0.018)
+        self.assertEqual(meta.ff_frag_bias, -1.25)
+
+    def test_results_and_config_fragmentomics_fields(self) -> None:
+        sca_res = SCAResult(
+            call="XY",
+            is_aneuploid=False,
+            confidence=0.99,
+            chrx_zscore=-0.1,
+        )
+        ff_res = FetalFractionResult(
+            fetal_sex="M",
+            active_ff=0.12,
+            active_ff_source="FFY",
+            ffy=0.12,
+            ffx=0.11,
+            ffa=0.10,
+            chrx_ratio=0.95,
+            chry_score=0.05,
+            yfrac_threshold=0.004,
+            sca=sca_res,
+            ff_size=0.115,
+        )
+        self.assertEqual(ff_res.ff_size, 0.115)
+
+        seg_res = SegmentResult(
+            contig="chr1",
+            start=0,
+            end=100_000,
+            ratio=1.1,
+            zscore=3.2,
+            weight=1.0,
+            bin_count=20,
+            call="gain",
+            frag_short_ratio=0.42,
+            frag_llr_size=2.85,
+            origin_call="FETAL_CONFIRMED",
+        )
+        self.assertEqual(seg_res.frag_short_ratio, 0.42)
+        self.assertEqual(seg_res.frag_llr_size, 2.85)
+        self.assertEqual(seg_res.origin_call, "FETAL_CONFIRMED")
+
+        cfg = ExtractConfig(
+            alignment=Path("sample.bam"),
+            prefix=Path("out"),
+            min_frag_len=30,
+            max_frag_len=600,
+        )
+        self.assertEqual(cfg.min_frag_len, 30)
+        self.assertEqual(cfg.max_frag_len, 600)
+        with self.assertRaisesRegex(ValueError, "invalid min_frag_len"):
+            ExtractConfig(
+                alignment=Path("sample.bam"),
+                prefix=Path("out"),
+                min_frag_len=600,
+                max_frag_len=30,
+            )
 
     def test_sample_contract_round_trip(self) -> None:
         metadata = metadata_for(
@@ -132,6 +271,11 @@ class TestSchemaContracts(unittest.TestCase):
                 "start": pa.array([0, 100_000, 200_000], type=pa.int64()),
                 "end": pa.array([100_000, 200_000, 250_001], type=pa.int64()),
                 "count": pa.array([10, 11, 12], type=pa.uint64()),
+                "fragment_lengths": pa.array(
+                    [[150] * 10, [166] * 11, [143] * 12], type=pa.list_(pa.uint16())
+                ),
+                "endpoint_count": pa.array([20, 22, 24], type=pa.uint32()),
+                "frag_gc_sum": pa.array([4.0, 4.4, 4.8], type=pa.float32()),
             },
             schema=SAMPLE_SCHEMA.with_metadata(metadata),
         )
@@ -157,6 +301,9 @@ class TestSchemaContracts(unittest.TestCase):
                 "start": pa.array([0], type=pa.int64()),
                 "end": pa.array([11], type=pa.int64()),
                 "count": pa.array([1], type=pa.uint64()),
+                "fragment_lengths": pa.array([[150]], type=pa.list_(pa.uint16())),
+                "endpoint_count": pa.array([2], type=pa.uint32()),
+                "frag_gc_sum": pa.array([0.4], type=pa.float32()),
             },
             schema=SAMPLE_SCHEMA.with_metadata(metadata),
         )
@@ -184,6 +331,11 @@ class TestSchemaContracts(unittest.TestCase):
                 "start": pa.array([0, 0], type=pa.int64()),
                 "end": pa.array([100, 80], type=pa.int64()),
                 "count": pa.array([1, 2], type=pa.uint64()),
+                "fragment_lengths": pa.array(
+                    [[150], [160, 170]], type=pa.list_(pa.uint16())
+                ),
+                "endpoint_count": pa.array([2, 4], type=pa.uint32()),
+                "frag_gc_sum": pa.array([0.4, 0.9], type=pa.float32()),
             },
             schema=SAMPLE_SCHEMA.with_metadata(metadata),
         )
@@ -255,13 +407,13 @@ class TestSchemaContracts(unittest.TestCase):
                 },
             )
 
-        # Version 1.0.0 is also rejected now that schema version is 2.0.0
-        with self.assertRaisesRegex(SchemaError, "unsupported schema version '1.0.0'"):
+        # Version 2.0.0 is rejected now that schema version is 1.0.0
+        with self.assertRaisesRegex(SchemaError, "unsupported schema version '2.0.0'"):
             metadata_for(
                 ArtifactKind.REFERENCE,
                 contig_lengths={"chr1": 200},
                 values={
-                    "schema_version": "1.0.0",
+                    "schema_version": "2.0.0",
                     "sample_identities": [],
                     "model": {"branches": ["autosomal"]},
                 },
