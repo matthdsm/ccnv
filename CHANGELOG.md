@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Autocorrelation-corrected Stouffer precision Z-score calling (`F1`) in `src/ccnv/predict.py` with Polars `.join_asof()` and `pl.corr().over("contig")` Newey-West AR(1) spatial autocorrelation correction.
 - Non-negative Elastic Net with built-in cross-validation (`F2`) via `sklearn.linear_model.ElasticNetCV(positive=True)` in `src/ccnv/stats/prenatal_math.py:fit_elasticnet_ffy`, eliminating $p \gg n$ pure Lasso saturation on 5 kb `chrY` bins.
-- Exact Smyth (2004) / Phipson et al. (2016) Empirical Bayes variance shrinkage (`F3`) in `src/ccnv/stats/neighbors.py:squeeze_var` under a conjugate scaled inverse-$\chi^2$ prior with Winsorized log-variance moments and `scipy.optimize.brentq` root-finding.
+- Exact Smyth (2004) / Phipson et al. (2016) Empirical Bayes variance shrinkage (`F3`) in `src/ccnv/stats/neighbors.py:squeeze_var` under a conjugate scaled inverse-$`\chi^2`$ prior with Winsorized log-variance moments and `scipy.optimize.brentq` root-finding.
 - Single-sample robust PCA subspace projection (`F4`) in `src/ccnv/predict.py:project_coverage` using `sklearn.linear_model.HuberRegressor(epsilon=1.35)`, bounding the influence of large copy-number aberrations and preventing ghost baseline shifts.
 - Result-equivalent DESeq2 median-of-ratios library size factor normalization (`F5`) in `src/ccnv/features/cohort.py:estimate_size_factors` and `normalize_depth`, achieving a 50% breakdown point against whole-chromosome aneuploidies.
 - Joint natural cubic B-spline and interaction robust regression (`F6`) via `sklearn.preprocessing.SplineTransformer`, `PolynomialFeatures`, and `HuberRegressor` in `src/ccnv/stats/regression.py:build_joint_covariate_basis`, replacing sequential 1D polynomial IRLS.
@@ -90,8 +90,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Fixed GitHub Markdown and MathJax formula rendering failures in `README.md` and `docs/methodology.md` (Sections 2.1.1, 3.1, 5.1.2) by removing `%` TeX comment characters from math spans, converting bare `<` and `>` inequalities to `\lt` and `\gt`, resolving prime subscript syntax errors, and standardizing display math blocks on separate-line `$$` delimiters.
-- Extended Markdown automated integrity contract test `tests/test_docs_markdown.py` to enforce clean display math delimiters, absence of `%` within math environments, and `\lt`/`\gt` inequality operators across all 18 repository documentation files.
+- Fixed GitHub Markdown (`cmark-gfm`) and MathJax formula rendering failures across `README.md`, `docs/pipeline.md`, `docs/methodology.md`, `CHANGELOG.md`, and `src/ccnv/**/README.md` by using GitHub `$`...`$` inline math delimiters for expressions adjacent to hyphens/parentheses or containing underscores/braces, unindenting display `$$` blocks inside ordered lists to column 0, replacing `\{`/`\}`, `\;`, `^{*}`, and single `\\` row breaks inside `$$` blocks with `\lbrace`/`\rbrace`, `\quad`, `^{\ast}`, and `\\\\`, removing `%` TeX comments from math spans, and converting `<`/`>` inequalities to `\lt`/`\gt`.
+- Extended Markdown automated integrity contract test `tests/test_docs_markdown.py` to enforce GitHub `cmark-gfm` display and inline math invariants across all 18 repository documentation files.
 - Fixed broken table column splitting in `docs/methodology.md` caused by unescaped pipe characters in inline math.
 - Prevented zero-division and missing Z-score degradation in `predict.normalize_branch` by guarding against machine-epsilon `null_std` values and falling back to sample ratio standard deviation when empirical median absolute deviation degenerates to zero.
 - Resolved `UnboundLocalError` for `fasta` variable in `ccnv reference` CLI command.

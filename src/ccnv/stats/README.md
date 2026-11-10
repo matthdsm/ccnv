@@ -13,7 +13,7 @@ The `ccnv.stats` package provides stateless numerical, statistical, and machine 
 - `[src/ccnv/stats/neighbors.py:select_nearest_bins]`: Parallelized off-contig nearest-bin selection in signal subspace via C-compiled `scipy.spatial.KDTree`.
 - `[src/ccnv/stats/neighbors.py:compute_null_models]`: Parameterizes per-bin empirical log2 ratio null expectations and degrees-of-freedom-corrected standard deviations.
 - `[src/ccnv/stats/neighbors.py:distance_cutoff]`: Computes empirical Euclidean distance percentiles for reference QC auditing.
-- `[src/ccnv/stats/neighbors.py:squeeze_var]`: Result-equivalent Smyth (2004) / Phipson et al. (2016) Empirical Bayes variance shrinkage under inverse-$\chi^2$ prior.
+- `[src/ccnv/stats/neighbors.py:squeeze_var]`: Result-equivalent Smyth (2004) / Phipson et al. (2016) Empirical Bayes variance shrinkage under inverse-$`\chi^2`$ prior.
 - `[src/ccnv/stats/regression.py:build_1d_basis]`: Formulates standardized polynomial basis matrices for covariate modeling.
 - `[src/ccnv/stats/regression.py:build_joint_covariate_basis]`: Formulates joint natural cubic B-spline and interaction basis matrix for GC and mappability modeling.
 - `[src/ccnv/stats/regression.py:fit_sample_trend]`: Fits multiplicative bias trends via robust Huber M-estimation or IRLS regression.

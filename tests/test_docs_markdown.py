@@ -84,6 +84,32 @@ class TestDocsMarkdown(unittest.TestCase):
             errors, [], "Mermaid syntax issues found:\n" + "\n".join(errors)
         )
 
+    @staticmethod
+    def _mask_non_math_code(content: str) -> str:
+        """Mask fenced code blocks and non-math inline code spans while preserving $`...`$ inline math and line offsets."""
+        masked = re.sub(
+            r"```.*?```",
+            lambda m: "\n" * m.group(0).count("\n"),
+            content,
+            flags=re.DOTALL,
+        )
+        return re.sub(
+            r"(?<!\$)`[^`\n]*`(?!\$)",
+            lambda m: " " * len(m.group(0)),
+            masked,
+        )
+
+    @staticmethod
+    def _iter_inline_math(masked_content: str) -> list[tuple[int, str, str]]:
+        """Return (lineno, raw_span, inner_math) for both $`...`$ and $...$ inline math spans."""
+        spans: list[tuple[int, str, str]] = []
+        pattern = re.compile(r"\$`([^`\n]+)`\$|(?<!\\)\$(?!\$|`)(.+?)(?<!\\|`)\$")
+        for m in pattern.finditer(masked_content):
+            lineno = masked_content[: m.start()].count("\n") + 1
+            inner = m.group(1) if m.group(1) is not None else m.group(2)
+            spans.append((lineno, m.group(0), inner))
+        return spans
+
     def test_no_disallowed_latex_macros(self) -> None:
         r"""Verify no disallowed LaTeX macros like \operatorname exist in markdown files."""
         errors: list[str] = []
@@ -91,16 +117,7 @@ class TestDocsMarkdown(unittest.TestCase):
             if not file_path.exists():
                 continue
             content = file_path.read_text(encoding="utf-8")
-            # Mask code blocks and inline spans while preserving newline offsets
-            stripped_content = re.sub(
-                r"```.*?```",
-                lambda m: "\n" * m.group(0).count("\n"),
-                content,
-                flags=re.DOTALL,
-            )
-            stripped_content = re.sub(
-                r"`[^`\n]*`", lambda m: " " * len(m.group(0)), stripped_content
-            )
+            stripped_content = self._mask_non_math_code(content)
             for m in re.finditer(r"\\operatorname\*?\{", stripped_content):
                 lineno = stripped_content[: m.start()].count("\n") + 1
                 errors.append(
@@ -124,43 +141,23 @@ class TestDocsMarkdown(unittest.TestCase):
             if not file_path.exists():
                 continue
             content = file_path.read_text(encoding="utf-8")
-            # Mask code blocks and inline spans while preserving newline offsets
-            stripped_content = re.sub(
-                r"```.*?```",
-                lambda m: "\n" * m.group(0).count("\n"),
-                content,
-                flags=re.DOTALL,
-            )
-            stripped_content = re.sub(
-                r"`[^`\n]*`", lambda m: " " * len(m.group(0)), stripped_content
-            )
-            for m in re.finditer(r"(?<!\\)\$(?!\$)(.*?)(?<!\\)\$", stripped_content):
-                inner = m.group(1)
+            stripped_content = self._mask_non_math_code(content)
+            for lineno, raw, inner in self._iter_inline_math(stripped_content):
                 if inner.startswith(" ") or inner.endswith(" "):
-                    lineno = stripped_content[: m.start()].count("\n") + 1
                     errors.append(
                         f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                        f"space-padded inline math: '${inner}'"
+                        f"space-padded inline math: '{raw}'"
                     )
         self.assertEqual(errors, [], "Math spacing issues found:\n" + "\n".join(errors))
 
     def test_math_delimiters_and_syntax(self) -> None:
-        """Verify no percent comments, bare < or > inequalities, or single-line display math blocks exist in LaTeX math."""
+        """Verify GitHub GFM + MathJax compatibility across all display and inline math blocks."""
         errors: list[str] = []
         for file_path in self.tracked_md_files:
             if not file_path.exists():
                 continue
             content = file_path.read_text(encoding="utf-8")
-            # Mask code blocks and inline spans while preserving newline offsets
-            stripped_content = re.sub(
-                r"```.*?```",
-                lambda m: "\n" * m.group(0).count("\n"),
-                content,
-                flags=re.DOTALL,
-            )
-            stripped_content = re.sub(
-                r"`[^`\n]*`", lambda m: " " * len(m.group(0)), stripped_content
-            )
+            stripped_content = self._mask_non_math_code(content)
 
             # Check for single-line display math blocks ($$...$$ on same line)
             for m in re.finditer(r"(?m)^[ \t]*\$\$(.+?)\$\$[ \t]*$", stripped_content):
@@ -170,7 +167,15 @@ class TestDocsMarkdown(unittest.TestCase):
                     "single-line display math block found; place $$ on separate lines"
                 )
 
-            # Check block math for %, bare < or >
+            # Check for indented $$ delimiters (cmark-gfm fails to parse indented $$ inside lists)
+            for m in re.finditer(r"(?m)^[ \t]+\$\$[ \t]*$", stripped_content):
+                lineno = stripped_content[: m.start()].count("\n") + 1
+                errors.append(
+                    f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                    "indented $$ delimiter found; place $$ at column 0 so GitHub recognizes display math"
+                )
+
+            # Check block math for %, bare < or >, \{, \}, \;, ^{*}, and single \\ in cases
             for m in re.finditer(r"\$\$(.*?)\$\$", stripped_content, flags=re.DOTALL):
                 inner = m.group(1)
                 lineno = stripped_content[: m.start()].count("\n") + 1
@@ -184,11 +189,37 @@ class TestDocsMarkdown(unittest.TestCase):
                         f"{file_path.relative_to(self.repo_root)}:{lineno} "
                         r"bare '<' or '>' in display math triggers HTML parsing conflicts; use \lt or \gt"
                     )
+                if r"\{" in inner or r"\}" in inner:
+                    errors.append(
+                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                        r"escaped brace \{ or \} in display math is stripped by GFM; use \lbrace or \rbrace"
+                    )
+                if r"\;" in inner:
+                    errors.append(
+                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                        r"\; in display math has backslash stripped by GFM; use \quad or comma"
+                    )
+                if "^{*}" in inner:
+                    errors.append(
+                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                        r"^{*} in display math triggers GFM emphasis; use ^{\ast}"
+                    )
+                if r"\begin{cases}" in inner and re.search(r"(?<!\\)\\\\(?!\\)", inner):
+                    errors.append(
+                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                        r"single \\ in \begin{cases} is stripped by GFM; use \\\\ for row breaks"
+                    )
+
+            # Check bare $...$ adjacent to hyphens (cmark-gfm rejects -$ or $-)
+            for m in re.finditer(r"-\$(?!`|(?:\$))|(?<!\\|`)\$-", stripped_content):
+                lineno = stripped_content[: m.start()].count("\n") + 1
+                errors.append(
+                    f"{file_path.relative_to(self.repo_root)}:{lineno} "
+                    "bare $ delimiter adjacent to hyphen is rejected by GFM; use $`...`$ syntax"
+                )
 
             # Check inline math for %, bare < or >
-            for m in re.finditer(r"(?<!\\)\$(?!\$)(.*?)(?<!\\)\$", stripped_content):
-                inner = m.group(1)
-                lineno = stripped_content[: m.start()].count("\n") + 1
+            for lineno, _raw, inner in self._iter_inline_math(stripped_content):
                 if "%" in inner:
                     errors.append(
                         f"{file_path.relative_to(self.repo_root)}:{lineno} "
