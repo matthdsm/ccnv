@@ -1,24 +1,25 @@
 # Copynumber-CNV (`ccnv`)
 
-Copynumber-CNV (`ccnv`) is an independent Python 3.14+ bioinformatics toolkit for copy-number variation (CNV) detection in shallow whole-genome sequencing (sWGS) data, inspired by the published statistical methodology of WISECONDOR (Straver et al., *Nucleic Acids Research*, 2014) and WisecondorX (Raman et al., *Nucleic Acids Research*, 2019).
+Copynumber-CNV (`ccnv`) is an independent Python 3.14+ bioinformatics toolkit for copy-number variation (CNV) detection in shallow whole-genome sequencing (sWGS) data, building on published within-sample reference normalization methodology (Straver et al., *Nucleic Acids Research*, 2014; Raman et al., *Nucleic Acids Research*, 2019).
 
-> [!NOTE]
-> Copynumber-CNV (`ccnv`) is in active pre-1.0 alpha development (`0.1.0dev`). CLI interfaces, data models, and schemas may evolve before the initial stable release.
+!!! note
+
+    Copynumber-CNV (`ccnv`) is in active pre-1.0 alpha development (`0.1.0dev`). CLI interfaces, data models, and schemas may evolve before the initial stable release.
 
 ---
 
 ## Key Features
 
-- **Versioned Parquet Storage**: Sample bin counts and reference models are stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC, provenance, and optional prenatal model metadata.
-- **Constitutional & Prenatal Analysis Modes**: Supports standard germline CNV profiling (`--mode germline`) as well as cell-free DNA (cfDNA) non-invasive prenatal screening (`--mode prenatal`) with pure NumPy/SciPy/scikit-learn fetal fraction estimation (`FFY`, `FFX`, `FFA`), 2D stoichiometric Bayesian sex chromosome aneuploidy calling, and discordance filtering.
+- **Versioned Parquet Storage (`1.0.0`)**: Sample bin counts, per-bin cfDNA fragmentomic channels (`fragment_lengths`, `endpoint_count`, `frag_gc_sum`), and reference models are stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC, `ccnv.fragmentomics`, and optional `ccnv.prenatal` metadata.
+- **Constitutional & Prenatal Analysis Modes**: Supports germline CNV profiling (`--mode germline`) and cell-free DNA (cfDNA) non-invasive prenatal screening (`--mode prenatal`) with pure NumPy/SciPy/scikit-learn fetal fraction estimation (`FFY`, `FFX`, `FFA`, `FF_size`), Fisher-optimal fragment length read weighting, 2D stoichiometric Bayesian sex chromosome aneuploidy calling, and segment discordance and fragmentomic origin annotation.
 - **Organism-Agnostic & 0-Based Half-Open Coordinates**: Contig names, order, and lengths are read directly from alignment or FASTA headers without assuming a fixed 24-chromosome layout. All intervals are 0-based half-open `[start, end)`.
-- **Pure-Python & DataFrame-Native Execution**: Uses `polars`, `pysam`, `pyBigWig`, `numpy`, `scipy`, `pyarrow`, `scikit-learn`, and weighted `ruptures` segmentation without heavy ML container dependencies.
+- **Pure-Python & DataFrame-Native Execution**: Uses `polars`, `pysam`, `pyBigWig`, `numpy`, `scipy`, `pyarrow`, `scikit-learn`, and weighted `ruptures` segmentation without external R or container runtime dependencies.
 
 ---
 
 ## Pipeline Overview
 
-The pipeline formalizes CNV identification across shallow whole-genome sequencing datasets into four discrete functional stages: read ingestion and binning (`extract`), cohort reference synthesis with covariate correction (`reference`), reference audit and quality verification (`ref-qc`), and single-sample projection and change-point segmentation (`predict`).
+The pipeline structures CNV identification across shallow whole-genome sequencing datasets into four stages: alignment ingestion and binning (`extract`), cohort or FASTA reference construction with covariate bias removal (`reference`), reference usability verification (`ref-qc`), and single-sample projection, change-point segmentation, and event calling (`predict`).
 
 ```mermaid
 flowchart LR
@@ -35,6 +36,7 @@ flowchart LR
     end
     subgraph S4["4. Predict"]
         C --> P["Segment & Call"]
+        BAM -.-> P
         REF --> P
         P --> PQC["Predict QC (.json)"]
         P --> BED["BED Tables (.bed.gz)"]
@@ -47,10 +49,9 @@ flowchart LR
 
 ## Documentation Sections
 
-- [Pipeline Architecture](pipeline.md): Comprehensive data flow, coordinate contracts, and algorithmic stages.
-- [CLI Reference](cli.md): Complete command-line options, defaults, input requirements, and exit codes.
-- [Mathematical Methodology](methodology.md): Formal mathematical formulations, statistical assumptions, model selections, and constant provenance.
-- [Benchmarks](benchmark.md): Performance, runtime, storage efficiency, and comparison against WisecondorX.
+- [Pipeline Architecture](pipeline.md): Data flow, coordinate contracts, and algorithmic stages.
+- [CLI Reference](cli.md): Command-line options, defaults, input requirements, deliverables, and exit codes.
+- [Mathematical Methodology](methodology.md): Mathematical formulations, statistical assumptions, model selections, and constant provenance.
 
 ---
 
@@ -72,7 +73,7 @@ ccnv reference -s cohort.yaml --mode prenatal --prefix prenatal_ref --bin-size 5
 # 3. Audit reference quality control metrics
 ccnv ref-qc reference.ccnv
 
-# 4a. Predict copy-number gains and losses in constitutional/germline mode
+# 4a. Predict copy-number gains and losses from .ccnv, .bam, or .cram (with --fasta)
 ccnv predict sample.ccnv reference.ccnv --prefix results/sample
 
 # 4b. Or run prenatal prediction with fetal fraction estimation and sex chromosome analysis

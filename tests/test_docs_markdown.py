@@ -4,37 +4,77 @@ from pathlib import Path
 
 
 class TestDocsMarkdown(unittest.TestCase):
+    repo_root: Path
+    zensical_md_files: list[Path]
+    github_md_files: list[Path]
+    tracked_md_files: list[Path]
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.repo_root = Path(__file__).resolve().parent.parent
-        cls.tracked_md_files = [
+        docs_dir = cls.repo_root / "docs"
+        excluded_docs = {"superpowers", "designs"}
+        cls.zensical_md_files = sorted(
+            p
+            for p in docs_dir.rglob("*.md")
+            if not any(part in excluded_docs for part in p.relative_to(docs_dir).parts)
+        )
+        root_md = [
             cls.repo_root / "AGENTS.md",
             cls.repo_root / "CHANGELOG.md",
             cls.repo_root / "LICENSE.md",
             cls.repo_root / "README.md",
-            cls.repo_root / "docs" / "benchmark.md",
-            cls.repo_root / "docs" / "cli.md",
-            cls.repo_root / "docs" / "index.md",
-            cls.repo_root / "docs" / "methodology.md",
-            cls.repo_root / "docs" / "pipeline.md",
-            cls.repo_root / "src" / "README.md",
-            cls.repo_root / "src" / "ccnv" / "README.md",
-            cls.repo_root / "src" / "ccnv" / "features" / "README.md",
-            cls.repo_root / "src" / "ccnv" / "io" / "README.md",
-            cls.repo_root / "src" / "ccnv" / "models" / "README.md",
-            cls.repo_root / "src" / "ccnv" / "qc" / "README.md",
-            cls.repo_root / "src" / "ccnv" / "report" / "README.md",
-            cls.repo_root / "src" / "ccnv" / "stats" / "README.md",
-            cls.repo_root / "tests" / "fixtures" / "benchmark" / "README.md",
-            cls.repo_root / "tests" / "fixtures" / "extract" / "README.md",
         ]
+        sub_md = sorted(
+            p
+            for base in (cls.repo_root / "src", cls.repo_root / "tests")
+            for p in base.rglob("*.md")
+            if "__pycache__" not in p.parts
+        )
+        cls.github_md_files = [p for p in root_md if p.exists()] + sub_md
+        cls.tracked_md_files = cls.zensical_md_files + cls.github_md_files
+
+    @staticmethod
+    def _mask_fenced_code(content: str) -> str:
+        """Replace fenced code blocks with line-preserving newlines."""
+        return re.sub(
+            r"(?m)^([ \t]*`{3,})[^\n]*\n.*?\n[ \t]*\1[ \t]*$",
+            lambda m: "\n" * m.group(0).count("\n"),
+            content,
+            flags=re.DOTALL,
+        )
+
+    @classmethod
+    def _mask_non_math_code(cls, content: str) -> str:
+        """Mask fenced code blocks and non-math inline code spans while preserving $`...`$ and line offsets."""
+        masked = cls._mask_fenced_code(content)
+        return re.sub(
+            r"(?<!\$)(`+)([^`\n]+?)\1(?!\$)",
+            lambda m: " " * len(m.group(0)),
+            masked,
+        )
+
+    @staticmethod
+    def _iter_inline_math(masked_content: str) -> list[tuple[int, str, str]]:
+        """Return (lineno, raw_span, inner_math) for $`...`$ and $...$ inline math spans outside block math."""
+        no_block = re.sub(
+            r"\$\$.*?\$\$",
+            lambda m: "\n" * m.group(0).count("\n"),
+            masked_content,
+            flags=re.DOTALL,
+        )
+        spans: list[tuple[int, str, str]] = []
+        pattern = re.compile(r"\$`([^`\n]+)`\$|(?<!\\)\$(?!\$|`)([^\n$]+?)(?<!\\|`)\$")
+        for m in pattern.finditer(no_block):
+            lineno = no_block[: m.start()].count("\n") + 1
+            inner = m.group(1) if m.group(1) is not None else m.group(2)
+            spans.append((lineno, m.group(0), inner))
+        return spans
 
     def test_markdown_tables_and_cell_pipes(self) -> None:
         """Verify all tables have consistent column counts and no unescaped bare pipes in math cells."""
         errors: list[str] = []
         for file_path in self.tracked_md_files:
-            if not file_path.exists():
-                continue
             lines = file_path.read_text(encoding="utf-8").splitlines()
             in_table = False
             expected_cols: int | None = None
@@ -50,7 +90,7 @@ class TestDocsMarkdown(unittest.TestCase):
                             f"{file_path.relative_to(self.repo_root)}:{idx} "
                             f"column mismatch: expected {expected_cols}, got {len(cells)}"
                         )
-                    for math in re.findall(r"\$(.*?)\$", stripped):
+                    for math in re.findall(r"\$`?([^`$\n]+)`?\$", stripped):
                         if re.search(r"(?<!\\)\|", math):
                             errors.append(
                                 f"{file_path.relative_to(self.repo_root)}:{idx} "
@@ -67,8 +107,6 @@ class TestDocsMarkdown(unittest.TestCase):
         """Verify Mermaid code blocks contain no blank lines."""
         errors: list[str] = []
         for file_path in self.tracked_md_files:
-            if not file_path.exists():
-                continue
             lines = file_path.read_text(encoding="utf-8").splitlines()
             in_mermaid = False
             for idx, line in enumerate(lines, 1):
@@ -85,181 +123,227 @@ class TestDocsMarkdown(unittest.TestCase):
             errors, [], "Mermaid syntax issues found:\n" + "\n".join(errors)
         )
 
-    @staticmethod
-    def _mask_non_math_code(content: str) -> str:
-        """Mask fenced code blocks and non-math inline code spans while preserving $`...`$ inline math and line offsets."""
-        masked = re.sub(
-            r"```.*?```",
-            lambda m: "\n" * m.group(0).count("\n"),
-            content,
-            flags=re.DOTALL,
-        )
-        return re.sub(
-            r"(?<!\$)`[^`\n]*`(?!\$)",
-            lambda m: " " * len(m.group(0)),
-            masked,
-        )
-
-    @staticmethod
-    def _iter_inline_math(masked_content: str) -> list[tuple[int, str, str]]:
-        """Return (lineno, raw_span, inner_math) for both $`...`$ and $...$ inline math spans."""
-        spans: list[tuple[int, str, str]] = []
-        pattern = re.compile(r"\$`([^`\n]+)`\$|(?<!\\)\$(?!\$|`)(.+?)(?<!\\|`)\$")
-        for m in pattern.finditer(masked_content):
-            lineno = masked_content[: m.start()].count("\n") + 1
-            inner = m.group(1) if m.group(1) is not None else m.group(2)
-            spans.append((lineno, m.group(0), inner))
-        return spans
-
-    def test_no_disallowed_latex_macros(self) -> None:
-        r"""Verify no disallowed LaTeX macros like \operatorname exist in markdown files."""
+    def test_shared_latex_syntax_and_balance(self) -> None:
+        """Verify TeX macro validity, brace/delimiter balance, and display block placement across all files."""
         errors: list[str] = []
         for file_path in self.tracked_md_files:
-            if not file_path.exists():
-                continue
+            rel = file_path.relative_to(self.repo_root)
             content = file_path.read_text(encoding="utf-8")
-            stripped_content = self._mask_non_math_code(content)
-            for m in re.finditer(r"\\operatorname\*?\{", stripped_content):
-                lineno = stripped_content[: m.start()].count("\n") + 1
-                errors.append(
-                    f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                    r"disallowed \operatorname macro found; use \mathrm or \text instead"
-                )
-            for m in re.finditer(r"\^(\*|\\top|\w+-\d+)", stripped_content):
-                lineno = stripped_content[: m.start()].count("\n") + 1
-                errors.append(
-                    f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                    f"unbraced superscript '^{m.group(1)}' found; wrap in {{...}}"
-                )
-        self.assertEqual(
-            errors, [], "Disallowed LaTeX macros found:\n" + "\n".join(errors)
-        )
+            stripped = self._mask_non_math_code(content)
 
-    def test_inline_math_no_padding(self) -> None:
-        """Verify inline math delimiters do not have leading or trailing space padding outside code spans."""
-        errors: list[str] = []
-        for file_path in self.tracked_md_files:
-            if not file_path.exists():
-                continue
-            content = file_path.read_text(encoding="utf-8")
-            stripped_content = self._mask_non_math_code(content)
-            for lineno, raw, inner in self._iter_inline_math(stripped_content):
+            for m in re.finditer(r"\\operatorname\*?\{", stripped):
+                lineno = stripped[: m.start()].count("\n") + 1
+                errors.append(
+                    f"{rel}:{lineno} disallowed \\operatorname macro; use \\mathrm or \\text"
+                )
+            for m in re.finditer(r"\^(\*|\\top|\w+-\d+)", stripped):
+                lineno = stripped[: m.start()].count("\n") + 1
+                errors.append(
+                    f"{rel}:{lineno} unbraced superscript '^{m.group(1)}'; wrap in {{...}}"
+                )
+            for m in re.finditer(r"(?m)^[ \t]*\$\$(.+?)\$\$[ \t]*$", stripped):
+                lineno = stripped[: m.start()].count("\n") + 1
+                errors.append(
+                    f"{rel}:{lineno} single-line display math block; place $$ on separate lines"
+                )
+            for m in re.finditer(r"(?m)^[ \t]+\$\$[ \t]*$", stripped):
+                lineno = stripped[: m.start()].count("\n") + 1
+                errors.append(
+                    f"{rel}:{lineno} indented $$ delimiter; place $$ at column 0"
+                )
+
+            all_exprs: list[tuple[int, str]] = []
+            for m in re.finditer(r"\$\$(.*?)\$\$", stripped, flags=re.DOTALL):
+                lineno = stripped[: m.start()].count("\n") + 1
+                all_exprs.append((lineno, m.group(1)))
+            for lineno, raw, inner in self._iter_inline_math(stripped):
                 if inner.startswith(" ") or inner.endswith(" "):
-                    errors.append(
-                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                        f"space-padded inline math: '{raw}'"
-                    )
-        self.assertEqual(errors, [], "Math spacing issues found:\n" + "\n".join(errors))
+                    errors.append(f"{rel}:{lineno} space-padded inline math: '{raw}'")
+                all_exprs.append((lineno, inner))
 
-    def test_math_delimiters_and_syntax(self) -> None:
-        """Verify GitHub GFM + MathJax compatibility across all display and inline math blocks."""
+            for lineno, expr in all_exprs:
+                if "%" in expr:
+                    errors.append(
+                        f"{rel}:{lineno} '%' in math triggers TeX comment hazard; move outside math"
+                    )
+                if re.search(r"(?<!\\)[<>]", expr):
+                    errors.append(
+                        f"{rel}:{lineno} bare '<' or '>' in math; use \\lt or \\gt"
+                    )
+                clean_braces = re.sub(r"\\[{}]", "", expr)
+                depth = 0
+                for ch in clean_braces:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                    if depth < 0:
+                        break
+                if depth != 0:
+                    errors.append(f"{rel}:{lineno} unbalanced TeX braces in: {expr!r}")
+                n_left = len(re.findall(r"\\left(?![a-zA-Z])", expr))
+                n_right = len(re.findall(r"\\right(?![a-zA-Z])", expr))
+                if n_left != n_right:
+                    errors.append(
+                        f"{rel}:{lineno} mismatched \\left ({n_left}) vs \\right ({n_right})"
+                    )
+                if len(re.findall(r"\\lbrace(?![a-zA-Z])", expr)) != len(
+                    re.findall(r"\\rbrace(?![a-zA-Z])", expr)
+                ):
+                    errors.append(f"{rel}:{lineno} mismatched \\lbrace vs \\rbrace")
+                if re.findall(r"\\begin\{([^}]+)\}", expr) != re.findall(
+                    r"\\end\{([^}]+)\}", expr
+                ):
+                    errors.append(f"{rel}:{lineno} mismatched \\begin / \\end")
+
+        self.assertEqual(
+            errors, [], "Shared LaTeX syntax/balance issues:\n" + "\n".join(errors)
+        )
+
+    def test_zensical_docs_rendering(self) -> None:
+        """Enforce Zensical (pymdownx.arithmatex + admonition) compatibility on all docs/**/*.md files."""
         errors: list[str] = []
-        for file_path in self.tracked_md_files:
-            if not file_path.exists():
-                continue
+        smart_dollar_re = re.compile(
+            r"(?<!\\)\$(?!\s)(?:\\.|[^\\$\x02\x03\n])+?(?<!\s)\$"
+        )
+        for file_path in self.zensical_md_files:
+            rel = file_path.relative_to(self.repo_root)
             content = file_path.read_text(encoding="utf-8")
-            stripped_content = self._mask_non_math_code(content)
+            no_fences = self._mask_fenced_code(content)
 
-            # Check for single-line display math blocks ($$...$$ on same line)
-            for m in re.finditer(r"(?m)^[ \t]*\$\$(.+?)\$\$[ \t]*$", stripped_content):
-                lineno = stripped_content[: m.start()].count("\n") + 1
+            for m in re.finditer(
+                r"(?m)^[ \t]*>[ \t]*\[!(?:NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]",
+                no_fences,
+            ):
+                lineno = no_fences[: m.start()].count("\n") + 1
                 errors.append(
-                    f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                    "single-line display math block found; place $$ on separate lines"
+                    f"{rel}:{lineno} GitHub alert syntax in docs/; use Zensical '!!! note' admonition"
                 )
 
-            # Check for indented $$ delimiters (cmark-gfm fails to parse indented $$ inside lists)
-            for m in re.finditer(r"(?m)^[ \t]+\$\$[ \t]*$", stripped_content):
-                lineno = stripped_content[: m.start()].count("\n") + 1
+            masked = self._mask_non_math_code(content)
+            for m in re.finditer(r"\$`[^`\n]+`\$", masked):
+                lineno = masked[: m.start()].count("\n") + 1
                 errors.append(
-                    f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                    "indented $$ delimiter found; place $$ at column 0 so GitHub recognizes display math"
+                    f"{rel}:{lineno} GitHub $`...`$ syntax breaks Zensical pymdownx.arithmatex; use $...$"
                 )
 
-            # Check block math for %, bare < or >, \{, \}, \;, ^{*}, and single \\ in cases
-            for m in re.finditer(r"\$\$(.*?)\$\$", stripped_content, flags=re.DOTALL):
+            for m in re.finditer(r"\$\$(.*?)\$\$", masked, flags=re.DOTALL):
                 inner = m.group(1)
-                lineno = stripped_content[: m.start()].count("\n") + 1
-                if "%" in inner:
+                lineno = masked[: m.start()].count("\n") + 1
+                if r"\begin{cases}" in inner and r"\\\\" in inner:
                     errors.append(
-                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                        r"percent symbol '%' in display math triggers TeX comment hazard; move outside math"
+                        f"{rel}:{lineno} quad-backslash \\\\\\\\ in \\begin{{cases}} renders blank row in Zensical; use \\\\"
                     )
-                if re.search(r"(?<!\\)[<>]", inner):
-                    errors.append(
-                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                        r"bare '<' or '>' in display math triggers HTML parsing conflicts; use \lt or \gt"
-                    )
+
+            code_sentinel = re.sub(
+                r"(`+)([^`\n]+?)\1",
+                lambda m: "\x02" + ("c" * (len(m.group(0)) - 2)) + "\x03",
+                no_fences,
+            )
+            no_blocks = re.sub(
+                r"\$\$.*?\$\$",
+                lambda m: "\n" * m.group(0).count("\n"),
+                code_sentinel,
+                flags=re.DOTALL,
+            )
+            after_inline = smart_dollar_re.sub(
+                lambda m: " " * len(m.group(0)), no_blocks
+            )
+            for m in re.finditer(r"(?<!\\)\$", after_inline):
+                lineno = after_inline[: m.start()].count("\n") + 1
+                errors.append(
+                    f"{rel}:{lineno} unparsed stray '$' under Zensical pymdownx.arithmatex"
+                )
+
+        self.assertEqual(
+            errors, [], "Zensical docs/ rendering issues found:\n" + "\n".join(errors)
+        )
+
+    def test_github_markdown_rendering(self) -> None:
+        """Enforce GitHub Flavored Markdown (cmark-gfm) compatibility on all non-docs/ Markdown files."""
+        errors: list[str] = []
+        for file_path in self.github_md_files:
+            rel = file_path.relative_to(self.repo_root)
+            content = file_path.read_text(encoding="utf-8")
+            no_fences = self._mask_fenced_code(content)
+
+            for m in re.finditer(r"(?m)^[ \t]*(?:!!!|\?\?\?)[ \t]+\w+", no_fences):
+                lineno = no_fences[: m.start()].count("\n") + 1
+                errors.append(
+                    f"{rel}:{lineno} Zensical admonition in GitHub Markdown; use '> [!NOTE]' alert"
+                )
+
+            masked = self._mask_non_math_code(content)
+
+            for m in re.finditer(r"\$\$(.*?)\$\$", masked, flags=re.DOTALL):
+                inner = m.group(1)
+                lineno = masked[: m.start()].count("\n") + 1
                 if r"\{" in inner or r"\}" in inner:
                     errors.append(
-                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                        r"escaped brace \{ or \} in display math is stripped by GFM; use \lbrace or \rbrace"
+                        f"{rel}:{lineno} \\{{ or \\}} in GFM display math; use \\lbrace or \\rbrace"
                     )
                 if r"\;" in inner:
                     errors.append(
-                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                        r"\; in display math has backslash stripped by GFM; use \quad or comma"
+                        f"{rel}:{lineno} \\; in GFM display math; use \\quad or comma"
                     )
                 if "^{*}" in inner:
                     errors.append(
-                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                        r"^{*} in display math triggers GFM emphasis; use ^{\ast}"
+                        f"{rel}:{lineno} ^{{*}} in GFM display math; use ^{{\\ast}}"
                     )
                 if r"\begin{cases}" in inner and re.search(r"(?<!\\)\\\\(?!\\)", inner):
                     errors.append(
-                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                        r"single \\ in \begin{cases} is stripped by GFM; use \\\\ for row breaks"
+                        f"{rel}:{lineno} single \\\\ in GFM \\begin{{cases}}; use \\\\\\\\"
                     )
 
-            # Check bare $...$ adjacent to hyphens (cmark-gfm rejects -$ or $-)
-            for m in re.finditer(r"-\$(?!`|(?:\$))|(?<!\\|`)\$-", stripped_content):
-                lineno = stripped_content[: m.start()].count("\n") + 1
-                errors.append(
-                    f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                    "bare $ delimiter adjacent to hyphen is rejected by GFM; use $`...`$ syntax"
-                )
+            no_block = re.sub(
+                r"\$\$.*?\$\$",
+                lambda m: "\n" * m.group(0).count("\n"),
+                masked,
+                flags=re.DOTALL,
+            )
+            no_backtick_math = re.sub(
+                r"\$`[^`\n]+`\$",
+                lambda m: " " * len(m.group(0)),
+                no_block,
+            )
+            for m in re.finditer(
+                r"(.?)(?<!\\)\$(?!\$|`)([^\n$]+?)(?<!\\|`)\$(.?)", no_backtick_math
+            ):
+                lineno = no_backtick_math[: m.start()].count("\n") + 1
+                pre, inner, post = m.group(1), m.group(2), m.group(3)
+                if pre in ("-", "–", "(") or post in ("-", "–", ")"):
+                    adj = pre if pre in ("-", "–", "(") else post
+                    errors.append(
+                        f"{rel}:{lineno} bare $...$ adjacent to '{adj}' ({m.group(0)!r}); use $`...`$ in GitHub Markdown"
+                    )
+                elif any(ch in inner for ch in ("{", "}", "_", "*")):
+                    errors.append(
+                        f"{rel}:{lineno} bare ${inner}$ contains braces/underscores/asterisks; use $`...`$ in GitHub Markdown"
+                    )
 
-            # Check inline math for %, bare < or >
-            for lineno, _raw, inner in self._iter_inline_math(stripped_content):
-                if "%" in inner:
-                    errors.append(
-                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                        r"percent symbol '%' in inline math triggers TeX comment hazard; move outside math"
-                    )
-                if re.search(r"(?<!\\)[<>]", inner):
-                    errors.append(
-                        f"{file_path.relative_to(self.repo_root)}:{lineno} "
-                        r"bare '<' or '>' in inline math triggers HTML parsing conflicts; use \lt or \gt"
-                    )
         self.assertEqual(
-            errors, [], "Math delimiter and syntax issues found:\n" + "\n".join(errors)
+            errors, [], "GitHub Markdown rendering issues found:\n" + "\n".join(errors)
         )
 
-    def test_no_local_filesystem_urls(self) -> None:
-        """Verify no local file:/// URLs exist in tracked markdown files outside inline code/docs."""
+    def test_links_and_urls(self) -> None:
+        """Verify no local file:/// URLs, no bracketed pseudo-links, and all relative links resolve."""
         errors: list[str] = []
         for file_path in self.tracked_md_files:
-            if not file_path.exists():
-                continue
-            lines = file_path.read_text(encoding="utf-8").splitlines()
-            for idx, line in enumerate(lines, 1):
-                # Only flag file:/// if not in a backticked example or comment
-                if re.search(r"(?<!`)(?:\[[^\]]*\]\()?(file:///[^\s\)`]+)", line):
-                    errors.append(
-                        f"{file_path.relative_to(self.repo_root)}:{idx} contains local file:/// URL"
-                    )
-        self.assertEqual(
-            errors, [], "Local filesystem URLs found:\n" + "\n".join(errors)
-        )
-
-    def test_relative_links_resolve(self) -> None:
-        """Verify internal relative markdown links resolve to existing files."""
-        errors: list[str] = []
-        for file_path in self.tracked_md_files:
-            if not file_path.exists():
-                continue
+            rel = file_path.relative_to(self.repo_root)
             content = file_path.read_text(encoding="utf-8")
-            for _text, link in re.findall(r"\[([^\]]+)\]\(([^)]+)\)", content):
+            lines = content.splitlines()
+            for idx, line in enumerate(lines, 1):
+                if re.search(r"(?<!`)(?:\[[^\]]*\]\()?(file:///[^\s\)`]+)", line):
+                    errors.append(f"{rel}:{idx} contains local file:/// URL")
+                line_no_double_ticks = re.sub(r"``.+?``", "", line)
+                if re.search(r"`\[src/ccnv/[^\]]+\]`", line_no_double_ticks):
+                    errors.append(
+                        f"{rel}:{idx} contains unlinked pseudo-link `[src/ccnv/...]`; use a relative Markdown link"
+                    )
+
+            no_fences = self._mask_fenced_code(content)
+            no_code = re.sub(r"`[^`\n]*`", "", no_fences)
+            for _text, link in re.findall(r"\[([^\]]+)\]\(([^)]+)\)", no_code):
                 if link.startswith(("#", "http://", "https://", "mailto:")):
                     continue
                 target = link.split("#")[0]
@@ -267,9 +351,8 @@ class TestDocsMarkdown(unittest.TestCase):
                     continue
                 target_path = (file_path.parent / target).resolve()
                 if not target_path.exists():
-                    errors.append(
-                        f"{file_path.relative_to(self.repo_root)}: broken link '{link}' target not found"
-                    )
+                    errors.append(f"{rel}: broken link '{link}' target not found")
+
         self.assertEqual(
-            errors, [], "Broken markdown links found:\n" + "\n".join(errors)
+            errors, [], "Markdown link/URL issues found:\n" + "\n".join(errors)
         )

@@ -2,34 +2,30 @@
 
 ## Overview
 
-The `ccnv.report` package generates downstream bioinformatic deliverables, bgzipped/tabix-indexed genomic tables, and interactive visualization reports. It formats binned evidence, segmented intervals, and copy-number calls into compressed BED and VCFv4.2 specifications, and renders self-contained Plotly HTML genome viewers using Jinja2 templating with optional cytoband ideograms and prenatal discordance overlays.
+The `ccnv.report` package generates downstream bioinformatic deliverables for `ccnv predict`: bgzipped and tabix-indexed 0-based half-open BED tables, bgzipped and tabix-indexed VCFv4.2 structural variant files, and interactive Plotly HTML genome viewers (`templates/genome_plot.html.j2`) with optional cytoband ideograms and prenatal/fragmentomic segment overlays.
 
 ## Interface
 
-- `[src/ccnv/report/__init__.py:write_outputs]`: Coordinates the serialization of all prediction artifacts (`.bed.gz`, `.vcf.gz`, `.html`).
-- `[src/ccnv/report/bed.py:write_compressed_bed]`: Writes bgzip-compressed BED tables with `#contig` headers and creates companion tabix (`.tbi`) index files.
-- `[src/ccnv/report/bed.py:bin_bed_rows]`: Formats binned ratio, observed count, expected depth, and Z-score records into BED lines.
-- `[src/ccnv/report/bed.py:segment_bed_rows]`: Formats segmented genomic intervals and prenatal discordance annotations into BED lines.
-- `[src/ccnv/report/bed.py:calls_bed_rows]`: Formats called copy-number gains and losses into BED lines.
-- `[src/ccnv/report/bed.py:sort_bin_results]`, `[src/ccnv/report/bed.py:sort_segments]`: Sorts genomic intervals across contigs using deterministic natural karyotype ordering.
-- `[src/ccnv/report/vcf.py:build_vcf_header]`: Assembles VCFv4.2 headers defining contig lengths, INFO tags, and FORMAT definitions.
-- `[src/ccnv/report/vcf.py:write_bins_vcf]`: Serializes binned observations into bgzipped and tabix-indexed VCFv4.2 files.
-- `[src/ccnv/report/vcf.py:write_segments_vcf]`: Serializes segments and calls into bgzipped and tabix-indexed VCFv4.2 files.
-- `[src/ccnv/report/html.py:render_genome_plot]`: Compiles an interactive Plotly HTML viewer from `templates/genome_plot.html.j2`.
-- `[src/ccnv/report/html.py:write_genome_plot]`: Writes the rendered HTML string to disk.
+- [`__init__.py:write_outputs`](./__init__.py): Coordinates writing `_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz` (plus `.tbi` indices), optional VCFv4.2 files (`_bins.vcf.gz`, `_segments.vcf.gz`, `_calls.vcf.gz`), and optional `<prefix>_plot.html`.
+- [`bed.py:write_compressed_bed`](./bed.py) & [`format_bed_float`](./bed.py): Write bgzipped BED tables with `#contig` headers and build `.tbi` tabix indices via `pysam`.
+- [`bed.py:bin_bed_rows`](./bed.py): Formats bin rows under `BINS_BED_HEADER` (`#contig`, `start`, `end`, `id`, `ratio`, `zscore`, `weight`, `reference_size`, `masked`, `branch`).
+- [`bed.py:segment_bed_rows`](./bed.py), [`calls_bed_rows`](./bed.py), & [`prenatal_bed_fields`](./bed.py): Format segment and gain/loss call rows, appending prenatal and fragmentomic columns (`expected_ratio`, `implied_ff`, `discordant`, `discordance_reason`, `frag_short_ratio`, `frag_llr_size`, `origin_call`) when `mode == "prenatal"`.
+- [`bed.py:sort_bin_result`](./bed.py), [`sort_bin_results`](./bed.py), & [`sort_segments`](./bed.py): Deterministically sort bins and segments in natural chromosome order (`natural_sort_key`).
+- [`vcf.py:build_vcf_header`](./vcf.py), [`write_bins_vcf`](./vcf.py), [`write_segments_vcf`](./vcf.py), & [`write_calls_vcf`](./vcf.py): Serialize bgzipped/tabix-indexed VCFv4.2 deliverables with `<DUP>`/`<DEL>` symbolic alleles, standard `INFO`/`FORMAT` tags, and prenatal extensions (`##fetalSex`, `##fetalFraction`, `##scaCall`, `EXP_LOG2R`, `IMPLIED_FF`, `DISCORDANT`, `DISC_REASON`, `FRAG_SHORT_R`, `FRAG_LLR`, `ORIGIN`, `FF`).
+- [`html.py:render_genome_plot`](./html.py) & [`write_genome_plot`](./html.py): Render the interactive Plotly WebGL genome viewer string from `templates/genome_plot.html.j2` (referencing the Plotly.js CDN) and write `<prefix>_plot.html` to disk.
 
 ## Invariants
 
-- `[src/ccnv/report/bed.py:write_compressed_bed]`: Emits 0-based half-open coordinates with `#contig` header; compresses with bgzip and indexes with tabix.
-- `[src/ccnv/report/vcf.py:build_vcf_header]`: Produces standard VCFv4.2 headers with matching contig lengths and caller metadata.
-- `[src/ccnv/report/html.py:render_genome_plot]`: Renders self-contained Plotly HTML via Jinja2 template (`templates/genome_plot.html.j2`), highlighting discordant segments in prenatal mode.
+- [`bed.py:write_compressed_bed`](./bed.py): Emits 0-based half-open intervals sorted in natural contig order (`preset="bed"` tabix indexing).
+- [`vcf.py:write_segments_vcf`](./vcf.py) & [`write_calls_vcf`](./vcf.py): Emit 1-based VCF `POS` (`start + 1`) and `END` (`end`) coordinates sorted in natural contig order (`preset="vcf"` tabix indexing), with `ORIGIN` restricted to `FETAL_CONFIRMED`, `MATERNAL_CONFIRMED`, or `INDETERMINATE` when non-null.
+- [`html.py:render_genome_plot`](./html.py): Pure in-memory template renderer returning an HTML string without filesystem writes.
 
 ## Side Effects
 
-- `[src/ccnv/report/bed.py:write_compressed_bed]`: Writes bgzipped BED files (`.bed.gz`) and creates tabix indices (`.tbi`) via `pysam`.
-- `[src/ccnv/report/vcf.py:write_bins_vcf]`, `[src/ccnv/report/vcf.py:write_segments_vcf]`: Writes bgzipped VCF files (`.vcf.gz`) and creates tabix indices (`.tbi`) via `pysam`.
-- `[src/ccnv/report/html.py:render_genome_plot]`: Writes standalone HTML visualization `<prefix>_plot.html` to disk.
+- [`bed.py:write_compressed_bed`](./bed.py): Writes `.bed.gz` and `.bed.gz.tbi` files to disk via `pysam`.
+- [`vcf.py:write_bins_vcf`](./vcf.py), [`write_segments_vcf`](./vcf.py), & [`write_calls_vcf`](./vcf.py): Write `.vcf.gz` and `.vcf.gz.tbi` files to disk via `pysam`.
+- [`html.py:write_genome_plot`](./html.py): Creates parent directories and writes `<prefix>_plot.html` to disk.
 
 ## Verification
 
-- Run: `pytest`
+- Run: `pixi run test`
