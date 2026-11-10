@@ -53,7 +53,7 @@ Chromosomes are pre-split at masked gaps $\gt 2\text{ Mb}$ into contiguous euchr
 
 - `features`: [features/README.md](./features/README.md) - Feature extraction, dynamic rebinning, DESeq2 cohort normalization, joint B-spline covariate bias correction, and prenatal inference models.
 - `io`: [io/README.md](./io/README.md) - External format ingestion (BAM/CRAM, BigWig, FASTA), samplesheet validation, and Parquet storage.
-- `models`: [models/README.md](./models/README.md) - Domain representations, configuration models, result structures, Arrow schemas (2.0.0), and exception types.
+- `models`: [models/README.md](./models/README.md) - Domain representations, configuration models, result structures, Arrow schemas, and exception types.
 - `qc`: [qc/README.md](./qc/README.md) - Quality control accounting, reference model auditing, usability verdicts, and JSON metrics reporting.
 - `report`: [report/README.md](./report/README.md) - Downstream bgzipped/tabix BED/VCF serialization and interactive Plotly HTML visualization.
 - `stats`: [stats/README.md](./stats/README.md) - Stateless numerical kernels, Gavish-Donoho SVHT PCA, signal-subspace KDTree search, Smyth Empirical Bayes shrinkage, and weighted change-point segmentation.
@@ -92,7 +92,7 @@ Chromosomes are pre-split at masked gaps $\gt 2\text{ Mb}$ into contiguous euchr
 
 ## Invariants
 
-- `[src/ccnv/models/schemas.py:validate_table]`: All tables must strictly conform to `SAMPLE_SCHEMA` or `REFERENCE_SCHEMA` under Arrow schema version `2.0.0` with `0-based-half-open` intervals.
+- `[src/ccnv/models/schemas.py:validate_table]`: All tables must strictly conform to `SAMPLE_SCHEMA` or `REFERENCE_SCHEMA` under Arrow schema version `1.0.0` with `0-based-half-open` intervals.
 - `[src/ccnv/models/schemas.py:validate_metadata]`: Metadata requires non-empty `contig_lengths` mapping identifiers to positive integers; row coordinates must satisfy $0 \le \text{start} \lt \text{end} \le \text{length}$.
 - `[src/ccnv/features/cohort.py:validate_cohort]`: Input cohort samples must share identical contig layouts, identical contig lengths, and matching bin coordinates.
 - `[src/ccnv/features/covariates.py:validate_min_mappability]`: Minimum mappability must be a finite floating-point value in $[0.0, 1.0]$.

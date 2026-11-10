@@ -11,7 +11,7 @@
 
 ## Features
 
-- **Versioned Parquet Storage (`2.0.0`)**: Sample bin counts and reference models stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC and metadata.
+- **Versioned Parquet Storage**: Sample bin counts and reference models stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC and metadata.
 - **Germline & Prenatal Analysis Modes**: Supports constitutional CNV profiling (`--mode germline`) and cfDNA non-invasive prenatal screening (`--mode prenatal`) with pure NumPy/SciPy/scikit-learn fetal fraction estimation (`FFY`, `FFX`, `FFA`), 2D stoichiometric Bayesian sex chromosome aneuploidy calling, and discordance scoring.
 - **Organism-Agnostic & 0-Based Coordinates**: Contig names, order, and lengths are read directly from alignment or FASTA headers without assuming a fixed 24-chromosome layout. All intervals are 0-based half-open `[start, end)`.
 - **Pure-Python & DataFrame-Native**: Built on `polars`, `pysam`, `pyBigWig`, `numpy`, `scipy`, `pyarrow`, `scikit-learn`, and weighted `ruptures` segmentation without heavy container dependencies.

@@ -936,13 +936,13 @@ def validate_table(table: pa.Table, kind: ArtifactKind) -> None:
 
 
 def validate_sample_table(table: pa.Table) -> None:
-    """Validate sample schema, version 2.0.0 metadata, and coordinate intervals."""
+    """Validate sample schema, version 1.0.0 metadata, and coordinate intervals."""
 
     validate_table(table, ArtifactKind.SAMPLE)
 
 
 def validate_reference_table(table: pa.Table) -> None:
-    """Validate reference schema, version 2.0.0 metadata, branches, and bin spacing."""
+    """Validate reference schema, version 1.0.0 metadata, branches, and bin spacing."""
 
     validate_table(table, ArtifactKind.REFERENCE)
 

@@ -28,8 +28,8 @@ The `ccnv.io` package manages external format ingestion, track extraction, and v
 ## Invariants
 
 - `[src/ccnv/io/alignments.py:open_alignment]`: File format must be BAM or CRAM; CRAM files strictly require a valid reference FASTA path.
-- `[src/ccnv/io/parquet.py:read_sample_parquet]`: Parquet files must conform to Arrow schema version `2.0.0` with `SAMPLE_SCHEMA` layout and `0-based-half-open` intervals.
-- `[src/ccnv/io/parquet.py:read_reference_parquet]`: Parquet files must conform to Arrow schema version `2.0.0` with `REFERENCE_SCHEMA` layout.
+- `[src/ccnv/io/parquet.py:read_sample_parquet]`: Parquet files must conform to Arrow schema version `1.0.0` with `SAMPLE_SCHEMA` layout and `0-based-half-open` intervals.
+- `[src/ccnv/io/parquet.py:read_reference_parquet]`: Parquet files must conform to Arrow schema version `1.0.0` with `REFERENCE_SCHEMA` layout.
 - `[src/ccnv/io/samplesheet.py:load_samplesheet]`: Samplesheet files must validate against `samplesheet.schema.json` with unique, non-empty sample IDs.
 - `[src/ccnv/io/tracks.py:load_gc_track]`: GC proportions must be finite floating-point values in $[0.0, 1.0]$.
 - `[src/ccnv/io/tracks.py:load_mappability_track]`: Mappability scores must be finite floating-point values in $[0.0, 1.0]$.
