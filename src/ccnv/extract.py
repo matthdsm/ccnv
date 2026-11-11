@@ -30,6 +30,8 @@ from ccnv.models import (
     PredictError,
     ReadFilters,
     ReferenceMetadata,
+    SampleBuffers,
+    SampleMetadata,
     metadata_for,
     parquet_path,
     select_layout,
@@ -43,6 +45,7 @@ __all__ = [
     "ExtractError",
     "extract_for_predict",
     "extract_sample_table",
+    "extracted_to_sample_buffers",
     "extracted_to_sample_table",
     "run",
     "run_extract",
@@ -90,6 +93,33 @@ def _scan_to_extracted(
         end_motif_counts=np.asarray(scan["motif_counts"], dtype=np.int64),
         paired_end=paired_end,
     )
+    contig_order = [name for name, _ in selected]
+    contig_lengths = dict(selected)
+    source_id: dict[str, object] = {
+        "path": str(resolved_alignment.resolve()),
+        "format": fmt,
+    }
+    ref_id: dict[str, object] = {
+        "n_contigs": len(contig_order),
+        "contig_order": contig_order,
+        **(
+            {"fasta": str(resolved_fasta.resolve())}
+            if resolved_fasta is not None
+            else {}
+        ),
+    }
+    qc_dict = dict(qc)
+    filters_dict = dict(asdict(filters))
+    sample_meta = SampleMetadata(
+        bin_size=bin_size,
+        contig_order=tuple(contig_order),
+        contig_lengths=contig_lengths,
+        source_identity=source_id,
+        reference_identity=ref_id,
+        qc=qc_dict,
+        filters=filters_dict,
+        fragmentomics=meta_frag,
+    )
     return {
         "counts": counts,
         "count": counts,
@@ -100,16 +130,39 @@ def _scan_to_extracted(
         "frag_gc_sum": frag_gc_sums,
         "frag_bands": bands_arr,
         "paired_end": paired_end,
-        "contig_lengths": dict(selected),
-        "contig_order": [name for name, _ in selected],
+        "contig_lengths": contig_lengths,
+        "contig_order": contig_order,
         "bin_size": bin_size,
         "format": fmt,
         "resolved_alignment": resolved_alignment,
         "resolved_fasta": resolved_fasta,
         "filters": filters,
-        "qc": dict(qc),
+        "qc": qc_dict,
         "fragmentomics": meta_frag,
+        "sample_metadata": sample_meta,
     }
+
+
+def extracted_to_sample_buffers(extracted: Mapping[str, object]) -> SampleBuffers:
+    """Wrap extracted scan arrays and metadata directly without building a PyArrow Table."""
+    meta = extracted["sample_metadata"]
+    assert isinstance(meta, SampleMetadata)
+    raw_bands = extracted.get("frag_bands")
+    bands = (
+        np.asarray(raw_bands, dtype=np.uint32)
+        if bool(extracted["paired_end"]) and isinstance(raw_bands, np.ndarray)
+        else None
+    )
+    return SampleBuffers(
+        meta=meta,
+        count=np.asarray(extracted["counts"], dtype=np.uint32),
+        paired_count=np.asarray(extracted["paired_count"], dtype=np.uint32),
+        frag_len_sum=np.asarray(extracted["frag_len_sum"], dtype=np.uint64),
+        short_frag_count=np.asarray(extracted["short_frag_count"], dtype=np.uint32),
+        endpoint_count=np.asarray(extracted["endpoint_count"], dtype=np.uint32),
+        frag_gc_sum=np.asarray(extracted["frag_gc_sum"], dtype=np.float32),
+        frag_bands=bands,
+    )
 
 
 def extracted_to_sample_table(extracted: Mapping[str, object]) -> pa.Table:

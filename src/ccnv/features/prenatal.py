@@ -27,6 +27,8 @@ from ccnv.features.fragmentomics import (
     fuse_active_fetal_fraction,
     score_segment_table_origin,
 )
+from ccnv.features.rebinning import rebin_sample_buffers
+from ccnv.io.parquet import extract_sample_meta_and_counts
 from ccnv.models import (
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
@@ -35,7 +37,7 @@ from ccnv.models import (
     FetalFractionResult,
     FetalSex,
     PrenatalModelMetadata,
-    SampleMetadata,
+    SampleBuffers,
     SamplesheetEntry,
     SCACall,
     SCAResult,
@@ -648,7 +650,7 @@ def fit_prenatal_models(
 
 
 def predict_prenatal(
-    sample_table: pa.Table,
+    sample_table: pa.Table | SampleBuffers,
     reference_table: pa.Table,
     prenatal_meta: PrenatalModelMetadata,
     min_ff_warning: float = 0.04,
@@ -675,16 +677,12 @@ def predict_prenatal(
     )
 
     # 2. Evaluate chry_score and fetal sex from sample sketch grid
-    s_meta = SampleMetadata.from_table(sample_table)
+    s_meta, sample_counts = extract_sample_meta_and_counts(sample_table)
     s_codes, s_names, s_starts_u32, s_ends_u32 = reconstruct_sample_grid(s_meta)
     sample_c = [s_names[int(c)] for c in s_codes]
     sample_s = s_starts_u32.astype(np.int64)
     sample_e = s_ends_u32.astype(np.int64)
     sample_w = sample_e - sample_s
-    sample_counts = np.asarray(
-        sample_table.column("count").to_numpy(zero_copy_only=False),
-        dtype=np.float64,
-    )
     norm_sample_c = np.array([normalize_chr(c) for c in sample_c], dtype=object)
 
     chry_mask = norm_sample_c == "Y"
@@ -735,17 +733,17 @@ def predict_prenatal(
         ffy = None
 
     # 4. Rebin sample to 100 kb for FFA and FFX
-    sample_100k = rebin_sample_table(sample_table, prenatal_meta.prenatal_bin_size)
-    s100_meta = SampleMetadata.from_table(sample_100k)
+    sample_100k: pa.Table | SampleBuffers = (
+        rebin_sample_buffers(sample_table, prenatal_meta.prenatal_bin_size)
+        if isinstance(sample_table, SampleBuffers)
+        else rebin_sample_table(sample_table, prenatal_meta.prenatal_bin_size)
+    )
+    s100_meta, counts_100k = extract_sample_meta_and_counts(sample_100k)
     c100_codes, c100_names, s100_u32, e100_u32 = reconstruct_sample_grid(s100_meta)
     c_100k = [c100_names[int(c)] for c in c100_codes]
     s_100k = s100_u32.astype(np.int64)
     e_100k = e100_u32.astype(np.int64)
     w_100k = e_100k - s_100k
-    counts_100k = np.asarray(
-        sample_100k.column("count").to_numpy(zero_copy_only=False),
-        dtype=np.float64,
-    )
     norm_c_100k = np.array([normalize_chr(c) for c in c_100k], dtype=object)
     auto_mask_100k = _resolve_autosome_mask(norm_c_100k)
     chrx_mask_100k = norm_c_100k == "X"
@@ -838,8 +836,10 @@ def predict_prenatal(
     )
 
     # 7. Active Fetal Fraction selection
-    sample_frag_meta = extract_sample_fragmentomics(
-        decode_metadata(sample_table.schema.metadata)
+    sample_frag_meta = (
+        sample_table.meta.fragmentomics
+        if isinstance(sample_table, SampleBuffers)
+        else extract_sample_fragmentomics(decode_metadata(sample_table.schema.metadata))
     )
     ff_size = (
         predict_ff_fragmentomics(sample_frag_meta, prenatal_meta)
@@ -887,7 +887,7 @@ def annotate_prenatal_segments(
     segments: Sequence[SegmentResult],
     prenatal_result: FetalFractionResult,
     z_threshold: float = 3.0,
-    sample_table: pa.Table | None = None,
+    sample_table: pa.Table | SampleBuffers | None = None,
     prenatal_meta: PrenatalModelMetadata | None = None,
 ) -> list[SegmentResult]:
     """Annotate segments with expected ratio, implied FF, discordance status, and origin."""
@@ -898,8 +898,12 @@ def annotate_prenatal_segments(
     p_fetal = None
     p_maternal = None
     if sample_table is not None:
-        frag_meta = extract_sample_fragmentomics(
-            decode_metadata(sample_table.schema.metadata)
+        frag_meta = (
+            sample_table.meta.fragmentomics
+            if isinstance(sample_table, SampleBuffers)
+            else extract_sample_fragmentomics(
+                decode_metadata(sample_table.schema.metadata)
+            )
         )
         if frag_meta is not None:
             shift_bp = frag_meta.sizing_shift_bp

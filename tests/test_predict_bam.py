@@ -64,17 +64,27 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
                 )
             )
 
+            from unittest.mock import patch
+
+            from ccnv.models import SampleBuffers
+
             fasta = ensure_published_fasta()
-            # Direct CRAM path passed as sample
-            inputs = load_inputs(
-                PUBLISHED_CRAM,
-                ref_path,
-                sex="autosomal",
-                mode="germline",
-                fasta=fasta,
-            )
-            self.assertIsNotNone(inputs.sample)
-            self.assertIn("frag_bands", inputs.sample.column_names)
+            # Direct CRAM path in germline mode skips frag_bands and SAMPLE_SCHEMA table construction
+            with patch(
+                "ccnv.extract.extracted_to_sample_table",
+                side_effect=AssertionError("must not materialize SAMPLE_SCHEMA table"),
+            ):
+                inputs = load_inputs(
+                    PUBLISHED_CRAM,
+                    ref_path,
+                    sex="autosomal",
+                    mode="germline",
+                    fasta=fasta,
+                )
+            self.assertIsInstance(inputs.sample, SampleBuffers)
+            assert isinstance(inputs.sample, SampleBuffers)
+            self.assertIsNone(inputs.sample.frag_bands)
+            self.assertIsNotNone(inputs.sample.meta.fragmentomics)
             self.assertGreater(inputs.sample.num_rows, 0)
 
     def test_annotate_prenatal_segments_origin_fetal_and_maternal(self) -> None:

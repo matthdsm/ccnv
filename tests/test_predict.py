@@ -575,6 +575,49 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
         with self.assertRaises(PredictError):
             build_branch_model(inputs, BRANCH_AUTOSOMAL)
 
+    def test_sample_buffers_rebin_and_branch_model_without_arrow_table(self) -> None:
+        from ccnv.features.rebinning import rebin_sample_buffers
+        from ccnv.models import SampleBuffers, SampleMetadata
+        from ccnv.predict import build_branch_model
+
+        bufs_50 = SampleBuffers(
+            meta=SampleMetadata(
+                bin_size=50,
+                contig_order=("chr1", "chr2"),
+                contig_lengths={"chr1": 100, "chr2": 80},
+                source_identity={},
+                reference_identity={},
+                qc={},
+                filters={},
+            ),
+            count=np.array([5, 5, 6, 4], dtype=np.uint32),
+            paired_count=np.zeros(4, dtype=np.uint32),
+            frag_len_sum=np.zeros(4, dtype=np.uint64),
+            short_frag_count=np.zeros(4, dtype=np.uint32),
+            endpoint_count=np.zeros(4, dtype=np.uint32),
+            frag_gc_sum=np.zeros(4, dtype=np.float32),
+            frag_bands=None,
+        )
+        bufs_100 = rebin_sample_buffers(bufs_50, 100)
+        self.assertEqual(bufs_100.meta.bin_size, 100)
+        self.assertIsNone(bufs_100.frag_bands)
+        np.testing.assert_array_equal(
+            bufs_100.count, np.array([10, 10], dtype=np.uint32)
+        )
+
+        ref = _reference_table()
+        bm = build_branch_model(
+            PredictionInput(
+                sample=bufs_100,
+                reference=ref,
+                contig_lengths={"chr1": 100, "chr2": 80},
+                sex=None,
+                branches=(BRANCH_AUTOSOMAL,),
+            ),
+            BRANCH_AUTOSOMAL,
+        )
+        np.testing.assert_allclose(bm.counts, [10.0, 10.0])
+
 
 class TestModeGuardrails(unittest.TestCase):
     def test_prenatal_mode_with_germline_ref_raises(self) -> None:

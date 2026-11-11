@@ -14,6 +14,7 @@ from ccnv.models import (
     SCHEMA_VERSION,
     AnalysisMode,
     FetalFractionResult,
+    SampleBuffers,
     SegmentResult,
     decode_metadata,
 )
@@ -41,20 +42,27 @@ def _int_metric(
 
 def build_predict_qc_payload(
     mode: AnalysisMode,
-    sample_table: pa.Table,
+    sample_table: pa.Table | SampleBuffers,
     segments: Sequence[SegmentResult],
     prenatal_result: FetalFractionResult | None = None,
 ) -> dict[str, object]:
     """Construct structured QC metrics for a prediction invocation."""
-    sample_meta = decode_metadata(sample_table.schema.metadata)
-    qc_meta_raw = sample_meta.get("qc")
-    qc_meta: Mapping[str, object] = (
-        qc_meta_raw if isinstance(qc_meta_raw, Mapping) else {}
-    )
-
-    counts = (
-        sample_table.column("count").to_numpy(zero_copy_only=False).astype(np.float64)
-    )
+    if isinstance(sample_table, SampleBuffers):
+        qc_meta: Mapping[str, object] = sample_table.meta.qc or {}
+        counts = np.asarray(sample_table.count, dtype=np.float64)
+        source_identity: object = sample_table.meta.source_identity
+        frag_meta = sample_table.meta.fragmentomics
+    else:
+        sample_meta = decode_metadata(sample_table.schema.metadata)
+        qc_meta_raw = sample_meta.get("qc")
+        qc_meta = qc_meta_raw if isinstance(qc_meta_raw, Mapping) else {}
+        counts = (
+            sample_table.column("count")
+            .to_numpy(zero_copy_only=False)
+            .astype(np.float64)
+        )
+        source_identity = sample_meta.get("source_identity")
+        frag_meta = extract_sample_fragmentomics(sample_meta)
     total_bins = int(counts.size)
     usable_bins = int(np.count_nonzero(counts > 0))
     masked_bins = total_bins - usable_bins
@@ -93,7 +101,6 @@ def build_predict_qc_payload(
         "median_bin_count": median_bin_count,
     }
 
-    source_identity = sample_meta.get("source_identity")
     sample_name = "SAMPLE"
     if isinstance(source_identity, Mapping):
         sample_path = source_identity.get("path")
@@ -148,7 +155,6 @@ def build_predict_qc_payload(
             "warnings": list(prenatal_result.warnings),
         }
 
-    frag_meta = extract_sample_fragmentomics(sample_meta)
     frag_data: dict[str, object] | None = None
     if frag_meta is not None:
         frag_data = {

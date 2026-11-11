@@ -193,11 +193,18 @@ def evaluate_loco_prototype_baseline(
     for m in range(n_protos):
         lo = int(p_starts[m])
         hi = int(p_ends[m])
-        if hi - lo <= 1:
+        if hi <= lo:
+            continue
+        if n_contigs == 1:
+            if hi - lo == 1:
+                loco_med[m, 0] = np.nan
+                loco_cnt[m, 0] = 0
             continue
         c_m = s_c[lo:hi]
         if c_m[0] == c_m[-1]:
-            # 100% of this prototype's eligible bins lie on one contig: retain full median
+            ck_only = int(c_m[0])
+            loco_med[m, ck_only] = np.nan
+            loco_cnt[m, ck_only] = 0
             continue
         v_m = s_v[lo:hi]
         cuts = np.flatnonzero(c_m[1:] != c_m[:-1]) + 1
@@ -209,20 +216,78 @@ def evaluate_loco_prototype_baseline(
             loco_med[m, ck] = float(np.median(off_v))
             loco_cnt[m, ck] = int(off_v.size)
 
+    r_cols = pids.shape[1]
+    first_occ = np.ones((u_count, r_cols), dtype=np.bool_)
+    for col_j in range(1, r_cols):
+        first_occ[:, col_j] = np.all(
+            pids[:, :col_j] != pids[:, col_j : col_j + 1], axis=1
+        )
+
     p_est = loco_med[pids, c_compact[:, np.newaxis]]
     p_cnt = loco_cnt[pids, c_compact[:, np.newaxis]]
-    valid_w = (pw > 0.0) & np.isfinite(p_est) & (p_est > 0.0) & (p_cnt > 0)
+    valid_proto = np.isfinite(p_est) & (p_est > 0.0) & (p_cnt > 0)
+    valid_w = valid_proto & (pw > 0.0)
     eff_w = np.where(valid_w, pw, 0.0)
     w_sum = np.sum(eff_w, axis=1)
-    has_est = w_sum > 0.0
 
+    fallback_proto = valid_proto & first_occ
+    need_unif = (w_sum <= 0.0) & np.any(fallback_proto, axis=1)
+    if np.any(need_unif):
+        eff_w = np.where(
+            need_unif[:, np.newaxis], np.where(fallback_proto, 1.0, 0.0), eff_w
+        )
+        w_sum = np.sum(eff_w, axis=1)
+
+    used_mask = np.where(need_unif[:, np.newaxis], fallback_proto, valid_w & first_occ)
+    has_est = w_sum > 0.0
     baselines = np.where(
         has_est,
-        np.sum(eff_w * np.where(valid_w, p_est, 0.0), axis=1)
+        np.sum(eff_w * np.where(valid_proto, p_est, 0.0), axis=1)
         / np.where(has_est, w_sum, 1.0),
         np.nan,
     )
-    support = np.sum(np.where(valid_w, p_cnt, 0), axis=1, dtype=np.int64)
+    support = np.sum(np.where(used_mask, p_cnt, 0), axis=1, dtype=np.int64)
+
+    missing_rows = np.flatnonzero(~has_est)
+    if missing_rows.size > 0:
+        lso_rows: list[int] = []
+        if n_contigs > 1:
+            for ck in np.unique(c_compact[missing_rows]):
+                ck_int = int(ck)
+                ck_rows = missing_rows[c_compact[missing_rows] == ck_int]
+                off_elig = e_v[e_c != ck_int]
+                if off_elig.size > 0:
+                    baselines[ck_rows] = float(np.median(off_elig))
+                    support[ck_rows] = int(off_elig.size)
+                else:
+                    lso_rows.extend(int(r) for r in ck_rows)
+        else:
+            lso_rows = [int(r) for r in missing_rows]
+
+        if lso_rows and e_v.size >= 2:
+            sv = np.sort(e_v)
+            e_len = int(sv.size)
+            full_e_med = float(np.median(sv))
+            m_len = e_len - 1
+            for r_i in lso_rows:
+                if not elig[r_i]:
+                    baselines[r_i] = full_e_med
+                    support[r_i] = e_len
+                else:
+                    pos = int(np.searchsorted(sv, vals[r_i], side="left"))
+                    if m_len % 2 == 1:
+                        q = m_len // 2
+                        baselines[r_i] = float(sv[q if q < pos else q + 1])
+                    else:
+                        q0, q1 = m_len // 2 - 1, m_len // 2
+                        i0 = q0 if q0 < pos else q0 + 1
+                        i1 = q1 if q1 < pos else q1 + 1
+                        baselines[r_i] = 0.5 * float(sv[i0] + sv[i1])
+                    support[r_i] = m_len
+        elif lso_rows and e_v.size == 1:
+            baselines[lso_rows] = float(e_v[0])
+            support[lso_rows] = 1
+
     return baselines, support
 
 

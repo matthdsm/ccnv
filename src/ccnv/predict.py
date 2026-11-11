@@ -16,7 +16,7 @@ import scipy.stats
 from numpy.typing import ArrayLike, NDArray
 from sklearn.linear_model import HuberRegressor
 
-from ccnv.extract import extract_for_predict, extracted_to_sample_table
+from ccnv.extract import extract_for_predict, extracted_to_sample_buffers
 from ccnv.features.covariates import (
     correct_covariate_bias,
     mask_covariates,
@@ -29,10 +29,11 @@ from ccnv.features.fragmentomics import (
     resolve_fragmentomics_compatibility,
 )
 from ccnv.features.prenatal import annotate_prenatal_segments, predict_prenatal
-from ccnv.features.rebinning import rebin_sample_sketch
+from ccnv.features.rebinning import rebin_sample_buffers, rebin_sample_sketch
 from ccnv.io.parquet import (
     align_sample_grid_indices,
     extract_reference_branch_arrays,
+    extract_sample_meta_and_counts,
     read_reference_parquet,
     read_sample_parquet,
     unique_dictionary_contigs,
@@ -58,6 +59,7 @@ from ccnv.models import (
     PredictionOutputs,
     PrenatalModelMetadata,
     ReferenceMetadata,
+    SampleBuffers,
     SampleMetadata,
     SchemaError,
     SegmentResult,
@@ -84,6 +86,7 @@ __all__ = [
     "PredictError",
     "PredictionInput",
     "ProjectedCoverage",
+    "SampleBuffers",
     "build_branch_model",
     "call_segment",
     "extract_for_predict",
@@ -98,7 +101,7 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class PredictionInput:
-    sample: pa.Table
+    sample: pa.Table | SampleBuffers
     reference: pa.Table
     contig_lengths: dict[str, int]
     sex: Sex | None
@@ -239,19 +242,14 @@ def load_inputs(
         raise PredictError(f"failed to read reference {reference_path}: {err}") from err
 
     if sample_path.suffix.lower() in {".bam", ".cram"}:
-        need_bands = (
-            mode == "prenatal"
-            or ref_meta_obj.fragmentomics_corrected
-            or ref_meta_obj.flat
-        )
         extracted = extract_for_predict(
             sample_path,
             ref_meta_obj,
             threads=threads,
             fasta=fasta,
-            collect_bands=need_bands,
+            collect_bands=(mode == "prenatal"),
         )
-        sample = extracted_to_sample_table(extracted)
+        sample: pa.Table | SampleBuffers = extracted_to_sample_buffers(extracted)
     else:
         try:
             sample = read_sample_parquet(sample_path)
@@ -310,7 +308,11 @@ def load_inputs(
                 branches.append(sex_branch)
         read_branches = list(branches)
 
-    sample_meta_obj = validate_sample_table(sample)
+    sample_meta_obj = (
+        sample.meta
+        if isinstance(sample, SampleBuffers)
+        else validate_sample_table(sample)
+    )
     if sample_meta_obj.bin_size != ref_meta_obj.bin_size:
         logger.debug(
             "rebinning sample from %d bp to reference bin size %d bp",
@@ -318,10 +320,14 @@ def load_inputs(
             ref_meta_obj.bin_size,
         )
         try:
-            sample = rebin_sample_sketch(sample, ref_meta_obj.bin_size)
+            if isinstance(sample, SampleBuffers):
+                sample = rebin_sample_buffers(sample, ref_meta_obj.bin_size)
+                sample_meta_obj = sample.meta
+            else:
+                sample = rebin_sample_sketch(sample, ref_meta_obj.bin_size)
+                sample_meta_obj = validate_sample_table(sample)
         except BinCompatibilityError as err:
             raise PredictError(str(err)) from err
-        sample_meta_obj = validate_sample_table(sample)
 
     try:
         reference, _ = read_reference_parquet(
@@ -375,11 +381,11 @@ def build_branch_model(
     """Build dense zero-copy NumPy arrays for one reference branch."""
     if isinstance(inputs, PredictionInput):
         ref_table = inputs.reference
-        sample_table: pa.Table | None = inputs.sample
+        sample_data: pa.Table | SampleBuffers | None = inputs.sample
         resolved_meta = ReferenceMetadata.from_schema(ref_table.schema)
     else:
         ref_table = inputs
-        sample_table = None
+        sample_data = None
         resolved_meta = (
             ref_meta
             if ref_meta is not None
@@ -387,28 +393,19 @@ def build_branch_model(
         )
 
     arrs = extract_reference_branch_arrays(ref_table, branch, resolved_meta)
-    if sample_table is not None:
+    if sample_data is not None:
         try:
-            if (
-                "count" in sample_table.schema.names
-                and sample_table.schema.field("count").type == pa.float64()
-            ):
-                s_meta = SampleMetadata.from_table(sample_table)
-                if sample_table.num_rows != s_meta.expected_num_bins:
-                    raise PredictError("weighted sample row count mismatch")
-            else:
-                s_meta = validate_sample_table(sample_table)
+            s_meta, s_counts = extract_sample_meta_and_counts(
+                sample_data, validate=True
+            )
         except SchemaError as err:
             raise PredictError(str(err)) from err
         s_idx = align_sample_grid_indices(
             s_meta, arrs.contigs, arrs.starts, arrs.ends, branch
         )
-        s_counts = (
-            sample_table.column("count").combine_chunks().to_numpy(zero_copy_only=False)
-        )
-        counts = s_counts[s_idx].astype(np.float64)
-        if resolve_fragmentomics_compatibility(sample_table, ref_table):
-            f_len, e_rat = extract_bin_fragmentomic_covariates(sample_table)
+        counts = s_counts[s_idx]
+        if resolve_fragmentomics_compatibility(sample_data, ref_table):
+            f_len, e_rat = extract_bin_fragmentomic_covariates(sample_data)
             mean_frag_len: NDArray[np.floating] | None = f_len[s_idx].astype(np.float64)
             endpoint_ratio: NDArray[np.floating] | None = e_rat[s_idx].astype(
                 np.float64
@@ -877,7 +874,7 @@ def segment_and_call(
 
 def _resolve_sample_sex(
     requested: Literal["autosomal", "female", "male"],
-    sample: pa.Table,
+    sample: pa.Table | SampleBuffers,
     metadata: dict[str, object],
     branches: set[object],
 ) -> Sex | None:
@@ -896,22 +893,30 @@ def _resolve_sample_sex(
     cutoff = model["sex_inference"].get("cutoff")
     if not isinstance(cutoff, int | float):
         raise PredictError("cannot infer sample sex; pass --sex female or --sex male")
-    counts = np.asarray(
-        sample.column("count").combine_chunks().to_numpy(zero_copy_only=False),
-        dtype=np.float64,
+    counts = (
+        np.asarray(sample.count, dtype=np.float64)
+        if isinstance(sample, SampleBuffers)
+        else np.asarray(
+            sample.column("count").combine_chunks().to_numpy(zero_copy_only=False),
+            dtype=np.float64,
+        )
     )
     total = float(np.sum(counts))
     if total <= 0:
         raise PredictError("sample has zero total coverage")
     signal = str(model["sex_signal_contig"])
-    if "contig" in sample.column_names:
+    if not isinstance(sample, SampleBuffers) and "contig" in sample.column_names:
         contigs = np.asarray(
             sample.column("contig").combine_chunks().to_numpy(zero_copy_only=False),
             dtype=object,
         )
         sig_sum = float(np.sum(counts[contigs == signal]))
     else:
-        s_meta = SampleMetadata.from_schema(sample.schema)
+        s_meta = (
+            sample.meta
+            if isinstance(sample, SampleBuffers)
+            else SampleMetadata.from_schema(sample.schema)
+        )
         codes, names, _, _ = reconstruct_sample_grid(s_meta)
         sig_sum = (
             float(np.sum(counts[codes == names.index(signal)]))

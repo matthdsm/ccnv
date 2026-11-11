@@ -223,7 +223,7 @@ def test_prototype_graph_fitting_edge_cases_and_loco_baseline() -> None:
     assert w_empty.shape == (0, 4) and w_empty.dtype == np.float16
     assert d_empty.shape == (0,)
 
-    # LOCO evaluation excludes same-contig gain and falls back when 100% on one contig
+    # LOCO evaluation excludes same-contig gain and never self-contaminates single-contig clusters
     loco_pids = np.array(
         [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [1, 1, 0, 0]],
         dtype=np.uint16,
@@ -234,21 +234,45 @@ def test_prototype_graph_fitting_edge_cases_and_loco_baseline() -> None:
             [1.0, 0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.5, 0.25, 0.0],
         ],
         dtype=np.float16,
     )
     contigs = np.array([0, 0, 1, 1, 2], dtype=np.int32)
-    vals = np.array([2.0, 2.0, 1.0, 1.0, 1.5], dtype=np.float64)
-    baselines, support = evaluate_loco_prototype_baseline(
-        vals, contigs, loco_pids, loco_w
+    vals_gain0 = np.array([2.0, 2.0, 1.0, 1.0, 1.5], dtype=np.float64)
+    baselines_g0, support_g0 = evaluate_loco_prototype_baseline(
+        vals_gain0, contigs, loco_pids, loco_w
     )
-    # Contig 0 bins get contig-1 prototype median (1.0), NOT contaminated by 2.0!
-    np.testing.assert_allclose(baselines[:2], 1.0)
-    assert np.all(support[:2] == 2)
-    # Prototype 1 has 100% of its bins on contig 2 -> falls back to full-genome median (1.5)
-    assert baselines[4] == pytest.approx(1.5)
-    assert support[4] == 1
+    np.testing.assert_allclose(baselines_g0[:2], 1.0)
+    assert np.all(support_g0[:2] == 2)
+
+    # Primary prototype 1 is 100% on trisomic contig 2 (1.5); secondary prototype 0 is on diploid 0..1 (1.0)
+    vals_tri2 = np.array([1.0, 1.0, 1.0, 1.0, 1.5], dtype=np.float64)
+    baselines_tri2, support_tri2 = evaluate_loco_prototype_baseline(
+        vals_tri2, contigs, loco_pids, loco_w
+    )
+    assert baselines_tri2[4] == pytest.approx(1.0)
+    assert support_tri2[4] == 4
+
+    # Singleton cluster (dists == 0.0) where float16 rounds secondary weights to 0.0 still resolves to 1.0
+    singleton_feats = np.vstack(
+        [
+            rng.normal(0.0, 0.05, size=(12, 2)),
+            np.array([[200.0, 200.0]]),
+        ]
+    ).astype(np.float32)
+    _, s_pids, s_weights, _ = fit_prototype_graph(
+        singleton_feats, max_prototypes=8, top_r=4
+    )
+    assert s_weights[12, 0] == np.float16(1.0)
+    np.testing.assert_array_equal(s_weights[12, 1:], np.float16(0.0))
+    s_contigs = np.array([0] * 6 + [1] * 6 + [2], dtype=np.int32)
+    s_vals = np.array([1.0] * 12 + [1.5], dtype=np.float64)
+    s_base, s_sup = evaluate_loco_prototype_baseline(
+        s_vals, s_contigs, s_pids, s_weights
+    )
+    assert s_base[12] == pytest.approx(1.0)
+    assert s_sup[12] > 0
 
 
 def test_branch_partitioned_reference_io_and_zero_copy_branch_model(
@@ -400,26 +424,40 @@ def test_end_to_end_reference_and_parallel_bam_predict(tmp_path: Path) -> None:
 
     _, ref_meta = read_reference_parquet(ref_path, branches=[BRANCH_AUTOSOMAL])
     bam_path = _write_synthetic_bam(tmp_path / "query.bam")
-    extracted = extract_for_predict(bam_path, ref_meta, threads=2)
+    extracted = extract_for_predict(bam_path, ref_meta, threads=2, collect_bands=False)
+    assert extracted["frag_bands"] is None
     assert isinstance(extracted["counts"], np.ndarray)
     assert extracted["counts"].shape == (20,)
     assert int(np.sum(extracted["counts"])) > 0
 
-    out_prefix = tmp_path / "pred" / "sample_out"
-    res = CliRunner().invoke(
-        app,
-        [
-            "predict",
-            str(bam_path),
-            str(ref_path),
-            "--prefix",
-            str(out_prefix),
-            "-t",
-            "2",
-            "--no-bins-vcf",
-            "--no-plot",
-        ],
-    )
+    from unittest.mock import patch
+
+    from ccnv.models import SampleBuffers
+    from ccnv.predict import load_inputs
+
+    with patch(
+        "ccnv.extract.extracted_to_sample_table",
+        side_effect=AssertionError("must not materialize SAMPLE_SCHEMA table"),
+    ):
+        direct_inputs = load_inputs(bam_path, ref_path, mode="germline", threads=2)
+        assert isinstance(direct_inputs.sample, SampleBuffers)
+        assert direct_inputs.sample.frag_bands is None
+
+        out_prefix = tmp_path / "pred" / "sample_out"
+        res = CliRunner().invoke(
+            app,
+            [
+                "predict",
+                str(bam_path),
+                str(ref_path),
+                "--prefix",
+                str(out_prefix),
+                "-t",
+                "2",
+                "--no-bins-vcf",
+                "--no-plot",
+            ],
+        )
     assert res.exit_code == 0, res.output
     assert Path(f"{out_prefix}_bins.bed.gz").is_file()
     assert Path(f"{out_prefix}_segments.bed.gz").is_file()

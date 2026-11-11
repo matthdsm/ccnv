@@ -19,6 +19,7 @@ from ccnv.models import (
     PredictError,
     ReferenceError,
     ReferenceMetadata,
+    SampleBuffers,
     SampleMetadata,
     SchemaError,
     decode_metadata,
@@ -33,6 +34,7 @@ __all__ = [
     "align_sample_grid_indices",
     "decode_dictionary_contigs",
     "extract_reference_branch_arrays",
+    "extract_sample_meta_and_counts",
     "is_sample_parquet",
     "load_cohort",
     "load_sample_or_extract",
@@ -316,6 +318,34 @@ def unique_dictionary_contigs(contig_col: pa.ChunkedArray) -> list[str]:
                 seen.append(name)
         return seen
     return list(dict.fromkeys(str(x) for x in combined.to_numpy(zero_copy_only=False)))
+
+
+def extract_sample_meta_and_counts(
+    sample: pa.Table | SampleBuffers,
+    *,
+    validate: bool = False,
+) -> tuple[SampleMetadata, NDArray[np.float64]]:
+    """Extract SampleMetadata and float64 count array from SampleBuffers or pa.Table."""
+    if isinstance(sample, SampleBuffers):
+        if sample.num_rows != sample.meta.expected_num_bins:
+            raise PredictError("sample buffer row count mismatch")
+        return sample.meta, np.asarray(sample.count, dtype=np.float64)
+    if (
+        "count" in sample.schema.names
+        and sample.schema.field("count").type == pa.float64()
+    ):
+        s_meta = SampleMetadata.from_table(sample)
+        if sample.num_rows != s_meta.expected_num_bins:
+            raise PredictError("weighted sample row count mismatch")
+    elif validate:
+        s_meta = validate_sample_table(sample)
+    else:
+        s_meta = SampleMetadata.from_table(sample)
+    counts = np.asarray(
+        sample.column("count").combine_chunks().to_numpy(zero_copy_only=False),
+        dtype=np.float64,
+    )
+    return s_meta, counts
 
 
 def align_sample_grid_indices(

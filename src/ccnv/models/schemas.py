@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
@@ -248,6 +249,24 @@ def fixed_size_list_to_numpy[ScalarT: np.generic](
     return out
 
 
+@dataclass(frozen=True, slots=True)
+class SampleBuffers:
+    """In-memory sample sketch channels and metadata for direct BAM/CRAM prediction."""
+
+    meta: SampleMetadata
+    count: NDArray[np.uint32] | NDArray[np.float64]
+    paired_count: NDArray[np.uint32]
+    frag_len_sum: NDArray[np.uint64]
+    short_frag_count: NDArray[np.uint32]
+    endpoint_count: NDArray[np.uint32]
+    frag_gc_sum: NDArray[np.float32]
+    frag_bands: NDArray[np.uint32] | None = None
+
+    @property
+    def num_rows(self) -> int:
+        return int(self.count.shape[0])
+
+
 def validate_table(table: pa.Table, kind: ArtifactKind) -> None:
     """Validate schema plus canonical coordinate bounds and row identity."""
     from ccnv.models.validation import validate_table as _impl
@@ -278,6 +297,7 @@ __all__ = [
     "FragmentomicsMetadata",
     "PrenatalModelMetadata",
     "ReferenceMetadata",
+    "SampleBuffers",
     "SampleMetadata",
     "SchemaError",
     "SchemaVersionError",
