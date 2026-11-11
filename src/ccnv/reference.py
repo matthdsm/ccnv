@@ -19,14 +19,15 @@ from ccnv.features.cohort import (
     SexLabel,
     cohort_from_fasta,
     compute_bin_exposure,
+    estimate_size_factors,
     infer_germline_sex_2d,
     load_and_assemble_cohort,
     mask_low_coverage_per_contig,
-    normalize_depth,
 )
 from ccnv.features.covariates import (
-    correct_covariate_bias,
+    build_exogenous_covariate_basis,
     covariate_features,
+    fit_poisson_covariate_trends,
     mask_covariates,
     validate_min_mappability,
 )
@@ -60,11 +61,11 @@ from ccnv.models import (
 )
 from ccnv.qc.reference import run_reference_qc_on_table
 from ccnv.stats.neighbors import (
-    build_signal_space_features,
-    compute_prototype_null_models,
+    build_whitened_subspace_features,
+    calibrate_prototype_dispersion,
     fit_prototype_graph,
 )
-from ccnv.stats.pca import fit_pca
+from ccnv.stats.pca import fit_whitened_pca, reconstruct_whitened_pca_expected
 
 DEFAULT_SEX_CONTIGS: Final[tuple[str, ...]] = ("X", "Y", "chrX", "chrY")
 DEFAULT_SEX_SIGNAL_CONTIGS: Final[tuple[str, ...]] = ("chrY", "Y")
@@ -584,9 +585,40 @@ def _build_branch_table(
     selected = np.isin(cohort.contigs, contig_names)
     if not np.any(selected):
         raise ReferenceError(f"branch {branch!r} has no bins")
-    counts = np.asarray(cohort.counts[np.ix_(selected, sample_index)], dtype=np.float64)
-    if np.any(np.sum(counts, axis=0) <= 0):
+    n_bins = int(np.count_nonzero(selected))
+    n_sub = int(sample_index.size)
+    if n_sub == 0:
+        raise ReferenceError(f"branch {branch!r} has no samples")
+
+    full_samples = n_sub == cohort.counts.shape[1] and bool(
+        np.array_equal(sample_index, np.arange(cohort.counts.shape[1]))
+    )
+    if bool(np.all(selected)) and full_samples:
+        counts = (
+            cohort.counts
+            if cohort.counts.dtype == np.float32
+            else np.asarray(cohort.counts, dtype=np.float32)
+        )
+    else:
+        sel_idx = np.flatnonzero(selected)
+        counts = np.empty((n_bins, n_sub), dtype=np.float32)
+        for r0 in range(0, n_bins, 32_768):
+            r1 = min(n_bins, r0 + 32_768)
+            sub_rows = cohort.counts[sel_idx[r0:r1]]
+            counts[r0:r1] = (
+                sub_rows
+                if full_samples
+                else np.asarray(sub_rows[:, sample_index], dtype=np.float32)
+            )
+
+    col_totals = np.zeros(n_sub, dtype=np.float64)
+    for r0 in range(0, n_bins, 32_768):
+        col_totals += np.sum(
+            counts[r0 : min(n_bins, r0 + 32_768)], axis=0, dtype=np.float64
+        )
+    if np.any(col_totals <= 0.0):
         raise ReferenceError(f"branch {branch!r} has a zero-coverage sample")
+
     contig_subset = np.array(cohort.contigs, dtype=object)[selected]
     uniq_c = list(dict.fromkeys(str(c) for c in contig_subset))
     c_map = {name: idx for idx, name in enumerate(uniq_c)}
@@ -595,6 +627,9 @@ def _build_branch_table(
     branch_ends = cohort.ends[selected]
     branch_exp = compute_bin_exposure(branch_starts, branch_ends, cohort.bin_size)
     branch_gc = cohort_gc[selected] if cohort_gc is not None else None
+    branch_gc_q = (
+        cohort_gc_quantiles[selected] if cohort_gc_quantiles is not None else None
+    )
     branch_map = (
         cohort_mappability[selected] if cohort_mappability is not None else None
     )
@@ -608,38 +643,14 @@ def _build_branch_table(
     )
     if not np.any(usable):
         raise ReferenceError(f"branch {branch!r} has no unmasked bins")
-    logger.debug(
-        "branch %s: mask kept %d/%d bins",
-        branch,
-        int(np.count_nonzero(usable)),
-        int(usable.size),
-    )
+    u_count = int(np.count_nonzero(usable))
+    logger.debug("branch %s: mask kept %d/%d bins", branch, u_count, int(usable.size))
 
     branch_frag_len = (
         cohort.ref_frag_len[selected] if cohort.ref_frag_len is not None else None
     )
     branch_ep_ratio = (
         cohort.ref_ep_rate[selected] if cohort.ref_ep_rate is not None else None
-    )
-    normalized = correct_covariate_bias(
-        normalize_depth(
-            counts,
-            mask=usable,
-            contigs=c_codes,
-            starts=branch_starts,
-            ends=branch_ends,
-        ),
-        usable,
-        gc=branch_gc,
-        mappability=branch_map,
-        mean_frag_len=branch_frag_len,
-        endpoint_ratio=branch_ep_ratio,
-    )
-    corrected, pca_mean, pca_loadings = fit_pca(
-        normalized[usable], config.pca_components
-    )
-    _, contig_ids = np.unique(
-        np.asarray(contig_subset[usable], dtype=str), return_inverse=True
     )
     cov_mat = covariate_features(
         usable,
@@ -648,40 +659,81 @@ def _build_branch_table(
         mean_frag_len=branch_frag_len,
         endpoint_ratio=branch_ep_ratio,
     )
-    scaled_loadings = (
-        pca_loadings * np.sqrt(pca_loadings.shape[1])
-        if pca_loadings.size > 0
-        else pca_loadings
-    )
-    profiles = build_signal_space_features(scaled_loadings, covariate_mat=cov_mat)
-    if profiles.size == 0 or np.allclose(profiles, 0.0):
-        profiles = corrected
 
-    logger.debug(
-        "branch %s: fitting prototype graph on %d usable bins",
-        branch,
-        int(np.count_nonzero(usable)),
-    )
-    _, pids_u, pweights_u, mdist_u = fit_prototype_graph(
-        profiles.astype(np.float32),
-        max_prototypes=2048,
-        top_r=NUM_PROTOTYPES_PER_BIN,
-    )
-    pca_rank = 0 if config.fasta is not None else int(pca_loadings.shape[0])
-    null_mean_u, bio_disp_u = compute_prototype_null_models(
-        corrected,
-        contig_ids,
-        pids_u,
-        pweights_u,
-        n_pca_components=pca_rank,
-    )
-    logger.debug(
-        "branch %s: null models computed for %d bins",
-        branch,
-        int(np.count_nonzero(usable)),
-    )
+    if config.fasta is not None:
+        branch_pca_mean = np.zeros(n_bins, dtype=np.float32)
+        branch_pca_mean[usable] = 1.0
+        pca_loadings = np.empty((0, u_count), dtype=np.float32)
+        profiles = build_whitened_subspace_features(
+            pca_loadings,
+            np.empty(0, dtype=np.float64),
+            0.0,
+            covariate_mat=cov_mat,
+        )
+        _, pids_u, pweights_u, mdist_u = fit_prototype_graph(
+            profiles,
+            max_prototypes=2048,
+            top_r=NUM_PROTOTYPES_PER_BIN,
+        )
+        branch_null_mean = np.zeros(n_bins, dtype=np.float32)
+        branch_bio_disp = np.zeros(n_bins, dtype=np.float32)
+    else:
+        sf = estimate_size_factors(
+            counts,
+            mask=usable,
+            contigs=c_codes,
+            starts=branch_starts,
+            ends=branch_ends,
+        )
+        design_u = build_exogenous_covariate_basis(
+            usable,
+            bin_size=cohort.bin_size,
+            gc=branch_gc,
+            gc_quantiles=branch_gc_q,
+            mappability=branch_map,
+            ref_frag_len=branch_frag_len,
+            ref_ep_rate=branch_ep_ratio,
+        )
+        expected = fit_poisson_covariate_trends(
+            counts,
+            sf,
+            branch_exp,
+            usable,
+            design_u,
+            threads=config.threads,
+        )
+        expected *= sf[np.newaxis, :].astype(np.float32)
 
-    n_bins = int(np.count_nonzero(selected))
+        max_comp = None if config.pca_components == 5 else config.pca_components
+        pca_res = fit_whitened_pca(counts, expected, usable, max_components=max_comp)
+        branch_pca_mean = pca_res.mean_rate
+        pca_loadings = pca_res.loadings
+        profiles = build_whitened_subspace_features(
+            pca_res.loadings,
+            pca_res.singular_values,
+            pca_res.mp_sigma,
+            covariate_mat=cov_mat,
+            fallback_rate=pca_res.mean_rate[usable],
+        )
+        centers, pids_u, pweights_u, mdist_u = fit_prototype_graph(
+            profiles,
+            max_prototypes=2048,
+            top_r=NUM_PROTOTYPES_PER_BIN,
+        )
+        recon_expected = reconstruct_whitened_pca_expected(
+            counts, expected, usable, pca_res
+        )
+        branch_null_mean, branch_bio_disp = calibrate_prototype_dispersion(
+            counts,
+            recon_expected,
+            c_codes,
+            usable,
+            pids_u,
+            pweights_u,
+            pca_rank=int(pca_loadings.shape[0]),
+            n_prototypes=int(centers.shape[0]),
+        )
+
     output_gc = (
         np.where(np.isfinite(branch_gc), branch_gc, -1.0).astype(np.float32)
         if branch_gc is not None
@@ -694,10 +746,10 @@ def _build_branch_table(
     )
     gc_q_col: pa.Array = (
         pa.FixedSizeListArray.from_arrays(
-            pa.array(cohort_gc_quantiles[selected].ravel(), type=pa.float32()),
+            pa.array(branch_gc_q.ravel(), type=pa.float32()),
             NUM_GC_QUANTILES,
         )
-        if cohort_gc_quantiles is not None
+        if branch_gc_q is not None
         else pa.nulls(n_bins, type=pa.list_(pa.float32(), NUM_GC_QUANTILES))
     )
     output_frag_len = (
@@ -710,9 +762,6 @@ def _build_branch_table(
         if branch_ep_ratio is not None
         else np.full(n_bins, -1.0, dtype=np.float32)
     )
-
-    branch_pca_mean = np.zeros(n_bins, dtype=np.float32)
-    branch_pca_mean[usable] = pca_mean.astype(np.float32)
 
     raw_rank = int(pca_loadings.shape[0])
     if raw_rank == 0:
@@ -732,10 +781,6 @@ def _build_branch_table(
 
     branch_mean_dist = np.zeros(n_bins, dtype=np.float32)
     branch_mean_dist[usable] = mdist_u
-    branch_null_mean = np.zeros(n_bins, dtype=np.float32)
-    branch_null_mean[usable] = null_mean_u
-    branch_bio_disp = np.zeros(n_bins, dtype=np.float32)
-    branch_bio_disp[usable] = bio_disp_u
 
     schema = build_reference_schema(raw_rank)
     return pa.table(

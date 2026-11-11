@@ -440,6 +440,7 @@ def fit_poisson_covariate_trends(
     usable: NDArray[np.bool_],
     design_usable: NDArray[np.floating],
     *,
+    fit_mask: NDArray[np.bool_] | None = None,
     max_fit_bins: int = 65_536,
     threads: int = 1,
 ) -> NDArray[np.float32]:
@@ -498,8 +499,22 @@ def fit_poisson_covariate_trends(
     if not np.all(np.isfinite(exp_usable)) or np.any(exp_usable <= 0.0):
         raise InvalidInputError("exposure must be finite and positive on usable bins")
 
-    n_fit = min(n_usable, max_fit_bins)
-    fit_rel_idx = np.linspace(0, n_usable - 1, n_fit, dtype=np.int64)
+    if fit_mask is not None:
+        fm = np.asarray(fit_mask, dtype=np.bool_)
+        if fm.ndim != 1 or fm.shape[0] != n_bins:
+            raise InvalidInputError(
+                "fit_mask must be a 1D boolean mask aligned with counts"
+            )
+        cand_rel = np.flatnonzero(fm[usable_idx])
+        if cand_rel.size == 0:
+            cand_rel = np.arange(n_usable, dtype=np.int64)
+    else:
+        cand_rel = np.arange(n_usable, dtype=np.int64)
+
+    n_fit = min(int(cand_rel.size), max_fit_bins)
+    fit_rel_idx = cand_rel[
+        np.linspace(0, int(cand_rel.size) - 1, n_fit, dtype=np.int64)
+    ]
     fit_abs_idx = usable_idx[fit_rel_idx]
     exp_fit = exp_usable[fit_rel_idx]
     x_fit = np.ascontiguousarray(design[fit_rel_idx], dtype=np.float64)

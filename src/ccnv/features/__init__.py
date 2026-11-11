@@ -43,6 +43,15 @@ from ccnv.features.fragmentomics import (
     fuse_active_fetal_fraction,
     score_segment_origin,
 )
+from ccnv.features.normalization import (
+    BranchModel,
+    BranchNormalizationResult,
+    ProjectedCoverage,
+    half_sample_mode,
+    normalize_branch,
+    normalize_sample_branch,
+    project_coverage,
+)
 from ccnv.features.prenatal import (
     annotate_prenatal_segments,
     classify_sca,
@@ -53,8 +62,11 @@ from ccnv.features.rebinning import rebin_sample_sketch
 
 __all__ = [
     "DEFAULT_MIN_MAPPABILITY",
+    "BranchModel",
+    "BranchNormalizationResult",
     "Cohort",
     "InvalidInputError",
+    "ProjectedCoverage",
     "SexInference",
     "SexLabel",
     "annotate_prenatal_segments",
@@ -76,6 +88,7 @@ __all__ = [
     "fit_poisson_covariate_trends",
     "fit_prenatal_models",
     "fuse_active_fetal_fraction",
+    "half_sample_mode",
     "infer_germline_sex_2d",
     "infer_sample_sexes",
     "load_and_assemble_cohort",
@@ -83,8 +96,11 @@ __all__ = [
     "mask_low_coverage",
     "mask_low_coverage_per_contig",
     "nonpar_contig_mask",
+    "normalize_branch",
     "normalize_depth",
+    "normalize_sample_branch",
     "predict_prenatal",
+    "project_coverage",
     "rebin_cohort",
     "rebin_counts",
     "rebin_sample_sketch",

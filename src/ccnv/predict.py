@@ -12,42 +12,39 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
-import scipy.stats
 from numpy.typing import ArrayLike, NDArray
-from sklearn.linear_model import HuberRegressor
 
 from ccnv.extract import extract_for_predict, extracted_to_sample_buffers
-from ccnv.features.covariates import (
-    correct_covariate_bias,
-    mask_covariates,
-    validate_min_mappability,
-)
+from ccnv.features.covariates import validate_min_mappability
 from ccnv.features.fragmentomics import (
     align_reference_to_weighted_sample,
     apply_prenatal_fisher_weighting,
-    extract_bin_fragmentomic_covariates,
     resolve_fragmentomics_compatibility,
+)
+from ccnv.features.normalization import (
+    BranchModel,
+    BranchNormalizationResult,
+    ProjectedCoverage,
+    build_branch_model_from_tables,
+    normalize_branch,
+    normalize_sample_branch,
+    project_coverage,
 )
 from ccnv.features.prenatal import annotate_prenatal_segments, predict_prenatal
 from ccnv.features.rebinning import rebin_sample_buffers, rebin_sample_sketch
 from ccnv.features.sex import infer_single_sample_sex
 from ccnv.io.parquet import (
-    align_sample_grid_indices,
-    extract_reference_branch_arrays,
-    extract_sample_meta_and_counts,
     read_reference_parquet,
     read_sample_parquet,
     unique_dictionary_contigs,
 )
-from ccnv.io.tracks import load_cytobands_track, load_gc_track, load_mappability_track
+from ccnv.io.tracks import load_cytobands_track
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
-    DEFAULT_MIN_MAPPABILITY,
-    NUM_PROTOTYPES_PER_BIN,
     AnalysisMode,
     ArtifactKind,
     BinCompatibilityError,
@@ -61,7 +58,6 @@ from ccnv.models import (
     PrenatalModelMetadata,
     ReferenceMetadata,
     SampleBuffers,
-    SchemaError,
     SegmentResult,
     decode_metadata,
     validate_sample_table,
@@ -69,7 +65,6 @@ from ccnv.models import (
 )
 from ccnv.qc.predict import build_predict_qc_payload, write_predict_qc_json
 from ccnv.report import write_outputs
-from ccnv.stats.neighbors import evaluate_loco_prototype_baseline
 from ccnv.stats.segmentation import (
     compute_contig_rho1,
     evaluate_stouffer_segment_scores,
@@ -77,11 +72,11 @@ from ccnv.stats.segmentation import (
 )
 
 Sex = Literal["female", "male"]
-_MASK_Z_THRESHOLD: Final[float] = 2.326347874
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "BranchModel",
+    "BranchNormalizationResult",
     "PredictError",
     "PredictionInput",
     "ProjectedCoverage",
@@ -91,6 +86,7 @@ __all__ = [
     "extract_for_predict",
     "load_inputs",
     "normalize_branch",
+    "normalize_sample_branch",
     "project_coverage",
     "run",
     "run_predict",
@@ -105,34 +101,6 @@ class PredictionInput:
     contig_lengths: dict[str, int]
     sex: Sex | None
     branches: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class BranchModel:
-    branch: str
-    contigs: tuple[str, ...]
-    starts: NDArray[np.int64]
-    ends: NDArray[np.int64]
-    counts: NDArray[np.float64]
-    masked: NDArray[np.bool_]
-    pca_mean: NDArray[np.float64]
-    pca_loadings: NDArray[np.float32]
-    proto_ids: NDArray[np.uint16]
-    proto_weights: NDArray[np.float16]
-    mean_distance: NDArray[np.float32]
-    null_mean: NDArray[np.float64]
-    null_std: NDArray[np.float64]
-    gc: NDArray[np.floating] | None = None
-    mappability: NDArray[np.floating] | None = None
-    mean_frag_len: NDArray[np.floating] | None = None
-    endpoint_ratio: NDArray[np.floating] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectedCoverage:
-    normalized: NDArray[np.float64]
-    corrected: NDArray[np.float64]
-    usable: NDArray[np.bool_]
 
 
 def run(config: PredictConfig) -> PredictionOutputs:
@@ -173,6 +141,7 @@ def run(config: PredictConfig) -> PredictionOutputs:
         normalize_branch(build_branch_model(inputs, branch), config)
         for branch in inputs.branches
     )
+    _require_aligned_results(bin_results)
     segments = segment_and_call(
         bin_results,
         inputs.contig_lengths,
@@ -379,310 +348,12 @@ def build_branch_model(
     branch: str,
     ref_meta: ReferenceMetadata | None = None,
 ) -> BranchModel:
-    """Build dense zero-copy NumPy arrays for one reference branch."""
+    """Build dense NumPy arrays for one reference branch."""
     if isinstance(inputs, PredictionInput):
-        ref_table = inputs.reference
-        sample_data: pa.Table | SampleBuffers | None = inputs.sample
-        resolved_meta = ReferenceMetadata.from_schema(ref_table.schema)
-    else:
-        ref_table = inputs
-        sample_data = None
-        resolved_meta = (
-            ref_meta
-            if ref_meta is not None
-            else ReferenceMetadata.from_schema(ref_table.schema)
+        return build_branch_model_from_tables(
+            inputs.reference, branch, sample_data=inputs.sample
         )
-
-    arrs = extract_reference_branch_arrays(ref_table, branch, resolved_meta)
-    if sample_data is not None:
-        try:
-            s_meta, s_counts = extract_sample_meta_and_counts(
-                sample_data, validate=True
-            )
-        except SchemaError as err:
-            raise PredictError(str(err)) from err
-        s_idx = align_sample_grid_indices(
-            s_meta, arrs.contigs, arrs.starts, arrs.ends, branch
-        )
-        counts = s_counts[s_idx]
-        if resolve_fragmentomics_compatibility(sample_data, ref_table):
-            f_len, e_rat = extract_bin_fragmentomic_covariates(sample_data)
-            mean_frag_len: NDArray[np.floating] | None = f_len[s_idx].astype(np.float64)
-            endpoint_ratio: NDArray[np.floating] | None = e_rat[s_idx].astype(
-                np.float64
-            )
-        else:
-            mean_frag_len, endpoint_ratio = None, None
-    else:
-        counts = np.zeros(arrs.starts.size, dtype=np.float64)
-        mean_frag_len, endpoint_ratio = None, None
-
-    return BranchModel(
-        branch=branch,
-        contigs=arrs.contigs,
-        starts=arrs.starts,
-        ends=arrs.ends,
-        counts=counts,
-        masked=arrs.masked,
-        pca_mean=arrs.pca_mean,
-        pca_loadings=arrs.pca_loadings,
-        proto_ids=arrs.proto_ids,
-        proto_weights=arrs.proto_weights,
-        mean_distance=arrs.mean_distance,
-        null_mean=arrs.null_mean,
-        null_std=arrs.null_std,
-        gc=arrs.gc,
-        mappability=arrs.mappability,
-        mean_frag_len=mean_frag_len,
-        endpoint_ratio=endpoint_ratio,
-    )
-
-
-def project_coverage(
-    model: BranchModel,
-    *,
-    gc_override: NDArray[np.floating] | None = None,
-    mappability_override: NDArray[np.floating] | None = None,
-    n_mask_override: NDArray[np.bool_] | None = None,
-    min_mappability: float = DEFAULT_MIN_MAPPABILITY,
-) -> ProjectedCoverage:
-    """Mask covariates, depth-normalize sample counts, and apply PCA projection."""
-    gc = model.gc if gc_override is None else gc_override
-    mappability = (
-        model.mappability if mappability_override is None else mappability_override
-    )
-    unmasked_reference_bins = ~model.masked
-    covariate_usable = mask_covariates(
-        unmasked_reference_bins,
-        gc=gc,
-        mappability=mappability,
-        n_mask=n_mask_override,
-        min_mappability=min_mappability,
-    )
-    usable_total = float(np.sum(model.counts[covariate_usable]))
-    if usable_total <= 0:
-        raise PredictError(
-            f"branch {model.branch!r} has zero sample coverage on usable bins"
-        )
-
-    active_unmasked = covariate_usable[unmasked_reference_bins]
-    pos_mu = active_unmasked & (model.pca_mean > 0)
-    scale = usable_total
-    if np.count_nonzero(pos_mu) >= 2:
-        ratios = model.counts[unmasked_reference_bins][pos_mu] / model.pca_mean[pos_mu]
-        valid_ratios = ratios[np.isfinite(ratios) & (ratios > 0)]
-        if valid_ratios.size >= 2:
-            s_hat = float(np.median(valid_ratios))
-            if s_hat > 0 and np.isfinite(s_hat):
-                scale = s_hat
-
-    normalized = correct_covariate_bias(
-        model.counts / scale,
-        covariate_usable,
-        gc=gc,
-        mappability=mappability,
-        mean_frag_len=model.mean_frag_len,
-        endpoint_ratio=model.endpoint_ratio,
-    )
-    selected = normalized[unmasked_reference_bins]
-    if selected.shape != model.pca_mean.shape:
-        raise PredictError("PCA mean does not align with unmasked sample bins")
-    active_subset = covariate_usable[unmasked_reference_bins] & np.isfinite(selected)
-    reconstruction = model.pca_mean.copy()
-    n_active = int(np.count_nonzero(active_subset))
-    loadings_f64 = np.asarray(model.pca_loadings, dtype=np.float64)
-    rank = (
-        int(np.linalg.matrix_rank(loadings_f64[:, active_subset].T))
-        if loadings_f64.size > 0
-        else 0
-    )
-    if n_active > rank > 0:
-        subset_centered = selected[active_subset] - model.pca_mean[active_subset]
-        X = loadings_f64[:, active_subset].T
-        coeffs = None
-        if n_active >= max(rank + 2, 4) and float(np.std(subset_centered)) > 1e-12:
-            try:
-                huber = HuberRegressor(
-                    fit_intercept=False,
-                    alpha=0.0,
-                    epsilon=1.35,
-                    max_iter=100,
-                )
-                huber.fit(X, subset_centered)
-                coeffs = huber.coef_
-            except ValueError:
-                coeffs = None
-        if coeffs is None:
-            coeffs, *_ = np.linalg.lstsq(X, subset_centered, rcond=None)
-        reconstruction = (coeffs @ loadings_f64) + model.pca_mean
-
-    corrected = np.full(normalized.shape, np.nan, dtype=np.float64)
-    valid = active_subset & np.isfinite(reconstruction) & (reconstruction > 0)
-    corrected_values = np.full(selected.shape, np.nan, dtype=np.float64)
-    corrected_values[valid] = selected[valid] / reconstruction[valid]
-    corrected[unmasked_reference_bins] = corrected_values
-    return ProjectedCoverage(
-        normalized,
-        corrected,
-        covariate_usable & np.isfinite(corrected) & (corrected > 0),
-    )
-
-
-def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
-    """Calculate within-sample LOCO prototype log2 ratios, null z-scores, and weights."""
-    logger.debug("normalizing branch %s (%d bins)", model.branch, model.counts.size)
-    try:
-        gc_override, n_mask_override = (
-            load_gc_track(config.gc, model.contigs, model.starts, model.ends)
-            if config.gc
-            else (None, None)
-        )
-        mappability_override = (
-            load_mappability_track(
-                config.mappability, model.contigs, model.starts, model.ends
-            )
-            if config.mappability
-            else None
-        )
-    except CovariateError as err:
-        raise PredictError(str(err)) from err
-    projected = project_coverage(
-        model,
-        gc_override=gc_override,
-        mappability_override=mappability_override,
-        n_mask_override=n_mask_override,
-        min_mappability=config.min_mappability,
-    )
-    unmasked_indices = np.flatnonzero(~model.masked)
-    u_count = unmasked_indices.size
-    corrected = projected.corrected[unmasked_indices]
-    ratios = np.full(model.counts.shape, np.nan)
-    zscores = np.full(model.counts.shape, np.nan)
-    weights = np.zeros(model.counts.shape)
-    reference_sizes = np.zeros(model.counts.shape, dtype=np.int64)
-
-    if u_count > 0:
-        _, contig_ids = np.unique(
-            np.asarray(model.contigs, dtype=str)[unmasked_indices],
-            return_inverse=True,
-        )
-        pids_u = model.proto_ids[unmasked_indices]
-        pw_u = model.proto_weights[unmasked_indices]
-    else:
-        contig_ids = np.empty(0, dtype=np.int64)
-        pids_u = np.empty((0, NUM_PROTOTYPES_PER_BIN), dtype=np.uint16)
-        pw_u = np.empty((0, NUM_PROTOTYPES_PER_BIN), dtype=np.float16)
-
-    eligible = np.isfinite(corrected) & (corrected > 0)
-    local_ratios = np.full(corrected.shape, np.nan)
-    local_zscores = np.full(corrected.shape, np.nan)
-
-    for iteration in range(config.mask_repeats):
-        active_vals = np.where(eligible, corrected, np.nan)
-        baselines, usable_nbr_counts = evaluate_loco_prototype_baseline(
-            active_vals,
-            contig_ids,
-            pids_u,
-            pw_u,
-        )
-        reference_sizes[unmasked_indices] = usable_nbr_counts
-
-        valid_bins = (
-            np.isfinite(corrected)
-            & (corrected > 0)
-            & (usable_nbr_counts >= config.min_reference_bins)
-            & np.isfinite(baselines)
-            & (baselines > 0)
-        )
-        local_ratios[:] = np.nan
-        local_zscores[:] = np.nan
-        local_ratios[valid_bins] = np.log2(
-            corrected[valid_bins] / baselines[valid_bins]
-        )
-
-        has_std = valid_bins & (model.null_std > 1e-8)
-        local_zscores[has_std] = (
-            local_ratios[has_std] - model.null_mean[has_std]
-        ) / model.null_std[has_std]
-
-        missing_zscores = np.isfinite(local_ratios) & ~np.isfinite(local_zscores)
-        if np.any(missing_zscores):
-            finite_ratios_sub = local_ratios[np.isfinite(local_ratios)]
-            median_ratio = float(np.median(finite_ratios_sub))
-            empirical_std = 1.4826 * float(
-                scipy.stats.median_abs_deviation(finite_ratios_sub, scale=1.0)
-            )
-            if empirical_std <= 1e-8:
-                empirical_std = float(np.std(finite_ratios_sub))
-            local_zscores[missing_zscores] = (
-                (local_ratios[missing_zscores] - median_ratio) / empirical_std
-                if empirical_std > 1e-8
-                else 0.0
-            )
-        eligible = (
-            np.isfinite(corrected)
-            & np.isfinite(local_zscores)
-            & (np.abs(local_zscores) < _MASK_Z_THRESHOLD)
-        )
-        logger.debug(
-            "branch %s within-sample iteration %d/%d: %d eligible bins",
-            model.branch,
-            iteration + 1,
-            config.mask_repeats,
-            int(np.count_nonzero(eligible)),
-        )
-
-    finite_ratios = np.isfinite(local_ratios)
-    median_shift = 0.0
-    if np.any(finite_ratios):
-        median_shift = float(np.median(local_ratios[finite_ratios]))
-        local_ratios[finite_ratios] -= median_shift
-
-    finite_zscores = np.isfinite(local_zscores)
-    if np.any(finite_zscores):
-        zscore_shift = float(np.median(local_zscores[finite_zscores]))
-        local_zscores[finite_zscores] -= zscore_shift
-
-    logger.debug(
-        "branch %s: %d finite ratios, median shift=%.4f (mean=%.4f, std=%.4f)",
-        model.branch,
-        int(np.count_nonzero(finite_ratios)),
-        median_shift,
-        float(np.mean(local_ratios[finite_ratios])) if np.any(finite_ratios) else 0.0,
-        float(np.std(local_ratios[finite_ratios])) if np.any(finite_ratios) else 0.0,
-    )
-    ratios[unmasked_indices] = local_ratios
-    zscores[unmasked_indices] = local_zscores
-
-    pos_null = model.null_std > 0
-    s0_sq = float(np.median(model.null_std[pos_null] ** 2)) if np.any(pos_null) else 1.0
-    eb_weights = np.clip(s0_sq / np.maximum(model.null_std**2, 1e-8), 0.05, 20.0)
-    tier2_weights = np.where(
-        model.mean_distance > 0,
-        1.0 / np.maximum(model.mean_distance, 1e-12),
-        1.0,
-    )
-    weights[unmasked_indices] = np.where(pos_null, eb_weights, tier2_weights)
-
-    valid = (
-        projected.usable
-        & np.isfinite(ratios)
-        & np.isfinite(zscores)
-        & (reference_sizes >= config.min_reference_bins)
-    )
-    ratios[~valid], zscores[~valid], weights[~valid] = np.nan, np.nan, 0.0
-    _require_aligned(model.counts.size, ratios, zscores, weights, reference_sizes)
-    return BinResult(
-        branch=model.branch,
-        contigs=model.contigs,
-        starts=model.starts,
-        ends=model.ends,
-        ratios=ratios,
-        zscores=zscores,
-        weights=weights,
-        reference_sizes=reference_sizes,
-        masked=~valid,
-    )
+    return build_branch_model_from_tables(inputs, branch, ref_meta=ref_meta)
 
 
 def call_segment(
@@ -919,6 +590,14 @@ def _require_aligned(length: int, *arrays: ArrayLike) -> None:
     if any(np.asarray(a).shape != (length,) for a in arrays):
         raise PredictError(
             "prediction result arrays must be aligned and one-dimensional"
+        )
+
+
+def _require_aligned_results(results: tuple[BinResult, ...]) -> None:
+    """Ensure all per-branch BinResult arrays are 1D aligned."""
+    for res in results:
+        _require_aligned(
+            res.starts.size, res.ratios, res.zscores, res.weights, res.reference_sizes
         )
 
 

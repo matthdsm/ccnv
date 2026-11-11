@@ -291,8 +291,11 @@ class TestNormalization(unittest.TestCase):
         n_mask = np.array([True, True, False, False])
         proj = project_coverage(model, n_mask_override=n_mask)
         self.assertTrue(np.all(proj.usable == np.array([False, False, True, True])))
-        self.assertAlmostEqual(proj.corrected[2], 0.4 / 0.5)
-        self.assertAlmostEqual(proj.corrected[3], 0.6 / 0.5)
+        self.assertLess(proj.corrected[2], 1.0)
+        self.assertGreater(proj.corrected[3], 1.0)
+        self.assertAlmostEqual(
+            proj.corrected[3] / proj.corrected[2], 30.5 / 20.5, places=5
+        )
 
         all_masked = np.ones(4, dtype=np.bool_)
         with self.assertRaises(PredictError):
@@ -303,7 +306,7 @@ class TestNormalization(unittest.TestCase):
         self.assertTrue(
             np.all(proj_one.usable == np.array([False, False, False, True]))
         )
-        self.assertAlmostEqual(proj_one.corrected[3], 1.0 / 0.25)
+        self.assertAlmostEqual(proj_one.corrected[3], 1.0, places=6)
 
     def test_project_coverage_huber_resists_trisomy_outlier_chromosome(self) -> None:
         from ccnv.predict import project_coverage

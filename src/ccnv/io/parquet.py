@@ -14,6 +14,8 @@ import pyarrow.parquet as pq
 from numpy.typing import NDArray
 
 from ccnv.models import (
+    BRANCH_PRENATAL_AUTOSOMAL,
+    NUM_GC_QUANTILES,
     NUM_PROTOTYPES_PER_BIN,
     ArtifactKind,
     PredictError,
@@ -65,6 +67,12 @@ class ReferenceBranchArrays:
     mean_distance: NDArray[np.float32]
     null_mean: NDArray[np.float64]
     null_std: NDArray[np.float64]
+    gc_quantiles: NDArray[np.float32] | None = None
+    ref_frag_len: NDArray[np.float32] | None = None
+    ref_ep_rate: NDArray[np.float32] | None = None
+    bio_dispersion: NDArray[np.float64] | None = None
+    bin_size: int = 5000
+    is_flat: bool = False
 
 
 def is_sample_parquet(path: Path | str) -> bool:
@@ -445,6 +453,35 @@ def extract_reference_branch_arrays(
     gc = gc_col if np.any(np.isfinite(gc_col) & (gc_col >= 0)) else None
     map_ = map_col if np.any(np.isfinite(map_col) & (map_col >= 0)) else None
 
+    gc_quantiles: NDArray[np.float32] | None = None
+    if "gc_quantiles" in ref_b.column_names:
+        gc_q_col = ref_b.column("gc_quantiles")
+        if gc_q_col.null_count < ref_b.num_rows:
+            raw_gc_q = fixed_size_list_to_numpy(gc_q_col, NUM_GC_QUANTILES, np.float32)
+            if np.any(np.isfinite(raw_gc_q)):
+                gc_quantiles = raw_gc_q
+
+    frag_len_col = (
+        _f32("ref_frag_len") if "ref_frag_len" in ref_b.column_names else None
+    )
+    ref_frag_len = (
+        frag_len_col
+        if (
+            frag_len_col is not None
+            and np.any(np.isfinite(frag_len_col) & (frag_len_col >= 0))
+        )
+        else None
+    )
+    ep_rate_col = _f32("ref_ep_rate") if "ref_ep_rate" in ref_b.column_names else None
+    ref_ep_rate = (
+        ep_rate_col
+        if (
+            ep_rate_col is not None
+            and np.any(np.isfinite(ep_rate_col) & (ep_rate_col >= 0))
+        )
+        else None
+    )
+
     unmasked = ~masked
     u_count = int(np.count_nonzero(unmasked))
     pca_m = _f32("pca_mean").astype(np.float64)[unmasked]
@@ -485,8 +522,19 @@ def extract_reference_branch_arrays(
 
     mean_dist = _f32("mean_distance")[unmasked]
     null_m = _f32("null_mean").astype(np.float64)[unmasked]
-    bio_disp = _f32("bio_dispersion").astype(np.float64)[unmasked]
-    null_s = np.sqrt(np.maximum(np.nan_to_num(bio_disp, nan=0.0), 0.0))
+    bio_disp = np.maximum(
+        np.nan_to_num(_f32("bio_dispersion").astype(np.float64)[unmasked], nan=0.0),
+        0.0,
+    )
+    null_s = np.sqrt(bio_disp) / float(np.log(2.0))
+    eff_bin_size = (
+        resolved_meta.prenatal_bin_size
+        if (
+            branch == BRANCH_PRENATAL_AUTOSOMAL
+            and resolved_meta.prenatal_bin_size is not None
+        )
+        else resolved_meta.bin_size
+    )
 
     return ReferenceBranchArrays(
         contigs=contigs,
@@ -502,4 +550,10 @@ def extract_reference_branch_arrays(
         mean_distance=mean_dist,
         null_mean=null_m,
         null_std=null_s,
+        gc_quantiles=gc_quantiles,
+        ref_frag_len=ref_frag_len,
+        ref_ep_rate=ref_ep_rate,
+        bio_dispersion=bio_disp,
+        bin_size=eff_bin_size,
+        is_flat=resolved_meta.flat,
     )
