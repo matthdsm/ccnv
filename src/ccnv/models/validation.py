@@ -18,6 +18,7 @@ from ccnv.models.schemas import (
     SCHEMA_VERSION,
     SUPPORTED_SCHEMA_VERSIONS,
     ArtifactKind,
+    FragmentomicsMetadata,
     PrenatalModelMetadata,
     ReferenceMetadata,
     SampleMetadata,
@@ -118,6 +119,16 @@ def validate_metadata(metadata: Mapping[str, object], kind: ArtifactKind) -> Non
                 contig_lengths.keys()
             ):
                 raise SchemaError("contig_order must match contig_lengths keys")
+        frag_obj = metadata.get("fragmentomics")
+        if frag_obj is not None:
+            if not isinstance(frag_obj, Mapping):
+                raise SchemaError("ccnv.fragmentomics metadata must be an object")
+            try:
+                FragmentomicsMetadata.from_dict(frag_obj)
+            except (KeyError, TypeError, ValueError) as err:
+                raise SchemaError(
+                    f"invalid ccnv.fragmentomics metadata: {err}"
+                ) from err
 
     if kind is ArtifactKind.REFERENCE:
         model = metadata.get("model")
@@ -134,8 +145,8 @@ def validate_metadata(metadata: Mapping[str, object], kind: ArtifactKind) -> Non
             raise SchemaError(
                 f"model.mode must be 'germline' or 'prenatal', got {mode!r}"
             )
-        if "prenatal" in metadata:
-            prenatal_obj = metadata["prenatal"]
+        prenatal_obj = metadata.get("prenatal")
+        if prenatal_obj is not None:
             if not isinstance(prenatal_obj, Mapping):
                 raise SchemaError("ccnv.prenatal metadata must be an object")
             try:
@@ -171,12 +182,22 @@ def _validate_arrow_fields(
 
 
 def _validate_non_null_columns(table: pa.Table, expected: pa.Schema) -> None:
-    """Reject null entries in columns declared non-nullable by the contract."""
+    """Reject null entries in non-nullable columns and inner nulls in fixed-size lists."""
     for idx, expected_field in enumerate(expected):
-        if not expected_field.nullable and table.column(idx).null_count > 0:
+        col = table.column(idx)
+        if not expected_field.nullable and col.null_count > 0:
             raise SchemaError(
                 f"column {expected_field.name!r} contains unexpected null values"
             )
+        if (
+            isinstance(expected_field.type, pa.FixedSizeListType)
+            and expected_field.type.list_size > 0
+        ):
+            non_null_rows = pc.drop_null(col) if col.null_count > 0 else col
+            if pc.list_flatten(non_null_rows).null_count > 0:
+                raise SchemaError(
+                    f"column {expected_field.name!r} contains null list elements"
+                )
 
 
 def validate_schema(schema: pa.Schema, kind: ArtifactKind) -> None:
@@ -252,6 +273,10 @@ def _validate_reference_rows(
         .unify_dictionaries()
         .combine_chunks()
     )
+    if branch_dict.dictionary.null_count > 0:
+        raise SchemaError("column 'branch' dictionary contains null entries")
+    if contig_dict.dictionary.null_count > 0:
+        raise SchemaError("column 'contig' dictionary contains null entries")
 
     b_codes = branch_dict.indices.to_numpy(zero_copy_only=False).astype(
         np.int32, copy=False
@@ -272,33 +297,51 @@ def _validate_reference_rows(
         .astype(np.int64, copy=False)
     )
 
-    target_size_by_bcode = np.zeros(len(branch_dict.dictionary), dtype=np.int64)
+    branch_to_canon: dict[str, int] = {}
+    canon_b = np.zeros(len(branch_dict.dictionary), dtype=np.int32)
+    target_sizes: list[int] = []
     for b_code_raw in np.unique(b_codes):
-        b_code = int(b_code_raw)
-        b_name = str(branch_dict.dictionary[b_code].as_py())
-        if b_name not in KNOWN_REFERENCE_BRANCHES:
-            raise SchemaError(
-                f"unknown branch {b_name!r}; "
-                f"expected one of {sorted(KNOWN_REFERENCE_BRANCHES)}"
-            )
-        if b_name == BRANCH_PRENATAL_AUTOSOMAL and prenatal_bin_size is None:
-            raise SchemaError(
-                "table contains 'prenatal_autosomal' branch but prenatal_bin_size "
-                "is not specified in metadata"
-            )
-        ts = prenatal_bin_size if b_name == BRANCH_PRENATAL_AUTOSOMAL else bin_size
-        target_size_by_bcode[b_code] = ts if ts is not None else 0
+        raw_b = int(b_code_raw)
+        b_name = str(branch_dict.dictionary[raw_b].as_py())
+        canon_b_id = branch_to_canon.get(b_name)
+        if canon_b_id is None:
+            if b_name not in KNOWN_REFERENCE_BRANCHES:
+                raise SchemaError(
+                    f"unknown branch {b_name!r}; "
+                    f"expected one of {sorted(KNOWN_REFERENCE_BRANCHES)}"
+                )
+            if b_name == BRANCH_PRENATAL_AUTOSOMAL and prenatal_bin_size is None:
+                raise SchemaError(
+                    "table contains 'prenatal_autosomal' branch but prenatal_bin_size "
+                    "is not specified in metadata"
+                )
+            canon_b_id = len(branch_to_canon)
+            branch_to_canon[b_name] = canon_b_id
+            ts = prenatal_bin_size if b_name == BRANCH_PRENATAL_AUTOSOMAL else bin_size
+            target_sizes.append(ts if ts is not None else 0)
+        canon_b[raw_b] = canon_b_id
+    b_codes = canon_b[b_codes]
+    target_size_by_bcode = np.asarray(target_sizes, dtype=np.int64)
 
-    contig_len_by_code = np.zeros(len(contig_dict.dictionary), dtype=np.int64)
-    contig_name_by_code: dict[int, str] = {}
+    contig_to_canon: dict[str, int] = {}
+    canon_c = np.zeros(len(contig_dict.dictionary), dtype=np.int32)
+    contig_lens_canon: list[int] = []
+    contig_names_canon: list[str] = []
     for c_code_raw in np.unique(c_codes):
-        c_code = int(c_code_raw)
-        c_name = str(contig_dict.dictionary[c_code].as_py())
-        c_len = ref_meta.contig_lengths.get(c_name)
-        if c_len is None:
-            raise SchemaError(f"undeclared contig {c_name!r}")
-        contig_len_by_code[c_code] = c_len
-        contig_name_by_code[c_code] = c_name
+        raw_c = int(c_code_raw)
+        c_name = str(contig_dict.dictionary[raw_c].as_py())
+        canon_c_id = contig_to_canon.get(c_name)
+        if canon_c_id is None:
+            c_len = ref_meta.contig_lengths.get(c_name)
+            if c_len is None:
+                raise SchemaError(f"undeclared contig {c_name!r}")
+            canon_c_id = len(contig_to_canon)
+            contig_to_canon[c_name] = canon_c_id
+            contig_lens_canon.append(c_len)
+            contig_names_canon.append(c_name)
+        canon_c[raw_c] = canon_c_id
+    c_codes = canon_c[c_codes]
+    contig_len_by_code = np.asarray(contig_lens_canon, dtype=np.int64)
 
     # Enforce contiguous branch blocks and unique contiguous (branch, contig) runs
     branch_run_starts = np.concatenate(
@@ -323,7 +366,7 @@ def _validate_reference_rows(
     bad_bounds = (starts < 0) | (ends <= starts) | (ends > row_contig_lens)
     if np.any(bad_bounds):
         idx = int(np.flatnonzero(bad_bounds)[0])
-        c_name = contig_name_by_code[int(c_codes[idx])]
+        c_name = contig_names_canon[int(c_codes[idx])]
         raise SchemaError(
             f"row {idx} interval [{int(starts[idx])}, {int(ends[idx])}) is outside "
             f"{c_name!r} length {int(row_contig_lens[idx])}"

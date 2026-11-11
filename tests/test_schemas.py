@@ -612,6 +612,26 @@ class TestSchemaContracts(unittest.TestCase):
                 branches=("autosomal",),
             )
 
+    def test_sample_metadata_validation_and_error_boundary(self) -> None:
+        from ccnv.models import SampleMetadata
+
+        with self.assertRaises(SchemaError):
+            SampleMetadata(
+                bin_size=0,
+                contig_lengths={"chr1": 100},
+                contig_order=("chr1",),
+                source_identity={},
+                reference_identity={},
+                qc={},
+                filters={},
+            )
+        with self.assertRaises(SchemaError):
+            SampleMetadata.from_dict({"bin_size": 5000, "contig_lengths": "invalid"})
+        with self.assertRaises(SchemaError):
+            ReferenceMetadata.from_dict(
+                {"contig_lengths": {"chr1": 100}, "model": {"pca_components": "bad"}}
+            )
+
     def test_validate_reference_table_all_five_branches(self) -> None:
         prenatal_meta = _make_prenatal_metadata()
         contig_lengths = {"chr1": 200_000, "chrX": 100_000, "chrY": 100_000}

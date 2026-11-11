@@ -40,10 +40,12 @@ from ccnv.models import (
     PrenatalModelMetadata,
     ReadFilters,
     ReferenceConfig,
+    ReferenceMetadata,
     SampleMetadata,
     SchemaError,
     SchemaVersionError,
     build_reference_schema,
+    decode_metadata,
     encode_metadata,
     metadata_for,
     parquet_path,
@@ -51,7 +53,12 @@ from ccnv.models import (
     resolve_contig_name,
     select_layout,
 )
-from ccnv.models.validation import validate_reference_table, validate_sample_table
+from ccnv.models.validation import (
+    validate_metadata,
+    validate_reference_table,
+    validate_sample_table,
+    validate_schema,
+)
 
 
 def _write_paired_bam(path: Path, contigs: list[tuple[str, int]]) -> None:
@@ -150,14 +157,19 @@ def _make_valid_reference_table(n_auto: int, n_fem: int, pca_rank: int = 3) -> p
     )
     ends = starts + np.uint32(bin_size)
 
+    contig_lengths = {"chr1": n_auto * bin_size}
+    branches = [BRANCH_AUTOSOMAL]
+    if n_fem > 0:
+        contig_lengths["chrX"] = n_fem * bin_size
+        branches.append(BRANCH_FEMALE_SEX)
     meta = metadata_for(
         ArtifactKind.REFERENCE,
-        contig_lengths={"chr1": n_auto * bin_size, "chrX": n_fem * bin_size},
+        contig_lengths=contig_lengths,
         values={
             "sample_identities": ["s1", "s2"],
             "model": {
                 "bin_size": bin_size,
-                "branches": [BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX],
+                "branches": branches,
                 "pca_components": pca_rank,
             },
         },
@@ -473,6 +485,259 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
         )
         with self.assertRaises(SchemaError):
             validate_reference_table(bad_runs, check_rows=True)
+
+    def test_dictionary_array_duplicate_vocab_and_null_dictionary_rejected(
+        self,
+    ) -> None:
+        base_ref = _make_valid_reference_table(2, 0, pca_rank=1)
+
+        # Duplicate contig vocabulary ["chr1", "chr1"] hiding duplicate [0, 5000) intervals
+        dup_contig_col = pa.DictionaryArray.from_arrays(
+            pa.array([0, 1], type=pa.int16()),
+            pa.array(["chr1", "chr1"], type=pa.string()),
+        )
+        dup_contig_table = (
+            base_ref.set_column(1, "contig", dup_contig_col)
+            .set_column(2, "start", pa.array([0, 0], type=pa.uint32()))
+            .set_column(3, "end", pa.array([5_000, 5_000], type=pa.uint32()))
+        )
+        with self.assertRaises(SchemaError):
+            validate_reference_table(dup_contig_table, check_rows=True)
+
+        # Duplicate branch vocabulary ["autosomal", "female_sex", "autosomal"] hiding non-contiguous branch runs
+        ref_3 = _make_valid_reference_table(2, 1, pca_rank=1)
+        dup_branch_col = pa.DictionaryArray.from_arrays(
+            pa.array([0, 1, 2], type=pa.int8()),
+            pa.array(
+                [BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_AUTOSOMAL],
+                type=pa.string(),
+            ),
+        )
+        dup_branch_table = (
+            ref_3.set_column(0, "branch", dup_branch_col)
+            .set_column(
+                1,
+                "contig",
+                pa.DictionaryArray.from_arrays(
+                    pa.array([0, 1, 0], type=pa.int16()), ["chr1", "chrX"]
+                ),
+            )
+            .set_column(2, "start", pa.array([0, 0, 5_000], type=pa.uint32()))
+            .set_column(3, "end", pa.array([5_000, 5_000, 10_000], type=pa.uint32()))
+        )
+        with self.assertRaisesRegex(SchemaError, "contiguous"):
+            validate_reference_table(dup_branch_table, check_rows=True)
+
+        # Null entry inside DictionaryArray.dictionary must be rejected with SchemaError
+        null_branch_dict = pa.DictionaryArray.from_arrays(
+            pa.array([0, 0], type=pa.int8()),
+            pa.array([BRANCH_AUTOSOMAL, None], type=pa.string()),
+        )
+        with self.assertRaisesRegex(SchemaError, "dictionary"):
+            validate_reference_table(
+                base_ref.set_column(0, "branch", null_branch_dict), check_rows=True
+            )
+
+        null_contig_dict = pa.DictionaryArray.from_arrays(
+            pa.array([0, 1], type=pa.int16()),
+            pa.array(["chr1", None], type=pa.string()),
+        )
+        with self.assertRaisesRegex(SchemaError, "dictionary"):
+            validate_reference_table(
+                base_ref.set_column(1, "contig", null_contig_dict), check_rows=True
+            )
+
+    def test_fixed_size_list_inner_nulls_rejected_on_sample_and_reference(
+        self,
+    ) -> None:
+        sample_meta = metadata_for(
+            ArtifactKind.SAMPLE,
+            contig_lengths={"chr1": 10_000},
+            values={
+                "bin_size": 5_000,
+                "source_identity": {"path": "s.bam"},
+                "reference_identity": {"n_contigs": 1, "contig_order": ["chr1"]},
+                "qc": {},
+                "filters": asdict(ReadFilters()),
+            },
+        )
+        bad_bands = pa.array(
+            [[1, None, *([0] * (NUM_FRAG_BANDS - 2))], [0] * NUM_FRAG_BANDS],
+            type=pa.list_(pa.uint32(), NUM_FRAG_BANDS),
+        )
+        assert bad_bands.null_count == 0
+        bad_sample = pa.table(
+            {
+                "count": pa.array([5, 5], type=pa.uint32()),
+                "paired_count": pa.array([5, 5], type=pa.uint32()),
+                "frag_len_sum": pa.array([800, 800], type=pa.uint64()),
+                "short_frag_count": pa.array([1, 1], type=pa.uint32()),
+                "endpoint_count": pa.array([10, 10], type=pa.uint32()),
+                "frag_gc_sum": pa.array([2.1, 2.1], type=pa.float32()),
+                "frag_bands": bad_bands,
+            },
+            schema=SAMPLE_SCHEMA.with_metadata(sample_meta),
+        )
+        with self.assertRaisesRegex(
+            SchemaError, "column 'frag_bands' contains null list elements"
+        ):
+            validate_sample_table(bad_sample)
+        with self.assertRaisesRegex(
+            SchemaError, "column 'frag_bands' contains null list elements"
+        ):
+            rebin_sample_sketch(bad_sample, 10_000)
+
+        # Mixed row-level null + inner element null in frag_bands
+        mixed_bands = pa.array(
+            [None, [1, None, *([0] * (NUM_FRAG_BANDS - 2))]],
+            type=pa.list_(pa.uint32(), NUM_FRAG_BANDS),
+        )
+        mixed_sample = bad_sample.set_column(6, "frag_bands", mixed_bands)
+        with self.assertRaisesRegex(
+            SchemaError, "column 'frag_bands' contains null list elements"
+        ):
+            validate_sample_table(mixed_sample)
+
+        # Valid row-level null mixed with clean list row coarsens cleanly without NaN cast
+        clean_row_null = pa.array(
+            [None, [2] * NUM_FRAG_BANDS],
+            type=pa.list_(pa.uint32(), NUM_FRAG_BANDS),
+        )
+        valid_mixed = bad_sample.set_column(6, "frag_bands", clean_row_null)
+        coarsened = rebin_sample_sketch(valid_mixed, 10_000)
+        assert coarsened["frag_bands"][0].as_py() == [2] * NUM_FRAG_BANDS
+
+        # Reference FixedSizeList inner nulls (proto_ids and nullable gc_quantiles)
+        base_ref = _make_valid_reference_table(2, 0, pca_rank=2)
+        bad_proto = pa.array(
+            [[0, None, 1, 2], [0, 1, 2, 3]],
+            type=pa.list_(pa.uint16(), NUM_PROTOTYPES_PER_BIN),
+        )
+        with self.assertRaisesRegex(
+            SchemaError, "column 'proto_ids' contains null list elements"
+        ):
+            validate_reference_table(
+                base_ref.set_column(
+                    base_ref.schema.get_field_index("proto_ids"),
+                    "proto_ids",
+                    bad_proto,
+                )
+            )
+
+        bad_gc_q = pa.array(
+            [None, [0.1, None, *([0.1] * (NUM_GC_QUANTILES - 2))]],
+            type=pa.list_(pa.float32(), NUM_GC_QUANTILES),
+        )
+        with self.assertRaisesRegex(
+            SchemaError, "column 'gc_quantiles' contains null list elements"
+        ):
+            validate_reference_table(
+                base_ref.set_column(
+                    base_ref.schema.get_field_index("gc_quantiles"),
+                    "gc_quantiles",
+                    bad_gc_q,
+                )
+            )
+
+    def test_metadata_schema_error_boundary_and_sample_metadata_post_init(
+        self,
+    ) -> None:
+        # 1. SampleMetadata.__post_init__ invariants raise SchemaError (never ZeroDivisionError)
+        with self.assertRaises(SchemaError):
+            SampleMetadata(
+                bin_size=0,
+                contig_lengths={"chr1": 10_000},
+                contig_order=("chr1",),
+                source_identity={},
+                reference_identity={},
+                qc={},
+                filters={},
+            )
+        with self.assertRaises(SchemaError):
+            SampleMetadata(
+                bin_size=True,
+                contig_lengths={"chr1": 10_000},
+                contig_order=("chr1",),
+                source_identity={},
+                reference_identity={},
+                qc={},
+                filters={},
+            )
+        with self.assertRaises(SchemaError):
+            SampleMetadata(
+                bin_size=5_000,
+                contig_lengths={"chr1": 0},
+                contig_order=("chr1",),
+                source_identity={},
+                reference_identity={},
+                qc={},
+                filters={},
+            )
+        with self.assertRaises(SchemaError):
+            SampleMetadata(
+                bin_size=5_000,
+                contig_lengths={"chr1": 10_000},
+                contig_order=("chr2",),
+                source_identity={},
+                reference_identity={},
+                qc={},
+                filters={},
+            )
+
+        # 2. Non-mapping or malformed ccnv.fragmentomics raises SchemaError everywhere
+        base_s_meta = decode_metadata(
+            metadata_for(
+                ArtifactKind.SAMPLE,
+                contig_lengths={"chr1": 5_000},
+                values={
+                    "bin_size": 5_000,
+                    "source_identity": {},
+                    "reference_identity": {},
+                    "qc": {},
+                    "filters": asdict(ReadFilters()),
+                },
+            )
+        )
+        for bad_frag in (123, ["not", "mapping"], {"paired_end": True}):
+            bad_dict = {**base_s_meta, "fragmentomics": bad_frag}
+            with self.assertRaises(SchemaError):
+                validate_metadata(bad_dict, ArtifactKind.SAMPLE)
+            with self.assertRaises(SchemaError):
+                validate_schema(
+                    SAMPLE_SCHEMA.with_metadata(encode_metadata(bad_dict)),
+                    ArtifactKind.SAMPLE,
+                )
+            with self.assertRaises(SchemaError):
+                SampleMetadata.from_dict(bad_dict)
+
+        # 3. Malformed field types in SampleMetadata / ReferenceMetadata raise SchemaError (not TypeError/KeyError/ValueError)
+        with self.assertRaises(SchemaError):
+            SampleMetadata.from_dict({})
+        with self.assertRaises(SchemaError):
+            SampleMetadata.from_dict({**base_s_meta, "bin_size": "five_kb"})
+
+        base_ref = _make_valid_reference_table(2, 0, pca_rank=1)
+        ref_dict = decode_metadata(base_ref.schema.metadata)
+        model_obj = ref_dict["model"]
+        assert isinstance(model_obj, dict)
+        for bad_field, bad_val in (
+            ("pca_components", "five"),
+            ("min_mappability", "high"),
+            ("nearest_bins", "many"),
+        ):
+            corrupt_ref_dict = {
+                **ref_dict,
+                "model": {**model_obj, bad_field: bad_val},
+            }
+            corrupt_table = base_ref.replace_schema_metadata(
+                encode_metadata(corrupt_ref_dict)
+            )
+            with self.assertRaises(SchemaError):
+                ReferenceMetadata.from_dict(corrupt_ref_dict)
+            with self.assertRaises(SchemaError):
+                ReferenceMetadata.from_table(corrupt_table)
+            with self.assertRaises(SchemaError):
+                validate_reference_table(corrupt_table)
 
 
 if __name__ == "__main__":

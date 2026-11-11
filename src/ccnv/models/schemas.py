@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
-from dataclasses import dataclass, fields
-from enum import StrEnum
 from typing import Final
 
 import numpy as np
@@ -13,19 +10,22 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from numpy.typing import NDArray
 
-from ccnv.models.config import DEFAULT_BIN_SIZE, DEFAULT_MIN_MAPPABILITY, AnalysisMode
 from ccnv.models.exceptions import SchemaError, SchemaVersionError
 from ccnv.models.metadata import (
+    COORDINATE_SYSTEM,
     FRAGMENTOMICS_METADATA_KEY,
+    METADATA_PREFIX,
     PRENATAL_METADATA_KEY,
+    SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
+    ArtifactKind,
     FragmentomicsMetadata,
     PrenatalModelMetadata,
+    ReferenceMetadata,
+    SampleMetadata,
+    decode_metadata,
+    encode_metadata,
 )
-
-SCHEMA_VERSION: Final[str] = "2.0.0"
-SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset({"2.0.0"})
-COORDINATE_SYSTEM: Final[str] = "0-based-half-open"
-METADATA_PREFIX: Final[str] = "ccnv."
 
 NUM_FRAG_BANDS: Final[int] = 24
 NUM_PROTOTYPES_PER_BIN: Final[int] = 4
@@ -49,291 +49,6 @@ KNOWN_REFERENCE_BRANCHES: Final[frozenset[str]] = frozenset(
 CNV_REFERENCE_BRANCHES: Final[frozenset[str]] = frozenset(
     {BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX}
 )
-
-
-class ArtifactKind(StrEnum):
-    SAMPLE = "sample"
-    REFERENCE = "reference"
-
-
-def _as_int(raw: object, name: str) -> int:
-    if isinstance(raw, bool) or not isinstance(raw, int):
-        raise TypeError(f"{name} must be an integer, got {raw!r}")
-    return int(raw)
-
-
-def _as_float(raw: object, name: str) -> float:
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        raise TypeError(f"{name} must be numeric, got {raw!r}")
-    return float(raw)
-
-
-def _as_str_tuple(raw: object) -> tuple[str, ...]:
-    return tuple(str(x) for x in raw) if isinstance(raw, (list, tuple)) else ()
-
-
-def _as_obj_dict(raw: object) -> dict[str, object]:
-    return {str(k): v for k, v in raw.items()} if isinstance(raw, Mapping) else {}
-
-
-def _check_pos_int(val: object, name: str) -> None:
-    if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {val!r}")
-
-
-@dataclass(frozen=True, slots=True)
-class SampleMetadata:
-    """Strongly-typed metadata container for Schema v2.0.0 sample sketch artifacts."""
-
-    bin_size: int
-    contig_lengths: dict[str, int]
-    contig_order: tuple[str, ...]
-    source_identity: dict[str, object]
-    reference_identity: dict[str, object]
-    qc: dict[str, object]
-    filters: dict[str, object]
-    schema_version: str = SCHEMA_VERSION
-    coordinate_system: str = COORDINATE_SYSTEM
-    fragmentomics: FragmentomicsMetadata | None = None
-
-    @property
-    def paired_end(self) -> bool:
-        """Whether paired-end fragments were detected during sample extraction."""
-        return (
-            self.fragmentomics.paired_end if self.fragmentomics is not None else False
-        )
-
-    @property
-    def expected_num_bins(self) -> int:
-        """Total row count implied by contig_order, contig_lengths, and bin_size."""
-        return sum(
-            (self.contig_lengths[c] + self.bin_size - 1) // self.bin_size
-            for c in self.contig_order
-        )
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, object]) -> SampleMetadata:
-        """Construct sample metadata from a decoded Arrow metadata dictionary."""
-        raw_lengths = data.get("contig_lengths")
-        if not isinstance(raw_lengths, Mapping) or not raw_lengths:
-            raise SchemaError("contig_lengths must be a non-empty object")
-        contig_lengths = {
-            str(k): _as_int(v, "contig_length") for k, v in raw_lengths.items()
-        }
-        ref_id = _as_obj_dict(data.get("reference_identity"))
-        raw_order = data.get("contig_order", ref_id.get("contig_order"))
-        contig_order = (
-            _as_str_tuple(raw_order)
-            if isinstance(raw_order, (list, tuple))
-            else tuple(contig_lengths.keys())
-        )
-        if len(contig_order) != len(contig_lengths) or set(contig_order) != set(
-            contig_lengths.keys()
-        ):
-            raise SchemaError("contig_order does not match contig_lengths keys")
-
-        frag_obj = data.get("fragmentomics")
-        frag_meta: FragmentomicsMetadata | None = None
-        if isinstance(frag_obj, Mapping):
-            try:
-                frag_meta = FragmentomicsMetadata.from_dict(frag_obj)
-            except (KeyError, TypeError, ValueError) as err:
-                raise SchemaError(
-                    f"invalid ccnv.fragmentomics metadata: {err}"
-                ) from err
-
-        return cls(
-            bin_size=_as_int(data["bin_size"], "bin_size"),
-            contig_lengths=contig_lengths,
-            contig_order=contig_order,
-            source_identity=_as_obj_dict(data.get("source_identity")),
-            reference_identity=ref_id,
-            qc=_as_obj_dict(data.get("qc")),
-            filters=_as_obj_dict(data.get("filters")),
-            schema_version=str(data.get("schema_version", SCHEMA_VERSION)),
-            coordinate_system=str(data.get("coordinate_system", COORDINATE_SYSTEM)),
-            fragmentomics=frag_meta,
-        )
-
-    @classmethod
-    def from_schema(cls, schema: pa.Schema) -> SampleMetadata:
-        """Construct sample metadata from an Arrow Schema."""
-        return cls.from_dict(decode_metadata(schema.metadata))
-
-    @classmethod
-    def from_table(cls, table: pa.Table) -> SampleMetadata:
-        """Construct sample metadata from an Arrow Table."""
-        return cls.from_schema(table.schema)
-
-
-_REF_TOP_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        "contig_lengths",
-        "sample_identities",
-        "schema_version",
-        "coordinate_system",
-        "prenatal",
-    }
-)
-
-
-@dataclass(frozen=True, slots=True)
-class ReferenceMetadata:
-    """Strongly-typed metadata container for ccnv reference artifacts."""
-
-    bin_size: int
-    contig_lengths: dict[str, int]
-    branches: tuple[str, ...]
-    autosomal_contigs: tuple[str, ...] = ()
-    sex_contigs: tuple[str, ...] = ()
-    pca_components: int = 5
-    nearest_bins: int = 300
-    mode: AnalysisMode = "germline"
-    prenatal_bin_size: int | None = None
-    sample_identities: tuple[object, ...] = ()
-    sex_signal_contig: str | None = None
-    sex_cutoff: float | None = None
-    sex_source: str | None = None
-    sample_sexes: tuple[str, ...] | None = None
-    sex_inference: dict[str, object] | None = None
-    max_batch_memory_mb: int = 256
-    flat: bool = False
-    gc_corrected: bool = False
-    mappability_corrected: bool = False
-    fragmentomics_corrected: bool = False
-    min_mappability: float = DEFAULT_MIN_MAPPABILITY
-    schema_version: str = SCHEMA_VERSION
-    coordinate_system: str = COORDINATE_SYSTEM
-    prenatal: PrenatalModelMetadata | None = None
-
-    def __post_init__(self) -> None:
-        """Validate reference metadata configuration and contig lengths."""
-        _check_pos_int(self.bin_size, "bin_size")
-        if self.prenatal_bin_size is not None:
-            _check_pos_int(self.prenatal_bin_size, "prenatal_bin_size")
-        if self.mode not in ("germline", "prenatal"):
-            raise ValueError(
-                f"mode must be 'germline' or 'prenatal', got {self.mode!r}"
-            )
-        if not self.contig_lengths:
-            raise ValueError("contig_lengths must be a non-empty mapping")
-
-    def to_metadata(self) -> dict[str, object]:
-        """Convert reference metadata to a dictionary for Arrow table persistence."""
-        model: dict[str, object] = {}
-        for f in fields(self):
-            if f.name in _REF_TOP_KEYS:
-                continue
-            val = getattr(self, f.name)
-            model[f.name] = list(val) if isinstance(val, tuple) else val
-        values: dict[str, object] = {
-            "sample_identities": list(self.sample_identities),
-            "model": model,
-        }
-        if self.prenatal is not None:
-            values["prenatal"] = self.prenatal.to_dict()
-        return values
-
-    def build_arrow_metadata(self) -> dict[bytes, bytes]:
-        """Build Arrow metadata mapping containing reference metadata."""
-        return metadata_for(
-            ArtifactKind.REFERENCE,
-            contig_lengths=self.contig_lengths,
-            values=self.to_metadata(),
-        )
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, object]) -> ReferenceMetadata:
-        """Construct reference metadata from a decoded metadata dictionary."""
-        model = _as_obj_dict(data.get("model"))
-        raw_clen = data.get("contig_lengths", {})
-        contig_lengths = (
-            {str(k): _as_int(v, "contig_length") for k, v in raw_clen.items()}
-            if isinstance(raw_clen, Mapping)
-            else {}
-        )
-        raw_ids = data.get("sample_identities", ())
-        sample_identities: tuple[object, ...] = (
-            tuple(dict(x) if isinstance(x, Mapping) else str(x) for x in raw_ids)
-            if isinstance(raw_ids, (list, tuple))
-            else ()
-        )
-        prenatal_obj = data.get("prenatal")
-        prenatal_meta = (
-            PrenatalModelMetadata.from_dict(prenatal_obj)
-            if isinstance(prenatal_obj, Mapping)
-            else None
-        )
-        raw_mode = str(model.get("mode", "germline"))
-        if raw_mode not in ("germline", "prenatal"):
-            raise ValueError(f"mode must be 'germline' or 'prenatal', got {raw_mode!r}")
-        mode: AnalysisMode = "prenatal" if raw_mode == "prenatal" else "germline"
-        raw_pbs = model.get("prenatal_bin_size")
-        prenatal_bs = (
-            _as_int(raw_pbs, "prenatal_bin_size")
-            if raw_pbs is not None
-            else (
-                prenatal_meta.prenatal_bin_size if prenatal_meta is not None else None
-            )
-        )
-        raw_sexes = model.get("sample_sexes")
-        raw_cutoff = model.get("sex_cutoff")
-        raw_sex_inf = model.get("sex_inference")
-        return cls(
-            bin_size=_as_int(model.get("bin_size", DEFAULT_BIN_SIZE), "bin_size"),
-            contig_lengths=contig_lengths,
-            branches=_as_str_tuple(model.get("branches")),
-            autosomal_contigs=_as_str_tuple(model.get("autosomal_contigs")),
-            sex_contigs=_as_str_tuple(model.get("sex_contigs")),
-            pca_components=_as_int(model.get("pca_components", 5), "pca_components"),
-            nearest_bins=_as_int(model.get("nearest_bins", 300), "nearest_bins"),
-            mode=mode,
-            prenatal_bin_size=prenatal_bs,
-            sample_identities=sample_identities,
-            sex_signal_contig=(
-                None
-                if model.get("sex_signal_contig") is None
-                else str(model["sex_signal_contig"])
-            ),
-            sex_cutoff=(
-                None if raw_cutoff is None else _as_float(raw_cutoff, "sex_cutoff")
-            ),
-            sex_source=(
-                None if model.get("sex_source") is None else str(model["sex_source"])
-            ),
-            sample_sexes=(
-                _as_str_tuple(raw_sexes)
-                if isinstance(raw_sexes, (list, tuple))
-                else None
-            ),
-            sex_inference=(
-                _as_obj_dict(raw_sex_inf) if isinstance(raw_sex_inf, Mapping) else None
-            ),
-            max_batch_memory_mb=_as_int(
-                model.get("max_batch_memory_mb", 256), "max_batch_memory_mb"
-            ),
-            flat=bool(model.get("flat", False)),
-            gc_corrected=bool(model.get("gc_corrected", False)),
-            mappability_corrected=bool(model.get("mappability_corrected", False)),
-            fragmentomics_corrected=bool(model.get("fragmentomics_corrected", False)),
-            min_mappability=_as_float(
-                model.get("min_mappability", DEFAULT_MIN_MAPPABILITY), "min_mappability"
-            ),
-            schema_version=str(data.get("schema_version", SCHEMA_VERSION)),
-            coordinate_system=str(data.get("coordinate_system", COORDINATE_SYSTEM)),
-            prenatal=prenatal_meta,
-        )
-
-    @classmethod
-    def from_schema(cls, schema: pa.Schema) -> ReferenceMetadata:
-        """Construct reference metadata from an Arrow Schema."""
-        return cls.from_dict(decode_metadata(schema.metadata))
-
-    @classmethod
-    def from_table(cls, table: pa.Table) -> ReferenceMetadata:
-        """Construct reference metadata from an Arrow Table."""
-        return cls.from_schema(table.schema)
-
 
 SAMPLE_SCHEMA: Final[pa.Schema] = pa.schema(
     [
@@ -439,6 +154,8 @@ def bin_coordinates(table: pa.Table) -> tuple[tuple[str, int, int], ...]:
         .unify_dictionaries()
         .combine_chunks()
     )
+    if c_dict.dictionary.null_count > 0 or c_dict.null_count > 0:
+        raise SchemaError("column 'contig' contains null entries")
     c_codes = c_dict.indices.to_numpy(zero_copy_only=False)
     c_names = tuple(
         str(c_dict.dictionary[i].as_py()) for i in range(len(c_dict.dictionary))
@@ -449,33 +166,6 @@ def bin_coordinates(table: pa.Table) -> tuple[tuple[str, int, int], ...]:
         (c_names[int(c)], int(s), int(e))
         for c, s, e in zip(c_codes, starts_arr, ends_arr, strict=True)
     )
-
-
-def encode_metadata(values: Mapping[str, object]) -> dict[bytes, bytes]:
-    """Encode namespaced metadata values as deterministic JSON."""
-    return {
-        f"{METADATA_PREFIX}{key}".encode(): json.dumps(
-            value, sort_keys=True, separators=(",", ":")
-        ).encode()
-        for key, value in values.items()
-    }
-
-
-def decode_metadata(metadata: Mapping[bytes, bytes] | None) -> dict[str, object]:
-    """Decode ccnv metadata and reject malformed JSON."""
-    if metadata is None:
-        return {}
-    decoded: dict[str, object] = {}
-    prefix = METADATA_PREFIX.encode()
-    for raw_key, raw_value in metadata.items():
-        if not raw_key.startswith(prefix):
-            continue
-        key = raw_key[len(prefix) :].decode()
-        try:
-            decoded[key] = json.loads(raw_value)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise SchemaError(f"invalid metadata value for {key!r}") from error
-    return decoded
 
 
 def metadata_for(

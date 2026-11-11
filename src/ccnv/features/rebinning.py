@@ -79,7 +79,12 @@ def _coarsen_nested_sketch(
         )
     else:
         combined_bands = raw_bands_col.combine_chunks()
-        bands_2d = combined_bands.values.to_numpy(zero_copy_only=False).reshape(
+        flat_vals = (
+            pc.fill_null(combined_bands.values, 0)
+            if combined_bands.values.null_count > 0
+            else combined_bands.values
+        )
+        bands_2d = flat_vals.to_numpy(zero_copy_only=False).reshape(
             table.num_rows, NUM_FRAG_BANDS
         )
         if combined_bands.null_count > 0:
