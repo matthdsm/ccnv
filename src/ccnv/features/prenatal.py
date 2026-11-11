@@ -72,9 +72,6 @@ def _is_ffa_autosome(norm_contig: str) -> bool:
     )
 
 
-_is_preface_autosome = _is_ffa_autosome
-
-
 def _resolve_autosome_mask(norm_contigs: Sequence[str]) -> NDArray[np.bool_]:
     """Resolve boolean autosome mask for FFA, falling back to all autosomes."""
     mask = np.array([_is_ffa_autosome(c) for c in norm_contigs], dtype=np.bool_)
@@ -551,16 +548,8 @@ def fit_prenatal_models(
         yfrac_threshold=float(yfrac_threshold),
         ffy_intercept=float(ffy_intercept),
         ffy_slope=float(ffy_slope),
-        mlp_w1=[[0.0, 0.0] for _ in range(n_feat)],
-        mlp_b1=[0.0, 0.0],
-        mlp_w2=[[0.0], [0.0]],
-        mlp_b2=[0.0],
-        mlp_skew_intercept=0.0,
-        mlp_skew_slope=1.0,
         olm_weights=[float(x) for x in w_ens],
         olm_bias=float(b_ens),
-        olm_skew_intercept=0.0,
-        olm_skew_slope=1.0,
         ffx_intercept=float(ffx_int),
         ffx_slope=float(ffx_slope),
         female_chrx_ratio_mean=float(fem_chrx_mean),
@@ -756,39 +745,17 @@ def predict_prenatal(
     centered = imputed - ref_pca_center
     features = centered @ ref_pca_rotation
 
-    # Evaluate FFA via convex logit ensemble or legacy MLP/OLM fallback
-    if prenatal_meta.ffa_logit_mode:
-        features_flat = features.ravel() if features.ndim > 1 else features
-        raw_logit = float(
-            np.dot(
-                features_flat, np.asarray(prenatal_meta.olm_weights, dtype=np.float64)
-            )
-            + prenatal_meta.olm_bias
-        )
-        ffa = float(scipy.special.expit(raw_logit))
-    else:
-        # Legacy MLP or fallback to OLM
-        w1 = np.asarray(prenatal_meta.mlp_w1, dtype=np.float64)
-        b1 = np.asarray(prenatal_meta.mlp_b1, dtype=np.float64)
-        w2 = np.asarray(prenatal_meta.mlp_w2, dtype=np.float64)
-        b2 = np.asarray(prenatal_meta.mlp_b2, dtype=np.float64)
-
-        h = scipy.special.expit(features @ w1 + b1)
-        raw_mlp = float(scipy.special.expit(h @ w2 + b2)[0])
-
-        if 0.01 <= raw_mlp <= 0.50:
-            ffa = float(
-                prenatal_meta.mlp_skew_intercept
-                + prenatal_meta.mlp_skew_slope * raw_mlp
-            )
-        else:
-            olm_w = np.asarray(prenatal_meta.olm_weights, dtype=np.float64)
-            olm_bias = float(prenatal_meta.olm_bias)
-            raw_olm = float(features @ olm_w + olm_bias)
-            ffa = float(
-                prenatal_meta.olm_skew_intercept
-                + prenatal_meta.olm_skew_slope * raw_olm
-            )
+    # Evaluate FFA via convex logit ensemble or linear OLM fallback
+    features_flat = features.ravel() if features.ndim > 1 else features
+    raw_linear = float(
+        np.dot(features_flat, np.asarray(prenatal_meta.olm_weights, dtype=np.float64))
+        + prenatal_meta.olm_bias
+    )
+    ffa = (
+        float(scipy.special.expit(raw_linear))
+        if prenatal_meta.ffa_logit_mode
+        else raw_linear
+    )
 
     # 5. Evaluate chrX ratio and FFX
     if np.any(chrx_mask_100k):

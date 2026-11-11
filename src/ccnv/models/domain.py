@@ -4,7 +4,7 @@ import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, overload
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,25 +91,25 @@ def normalize_chr(name: str) -> str:
 
 
 def is_autosome_name(name: str) -> bool:
-    """Return True if contig is a canonical numbered autosome (1..22)."""
+    """Return True if contig is a canonical numbered autosome (>= 1)."""
 
     stripped = normalize_chr(name)
-    return stripped.isdigit() and 1 <= int(stripped) <= 22
+    return stripped.isascii() and stripped.isdigit() and int(stripped) >= 1
 
 
 def resolve_contig_name(contig: str, available: Iterable[str]) -> str | None:
     """Resolve contig name against available keys with chr-prefix and case fallback."""
 
-    avail_set = set(available)
-    if contig in avail_set:
+    avail = dict.fromkeys(available)
+    if contig in avail:
         return contig
     stripped = normalize_chr(contig)
-    if stripped in avail_set:
+    if stripped in avail:
         return stripped
     prefixed = f"chr{stripped}"
-    if prefixed in avail_set:
+    if prefixed in avail:
         return prefixed
-    lower_map = {normalize_chr(k).lower(): k for k in available}
+    lower_map = {normalize_chr(k).lower(): k for k in avail}
     return lower_map.get(stripped.lower())
 
 
@@ -134,24 +134,61 @@ def natural_sort_key(name: str) -> tuple[tuple[int, int | str], ...]:
     )
 
 
+@overload
+def select_layout(
+    names: Sequence[tuple[str, int]],
+    lengths: None = None,
+    *,
+    all_contigs: bool = False,
+) -> list[tuple[str, int]]: ...
+
+
+@overload
 def select_layout(
     names: Sequence[str],
     lengths: Sequence[int],
     *,
-    all_contigs: bool,
-) -> tuple[Contig, ...]:
+    all_contigs: bool = False,
+) -> tuple[Contig, ...]: ...
+
+
+def select_layout(
+    names: Sequence[tuple[str, int]] | Sequence[str],
+    lengths: Sequence[int] | None = None,
+    *,
+    all_contigs: bool = False,
+) -> list[tuple[str, int]] | tuple[Contig, ...]:
     """Keep canonical chromosomes unless ``all_contigs`` is set.
 
-    The result may be empty; callers decide how to report that. Header
-    names and lengths must already be aligned.
+    Accepts either ordered ``(name, length)`` header pairs (returning
+    ``list[tuple[str, int]]``) or parallel ``(names, lengths)`` sequences
+    (returning ``tuple[Contig, ...]``).
     """
+
+    if lengths is None:
+        selected: list[tuple[str, int]] = []
+        for entry in names:
+            if not isinstance(entry, tuple) or len(entry) != 2:
+                raise TypeError("header entries must be (name, length) pairs")
+            contig_name, contig_len = entry
+            if not isinstance(contig_name, str) or not contig_name:
+                raise ValueError("contig name must not be empty")
+            if (
+                not isinstance(contig_len, int)
+                or isinstance(contig_len, bool)
+                or contig_len <= 0
+            ):
+                raise ValueError("contig length must be positive")
+            if all_contigs or is_canonical_contig(contig_name):
+                selected.append((contig_name, int(contig_len)))
+        return selected
 
     if len(names) != len(lengths):
         raise ValueError("contig names and lengths must have equal length")
     return tuple(
-        Contig(name, length)
+        Contig(str(name), length)
         for name, length in zip(names, lengths, strict=True)
-        if all_contigs or is_canonical_contig(name)
+        if all_contigs or is_canonical_contig(str(name))
     )
 
 

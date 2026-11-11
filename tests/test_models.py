@@ -72,10 +72,10 @@ class TestReferenceConfig(unittest.TestCase):
         self.assertEqual(config.input_paths, ())
         self.assertEqual(config.threads, 1)
 
-    def test_reference_config_positional_prefix(self) -> None:
-        config = ReferenceConfig(Path("ref_out"))
+    def test_reference_config_single_sample_path_preserves_prefix(self) -> None:
+        config = ReferenceConfig(samples=Path("s1.ccnv"), prefix=Path("ref_out"))
         self.assertEqual(config.prefix, Path("ref_out"))
-        self.assertEqual(config.samples, ())
+        self.assertEqual(config.samples, (Path("s1.ccnv"),))
 
     def test_reference_config_positional_samples_and_prefix(self) -> None:
         p1 = Path("s1.ccnv")
@@ -118,6 +118,12 @@ class TestReferenceConfig(unittest.TestCase):
     def test_reference_config_validation(self) -> None:
         with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
             ReferenceConfig(prefix=Path("ref"), threads=0)
+        with self.assertRaisesRegex(ValueError, "bin_size must be a positive integer"):
+            ReferenceConfig(prefix=Path("ref"), bin_size=0)
+        with self.assertRaisesRegex(
+            ValueError, "min_mappability must be between 0.0 and 1.0"
+        ):
+            ReferenceConfig(prefix=Path("ref"), min_mappability=1.1)
         with self.assertRaisesRegex(
             ValueError, "prenatal_bin_size must be a positive integer"
         ):
@@ -143,6 +149,9 @@ class TestPredictConfig(unittest.TestCase):
         self.assertEqual(config.mode, "germline")
         self.assertAlmostEqual(config.min_fetal_fraction_warning, 0.04)
         self.assertEqual(config.sex, "autosomal")
+        self.assertEqual(config.threads, 1)
+        self.assertFalse(config.bins_vcf)
+        self.assertIsNone(config.bin_size)
 
     def test_predict_config_prenatal_mode(self) -> None:
         config = PredictConfig(
@@ -173,6 +182,29 @@ class TestPredictConfig(unittest.TestCase):
                 reference=Path("r"),
                 prefix=Path("o"),
                 min_fetal_fraction_warning=-0.01,
+            )
+        with self.assertRaisesRegex(ValueError, "bin_size must be a positive integer"):
+            PredictConfig(
+                sample=Path("s"),
+                reference=Path("r"),
+                prefix=Path("o"),
+                bin_size=0,
+            )
+        with self.assertRaisesRegex(
+            ValueError, "min_mappability must be between 0.0 and 1.0"
+        ):
+            PredictConfig(
+                sample=Path("s"),
+                reference=Path("r"),
+                prefix=Path("o"),
+                min_mappability=-0.1,
+            )
+        with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
+            PredictConfig(
+                sample=Path("s"),
+                reference=Path("r"),
+                prefix=Path("o"),
+                threads=0,
             )
 
     def test_predict_config_immutability(self) -> None:
@@ -427,6 +459,8 @@ class TestPredictionOutputsAliasesAndFields(unittest.TestCase):
 class TestExceptions(unittest.TestCase):
     def test_exception_hierarchy(self) -> None:
         from ccnv.models.exceptions import (
+            AlignmentError,
+            BinCompatibilityError,
             CcnvError,
             CovariateError,
             ExtractError,
@@ -434,18 +468,25 @@ class TestExceptions(unittest.TestCase):
             ReferenceError,
             ReferenceQCError,
             SchemaError,
+            SchemaVersionError,
         )
 
         for err_cls in (
+            AlignmentError,
+            BinCompatibilityError,
             CovariateError,
             ExtractError,
             PredictError,
             ReferenceError,
             ReferenceQCError,
             SchemaError,
+            SchemaVersionError,
         ):
             self.assertTrue(issubclass(err_cls, CcnvError))
             self.assertTrue(issubclass(err_cls, Exception))
+        self.assertTrue(issubclass(SchemaVersionError, SchemaError))
+        self.assertTrue(issubclass(BinCompatibilityError, ReferenceError))
+        self.assertTrue(issubclass(BinCompatibilityError, PredictError))
 
     def test_exception_instantiation(self) -> None:
         from ccnv.models.exceptions import CcnvError, ReferenceError
@@ -564,6 +605,9 @@ class TestModelReExports(unittest.TestCase):
             "SAMPLE_SCHEMA",
             "REFERENCE_SCHEMA",
             "SCHEMA_VERSION",
+            "NUM_FRAG_BANDS",
+            "NUM_GC_QUANTILES",
+            "NUM_PROTOTYPES_PER_BIN",
             "BRANCH_AUTOSOMAL",
             "BRANCH_FEMALE_SEX",
             "BRANCH_MALE_SEX",
@@ -572,10 +616,13 @@ class TestModelReExports(unittest.TestCase):
             "KNOWN_REFERENCE_BRANCHES",
             "CNV_REFERENCE_BRANCHES",
             "ArtifactKind",
+            "SampleMetadata",
             "ReferenceMetadata",
             "PrenatalModelMetadata",
             "PRENATAL_METADATA_KEY",
             "COORDINATE_SYSTEM",
+            "build_reference_schema",
+            "reconstruct_sample_grid",
             "decode_metadata",
             "metadata_for",
             "encode_metadata",
@@ -586,10 +633,13 @@ class TestModelReExports(unittest.TestCase):
             "validate_reference_table",
             "bin_coordinates",
             "CcnvError",
+            "AlignmentError",
+            "BinCompatibilityError",
             "ReferenceError",
             "CovariateError",
             "PredictError",
             "SchemaError",
+            "SchemaVersionError",
             "ExtractError",
             "ReferenceQCError",
         ]

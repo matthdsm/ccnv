@@ -40,8 +40,13 @@ from ccnv.models import (
     metadata_for,
 )
 from ccnv.models.schemas import (
-    REFERENCE_SCHEMA,
+    NUM_FRAG_BANDS,
+    NUM_GC_QUANTILES,
+    NUM_PROTOTYPES_PER_BIN,
     SAMPLE_SCHEMA,
+    SampleMetadata,
+    build_reference_schema,
+    reconstruct_sample_grid,
 )
 
 
@@ -142,6 +147,7 @@ class TestParquetIO(unittest.TestCase):
                 contig_lengths={"chr1": 200},
                 values={
                     "bin_size": 100,
+                    "contig_order": ["chr1"],
                     "source_identity": {"path": "test.bam"},
                     "reference_identity": {"name": "test"},
                     "qc": {},
@@ -150,13 +156,15 @@ class TestParquetIO(unittest.TestCase):
             )
             table = pa.table(
                 {
-                    "contig": pa.array(["chr1", "chr1"], type=pa.string()),
-                    "start": pa.array([0, 100], type=pa.int64()),
-                    "end": pa.array([100, 200], type=pa.int64()),
-                    "count": pa.array([10, 20], type=pa.uint64()),
-                    "fragment_lengths": pa.array([[], []], type=pa.list_(pa.uint16())),
+                    "count": pa.array([10, 20], type=pa.uint32()),
+                    "paired_count": pa.array([0, 0], type=pa.uint32()),
+                    "frag_len_sum": pa.array([0, 0], type=pa.uint64()),
+                    "short_frag_count": pa.array([0, 0], type=pa.uint32()),
                     "endpoint_count": pa.array([0, 0], type=pa.uint32()),
                     "frag_gc_sum": pa.array([0.0, 0.0], type=pa.float32()),
+                    "frag_bands": pa.nulls(
+                        2, type=pa.list_(pa.uint32(), NUM_FRAG_BANDS)
+                    ),
                 },
                 schema=SAMPLE_SCHEMA.with_metadata(metadata),
             )
@@ -168,7 +176,8 @@ class TestParquetIO(unittest.TestCase):
             # Read back
             loaded = read_sample_parquet(path)
             self.assertEqual(loaded.num_rows, 2)
-            self.assertEqual(loaded.column("start").to_pylist(), [0, 100])
+            _, _, starts, _ = reconstruct_sample_grid(SampleMetadata.from_table(loaded))
+            self.assertEqual(starts.tolist(), [0, 100])
             self.assertTrue(is_sample_parquet(path))
 
     def test_reference_parquet_roundtrip(self) -> None:
@@ -178,11 +187,11 @@ class TestParquetIO(unittest.TestCase):
                 ArtifactKind.REFERENCE,
                 contig_lengths={"chr1": 100},
                 values={
-                    "bin_size": 100,
                     "cohort_samples": ["s1", "s2"],
                     "sample_identities": [{"id": "s1"}, {"id": "s2"}],
                     "n_samples": 2,
                     "model": {
+                        "bin_size": 100,
                         "mode": "germline",
                         "branches": [
                             BRANCH_AUTOSOMAL,
@@ -192,23 +201,42 @@ class TestParquetIO(unittest.TestCase):
                     },
                 },
             )
+            ref_schema = build_reference_schema(1).with_metadata(metadata)
             table = pa.table(
                 {
-                    "branch": pa.array([BRANCH_AUTOSOMAL], type=pa.string()),
-                    "contig": pa.array(["chr1"], type=pa.string()),
-                    "start": pa.array([0], type=pa.int64()),
-                    "end": pa.array([100], type=pa.int64()),
+                    "branch": pa.DictionaryArray.from_arrays(
+                        pa.array([0], type=pa.int8()), [BRANCH_AUTOSOMAL]
+                    ),
+                    "contig": pa.DictionaryArray.from_arrays(
+                        pa.array([0], type=pa.int16()), ["chr1"]
+                    ),
+                    "start": pa.array([0], type=pa.uint32()),
+                    "end": pa.array([100], type=pa.uint32()),
                     "masked": pa.array([False], type=pa.bool_()),
                     "gc": pa.array([0.45], type=pa.float32()),
                     "mappability": pa.array([1.0], type=pa.float32()),
+                    "gc_quantiles": pa.nulls(
+                        1, type=pa.list_(pa.float32(), NUM_GC_QUANTILES)
+                    ),
+                    "ref_frag_len": pa.array([166.0], type=pa.float32()),
+                    "ref_ep_rate": pa.array([2.0], type=pa.float32()),
                     "pca_mean": pa.array([1.0], type=pa.float32()),
-                    "pca_loadings": pa.array([[0.1]], type=pa.list_(pa.float32())),
-                    "nearest_ref_indices": pa.array([[0]], type=pa.list_(pa.int32())),
+                    "pca_loadings": pa.FixedSizeListArray.from_arrays(
+                        pa.array([0.1], type=pa.float32()), 1
+                    ),
+                    "proto_ids": pa.FixedSizeListArray.from_arrays(
+                        pa.array([0] * NUM_PROTOTYPES_PER_BIN, type=pa.uint16()),
+                        NUM_PROTOTYPES_PER_BIN,
+                    ),
+                    "proto_weights": pa.FixedSizeListArray.from_arrays(
+                        pa.array([0.25] * NUM_PROTOTYPES_PER_BIN, type=pa.float16()),
+                        NUM_PROTOTYPES_PER_BIN,
+                    ),
                     "mean_distance": pa.array([0.05], type=pa.float32()),
                     "null_mean": pa.array([0.0], type=pa.float32()),
-                    "null_std": pa.array([1.0], type=pa.float32()),
+                    "bio_dispersion": pa.array([0.01], type=pa.float32()),
                 },
-                schema=REFERENCE_SCHEMA.with_metadata(metadata),
+                schema=ref_schema,
             )
             write_reference_parquet(table, path)
             loaded = read_reference_parquet(path)

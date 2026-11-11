@@ -66,8 +66,7 @@ def load_sample_or_extract(
             bin_size=bin_size,
             threads=threads,
         )
-        table, _ = extract_sample_table(config)
-        return table
+        return extract_sample_table(config)
     return read_sample_parquet(p)
 
 
@@ -107,7 +106,6 @@ def write_reference_parquet(
         column_encoding={
             "start": "DELTA_BINARY_PACKED",
             "end": "DELTA_BINARY_PACKED",
-            "nearest_ref_indices.list.element": "DELTA_BINARY_PACKED",
         },
     )
     return out_path

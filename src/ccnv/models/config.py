@@ -91,13 +91,24 @@ class ReferenceConfig:
     def __post_init__(self) -> None:
         """Validate and normalize reference configuration invariants."""
         if isinstance(self.samples, (Path, str)):
-            object.__setattr__(self, "prefix", Path(self.samples))
-            object.__setattr__(self, "samples", ())
+            single_path = Path(self.samples)
+            if single_path.suffix.lower() in {".yaml", ".yml", ".json"}:
+                if self.samplesheet_path is None:
+                    object.__setattr__(self, "samplesheet_path", single_path)
+                object.__setattr__(self, "samples", ())
+            else:
+                object.__setattr__(self, "samples", (single_path,))
+        elif isinstance(self.samples, list):
+            object.__setattr__(self, "samples", tuple(Path(p) for p in self.samples))
 
         if self.threads <= 0:
             raise ValueError("threads must be a positive integer")
+        if self.bin_size is not None and self.bin_size <= 0:
+            raise ValueError("bin_size must be a positive integer")
         if self.prenatal_bin_size <= 0:
             raise ValueError("prenatal_bin_size must be a positive integer")
+        if not (0.0 <= self.min_mappability <= 1.0):
+            raise ValueError("min_mappability must be between 0.0 and 1.0")
         if self.mode not in ("germline", "prenatal"):
             raise ValueError(
                 f"mode must be 'germline' or 'prenatal', got {self.mode!r}"
@@ -134,16 +145,25 @@ class PredictConfig:
     max_blacklist_gap: int = 2_000_000
     plot: bool = True
     vcf: bool = True
+    bins_vcf: bool = False
     cytobands: Path | None = None
     mappability: Path | None = None
     gc: Path | None = None
     fasta: Path | None = None
+    bin_size: int | None = None
+    threads: int = 1
     min_mappability: float = DEFAULT_MIN_MAPPABILITY
     mode: AnalysisMode = "germline"
     min_fetal_fraction_warning: float = 0.04
 
     def __post_init__(self) -> None:
         """Validate prediction configuration invariants."""
+        if self.threads <= 0:
+            raise ValueError("threads must be a positive integer")
+        if self.bin_size is not None and self.bin_size <= 0:
+            raise ValueError("bin_size must be a positive integer")
+        if not (0.0 <= self.min_mappability <= 1.0):
+            raise ValueError("min_mappability must be between 0.0 and 1.0")
         if self.mode not in ("germline", "prenatal"):
             raise ValueError(
                 f"mode must be 'germline' or 'prenatal', got {self.mode!r}"

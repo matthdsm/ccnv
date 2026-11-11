@@ -39,6 +39,7 @@ from ccnv.features.prenatal import (
     fit_prenatal_models,
     predict_prenatal,
 )
+from ccnv.features.rebinning import rebin_sample_sketch
 
 __all__ = [
     "DEFAULT_MIN_MAPPABILITY",
@@ -66,6 +67,7 @@ __all__ = [
     "predict_prenatal",
     "rebin_cohort",
     "rebin_counts",
+    "rebin_sample_sketch",
     "rebin_sample_table",
     "score_segment_origin",
     "validate_cohort",

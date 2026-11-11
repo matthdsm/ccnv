@@ -1,11 +1,17 @@
+"""Unit tests for Schema v2.0.0 Arrow contracts, metadata containers, and validation."""
+
+from __future__ import annotations
+
 import json
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from typing import cast
 
+import numpy as np
 import pyarrow as pa
 
-from ccnv.models import ReadFilters
+from ccnv.models import AnalysisMode, ReadFilters
 from ccnv.models.config import ExtractConfig
 from ccnv.models.results import FetalFractionResult, SCAResult, SegmentResult
 from ccnv.models.schemas import (
@@ -17,8 +23,10 @@ from ccnv.models.schemas import (
     COORDINATE_SYSTEM,
     FRAGMENTOMICS_METADATA_KEY,
     KNOWN_REFERENCE_BRANCHES,
+    NUM_FRAG_BANDS,
+    NUM_GC_QUANTILES,
+    NUM_PROTOTYPES_PER_BIN,
     PRENATAL_METADATA_KEY,
-    REFERENCE_SCHEMA,
     SAMPLE_SCHEMA,
     SCHEMA_VERSION,
     SUPPORTED_SCHEMA_VERSIONS,
@@ -27,9 +35,12 @@ from ccnv.models.schemas import (
     PrenatalModelMetadata,
     ReferenceMetadata,
     SchemaError,
+    SchemaVersionError,
     bin_coordinates,
+    build_reference_schema,
     decode_metadata,
     metadata_for,
+    reconstruct_sample_grid,
     validate_reference_table,
     validate_sample_table,
     validate_schema,
@@ -43,16 +54,8 @@ def _make_prenatal_metadata() -> PrenatalModelMetadata:
         yfrac_threshold=0.0041,
         ffy_intercept=0.0012,
         ffy_slope=0.985,
-        mlp_w1=[[0.1, 0.2] for _ in range(50)],
-        mlp_b1=[0.12, -0.34],
-        mlp_w2=[[0.85], [-0.61]],
-        mlp_b2=[0.04],
-        mlp_skew_intercept=-0.002,
-        mlp_skew_slope=1.018,
         olm_weights=[0.02 for _ in range(50)],
         olm_bias=0.005,
-        olm_skew_intercept=-0.001,
-        olm_skew_slope=1.01,
         ffx_intercept=1.0004,
         ffx_slope=-0.498,
         female_chrx_ratio_mean=1.0003,
@@ -60,28 +63,83 @@ def _make_prenatal_metadata() -> PrenatalModelMetadata:
     )
 
 
+def _make_ref_table(
+    branches: list[str],
+    contigs: list[str],
+    starts: list[int],
+    ends: list[int],
+    metadata: dict[bytes, bytes],
+    *,
+    pca_rank: int = 1,
+) -> pa.Table:
+    n_rows = len(branches)
+    branch_vocab = list(dict.fromkeys(branches))
+    branch_idx = np.array([branch_vocab.index(b) for b in branches], dtype=np.int8)
+    contig_vocab = list(dict.fromkeys(contigs))
+    contig_idx = np.array([contig_vocab.index(c) for c in contigs], dtype=np.int16)
+    loadings_col: pa.Array = (
+        pa.nulls(n_rows, type=pa.list_(pa.float32(), 0))
+        if pca_rank == 0
+        else pa.FixedSizeListArray.from_arrays(
+            np.full(n_rows * pca_rank, 0.1, dtype=np.float32), pca_rank
+        )
+    )
+    return pa.table(
+        {
+            "branch": pa.DictionaryArray.from_arrays(branch_idx, branch_vocab),
+            "contig": pa.DictionaryArray.from_arrays(contig_idx, contig_vocab),
+            "start": pa.array(starts, type=pa.uint32()),
+            "end": pa.array(ends, type=pa.uint32()),
+            "masked": pa.array([False] * n_rows, type=pa.bool_()),
+            "gc": pa.array([0.42] * n_rows, type=pa.float32()),
+            "mappability": pa.array([0.99] * n_rows, type=pa.float32()),
+            "gc_quantiles": pa.nulls(
+                n_rows, type=pa.list_(pa.float32(), NUM_GC_QUANTILES)
+            ),
+            "ref_frag_len": pa.array([166.0] * n_rows, type=pa.float32()),
+            "ref_ep_rate": pa.array([2.0] * n_rows, type=pa.float32()),
+            "pca_mean": pa.array([0.0] * n_rows, type=pa.float32()),
+            "pca_loadings": loadings_col,
+            "proto_ids": pa.FixedSizeListArray.from_arrays(
+                np.zeros(n_rows * NUM_PROTOTYPES_PER_BIN, dtype=np.uint16),
+                NUM_PROTOTYPES_PER_BIN,
+            ),
+            "proto_weights": pa.FixedSizeListArray.from_arrays(
+                np.full(n_rows * NUM_PROTOTYPES_PER_BIN, 0.25, dtype=np.float16),
+                NUM_PROTOTYPES_PER_BIN,
+            ),
+            "mean_distance": pa.array([0.2] * n_rows, type=pa.float32()),
+            "null_mean": pa.array([0.0] * n_rows, type=pa.float32()),
+            "bio_dispersion": pa.array([0.01] * n_rows, type=pa.float32()),
+        },
+        schema=build_reference_schema(pca_rank).with_metadata(metadata),
+    )
+
+
 class TestSchemaContracts(unittest.TestCase):
-    def test_schema_version_is_1_0_0(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, "1.0.0")
-        self.assertEqual(SUPPORTED_SCHEMA_VERSIONS, frozenset({"1.0.0"}))
+    def test_schema_version_is_2_0_0(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, "2.0.0")
+        self.assertEqual(SUPPORTED_SCHEMA_VERSIONS, frozenset({"2.0.0"}))
         self.assertEqual(PRENATAL_METADATA_KEY, b"ccnv.prenatal")
         self.assertEqual(FRAGMENTOMICS_METADATA_KEY, b"ccnv.fragmentomics")
 
-    def test_sample_schema_has_fragmentomics_columns(self) -> None:
+    def test_sample_schema_has_compact_v2_columns(self) -> None:
         expected_fields = [
-            ("contig", pa.string()),
-            ("start", pa.int64()),
-            ("end", pa.int64()),
-            ("count", pa.uint64()),
-            ("fragment_lengths", pa.list_(pa.uint16())),
-            ("endpoint_count", pa.uint32()),
-            ("frag_gc_sum", pa.float32()),
+            ("count", pa.uint32(), False),
+            ("paired_count", pa.uint32(), False),
+            ("frag_len_sum", pa.uint64(), False),
+            ("short_frag_count", pa.uint32(), False),
+            ("endpoint_count", pa.uint32(), False),
+            ("frag_gc_sum", pa.float32(), False),
+            ("frag_bands", pa.list_(pa.uint32(), NUM_FRAG_BANDS), True),
         ]
         self.assertEqual(SAMPLE_SCHEMA.names, [f[0] for f in expected_fields])
-        for name, expected_type in expected_fields:
+        for name, expected_type, expected_nullable in expected_fields:
             field = SAMPLE_SCHEMA.field(name)
             self.assertEqual(field.type, expected_type, f"Field {name} type mismatch")
-            self.assertFalse(field.nullable, f"Field {name} must be non-nullable")
+            self.assertEqual(
+                field.nullable, expected_nullable, f"Field {name} nullability mismatch"
+            )
 
     def test_fragmentomics_metadata_dataclass_and_serialization(self) -> None:
         meta = FragmentomicsMetadata(
@@ -104,10 +162,9 @@ class TestSchemaContracts(unittest.TestCase):
         self.assertTrue(meta.paired_end)
         self.assertEqual(len(meta.hist_autosomal), 571)
         self.assertEqual(len(meta.end_motif_counts), 256)
-        # Round trip via asdict / json
         encoded = json.dumps(asdict(meta))
         decoded = json.loads(encoded)
-        restored = FragmentomicsMetadata(**decoded)
+        restored = FragmentomicsMetadata.from_dict(decoded)
         self.assertEqual(meta, restored)
 
     def test_prenatal_model_metadata_with_fragmentomics_fields(self) -> None:
@@ -119,16 +176,8 @@ class TestSchemaContracts(unittest.TestCase):
             yfrac_threshold=0.0041,
             ffy_intercept=0.0012,
             ffy_slope=0.985,
-            mlp_w1=[[0.1, 0.2] for _ in range(50)],
-            mlp_b1=[0.12, -0.34],
-            mlp_w2=[[0.85], [-0.61]],
-            mlp_b2=[0.04],
-            mlp_skew_intercept=-0.002,
-            mlp_skew_slope=1.018,
             olm_weights=[0.02 for _ in range(50)],
             olm_bias=0.005,
-            olm_skew_intercept=-0.001,
-            olm_skew_slope=1.01,
             ffx_intercept=1.0004,
             ffx_slope=-0.498,
             female_chrx_ratio_mean=1.0003,
@@ -219,6 +268,7 @@ class TestSchemaContracts(unittest.TestCase):
         self.assertEqual(decoded["schema_version"], SCHEMA_VERSION)
         self.assertEqual(decoded["coordinate_system"], COORDINATE_SYSTEM)
         self.assertEqual(decoded["contig_lengths"], {"chr1": 250_001, "scaffold-A": 99})
+        self.assertEqual(decoded["contig_order"], ["chr1", "scaffold-A"])
 
     def test_schema_rejects_invalid_coordinate_system(self) -> None:
         metadata = metadata_for(
@@ -267,23 +317,26 @@ class TestSchemaContracts(unittest.TestCase):
         )
         table = pa.table(
             {
-                "contig": ["scaffold-A", "scaffold-A", "scaffold-A"],
-                "start": pa.array([0, 100_000, 200_000], type=pa.int64()),
-                "end": pa.array([100_000, 200_000, 250_001], type=pa.int64()),
-                "count": pa.array([10, 11, 12], type=pa.uint64()),
-                "fragment_lengths": pa.array(
-                    [[150] * 10, [166] * 11, [143] * 12], type=pa.list_(pa.uint16())
-                ),
+                "count": pa.array([10, 11, 12], type=pa.uint32()),
+                "paired_count": pa.array([10, 11, 12], type=pa.uint32()),
+                "frag_len_sum": pa.array([1500, 1826, 1716], type=pa.uint64()),
+                "short_frag_count": pa.array([10, 0, 12], type=pa.uint32()),
                 "endpoint_count": pa.array([20, 22, 24], type=pa.uint32()),
                 "frag_gc_sum": pa.array([4.0, 4.4, 4.8], type=pa.float32()),
+                "frag_bands": pa.nulls(3, type=pa.list_(pa.uint32(), NUM_FRAG_BANDS)),
             },
             schema=SAMPLE_SCHEMA.with_metadata(metadata),
         )
 
         validate_table(table, ArtifactKind.SAMPLE)
-        validate_sample_table(table)
+        smeta = validate_sample_table(table)
+        codes, names, starts, ends = reconstruct_sample_grid(smeta)
+        self.assertEqual(names, ("scaffold-A",))
+        self.assertEqual(codes.tolist(), [0, 0, 0])
+        self.assertEqual(starts.tolist(), [0, 100_000, 200_000])
+        self.assertEqual(ends.tolist(), [100_000, 200_000, 250_001])
 
-    def test_table_rejects_interval_past_true_contig_end(self) -> None:
+    def test_table_rejects_mismatched_sample_row_count(self) -> None:
         metadata = metadata_for(
             ArtifactKind.SAMPLE,
             contig_lengths={"chr1": 10},
@@ -297,13 +350,13 @@ class TestSchemaContracts(unittest.TestCase):
         )
         table = pa.table(
             {
-                "contig": ["chr1"],
-                "start": pa.array([0], type=pa.int64()),
-                "end": pa.array([11], type=pa.int64()),
-                "count": pa.array([1], type=pa.uint64()),
-                "fragment_lengths": pa.array([[150]], type=pa.list_(pa.uint16())),
-                "endpoint_count": pa.array([2], type=pa.uint32()),
-                "frag_gc_sum": pa.array([0.4], type=pa.float32()),
+                "count": pa.array([1, 2], type=pa.uint32()),
+                "paired_count": pa.array([0, 0], type=pa.uint32()),
+                "frag_len_sum": pa.array([0, 0], type=pa.uint64()),
+                "short_frag_count": pa.array([0, 0], type=pa.uint32()),
+                "endpoint_count": pa.array([2, 2], type=pa.uint32()),
+                "frag_gc_sum": pa.array([0.4, 0.4], type=pa.float32()),
+                "frag_bands": pa.nulls(2, type=pa.list_(pa.uint32(), NUM_FRAG_BANDS)),
             },
             schema=SAMPLE_SCHEMA.with_metadata(metadata),
         )
@@ -316,7 +369,7 @@ class TestSchemaContracts(unittest.TestCase):
     def test_bin_coordinates_are_contig_start_end_tuples(self) -> None:
         metadata = metadata_for(
             ArtifactKind.SAMPLE,
-            contig_lengths={"chr1": 200, "chr2": 80},
+            contig_lengths={"chr1": 100, "chr2": 80},
             values={
                 "bin_size": 100,
                 "source_identity": {},
@@ -327,15 +380,13 @@ class TestSchemaContracts(unittest.TestCase):
         )
         table = pa.table(
             {
-                "contig": ["chr1", "chr2"],
-                "start": pa.array([0, 0], type=pa.int64()),
-                "end": pa.array([100, 80], type=pa.int64()),
-                "count": pa.array([1, 2], type=pa.uint64()),
-                "fragment_lengths": pa.array(
-                    [[150], [160, 170]], type=pa.list_(pa.uint16())
-                ),
+                "count": pa.array([1, 2], type=pa.uint32()),
+                "paired_count": pa.array([1, 2], type=pa.uint32()),
+                "frag_len_sum": pa.array([150, 330], type=pa.uint64()),
+                "short_frag_count": pa.array([1, 0], type=pa.uint32()),
                 "endpoint_count": pa.array([2, 4], type=pa.uint32()),
                 "frag_gc_sum": pa.array([0.4, 0.9], type=pa.float32()),
+                "frag_bands": pa.nulls(2, type=pa.list_(pa.uint32(), NUM_FRAG_BANDS)),
             },
             schema=SAMPLE_SCHEMA.with_metadata(metadata),
         )
@@ -353,29 +404,18 @@ class TestSchemaContracts(unittest.TestCase):
                 "model": {"bin_size": 100, "branches": ["autosomal"]},
             },
         )
-        ref_table = pa.table(
-            {
-                "branch": ["autosomal", "autosomal"],
-                "contig": ["chr1", "chr1"],
-                "start": pa.array([0, 100], type=pa.int64()),
-                "end": pa.array([100, 200], type=pa.int64()),
-                "masked": [False, False],
-                "gc": pa.array([0.42, 0.45], type=pa.float32()),
-                "mappability": pa.array([0.98, 0.99], type=pa.float32()),
-                "pca_mean": [0.0, 0.0],
-                "pca_loadings": [[0.1], [0.1]],
-                "nearest_ref_indices": [[1], [0]],
-                "mean_distance": pa.array([0.5, 0.5], type=pa.float32()),
-                "null_mean": [0.0, 0.0],
-                "null_std": [0.1, 0.1],
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(ref_meta),
+        ref_table = _make_ref_table(
+            ["autosomal", "autosomal"],
+            ["chr1", "chr1"],
+            [0, 100],
+            [100, 200],
+            ref_meta,
+            pca_rank=2,
         )
         validate_schema(ref_table.schema, ArtifactKind.REFERENCE)
         validate_table(ref_table, ArtifactKind.REFERENCE)
         validate_reference_table(ref_table)
 
-        # Old schema with nearest_ref_distances and null_ratios is rejected
         old_schema = pa.schema(
             [
                 pa.field("branch", pa.string(), nullable=False),
@@ -386,17 +426,13 @@ class TestSchemaContracts(unittest.TestCase):
                 pa.field("pca_mean", pa.float64(), nullable=False),
                 pa.field("pca_loadings", pa.list_(pa.float64()), nullable=False),
                 pa.field("nearest_ref_indices", pa.list_(pa.int32()), nullable=False),
-                pa.field(
-                    "nearest_ref_distances", pa.list_(pa.float64()), nullable=False
-                ),
-                pa.field("null_ratios", pa.list_(pa.float64()), nullable=False),
             ]
         )
         with self.assertRaisesRegex(SchemaError, "fields do not match"):
             validate_schema(old_schema.with_metadata(ref_meta), ArtifactKind.REFERENCE)
 
     def test_unsupported_schema_version_rejected(self) -> None:
-        with self.assertRaisesRegex(SchemaError, "unsupported schema version"):
+        with self.assertRaisesRegex(SchemaVersionError, "unsupported schema version"):
             metadata_for(
                 ArtifactKind.REFERENCE,
                 contig_lengths={"chr1": 200},
@@ -407,13 +443,14 @@ class TestSchemaContracts(unittest.TestCase):
                 },
             )
 
-        # Version 2.0.0 is rejected now that schema version is 1.0.0
-        with self.assertRaisesRegex(SchemaError, "unsupported schema version '2.0.0'"):
+        with self.assertRaisesRegex(
+            SchemaVersionError, "unsupported schema version '1.0.0'"
+        ):
             metadata_for(
                 ArtifactKind.REFERENCE,
                 contig_lengths={"chr1": 200},
                 values={
-                    "schema_version": "2.0.0",
+                    "schema_version": "1.0.0",
                     "sample_identities": [],
                     "model": {"branches": ["autosomal"]},
                 },
@@ -423,8 +460,8 @@ class TestSchemaContracts(unittest.TestCase):
         meta = _make_prenatal_metadata()
         as_dict = meta.to_dict()
         self.assertEqual(as_dict["prenatal_bin_size"], 100_000)
-        self.assertEqual(len(as_dict["mlp_w1"]), 50)
-        self.assertEqual(as_dict["mlp_b2"], [0.04])
+        self.assertNotIn("mlp_w1", as_dict)
+        self.assertNotIn("preface_std", as_dict)
 
         encoded = meta.encode()
         decoded = PrenatalModelMetadata.decode(encoded)
@@ -439,16 +476,8 @@ class TestSchemaContracts(unittest.TestCase):
             yfrac_threshold=0.0041,
             ffy_intercept=0.0012,
             ffy_slope=0.985,
-            mlp_w1=[[0.1, 0.2] for _ in range(50)],
-            mlp_b1=[0.12, -0.34],
-            mlp_w2=[[0.85], [-0.61]],
-            mlp_b2=[0.04],
-            mlp_skew_intercept=-0.002,
-            mlp_skew_slope=1.018,
             olm_weights=[0.02 for _ in range(50)],
             olm_bias=0.005,
-            olm_skew_intercept=-0.001,
-            olm_skew_slope=1.01,
             ffx_intercept=1.0004,
             ffx_slope=-0.498,
             female_chrx_ratio_mean=1.0003,
@@ -482,27 +511,17 @@ class TestSchemaContracts(unittest.TestCase):
         self.assertEqual(decoded, meta)
         self.assertEqual(decoded.ff_size_std, 0.035)
 
-    def test_prenatal_model_metadata_backward_compatibility_defaults(self) -> None:
+    def test_prenatal_model_metadata_defaults_for_optional_keys(self) -> None:
         meta = _make_prenatal_metadata()
         as_dict = meta.to_dict()
-        # Remove the new fields to simulate legacy metadata
-        for k in (
-            "ffy_std",
-            "ffa_std",
-            "preface_std",
-            "ffx_std",
-            "ffa_logit_mode",
-            "preface_logit_mode",
-        ):
+        for k in ("ffy_std", "ffa_std", "ffx_std", "ffa_logit_mode"):
             as_dict.pop(k, None)
 
-        legacy_loaded = PrenatalModelMetadata.from_dict(as_dict)
-        self.assertEqual(legacy_loaded.ffy_std, 0.01)
-        self.assertEqual(legacy_loaded.ffa_std, 0.02)
-        self.assertEqual(legacy_loaded.preface_std, 0.02)
-        self.assertEqual(legacy_loaded.ffx_std, 0.025)
-        self.assertFalse(legacy_loaded.ffa_logit_mode)
-        self.assertFalse(legacy_loaded.preface_logit_mode)
+        loaded = PrenatalModelMetadata.from_dict(as_dict)
+        self.assertEqual(loaded.ffy_std, 0.01)
+        self.assertEqual(loaded.ffa_std, 0.02)
+        self.assertEqual(loaded.ffx_std, 0.025)
+        self.assertFalse(loaded.ffa_logit_mode)
 
     def test_prenatal_model_metadata_rejects_missing_keys_or_empty_dict(self) -> None:
         with self.assertRaises(KeyError):
@@ -527,16 +546,8 @@ class TestSchemaContracts(unittest.TestCase):
                 yfrac_threshold=0.0,
                 ffy_intercept=0.0,
                 ffy_slope=1.0,
-                mlp_w1=[],
-                mlp_b1=[],
-                mlp_w2=[],
-                mlp_b2=[],
-                mlp_skew_intercept=0.0,
-                mlp_skew_slope=1.0,
                 olm_weights=[],
                 olm_bias=0.0,
-                olm_skew_intercept=0.0,
-                olm_skew_slope=1.0,
                 ffx_intercept=0.0,
                 ffx_slope=1.0,
                 female_chrx_ratio_mean=1.0,
@@ -557,8 +568,9 @@ class TestSchemaContracts(unittest.TestCase):
         self.assertEqual(ref_meta.prenatal_bin_size, 100_000)
 
         metadata_dict = ref_meta.to_metadata()
-        self.assertEqual(metadata_dict["model"]["mode"], "prenatal")
-        self.assertEqual(metadata_dict["model"]["prenatal_bin_size"], 100_000)
+        model_dict = cast(dict[str, object], metadata_dict["model"])
+        self.assertEqual(model_dict["mode"], "prenatal")
+        self.assertEqual(model_dict["prenatal_bin_size"], 100_000)
         self.assertIn("prenatal", metadata_dict)
 
         arrow_meta = ref_meta.build_arrow_metadata()
@@ -571,7 +583,7 @@ class TestSchemaContracts(unittest.TestCase):
         self.assertEqual(reconstructed.mode, "prenatal")
         self.assertEqual(reconstructed.bin_size, 5000)
         self.assertEqual(reconstructed.prenatal_bin_size, 100_000)
-        self.assertIsNotNone(reconstructed.prenatal)
+        assert reconstructed.prenatal is not None
         self.assertEqual(
             reconstructed.prenatal.yfrac_threshold, prenatal_meta.yfrac_threshold
         )
@@ -583,6 +595,7 @@ class TestSchemaContracts(unittest.TestCase):
                 contig_lengths={"chr1": 100},
                 branches=("autosomal",),
             )
+        bad_mode = cast(AnalysisMode, "invalid_mode")
         with self.assertRaisesRegex(
             ValueError, "mode must be 'germline' or 'prenatal'"
         ):
@@ -590,7 +603,7 @@ class TestSchemaContracts(unittest.TestCase):
                 bin_size=5000,
                 contig_lengths={"chr1": 100},
                 branches=("autosomal",),
-                mode="invalid_mode",  # type: ignore[arg-type]
+                mode=bad_mode,
             )
         with self.assertRaisesRegex(ValueError, "non-empty mapping"):
             ReferenceMetadata(
@@ -602,42 +615,19 @@ class TestSchemaContracts(unittest.TestCase):
     def test_validate_reference_table_all_five_branches(self) -> None:
         prenatal_meta = _make_prenatal_metadata()
         contig_lengths = {"chr1": 200_000, "chrX": 100_000, "chrY": 100_000}
-        branches_list: list[str] = []
-        contigs_list: list[str] = []
-        starts_list: list[int] = []
-        ends_list: list[int] = []
+        branches_list = [
+            BRANCH_AUTOSOMAL,
+            BRANCH_AUTOSOMAL,
+            BRANCH_FEMALE_SEX,
+            BRANCH_MALE_SEX,
+            BRANCH_PRENATAL_AUTOSOMAL,
+            BRANCH_PRENATAL_AUTOSOMAL,
+            BRANCH_PRENATAL_FFY,
+        ]
+        contigs_list = ["chr1", "chr1", "chrX", "chrY", "chr1", "chr1", "chrY"]
+        starts_list = [0, 5000, 0, 0, 0, 100_000, 0]
+        ends_list = [5000, 10_000, 5000, 5000, 100_000, 200_000, 5000]
 
-        # 1. autosomal (5 kb bins)
-        branches_list.extend([BRANCH_AUTOSOMAL, BRANCH_AUTOSOMAL])
-        contigs_list.extend(["chr1", "chr1"])
-        starts_list.extend([0, 5000])
-        ends_list.extend([5000, 10000])
-
-        # 2. female_sex (5 kb bins)
-        branches_list.append(BRANCH_FEMALE_SEX)
-        contigs_list.append("chrX")
-        starts_list.append(0)
-        ends_list.append(5000)
-
-        # 3. male_sex (5 kb bins)
-        branches_list.append(BRANCH_MALE_SEX)
-        contigs_list.append("chrY")
-        starts_list.append(0)
-        ends_list.append(5000)
-
-        # 4. prenatal_autosomal (100 kb bins)
-        branches_list.extend([BRANCH_PRENATAL_AUTOSOMAL, BRANCH_PRENATAL_AUTOSOMAL])
-        contigs_list.extend(["chr1", "chr1"])
-        starts_list.extend([0, 100_000])
-        ends_list.extend([100_000, 200_000])
-
-        # 5. prenatal_ffy (5 kb bins on chrY)
-        branches_list.append(BRANCH_PRENATAL_FFY)
-        contigs_list.append("chrY")
-        starts_list.append(0)
-        ends_list.append(5000)
-
-        n_rows = len(branches_list)
         ref_meta = metadata_for(
             ArtifactKind.REFERENCE,
             contig_lengths=contig_lengths,
@@ -652,35 +642,18 @@ class TestSchemaContracts(unittest.TestCase):
                 "prenatal": prenatal_meta.to_dict(),
             },
         )
-        table = pa.table(
-            {
-                "branch": branches_list,
-                "contig": contigs_list,
-                "start": pa.array(starts_list, type=pa.int64()),
-                "end": pa.array(ends_list, type=pa.int64()),
-                "masked": [False] * n_rows,
-                "gc": pa.array([0.4] * n_rows, type=pa.float32()),
-                "mappability": pa.array([1.0] * n_rows, type=pa.float32()),
-                "pca_mean": [0.0] * n_rows,
-                "pca_loadings": [[0.1]] * n_rows,
-                "nearest_ref_indices": [[0]] * n_rows,
-                "mean_distance": pa.array([0.1] * n_rows, type=pa.float32()),
-                "null_mean": [0.0] * n_rows,
-                "null_std": [0.1] * n_rows,
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(ref_meta),
+        table = _make_ref_table(
+            branches_list, contigs_list, starts_list, ends_list, ref_meta
         )
 
         validate_reference_table(table)
 
-        # Also verify PrenatalModelMetadata.from_table
         extracted_prenatal = PrenatalModelMetadata.from_table(table)
-        self.assertIsNotNone(extracted_prenatal)
+        assert extracted_prenatal is not None
         self.assertEqual(
             extracted_prenatal.yfrac_threshold, prenatal_meta.yfrac_threshold
         )
 
-        # Verify ReferenceMetadata.from_table
         ref_metadata_obj = ReferenceMetadata.from_table(table)
         self.assertEqual(ref_metadata_obj.mode, "prenatal")
         self.assertEqual(ref_metadata_obj.bin_size, 5000)
@@ -695,24 +668,7 @@ class TestSchemaContracts(unittest.TestCase):
                 "model": {"bin_size": 5000, "branches": ["unknown_branch"]},
             },
         )
-        table = pa.table(
-            {
-                "branch": ["unknown_branch"],
-                "contig": ["chr1"],
-                "start": pa.array([0], type=pa.int64()),
-                "end": pa.array([5000], type=pa.int64()),
-                "masked": [False],
-                "gc": pa.array([0.4], type=pa.float32()),
-                "mappability": pa.array([1.0], type=pa.float32()),
-                "pca_mean": [0.0],
-                "pca_loadings": [[0.1]],
-                "nearest_ref_indices": [[0]],
-                "mean_distance": pa.array([0.1], type=pa.float32()),
-                "null_mean": [0.0],
-                "null_std": [0.1],
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(ref_meta),
-        )
+        table = _make_ref_table(["unknown_branch"], ["chr1"], [0], [5000], ref_meta)
 
         with self.assertRaisesRegex(SchemaError, "unknown branch"):
             validate_reference_table(table)
@@ -735,51 +691,18 @@ class TestSchemaContracts(unittest.TestCase):
             },
         )
 
-        # 1. Invalid bin width on autosomal (expected 5000, got 10000)
-        table_bad_auto = pa.table(
-            {
-                "branch": [BRANCH_AUTOSOMAL],
-                "contig": ["chr1"],
-                "start": pa.array([0], type=pa.int64()),
-                "end": pa.array([10_000], type=pa.int64()),
-                "masked": [False],
-                "gc": pa.array([0.4], type=pa.float32()),
-                "mappability": pa.array([1.0], type=pa.float32()),
-                "pca_mean": [0.0],
-                "pca_loadings": [[0.1]],
-                "nearest_ref_indices": [[0]],
-                "mean_distance": pa.array([0.1], type=pa.float32()),
-                "null_mean": [0.0],
-                "null_std": [0.1],
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(ref_meta),
+        table_bad_auto = _make_ref_table(
+            [BRANCH_AUTOSOMAL], ["chr1"], [0], [10_000], ref_meta
         )
         with self.assertRaisesRegex(SchemaError, "bin width 10000 does not match"):
             validate_reference_table(table_bad_auto)
 
-        # 2. Invalid bin width on prenatal_autosomal (expected 100000, got 5000)
-        table_bad_prenatal = pa.table(
-            {
-                "branch": [BRANCH_PRENATAL_AUTOSOMAL],
-                "contig": ["chr1"],
-                "start": pa.array([0], type=pa.int64()),
-                "end": pa.array([5000], type=pa.int64()),
-                "masked": [False],
-                "gc": pa.array([0.4], type=pa.float32()),
-                "mappability": pa.array([1.0], type=pa.float32()),
-                "pca_mean": [0.0],
-                "pca_loadings": [[0.1]],
-                "nearest_ref_indices": [[0]],
-                "mean_distance": pa.array([0.1], type=pa.float32()),
-                "null_mean": [0.0],
-                "null_std": [0.1],
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(ref_meta),
+        table_bad_prenatal = _make_ref_table(
+            [BRANCH_PRENATAL_AUTOSOMAL], ["chr1"], [0], [5000], ref_meta
         )
         with self.assertRaisesRegex(SchemaError, "bin width 5000 does not match"):
             validate_reference_table(table_bad_prenatal)
 
-        # 3. Missing prenatal_bin_size when prenatal_autosomal branch is present
         ref_meta_no_p_size = metadata_for(
             ArtifactKind.REFERENCE,
             contig_lengths=contig_lengths,
@@ -791,45 +714,14 @@ class TestSchemaContracts(unittest.TestCase):
                 },
             },
         )
-        table_no_p_size = pa.table(
-            {
-                "branch": [BRANCH_PRENATAL_AUTOSOMAL],
-                "contig": ["chr1"],
-                "start": pa.array([0], type=pa.int64()),
-                "end": pa.array([100_000], type=pa.int64()),
-                "masked": [False],
-                "gc": pa.array([0.4], type=pa.float32()),
-                "mappability": pa.array([1.0], type=pa.float32()),
-                "pca_mean": [0.0],
-                "pca_loadings": [[0.1]],
-                "nearest_ref_indices": [[0]],
-                "mean_distance": pa.array([0.1], type=pa.float32()),
-                "null_mean": [0.0],
-                "null_std": [0.1],
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(ref_meta_no_p_size),
+        table_no_p_size = _make_ref_table(
+            [BRANCH_PRENATAL_AUTOSOMAL], ["chr1"], [0], [100_000], ref_meta_no_p_size
         )
         with self.assertRaisesRegex(SchemaError, "prenatal_bin_size is not specified"):
             validate_reference_table(table_no_p_size)
 
-        # 4. Unaligned start coordinate (start=100 instead of multiple of 5000)
-        table_unaligned_start = pa.table(
-            {
-                "branch": [BRANCH_AUTOSOMAL],
-                "contig": ["chr1"],
-                "start": pa.array([100], type=pa.int64()),
-                "end": pa.array([5100], type=pa.int64()),
-                "masked": [False],
-                "gc": pa.array([0.4], type=pa.float32()),
-                "mappability": pa.array([1.0], type=pa.float32()),
-                "pca_mean": [0.0],
-                "pca_loadings": [[0.1]],
-                "nearest_ref_indices": [[0]],
-                "mean_distance": pa.array([0.1], type=pa.float32()),
-                "null_mean": [0.0],
-                "null_std": [0.1],
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(ref_meta),
+        table_unaligned_start = _make_ref_table(
+            [BRANCH_AUTOSOMAL], ["chr1"], [100], [5100], ref_meta
         )
         with self.assertRaisesRegex(
             SchemaError, "start coordinate 100 is not a multiple"
@@ -837,7 +729,6 @@ class TestSchemaContracts(unittest.TestCase):
             validate_reference_table(table_unaligned_start)
 
     def test_validate_reference_table_large_table_fast_path(self) -> None:
-        # > 1000 rows to exercise the vectorized fast path
         n_bins = 1005
         bin_size = 5000
         contig_len = n_bins * bin_size
@@ -855,52 +746,24 @@ class TestSchemaContracts(unittest.TestCase):
                 },
             },
         )
-        table = pa.table(
-            {
-                "branch": [BRANCH_AUTOSOMAL] * n_bins,
-                "contig": ["chr1"] * n_bins,
-                "start": pa.array(starts, type=pa.int64()),
-                "end": pa.array(ends, type=pa.int64()),
-                "masked": [False] * n_bins,
-                "gc": pa.array([0.4] * n_bins, type=pa.float32()),
-                "mappability": pa.array([1.0] * n_bins, type=pa.float32()),
-                "pca_mean": [0.0] * n_bins,
-                "pca_loadings": [[0.1]] * n_bins,
-                "nearest_ref_indices": [[0]] * n_bins,
-                "mean_distance": pa.array([0.1] * n_bins, type=pa.float32()),
-                "null_mean": [0.0] * n_bins,
-                "null_std": [0.1] * n_bins,
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(ref_meta),
+        table = _make_ref_table(
+            [BRANCH_AUTOSOMAL] * n_bins,
+            ["chr1"] * n_bins,
+            starts,
+            ends,
+            ref_meta,
         )
-
-        # Valid > 1000 row table passes
         validate_reference_table(table)
 
-        # > 1000 row table with undeclared contig must raise SchemaError, not KeyError
         contigs_with_undeclared = ["chr1"] * (n_bins - 1) + ["chrUndeclared"]
-        bad_table = pa.table(
-            {
-                "branch": [BRANCH_AUTOSOMAL] * n_bins,
-                "contig": contigs_with_undeclared,
-                "start": pa.array(starts, type=pa.int64()),
-                "end": pa.array(ends, type=pa.int64()),
-                "masked": [False] * n_bins,
-                "gc": pa.array([0.4] * n_bins, type=pa.float32()),
-                "mappability": pa.array([1.0] * n_bins, type=pa.float32()),
-                "pca_mean": [0.0] * n_bins,
-                "pca_loadings": [[0.1]] * n_bins,
-                "nearest_ref_indices": [[0]] * n_bins,
-                "mean_distance": pa.array([0.1] * n_bins, type=pa.float32()),
-                "null_mean": [0.0] * n_bins,
-                "null_std": [0.1] * n_bins,
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(ref_meta),
+        bad_table = _make_ref_table(
+            [BRANCH_AUTOSOMAL] * n_bins,
+            contigs_with_undeclared,
+            starts,
+            ends,
+            ref_meta,
         )
-
-        with self.assertRaisesRegex(
-            SchemaError, "uses undeclared contig 'chrUndeclared'"
-        ):
+        with self.assertRaisesRegex(SchemaError, "undeclared contig 'chrUndeclared'"):
             validate_reference_table(bad_table)
 
 

@@ -1,23 +1,35 @@
-"""Versioned Arrow contracts for ccnv Parquet artifacts."""
+"""Versioned Arrow contracts and artifact metadata for ccnv Parquet tables."""
+
+from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import StrEnum
-from typing import Any, Final
+from typing import Final
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
+from numpy.typing import NDArray
 
 from ccnv.models.config import DEFAULT_BIN_SIZE, DEFAULT_MIN_MAPPABILITY, AnalysisMode
-from ccnv.models.exceptions import SchemaError
+from ccnv.models.exceptions import SchemaError, SchemaVersionError
+from ccnv.models.metadata import (
+    FRAGMENTOMICS_METADATA_KEY,
+    PRENATAL_METADATA_KEY,
+    FragmentomicsMetadata,
+    PrenatalModelMetadata,
+)
 
-SCHEMA_VERSION: Final[str] = "1.0.0"
-SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset({"1.0.0"})
+SCHEMA_VERSION: Final[str] = "2.0.0"
+SUPPORTED_SCHEMA_VERSIONS: Final[frozenset[str]] = frozenset({"2.0.0"})
 COORDINATE_SYSTEM: Final[str] = "0-based-half-open"
 METADATA_PREFIX: Final[str] = "ccnv."
-PRENATAL_METADATA_KEY: Final[bytes] = b"ccnv.prenatal"
-FRAGMENTOMICS_METADATA_KEY: Final[bytes] = b"ccnv.fragmentomics"
+
+NUM_FRAG_BANDS: Final[int] = 24
+NUM_PROTOTYPES_PER_BIN: Final[int] = 4
+NUM_GC_QUANTILES: Final[int] = 8
 
 BRANCH_AUTOSOMAL: Final[str] = "autosomal"
 BRANCH_FEMALE_SEX: Final[str] = "female_sex"
@@ -35,11 +47,7 @@ KNOWN_REFERENCE_BRANCHES: Final[frozenset[str]] = frozenset(
     }
 )
 CNV_REFERENCE_BRANCHES: Final[frozenset[str]] = frozenset(
-    {
-        BRANCH_AUTOSOMAL,
-        BRANCH_FEMALE_SEX,
-        BRANCH_MALE_SEX,
-    }
+    {BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX}
 )
 
 
@@ -48,261 +56,125 @@ class ArtifactKind(StrEnum):
     REFERENCE = "reference"
 
 
-@dataclass(frozen=True, slots=True)
-class FragmentomicsMetadata:
-    """Sample-level multi-modal fragmentomic metrics serialized under ccnv.fragmentomics."""
+def _as_int(raw: object, name: str) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise TypeError(f"{name} must be an integer, got {raw!r}")
+    return int(raw)
 
-    paired_end: bool
-    total_paired_fragments: int
-    chromatosome_mode_bp: float
-    core_shoulder_bp: float
-    sizing_shift_bp: float
-    self_referenced_peak_ratio: float
-    dinucleosome_fraction: float
-    high_mw_fraction: float
-    helical_10bp_amplitude: float
-    helical_10bp_phase: float
-    motif_diversity_score: float
-    hist_autosomal: list[int]
-    hist_chry: list[int]
-    hist_chrx: list[int]
-    end_motif_counts: list[int]
 
-    def __post_init__(self) -> None:
-        """Validate fragmentomics vector dimensions."""
-        if len(self.hist_autosomal) != 571:
-            raise ValueError(
-                f"hist_autosomal must contain 571 elements, got {len(self.hist_autosomal)}"
-            )
-        if len(self.hist_chry) != 571:
-            raise ValueError(
-                f"hist_chry must contain 571 elements, got {len(self.hist_chry)}"
-            )
-        if len(self.hist_chrx) != 571:
-            raise ValueError(
-                f"hist_chrx must contain 571 elements, got {len(self.hist_chrx)}"
-            )
-        if len(self.end_motif_counts) != 256:
-            raise ValueError(
-                f"end_motif_counts must contain 256 elements, got {len(self.end_motif_counts)}"
-            )
+def _as_float(raw: object, name: str) -> float:
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise TypeError(f"{name} must be numeric, got {raw!r}")
+    return float(raw)
+
+
+def _as_str_tuple(raw: object) -> tuple[str, ...]:
+    return tuple(str(x) for x in raw) if isinstance(raw, (list, tuple)) else ()
+
+
+def _as_obj_dict(raw: object) -> dict[str, object]:
+    return {str(k): v for k, v in raw.items()} if isinstance(raw, Mapping) else {}
+
+
+def _check_pos_int(val: object, name: str) -> None:
+    if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {val!r}")
 
 
 @dataclass(frozen=True, slots=True)
-class PrenatalModelMetadata:
-    """Scalar parameters for prenatal models serialized under ccnv.prenatal."""
+class SampleMetadata:
+    """Strongly-typed metadata container for Schema v2.0.0 sample sketch artifacts."""
 
-    prenatal_bin_size: int
-    yfrac_threshold: float
-    ffy_intercept: float
-    ffy_slope: float
-    mlp_w1: list[list[float]]
-    mlp_b1: list[float]
-    mlp_w2: list[list[float]]
-    mlp_b2: list[float]
-    mlp_skew_intercept: float
-    mlp_skew_slope: float
-    olm_weights: list[float]
-    olm_bias: float
-    olm_skew_intercept: float
-    olm_skew_slope: float
-    ffx_intercept: float
-    ffx_slope: float
-    female_chrx_ratio_mean: float
-    female_chrx_ratio_std: float
-    ffy_std: float = 0.01
-    ffa_std: float = 0.02
-    ffx_std: float = 0.025
-    ffa_logit_mode: bool = False
-    p_fetal_density: list[float] | None = None
-    p_maternal_density: list[float] | None = None
-    ff_frag_weights: list[float] | None = None
-    ff_frag_bias: float | None = None
-    ff_frag_feature_mean: list[float] | None = None
-    ff_frag_feature_scale: list[float] | None = None
-    ff_size_std: float = 0.018
+    bin_size: int
+    contig_lengths: dict[str, int]
+    contig_order: tuple[str, ...]
+    source_identity: dict[str, object]
+    reference_identity: dict[str, object]
+    qc: dict[str, object]
+    filters: dict[str, object]
+    schema_version: str = SCHEMA_VERSION
+    coordinate_system: str = COORDINATE_SYSTEM
+    fragmentomics: FragmentomicsMetadata | None = None
 
     @property
-    def preface_std(self) -> float:
-        """Deprecated alias for ffa_std."""
-        return self.ffa_std
+    def paired_end(self) -> bool:
+        """Whether paired-end fragments were detected during sample extraction."""
+        return (
+            self.fragmentomics.paired_end if self.fragmentomics is not None else False
+        )
 
     @property
-    def preface_logit_mode(self) -> bool:
-        """Deprecated alias for ffa_logit_mode."""
-        return self.ffa_logit_mode
+    def expected_num_bins(self) -> int:
+        """Total row count implied by contig_order, contig_lengths, and bin_size."""
+        return sum(
+            (self.contig_lengths[c] + self.bin_size - 1) // self.bin_size
+            for c in self.contig_order
+        )
 
-    def __post_init__(self) -> None:
-        """Validate prenatal model metadata dimensions and types."""
-        if (
-            not isinstance(self.prenatal_bin_size, int)
-            or isinstance(self.prenatal_bin_size, bool)
-            or self.prenatal_bin_size <= 0
-        ):
-            raise ValueError(
-                f"prenatal_bin_size must be a positive integer, "
-                f"got {self.prenatal_bin_size!r}"
-            )
-        if not isinstance(self.mlp_b2, (list, tuple)):
-            object.__setattr__(self, "mlp_b2", [float(self.mlp_b2)])
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert metadata container to a JSON-serializable dictionary."""
-        return {
-            "prenatal_bin_size": int(self.prenatal_bin_size),
-            "yfrac_threshold": float(self.yfrac_threshold),
-            "ffy_intercept": float(self.ffy_intercept),
-            "ffy_slope": float(self.ffy_slope),
-            "mlp_w1": [[float(x) for x in row] for row in self.mlp_w1],
-            "mlp_b1": [float(x) for x in self.mlp_b1],
-            "mlp_w2": [[float(x) for x in row] for row in self.mlp_w2],
-            "mlp_b2": [float(x) for x in self.mlp_b2],
-            "mlp_skew_intercept": float(self.mlp_skew_intercept),
-            "mlp_skew_slope": float(self.mlp_skew_slope),
-            "olm_weights": [float(x) for x in self.olm_weights],
-            "olm_bias": float(self.olm_bias),
-            "olm_skew_intercept": float(self.olm_skew_intercept),
-            "olm_skew_slope": float(self.olm_skew_slope),
-            "ffx_intercept": float(self.ffx_intercept),
-            "ffx_slope": float(self.ffx_slope),
-            "female_chrx_ratio_mean": float(self.female_chrx_ratio_mean),
-            "female_chrx_ratio_std": float(self.female_chrx_ratio_std),
-            "ffy_std": float(self.ffy_std),
-            "ffa_std": float(self.ffa_std),
-            "ffx_std": float(self.ffx_std),
-            "ffa_logit_mode": bool(self.ffa_logit_mode),
-            "preface_std": float(self.ffa_std),
-            "preface_logit_mode": bool(self.ffa_logit_mode),
-            "p_fetal_density": (
-                [float(x) for x in self.p_fetal_density]
-                if self.p_fetal_density is not None
-                else None
-            ),
-            "p_maternal_density": (
-                [float(x) for x in self.p_maternal_density]
-                if self.p_maternal_density is not None
-                else None
-            ),
-            "ff_frag_weights": (
-                [float(x) for x in self.ff_frag_weights]
-                if self.ff_frag_weights is not None
-                else None
-            ),
-            "ff_frag_bias": (
-                float(self.ff_frag_bias) if self.ff_frag_bias is not None else None
-            ),
-            "ff_frag_feature_mean": (
-                [float(x) for x in self.ff_frag_feature_mean]
-                if self.ff_frag_feature_mean is not None
-                else None
-            ),
-            "ff_frag_feature_scale": (
-                [float(x) for x in self.ff_frag_feature_scale]
-                if self.ff_frag_feature_scale is not None
-                else None
-            ),
-            "ff_size_std": float(self.ff_size_std),
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> SampleMetadata:
+        """Construct sample metadata from a decoded Arrow metadata dictionary."""
+        raw_lengths = data.get("contig_lengths")
+        if not isinstance(raw_lengths, Mapping) or not raw_lengths:
+            raise SchemaError("contig_lengths must be a non-empty object")
+        contig_lengths = {
+            str(k): _as_int(v, "contig_length") for k, v in raw_lengths.items()
         }
+        ref_id = _as_obj_dict(data.get("reference_identity"))
+        raw_order = data.get("contig_order", ref_id.get("contig_order"))
+        contig_order = (
+            _as_str_tuple(raw_order)
+            if isinstance(raw_order, (list, tuple))
+            else tuple(contig_lengths.keys())
+        )
+        if len(contig_order) != len(contig_lengths) or set(contig_order) != set(
+            contig_lengths.keys()
+        ):
+            raise SchemaError("contig_order does not match contig_lengths keys")
 
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> PrenatalModelMetadata:
-        """Construct prenatal model metadata from a parsed dictionary."""
-        raw_bin_size = data["prenatal_bin_size"]
-        if isinstance(raw_bin_size, bool):
-            raise TypeError(
-                f"prenatal_bin_size must be a positive integer, got {raw_bin_size!r}"
-            )
-        raw_b2 = data["mlp_b2"]
-        mlp_b2 = (
-            [float(x) for x in raw_b2]
-            if isinstance(raw_b2, (list, tuple))
-            else [float(raw_b2)]
-        )
-        ffa_std_val = float(data.get("ffa_std", data.get("preface_std", 0.02)))
-        ffa_logit_val = bool(
-            data.get("ffa_logit_mode", data.get("preface_logit_mode", False))
-        )
-        p_fet = data.get("p_fetal_density")
-        p_mat = data.get("p_maternal_density")
-        w_frag = data.get("ff_frag_weights")
-        b_frag = data.get("ff_frag_bias")
-        m_frag = data.get("ff_frag_feature_mean")
-        s_frag = data.get("ff_frag_feature_scale")
-        std_size = float(data.get("ff_size_std", 0.018))
+        frag_obj = data.get("fragmentomics")
+        frag_meta: FragmentomicsMetadata | None = None
+        if isinstance(frag_obj, Mapping):
+            try:
+                frag_meta = FragmentomicsMetadata.from_dict(frag_obj)
+            except (KeyError, TypeError, ValueError) as err:
+                raise SchemaError(
+                    f"invalid ccnv.fragmentomics metadata: {err}"
+                ) from err
+
         return cls(
-            prenatal_bin_size=int(raw_bin_size),
-            yfrac_threshold=float(data["yfrac_threshold"]),
-            ffy_intercept=float(data["ffy_intercept"]),
-            ffy_slope=float(data["ffy_slope"]),
-            mlp_w1=[[float(x) for x in row] for row in data["mlp_w1"]],
-            mlp_b1=[float(x) for x in data["mlp_b1"]],
-            mlp_w2=[[float(x) for x in row] for row in data["mlp_w2"]],
-            mlp_b2=mlp_b2,
-            mlp_skew_intercept=float(data["mlp_skew_intercept"]),
-            mlp_skew_slope=float(data["mlp_skew_slope"]),
-            olm_weights=[float(x) for x in data["olm_weights"]],
-            olm_bias=float(data["olm_bias"]),
-            olm_skew_intercept=float(data["olm_skew_intercept"]),
-            olm_skew_slope=float(data["olm_skew_slope"]),
-            ffx_intercept=float(data["ffx_intercept"]),
-            ffx_slope=float(data["ffx_slope"]),
-            female_chrx_ratio_mean=float(data["female_chrx_ratio_mean"]),
-            female_chrx_ratio_std=float(data["female_chrx_ratio_std"]),
-            ffy_std=float(data.get("ffy_std", 0.01)),
-            ffa_std=ffa_std_val,
-            ffx_std=float(data.get("ffx_std", 0.025)),
-            ffa_logit_mode=ffa_logit_val,
-            p_fetal_density=[float(x) for x in p_fet] if p_fet is not None else None,
-            p_maternal_density=[float(x) for x in p_mat] if p_mat is not None else None,
-            ff_frag_weights=[float(x) for x in w_frag] if w_frag is not None else None,
-            ff_frag_bias=float(b_frag) if b_frag is not None else None,
-            ff_frag_feature_mean=[float(x) for x in m_frag]
-            if m_frag is not None
-            else None,
-            ff_frag_feature_scale=[float(x) for x in s_frag]
-            if s_frag is not None
-            else None,
-            ff_size_std=std_size,
+            bin_size=_as_int(data["bin_size"], "bin_size"),
+            contig_lengths=contig_lengths,
+            contig_order=contig_order,
+            source_identity=_as_obj_dict(data.get("source_identity")),
+            reference_identity=ref_id,
+            qc=_as_obj_dict(data.get("qc")),
+            filters=_as_obj_dict(data.get("filters")),
+            schema_version=str(data.get("schema_version", SCHEMA_VERSION)),
+            coordinate_system=str(data.get("coordinate_system", COORDINATE_SYSTEM)),
+            fragmentomics=frag_meta,
         )
 
-    def encode(self) -> bytes:
-        """Serialize metadata container to canonical JSON UTF-8 bytes."""
-        return json.dumps(
-            self.to_dict(), sort_keys=True, separators=(",", ":")
-        ).encode()
+    @classmethod
+    def from_schema(cls, schema: pa.Schema) -> SampleMetadata:
+        """Construct sample metadata from an Arrow Schema."""
+        return cls.from_dict(decode_metadata(schema.metadata))
 
     @classmethod
-    def decode(cls, raw: bytes | str | Mapping[str, Any]) -> PrenatalModelMetadata:
-        """Decode prenatal model metadata from JSON bytes, string, or mapping."""
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode("utf-8")
-        if isinstance(raw, str):
-            raw = json.loads(raw)
-        if not isinstance(raw, Mapping):
-            raise SchemaError(
-                f"invalid prenatal metadata payload: expected mapping, got {type(raw)}"
-            )
-        try:
-            return cls.from_dict(raw)
-        except (ValueError, TypeError, KeyError) as error:
-            raise SchemaError(f"invalid prenatal metadata: {error}") from error
+    def from_table(cls, table: pa.Table) -> SampleMetadata:
+        """Construct sample metadata from an Arrow Table."""
+        return cls.from_schema(table.schema)
 
-    @classmethod
-    def from_metadata(
-        cls, metadata: Mapping[bytes, bytes] | None
-    ) -> PrenatalModelMetadata | None:
-        """Extract and decode prenatal model metadata from Arrow schema metadata."""
-        if metadata is None:
-            return None
-        raw = metadata.get(PRENATAL_METADATA_KEY)
-        if raw is None:
-            return None
-        return cls.decode(raw)
 
-    @classmethod
-    def from_table(cls, table: pa.Table) -> PrenatalModelMetadata | None:
-        """Extract and decode prenatal model metadata from an Arrow Table."""
-        return cls.from_metadata(table.schema.metadata)
+_REF_TOP_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "contig_lengths",
+        "sample_identities",
+        "schema_version",
+        "coordinate_system",
+        "prenatal",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,23 +208,9 @@ class ReferenceMetadata:
 
     def __post_init__(self) -> None:
         """Validate reference metadata configuration and contig lengths."""
-        if (
-            not isinstance(self.bin_size, int)
-            or isinstance(self.bin_size, bool)
-            or self.bin_size <= 0
-        ):
-            raise ValueError(
-                f"bin_size must be a positive integer, got {self.bin_size!r}"
-            )
-        if self.prenatal_bin_size is not None and (
-            not isinstance(self.prenatal_bin_size, int)
-            or isinstance(self.prenatal_bin_size, bool)
-            or self.prenatal_bin_size <= 0
-        ):
-            raise ValueError(
-                f"prenatal_bin_size must be a positive integer, "
-                f"got {self.prenatal_bin_size!r}"
-            )
+        _check_pos_int(self.bin_size, "bin_size")
+        if self.prenatal_bin_size is not None:
+            _check_pos_int(self.prenatal_bin_size, "prenatal_bin_size")
         if self.mode not in ("germline", "prenatal"):
             raise ValueError(
                 f"mode must be 'germline' or 'prenatal', got {self.mode!r}"
@@ -362,29 +220,12 @@ class ReferenceMetadata:
 
     def to_metadata(self) -> dict[str, object]:
         """Convert reference metadata to a dictionary for Arrow table persistence."""
-        model: dict[str, object] = {
-            "bin_size": self.bin_size,
-            "branches": list(self.branches),
-            "autosomal_contigs": list(self.autosomal_contigs),
-            "sex_contigs": list(self.sex_contigs),
-            "pca_components": self.pca_components,
-            "nearest_bins": self.nearest_bins,
-            "mode": self.mode,
-            "prenatal_bin_size": self.prenatal_bin_size,
-            "sex_signal_contig": self.sex_signal_contig,
-            "sex_cutoff": self.sex_cutoff,
-            "sex_source": self.sex_source,
-            "sample_sexes": (
-                list(self.sample_sexes) if self.sample_sexes is not None else None
-            ),
-            "sex_inference": self.sex_inference,
-            "max_batch_memory_mb": self.max_batch_memory_mb,
-            "flat": self.flat,
-            "gc_corrected": self.gc_corrected,
-            "mappability_corrected": self.mappability_corrected,
-            "fragmentomics_corrected": self.fragmentomics_corrected,
-            "min_mappability": self.min_mappability,
-        }
+        model: dict[str, object] = {}
+        for f in fields(self):
+            if f.name in _REF_TOP_KEYS:
+                continue
+            val = getattr(self, f.name)
+            model[f.name] = list(val) if isinstance(val, tuple) else val
         values: dict[str, object] = {
             "sample_identities": list(self.sample_identities),
             "model": model,
@@ -404,98 +245,79 @@ class ReferenceMetadata:
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> ReferenceMetadata:
         """Construct reference metadata from a decoded metadata dictionary."""
-        model_obj = data.get("model")
-        model = dict(model_obj) if isinstance(model_obj, Mapping) else {}
-        contig_lengths_obj = data.get("contig_lengths", {})
+        model = _as_obj_dict(data.get("model"))
+        raw_clen = data.get("contig_lengths", {})
         contig_lengths = (
-            {str(k): int(v) for k, v in contig_lengths_obj.items()}
-            if isinstance(contig_lengths_obj, Mapping)
+            {str(k): _as_int(v, "contig_length") for k, v in raw_clen.items()}
+            if isinstance(raw_clen, Mapping)
             else {}
         )
-        sample_ids_obj = data.get("sample_identities", ())
+        raw_ids = data.get("sample_identities", ())
         sample_identities: tuple[object, ...] = (
-            tuple(dict(x) if isinstance(x, Mapping) else str(x) for x in sample_ids_obj)
-            if isinstance(sample_ids_obj, (list, tuple))
+            tuple(dict(x) if isinstance(x, Mapping) else str(x) for x in raw_ids)
+            if isinstance(raw_ids, (list, tuple))
             else ()
         )
-        branches_obj = model.get("branches", ())
-        branches = (
-            tuple(str(x) for x in branches_obj)
-            if isinstance(branches_obj, (list, tuple))
-            else ()
-        )
-        autosomal_obj = model.get("autosomal_contigs", ())
-        autosomal_contigs = (
-            tuple(str(x) for x in autosomal_obj)
-            if isinstance(autosomal_obj, (list, tuple))
-            else ()
-        )
-        sex_obj = model.get("sex_contigs", ())
-        sex_contigs = (
-            tuple(str(x) for x in sex_obj) if isinstance(sex_obj, (list, tuple)) else ()
-        )
-        sample_sexes_obj = model.get("sample_sexes")
-        sample_sexes = (
-            tuple(str(x) for x in sample_sexes_obj)
-            if isinstance(sample_sexes_obj, (list, tuple))
+        prenatal_obj = data.get("prenatal")
+        prenatal_meta = (
+            PrenatalModelMetadata.from_dict(prenatal_obj)
+            if isinstance(prenatal_obj, Mapping)
             else None
         )
-        prenatal_meta: PrenatalModelMetadata | None = None
-        if "prenatal" in data and isinstance(data["prenatal"], Mapping):
-            prenatal_meta = PrenatalModelMetadata.from_dict(data["prenatal"])
-
         raw_mode = str(model.get("mode", "germline"))
         if raw_mode not in ("germline", "prenatal"):
             raise ValueError(f"mode must be 'germline' or 'prenatal', got {raw_mode!r}")
         mode: AnalysisMode = "prenatal" if raw_mode == "prenatal" else "germline"
-
+        raw_pbs = model.get("prenatal_bin_size")
+        prenatal_bs = (
+            _as_int(raw_pbs, "prenatal_bin_size")
+            if raw_pbs is not None
+            else (
+                prenatal_meta.prenatal_bin_size if prenatal_meta is not None else None
+            )
+        )
+        raw_sexes = model.get("sample_sexes")
+        raw_cutoff = model.get("sex_cutoff")
+        raw_sex_inf = model.get("sex_inference")
         return cls(
-            bin_size=int(model.get("bin_size", DEFAULT_BIN_SIZE)),
+            bin_size=_as_int(model.get("bin_size", DEFAULT_BIN_SIZE), "bin_size"),
             contig_lengths=contig_lengths,
-            branches=branches,
-            autosomal_contigs=autosomal_contigs,
-            sex_contigs=sex_contigs,
-            pca_components=int(model.get("pca_components", 5)),
-            nearest_bins=int(model.get("nearest_bins", 300)),
+            branches=_as_str_tuple(model.get("branches")),
+            autosomal_contigs=_as_str_tuple(model.get("autosomal_contigs")),
+            sex_contigs=_as_str_tuple(model.get("sex_contigs")),
+            pca_components=_as_int(model.get("pca_components", 5), "pca_components"),
+            nearest_bins=_as_int(model.get("nearest_bins", 300), "nearest_bins"),
             mode=mode,
-            prenatal_bin_size=(
-                int(model["prenatal_bin_size"])
-                if model.get("prenatal_bin_size") is not None
-                else (
-                    prenatal_meta.prenatal_bin_size
-                    if prenatal_meta is not None
-                    else None
-                )
-            ),
+            prenatal_bin_size=prenatal_bs,
             sample_identities=sample_identities,
             sex_signal_contig=(
-                str(model["sex_signal_contig"])
-                if model.get("sex_signal_contig") is not None
-                else None
+                None
+                if model.get("sex_signal_contig") is None
+                else str(model["sex_signal_contig"])
             ),
             sex_cutoff=(
-                float(model["sex_cutoff"])
-                if model.get("sex_cutoff") is not None
-                else None
+                None if raw_cutoff is None else _as_float(raw_cutoff, "sex_cutoff")
             ),
             sex_source=(
-                str(model["sex_source"])
-                if model.get("sex_source") is not None
+                None if model.get("sex_source") is None else str(model["sex_source"])
+            ),
+            sample_sexes=(
+                _as_str_tuple(raw_sexes)
+                if isinstance(raw_sexes, (list, tuple))
                 else None
             ),
-            sample_sexes=sample_sexes,
             sex_inference=(
-                dict(model["sex_inference"])
-                if isinstance(model.get("sex_inference"), Mapping)
-                else None
+                _as_obj_dict(raw_sex_inf) if isinstance(raw_sex_inf, Mapping) else None
             ),
-            max_batch_memory_mb=int(model.get("max_batch_memory_mb", 256)),
+            max_batch_memory_mb=_as_int(
+                model.get("max_batch_memory_mb", 256), "max_batch_memory_mb"
+            ),
             flat=bool(model.get("flat", False)),
             gc_corrected=bool(model.get("gc_corrected", False)),
             mappability_corrected=bool(model.get("mappability_corrected", False)),
             fragmentomics_corrected=bool(model.get("fragmentomics_corrected", False)),
-            min_mappability=float(
-                model.get("min_mappability", DEFAULT_MIN_MAPPABILITY)
+            min_mappability=_as_float(
+                model.get("min_mappability", DEFAULT_MIN_MAPPABILITY), "min_mappability"
             ),
             schema_version=str(data.get("schema_version", SCHEMA_VERSION)),
             coordinate_system=str(data.get("coordinate_system", COORDINATE_SYSTEM)),
@@ -515,64 +337,122 @@ class ReferenceMetadata:
 
 SAMPLE_SCHEMA: Final[pa.Schema] = pa.schema(
     [
-        pa.field("contig", pa.string(), nullable=False),
-        pa.field("start", pa.int64(), nullable=False),
-        pa.field("end", pa.int64(), nullable=False),
-        pa.field("count", pa.uint64(), nullable=False),
-        pa.field("fragment_lengths", pa.list_(pa.uint16()), nullable=False),
+        pa.field("count", pa.uint32(), nullable=False),
+        pa.field("paired_count", pa.uint32(), nullable=False),
+        pa.field("frag_len_sum", pa.uint64(), nullable=False),
+        pa.field("short_frag_count", pa.uint32(), nullable=False),
         pa.field("endpoint_count", pa.uint32(), nullable=False),
         pa.field("frag_gc_sum", pa.float32(), nullable=False),
+        pa.field("frag_bands", pa.list_(pa.uint32(), NUM_FRAG_BANDS), nullable=True),
     ]
 )
 
-REFERENCE_SCHEMA: Final[pa.Schema] = pa.schema(
-    [
-        pa.field("branch", pa.string(), nullable=False),
-        pa.field("contig", pa.string(), nullable=False),
-        pa.field("start", pa.int64(), nullable=False),
-        pa.field("end", pa.int64(), nullable=False),
-        pa.field("masked", pa.bool_(), nullable=False),
-        pa.field("gc", pa.float32(), nullable=False),
-        pa.field("mappability", pa.float32(), nullable=False),
-        pa.field("pca_mean", pa.float64(), nullable=False),
-        pa.field("pca_loadings", pa.list_(pa.float64()), nullable=False),
-        pa.field("nearest_ref_indices", pa.list_(pa.int32()), nullable=False),
-        pa.field("mean_distance", pa.float32(), nullable=False),
-        pa.field("null_mean", pa.float64(), nullable=False),
-        pa.field("null_std", pa.float64(), nullable=False),
-    ]
-)
 
-_COMMON_METADATA: Final[frozenset[str]] = frozenset(
-    {
-        "artifact_kind",
-        "schema_version",
-        "coordinate_system",
-        "contig_lengths",
-    }
-)
-_KIND_METADATA: Final[Mapping[ArtifactKind, frozenset[str]]] = {
-    ArtifactKind.SAMPLE: frozenset(
-        {
-            "bin_size",
-            "source_identity",
-            "reference_identity",
-            "qc",
-            "filters",
-        }
-    ),
-    ArtifactKind.REFERENCE: frozenset(
-        {
-            "model",
-            "sample_identities",
-        }
-    ),
-}
+def build_reference_schema(pca_rank: int) -> pa.Schema:
+    """Build Schema v2.0.0 reference Arrow schema parameterized by PCA rank."""
+    if not isinstance(pca_rank, int) or isinstance(pca_rank, bool) or pca_rank < 0:
+        raise ValueError(f"pca_rank must be a non-negative integer, got {pca_rank!r}")
+    return pa.schema(
+        [
+            pa.field("branch", pa.dictionary(pa.int8(), pa.string()), nullable=False),
+            pa.field("contig", pa.dictionary(pa.int16(), pa.string()), nullable=False),
+            pa.field("start", pa.uint32(), nullable=False),
+            pa.field("end", pa.uint32(), nullable=False),
+            pa.field("masked", pa.bool_(), nullable=False),
+            pa.field("gc", pa.float32(), nullable=False),
+            pa.field("mappability", pa.float32(), nullable=False),
+            pa.field(
+                "gc_quantiles", pa.list_(pa.float32(), NUM_GC_QUANTILES), nullable=True
+            ),
+            pa.field("ref_frag_len", pa.float32(), nullable=False),
+            pa.field("ref_ep_rate", pa.float32(), nullable=False),
+            pa.field("pca_mean", pa.float32(), nullable=False),
+            pa.field(
+                "pca_loadings",
+                pa.list_(pa.float32(), pca_rank),
+                nullable=(pca_rank == 0),
+            ),
+            pa.field(
+                "proto_ids",
+                pa.list_(pa.uint16(), NUM_PROTOTYPES_PER_BIN),
+                nullable=False,
+            ),
+            pa.field(
+                "proto_weights",
+                pa.list_(pa.float16(), NUM_PROTOTYPES_PER_BIN),
+                nullable=False,
+            ),
+            pa.field("mean_distance", pa.float32(), nullable=False),
+            pa.field("null_mean", pa.float32(), nullable=False),
+            pa.field("bio_dispersion", pa.float32(), nullable=False),
+        ]
+    )
+
+
+REFERENCE_SCHEMA: Final[pa.Schema] = build_reference_schema(0)
+
+
+def reconstruct_sample_grid(
+    meta: SampleMetadata,
+) -> tuple[NDArray[np.int16], tuple[str, ...], NDArray[np.uint32], NDArray[np.uint32]]:
+    """Reconstruct implicit (contig_codes, contig_names, starts, ends) bin grid."""
+    names = meta.contig_order
+    if len(names) > np.iinfo(np.int16).max:
+        raise SchemaError(f"contig count {len(names)} exceeds int16 dictionary bounds")
+    bin_size_u64 = np.uint64(meta.bin_size)
+    max_u32 = int(np.iinfo(np.uint32).max)
+
+    counts_per_contig = np.empty(len(names), dtype=np.int64)
+    starts_parts: list[NDArray[np.uint32]] = []
+    ends_parts: list[NDArray[np.uint32]] = []
+    for idx, name in enumerate(names):
+        length = meta.contig_lengths[name]
+        if length > max_u32:
+            raise SchemaError(f"contig {name!r} length {length} exceeds uint32 bounds")
+        n_bins = (length + meta.bin_size - 1) // meta.bin_size
+        counts_per_contig[idx] = n_bins
+        s64 = np.arange(n_bins, dtype=np.uint64) * bin_size_u64
+        e64 = np.minimum(s64 + bin_size_u64, np.uint64(length))
+        starts_parts.append(s64.astype(np.uint32))
+        ends_parts.append(e64.astype(np.uint32))
+
+    codes = np.repeat(np.arange(len(names), dtype=np.int16), counts_per_contig)
+    starts = (
+        np.concatenate(starts_parts) if starts_parts else np.empty(0, dtype=np.uint32)
+    )
+    ends = np.concatenate(ends_parts) if ends_parts else np.empty(0, dtype=np.uint32)
+    return codes, names, starts, ends
+
+
+def bin_coordinates(table: pa.Table) -> tuple[tuple[str, int, int], ...]:
+    """Return row identity as ``(contig, start, end)`` tuples."""
+    if "contig" not in table.column_names:
+        codes, names, starts, ends = reconstruct_sample_grid(
+            SampleMetadata.from_table(table)
+        )
+        return tuple(
+            (names[int(c)], int(s), int(e))
+            for c, s, e in zip(codes, starts, ends, strict=True)
+        )
+    c_dict = (
+        pc.dictionary_encode(table.column("contig"))
+        .unify_dictionaries()
+        .combine_chunks()
+    )
+    c_codes = c_dict.indices.to_numpy(zero_copy_only=False)
+    c_names = tuple(
+        str(c_dict.dictionary[i].as_py()) for i in range(len(c_dict.dictionary))
+    )
+    starts_arr = table.column("start").combine_chunks().to_numpy(zero_copy_only=False)
+    ends_arr = table.column("end").combine_chunks().to_numpy(zero_copy_only=False)
+    return tuple(
+        (c_names[int(c)], int(s), int(e))
+        for c, s, e in zip(c_codes, starts_arr, ends_arr, strict=True)
+    )
 
 
 def encode_metadata(values: Mapping[str, object]) -> dict[bytes, bytes]:
     """Encode namespaced metadata values as deterministic JSON."""
-
     return {
         f"{METADATA_PREFIX}{key}".encode(): json.dumps(
             value, sort_keys=True, separators=(",", ":")
@@ -583,7 +463,6 @@ def encode_metadata(values: Mapping[str, object]) -> dict[bytes, bytes]:
 
 def decode_metadata(metadata: Mapping[bytes, bytes] | None) -> dict[str, object]:
     """Decode ccnv metadata and reject malformed JSON."""
-
     if metadata is None:
         return {}
     decoded: dict[str, object] = {}
@@ -605,13 +484,16 @@ def metadata_for(
     contig_lengths: Mapping[str, int],
     values: Mapping[str, object],
 ) -> dict[bytes, bytes]:
-    """Build complete metadata for an artifact."""
-
+    """Build complete metadata for an artifact, preserving sample contig order."""
+    extra: dict[str, object] = {}
+    if kind is ArtifactKind.SAMPLE and "contig_order" not in values:
+        extra["contig_order"] = list(contig_lengths.keys())
     metadata: dict[str, object] = {
         "artifact_kind": kind.value,
         "schema_version": SCHEMA_VERSION,
         "coordinate_system": COORDINATE_SYSTEM,
         "contig_lengths": dict(contig_lengths),
+        **extra,
         **values,
     }
     validate_metadata(metadata, kind)
@@ -620,334 +502,39 @@ def metadata_for(
 
 def validate_metadata(metadata: Mapping[str, object], kind: ArtifactKind) -> None:
     """Validate required keys and cross-artifact coordinate invariants."""
+    from ccnv.models.validation import validate_metadata as _impl
 
-    required = _COMMON_METADATA | _KIND_METADATA[kind]
-    missing = sorted(required - metadata.keys())
-    if missing:
-        raise SchemaError(f"missing {kind.value} metadata: {', '.join(missing)}")
-    if metadata["artifact_kind"] != kind.value:
-        raise SchemaError(f"expected artifact kind {kind.value!r}")
-    version = metadata.get("schema_version")
-    if version not in SUPPORTED_SCHEMA_VERSIONS:
-        raise SchemaError(
-            f"unsupported schema version {version!r}; expected {SCHEMA_VERSION!r}"
-        )
-    if metadata["coordinate_system"] != COORDINATE_SYSTEM:
-        raise SchemaError(f"coordinates must be {COORDINATE_SYSTEM}")
-
-    contig_lengths = metadata["contig_lengths"]
-    if not isinstance(contig_lengths, dict) or not contig_lengths:
-        raise SchemaError("contig_lengths must be a non-empty object")
-    if any(
-        not isinstance(name, str)
-        or not name
-        or not isinstance(length, int)
-        or isinstance(length, bool)
-        or length <= 0
-        for name, length in contig_lengths.items()
-    ):
-        raise SchemaError(
-            "contig_lengths must map non-empty names to positive integers"
-        )
-
-    if kind is ArtifactKind.SAMPLE:
-        bin_size = metadata["bin_size"]
-        if not isinstance(bin_size, int) or isinstance(bin_size, bool) or bin_size <= 0:
-            raise SchemaError("bin_size must be a positive integer")
-        filters = metadata["filters"]
-        if not isinstance(filters, dict):
-            raise SchemaError("filters must be an object")
-        min_mapping_quality = filters.get("min_mapping_quality")
-        if (
-            not isinstance(min_mapping_quality, int)
-            or isinstance(min_mapping_quality, bool)
-            or min_mapping_quality < 0
-        ):
-            raise SchemaError(
-                "filters.min_mapping_quality must be a non-negative integer"
-            )
-
-    if kind is ArtifactKind.REFERENCE:
-        model = metadata.get("model")
-        if not isinstance(model, dict):
-            raise SchemaError("model must be an object")
-        bin_size = model.get("bin_size")
-        if bin_size is not None and (
-            not isinstance(bin_size, int) or isinstance(bin_size, bool) or bin_size <= 0
-        ):
-            raise SchemaError("model.bin_size must be a positive integer")
-        prenatal_bin_size = model.get("prenatal_bin_size")
-        if prenatal_bin_size is not None and (
-            not isinstance(prenatal_bin_size, int)
-            or isinstance(prenatal_bin_size, bool)
-            or prenatal_bin_size <= 0
-        ):
-            raise SchemaError("model.prenatal_bin_size must be a positive integer")
-        mode = model.get("mode")
-        if mode is not None and mode not in ("germline", "prenatal"):
-            raise SchemaError(
-                f"model.mode must be 'germline' or 'prenatal', got {mode!r}"
-            )
-        if "prenatal" in metadata:
-            prenatal_obj = metadata["prenatal"]
-            if not isinstance(prenatal_obj, Mapping):
-                raise SchemaError("ccnv.prenatal metadata must be an object")
-            try:
-                PrenatalModelMetadata.from_dict(prenatal_obj)
-            except (ValueError, TypeError, KeyError) as err:
-                raise SchemaError(f"invalid ccnv.prenatal metadata: {err}") from err
+    _impl(metadata, kind)
 
 
 def validate_schema(schema: pa.Schema, kind: ArtifactKind) -> None:
     """Validate Arrow fields and embedded file metadata."""
+    from ccnv.models.validation import validate_schema as _impl
 
-    expected = SAMPLE_SCHEMA if kind is ArtifactKind.SAMPLE else REFERENCE_SCHEMA
-    if not schema.equals(expected, check_metadata=False):
-        raise SchemaError(f"{kind.value} fields do not match schema {SCHEMA_VERSION}")
-
-    metadata = decode_metadata(schema.metadata)
-    validate_metadata(metadata, kind)
+    _impl(schema, kind)
 
 
-def bin_coordinates(table: pa.Table) -> tuple[tuple[str, int, int], ...]:
-    """Return row identity as ``(contig, start, end)`` tuples."""
+def validate_sample_table(table: pa.Table) -> SampleMetadata:
+    """Validate compact Schema v2.0.0 sample table and implicit coordinate grid."""
+    from ccnv.models.validation import validate_sample_table as _impl
 
-    return tuple(
-        zip(
-            table.column("contig").to_pylist(),
-            table.column("start").to_pylist(),
-            table.column("end").to_pylist(),
-            strict=True,
-        )
-    )
+    return _impl(table)
 
 
-def _validate_reference_table_content(
-    table: pa.Table,
-    metadata: Mapping[str, object],
-    contig_lengths: Mapping[str, int],
-) -> None:
-    """Validate reference branches, coordinate bounds, and per-branch bin spacing."""
+def validate_reference_table(
+    table: pa.Table, *, check_rows: bool = True
+) -> ReferenceMetadata:
+    """Validate Schema v2.0.0 reference table, metadata, and optional row intervals."""
+    from ccnv.models.validation import validate_reference_table as _impl
 
-    model_obj = metadata.get("model")
-    model = model_obj if isinstance(model_obj, Mapping) else {}
-    bin_size = model.get("bin_size")
-    if not isinstance(bin_size, int) or isinstance(bin_size, bool) or bin_size <= 0:
-        bin_size = None
-
-    prenatal_bin_size = model.get("prenatal_bin_size")
-    if prenatal_bin_size is None and isinstance(metadata.get("prenatal"), Mapping):
-        prenatal_bin_size = metadata["prenatal"].get("prenatal_bin_size")
-    if (
-        not isinstance(prenatal_bin_size, int)
-        or isinstance(prenatal_bin_size, bool)
-        or prenatal_bin_size <= 0
-    ):
-        prenatal_bin_size = None
-
-    unique_branches = set(table.column("branch").unique().to_pylist())
-    unknown_branches = unique_branches - KNOWN_REFERENCE_BRANCHES
-    if unknown_branches:
-        raise SchemaError(
-            f"unknown branch(es): {sorted(unknown_branches)}; "
-            f"expected one of {sorted(KNOWN_REFERENCE_BRANCHES)}"
-        )
-
-    if BRANCH_PRENATAL_AUTOSOMAL in unique_branches and prenatal_bin_size is None:
-        raise SchemaError(
-            "table contains 'prenatal_autosomal' branch but prenatal_bin_size "
-            "is not specified in metadata"
-        )
-
-    # Fast path for large tables (> 1000 rows)
-    if table.num_rows > 1000:
-        starts = table.column("start").to_numpy(zero_copy_only=False)
-        ends = table.column("end").to_numpy(zero_copy_only=False)
-        contig_arr = np.asarray(table.column("contig").to_numpy(zero_copy_only=False))
-        branch_arr = np.asarray(table.column("branch").to_numpy(zero_copy_only=False))
-        unique_contigs = set(table.column("contig").unique().to_pylist())
-
-        all_contigs_declared = unique_contigs.issubset(contig_lengths.keys())
-        basic_bounds_ok = bool(np.all(starts >= 0) and np.all(ends > starts))
-        lengths_ok = all_contigs_declared and all(
-            bool(np.all(ends[contig_arr == c] <= contig_lengths[c]))
-            for c in unique_contigs
-        )
-        no_duplicates = (
-            table.group_by(["branch", "contig", "start", "end"]).aggregate([]).num_rows
-            == table.num_rows
-        )
-
-        spacing_ok = all_contigs_declared
-        if spacing_ok:
-            for b in unique_branches:
-                target_size = (
-                    prenatal_bin_size if b == BRANCH_PRENATAL_AUTOSOMAL else bin_size
-                )
-                if target_size is not None:
-                    mask = branch_arr == b
-                    b_starts = starts[mask]
-                    b_ends = ends[mask]
-                    b_contigs = contig_arr[mask]
-                    widths = b_ends - b_starts
-
-                    if not bool(np.all(b_starts % target_size == 0)):
-                        spacing_ok = False
-                        break
-
-                    for c in set(b_contigs):
-                        c_mask = b_contigs == c
-                        c_ends = b_ends[c_mask]
-                        c_widths = widths[c_mask]
-                        c_len = contig_lengths[c]
-                        is_final = c_ends == c_len
-                        if not bool(
-                            np.all(c_widths[~is_final] == target_size)
-                            and np.all(
-                                (c_widths[is_final] > 0)
-                                & (c_widths[is_final] <= target_size)
-                            )
-                        ):
-                            spacing_ok = False
-                            break
-                    if not spacing_ok:
-                        break
-
-        if (
-            all_contigs_declared
-            and basic_bounds_ok
-            and lengths_ok
-            and no_duplicates
-            and spacing_ok
-        ):
-            return
-
-    # Row-by-row validation
-    branches: list[str] = table.column("branch").to_pylist()
-    contigs: list[str] = table.column("contig").to_pylist()
-    starts_list: list[int] = table.column("start").to_pylist()
-    ends_list: list[int] = table.column("end").to_pylist()
-
-    seen: set[tuple[str, str, int, int]] = set()
-    for index, (branch, contig, start, end) in enumerate(
-        zip(branches, contigs, starts_list, ends_list, strict=True)
-    ):
-        if branch not in KNOWN_REFERENCE_BRANCHES:
-            raise SchemaError(
-                f"row {index} uses unknown branch {branch!r}; "
-                f"expected one of {sorted(KNOWN_REFERENCE_BRANCHES)}"
-            )
-        length = contig_lengths.get(contig)
-        if not isinstance(length, int):
-            raise SchemaError(f"row {index} uses undeclared contig {contig!r}")
-        if start < 0 or end <= start or end > length:
-            raise SchemaError(
-                f"row {index} interval [{start}, {end}) is outside "
-                f"{contig!r} length {length}"
-            )
-
-        target_size = (
-            prenatal_bin_size if branch == BRANCH_PRENATAL_AUTOSOMAL else bin_size
-        )
-        if target_size is not None:
-            width = end - start
-            if end == length:
-                if width <= 0 or width > target_size:
-                    raise SchemaError(
-                        f"row {index} ({branch}, {contig}:{start}-{end}) "
-                        f"final bin width {width} outside expected (0, {target_size}]"
-                    )
-            else:
-                if width != target_size:
-                    raise SchemaError(
-                        f"row {index} ({branch}, {contig}:{start}-{end}) "
-                        f"bin width {width} does not match {target_size}"
-                    )
-            if start % target_size != 0:
-                raise SchemaError(
-                    f"row {index} ({branch}, {contig}:{start}-{end}) "
-                    f"start coordinate {start} is not a multiple of "
-                    f"expected bin size {target_size}"
-                )
-
-        identity = (branch, contig, start, end)
-        if identity in seen:
-            raise SchemaError(f"row {index} duplicates bin identity {identity!r}")
-        seen.add(identity)
-
-
-def _validate_sample_table_content(
-    table: pa.Table,
-    contig_lengths: Mapping[str, int],
-) -> None:
-    """Validate sample coordinate bounds and bin identity."""
-
-    # Fast path for large tables (> 1000 rows)
-    if table.num_rows > 1000:
-        starts = table.column("start").to_numpy(zero_copy_only=False)
-        ends = table.column("end").to_numpy(zero_copy_only=False)
-        contig_arr = np.asarray(table.column("contig").to_numpy(zero_copy_only=False))
-        unique_contigs = set(table.column("contig").unique().to_pylist())
-
-        all_contigs_declared = unique_contigs.issubset(contig_lengths.keys())
-        basic_bounds_ok = bool(np.all(starts >= 0) and np.all(ends > starts))
-        lengths_ok = all_contigs_declared and all(
-            bool(np.all(ends[contig_arr == c] <= contig_lengths[c]))
-            for c in unique_contigs
-        )
-        no_duplicates = (
-            table.group_by(["contig", "start", "end"]).aggregate([]).num_rows
-            == table.num_rows
-        )
-        if all_contigs_declared and basic_bounds_ok and lengths_ok and no_duplicates:
-            return
-
-    contigs: list[str] = table.column("contig").to_pylist()
-    starts_list: list[int] = table.column("start").to_pylist()
-    ends_list: list[int] = table.column("end").to_pylist()
-
-    seen: set[tuple[str, int, int]] = set()
-    for index, (contig, start, end) in enumerate(
-        zip(contigs, starts_list, ends_list, strict=True)
-    ):
-        length = contig_lengths.get(contig)
-        if not isinstance(length, int):
-            raise SchemaError(f"row {index} uses undeclared contig {contig!r}")
-        if start < 0 or end <= start or end > length:
-            raise SchemaError(
-                f"row {index} interval [{start}, {end}) is outside "
-                f"{contig!r} length {length}"
-            )
-        identity = (contig, start, end)
-        if identity in seen:
-            raise SchemaError(f"row {index} duplicates bin identity {identity!r}")
-        seen.add(identity)
+    return _impl(table, check_rows=check_rows)
 
 
 def validate_table(table: pa.Table, kind: ArtifactKind) -> None:
     """Validate schema plus canonical coordinate bounds and row identity."""
+    from ccnv.models.validation import validate_table as _impl
 
-    validate_schema(table.schema, kind)
-    metadata = decode_metadata(table.schema.metadata)
-    contig_lengths = metadata["contig_lengths"]
-    assert isinstance(contig_lengths, dict)
-
-    if kind is ArtifactKind.REFERENCE:
-        _validate_reference_table_content(table, metadata, contig_lengths)
-    else:
-        _validate_sample_table_content(table, contig_lengths)
-
-
-def validate_sample_table(table: pa.Table) -> None:
-    """Validate sample schema, version 1.0.0 metadata, and coordinate intervals."""
-
-    validate_table(table, ArtifactKind.SAMPLE)
-
-
-def validate_reference_table(table: pa.Table) -> None:
-    """Validate reference schema, version 1.0.0 metadata, branches, and bin spacing."""
-
-    validate_table(table, ArtifactKind.REFERENCE)
+    _impl(table, kind)
 
 
 __all__ = [
@@ -961,6 +548,9 @@ __all__ = [
     "FRAGMENTOMICS_METADATA_KEY",
     "KNOWN_REFERENCE_BRANCHES",
     "METADATA_PREFIX",
+    "NUM_FRAG_BANDS",
+    "NUM_GC_QUANTILES",
+    "NUM_PROTOTYPES_PER_BIN",
     "PRENATAL_METADATA_KEY",
     "REFERENCE_SCHEMA",
     "SAMPLE_SCHEMA",
@@ -970,11 +560,15 @@ __all__ = [
     "FragmentomicsMetadata",
     "PrenatalModelMetadata",
     "ReferenceMetadata",
+    "SampleMetadata",
     "SchemaError",
+    "SchemaVersionError",
     "bin_coordinates",
+    "build_reference_schema",
     "decode_metadata",
     "encode_metadata",
     "metadata_for",
+    "reconstruct_sample_grid",
     "validate_metadata",
     "validate_reference_table",
     "validate_sample_table",

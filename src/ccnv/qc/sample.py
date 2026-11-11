@@ -15,6 +15,8 @@ QC_COUNTERS: Final[tuple[str, ...]] = (
     "header_no_coordinate",
     "reads_seen",
     "reads_kept",
+    "mate_dedup_skipped",
+    "reads_filtered",
     "effective_reads_examined",
     "effective_reads_kept",
     "autosomal_reads_kept",

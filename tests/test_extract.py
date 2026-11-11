@@ -1,3 +1,7 @@
+"""Unit and integration tests for BAM/CRAM sample sketch extraction."""
+
+from __future__ import annotations
+
 import json
 import tempfile
 import unittest
@@ -19,29 +23,31 @@ from published_fixtures import (
 from typer.testing import CliRunner
 
 from ccnv.cli import app
-from ccnv.extract import (
-    run,
-    split_thread_budget,
-)
+from ccnv.extract import extract_sample_table, run
 from ccnv.features.binning import (
     bin_counts,
     bin_intervals,
     rebin_counts,
 )
-from ccnv.features.cohort import rebin_sample_table
+from ccnv.features.rebinning import rebin_sample_sketch
 from ccnv.io.alignments import rejection_reason
 from ccnv.io.parquet import read_sample_parquet
 from ccnv.models import (
     FRAGMENTOMICS_METADATA_KEY,
+    NUM_FRAG_BANDS,
+    AlignmentError,
+    BinCompatibilityError,
     Contig,
     ExtractConfig,
     ExtractError,
     FragmentomicsMetadata,
     GenomeProfile,
     ReadFilters,
+    SampleMetadata,
     is_canonical_contig,
     normalize_chr,
     parquet_path,
+    reconstruct_sample_grid,
     select_layout,
 )
 from ccnv.models.schemas import (
@@ -154,12 +160,12 @@ class TestRebin(unittest.TestCase):
                 source_starts, source_ends, source_counts, target_starts, target_ends
             )
 
-    def test_rebin_sample_table_updates_metadata_and_counts(self) -> None:
+    def test_rebin_sample_sketch_coarsens_and_rejects_upsampling(self) -> None:
         metadata = metadata_for(
             ArtifactKind.SAMPLE,
             contig_lengths={"chr1": 200},
             values={
-                "bin_size": 100,
+                "bin_size": 50,
                 "source_identity": {"id": "s1"},
                 "reference_identity": {"name": "test"},
                 "qc": {},
@@ -168,25 +174,26 @@ class TestRebin(unittest.TestCase):
         )
         table = pa.table(
             {
-                "contig": ["chr1", "chr1"],
-                "start": pa.array([0, 100], type=pa.int64()),
-                "end": pa.array([100, 200], type=pa.int64()),
-                "count": pa.array([10, 20], type=pa.uint64()),
-                "fragment_lengths": pa.array([[], []], type=pa.list_(pa.uint16())),
-                "endpoint_count": pa.array([0, 0], type=pa.uint32()),
-                "frag_gc_sum": pa.array([0.0, 0.0], type=pa.float32()),
+                "count": pa.array([5, 5, 10, 10], type=pa.uint32()),
+                "paired_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
+                "frag_len_sum": pa.array([0, 0, 0, 0], type=pa.uint64()),
+                "short_frag_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
+                "endpoint_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
+                "frag_gc_sum": pa.array([0.0, 0.0, 0.0, 0.0], type=pa.float32()),
+                "frag_bands": pa.nulls(4, type=pa.list_(pa.uint32(), NUM_FRAG_BANDS)),
             },
             schema=SAMPLE_SCHEMA.with_metadata(metadata),
         )
 
-        rebinned = rebin_sample_table(table, target_bin_size=50)
+        rebinned = rebin_sample_sketch(table, target_bin_size=100)
         rebinned_meta = decode_metadata(rebinned.schema.metadata)
-        self.assertEqual(rebinned_meta["bin_size"], 50)
+        self.assertEqual(rebinned_meta["bin_size"], 100)
         self.assertEqual(rebinned_meta["contig_lengths"], {"chr1": 200})
-        self.assertEqual(rebinned.num_rows, 4)
-        np.testing.assert_allclose(
-            rebinned.column("count").to_pylist(), [5.0, 5.0, 10.0, 10.0]
-        )
+        self.assertEqual(rebinned.num_rows, 2)
+        self.assertEqual(rebinned.column("count").to_pylist(), [10, 20])
+
+        with self.assertRaises(BinCompatibilityError):
+            rebin_sample_sketch(rebinned, target_bin_size=50)
 
 
 class TestReadFilters(unittest.TestCase):
@@ -231,38 +238,31 @@ class TestReadFilters(unittest.TestCase):
 
 
 class TestExtractAlignment(unittest.TestCase):
-    def test_alignment_handle_closes_when_validation_fails(self) -> None:
-        class FakeAlignment:
-            closed = False
-
-            @staticmethod
-            def has_index() -> bool:
-                return False
-
-            def close(self) -> None:
-                self.closed = True
-
+    def test_invalid_header_raises_extract_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "sample.bam"
             bam_path.touch()
-            alignment = FakeAlignment()
             with (
-                patch("ccnv.extract.open_alignment", return_value=alignment),
+                patch("ccnv.extract.read_alignment_header", return_value=[]),
                 self.assertRaises(ExtractError),
             ):
                 run(ExtractConfig(bam_path, Path(tmpdir) / "out", bin_size=100))
-            self.assertTrue(alignment.closed)
 
-    def test_missing_bam_index_is_created(self) -> None:
+    def test_unindexed_bam_streams_sequentially_and_parallel_requires_index(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "sample.bam"
             prefix = Path(tmpdir) / "sample"
             _write_bam(bam_path, [_read("r1", 0, 0, 10)], index=False)
             self.assertFalse(_has_alignment_index(bam_path))
-            run(ExtractConfig(bam_path, prefix, bin_size=100))
-            self.assertTrue(_has_alignment_index(bam_path))
+            run(ExtractConfig(bam_path, prefix, bin_size=100, threads=1))
+            self.assertFalse(_has_alignment_index(bam_path))
             table = read_sample_parquet(parquet_path(prefix))
             self.assertEqual(table.column("count").to_pylist(), [1, 0, 0])
+
+            with self.assertRaises(AlignmentError):
+                run(ExtractConfig(bam_path, prefix, bin_size=100, threads=2))
 
     def test_cram_without_fasta_is_actionable(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -271,10 +271,10 @@ class TestExtractAlignment(unittest.TestCase):
             with self.assertRaisesRegex(ExtractError, r"CRAM.*--fasta"):
                 run(ExtractConfig(cram_path, Path(tmpdir) / "out", bin_size=100))
 
-    def test_missing_cram_index_is_created(self) -> None:
+    def test_unindexed_cram_streams_sequentially(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             fasta = Path(tmpdir) / "ref.fa"
-            fasta.write_text(">chr1\n" + "A" * 250 + "\n")
+            fasta.write_text(">chr1\n" + "A" * 250 + "\n", encoding="utf-8")
             pysam.faidx(str(fasta))
             bam_path = Path(tmpdir) / "sample.bam"
             cram_path = Path(tmpdir) / "sample.cram"
@@ -298,9 +298,10 @@ class TestExtractAlignment(unittest.TestCase):
                     prefix,
                     bin_size=100,
                     fasta=fasta,
+                    threads=1,
                 )
             )
-            self.assertTrue(_has_alignment_index(cram_path))
+            self.assertFalse(_has_alignment_index(cram_path))
             table = read_sample_parquet(parquet_path(prefix))
             self.assertEqual(sum(table.column("count").to_pylist()), 1)
 
@@ -339,11 +340,11 @@ class TestExtractAlignment(unittest.TestCase):
                 metadata["contig_lengths"],
                 {"chr1": 250, "scaffold-A": 99, "chrM": 50},
             )
-            self.assertEqual(
-                metadata["reference_identity"]["contig_order"],
-                ["chr1", "scaffold-A", "chrM"],
-            )
+            ref_id = metadata["reference_identity"]
+            assert isinstance(ref_id, dict)
+            self.assertEqual(ref_id["contig_order"], ["chr1", "scaffold-A", "chrM"])
             qc = metadata["qc"]
+            assert isinstance(qc, dict)
             self.assertEqual(qc["reads_seen"], 8)
             self.assertEqual(qc["reads_kept"], 6)
             self.assertEqual(qc["effective_reads_examined"], 8)
@@ -353,16 +354,20 @@ class TestExtractAlignment(unittest.TestCase):
             self.assertEqual(qc["filter_mapq"], 1)
             self.assertEqual(qc["filter_duplicate"], 1)
             self.assertEqual(set(qc), set(QC_COUNTERS))
-            self.assertEqual(metadata["filters"]["min_mapping_quality"], 1)
+            filters = metadata["filters"]
+            assert isinstance(filters, dict)
+            self.assertEqual(filters["min_mapping_quality"], 1)
 
-            rows = table.to_pydict()
+            codes, names, starts, ends = reconstruct_sample_grid(
+                SampleMetadata.from_table(table)
+            )
             self.assertEqual(
-                rows["contig"],
+                [names[int(c)] for c in codes],
                 ["chr1", "chr1", "chr1", "scaffold-A", "chrM"],
             )
-            self.assertEqual(rows["start"], [0, 100, 200, 0, 0])
-            self.assertEqual(rows["end"], [100, 200, 250, 99, 50])
-            self.assertEqual(rows["count"], [2, 1, 1, 1, 1])
+            self.assertEqual(starts.tolist(), [0, 100, 200, 0, 0])
+            self.assertEqual(ends.tolist(), [100, 200, 250, 99, 50])
+            self.assertEqual(table.column("count").to_pylist(), [2, 1, 1, 1, 1])
 
     def test_extract_applies_configured_min_mapping_quality(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -386,9 +391,12 @@ class TestExtractAlignment(unittest.TestCase):
             )
             table = read_sample_parquet(parquet_path(prefix))
             metadata = decode_metadata(table.schema.metadata)
-            self.assertEqual(metadata["filters"]["min_mapping_quality"], 20)
-            self.assertEqual(metadata["qc"]["filter_mapq"], 1)
-            self.assertEqual(metadata["qc"]["reads_kept"], 1)
+            filters = metadata["filters"]
+            qc = metadata["qc"]
+            assert isinstance(filters, dict) and isinstance(qc, dict)
+            self.assertEqual(filters["min_mapping_quality"], 20)
+            self.assertEqual(qc["filter_mapq"], 1)
+            self.assertEqual(qc["reads_kept"], 1)
             self.assertEqual(table.column("count").to_pylist(), [1, 0, 0])
 
     def test_cli_min_mapq_filters_reads(self) -> None:
@@ -419,7 +427,9 @@ class TestExtractAlignment(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             table = read_sample_parquet(parquet_path(prefix))
             metadata = decode_metadata(table.schema.metadata)
-            self.assertEqual(metadata["filters"]["min_mapping_quality"], 30)
+            filters = metadata["filters"]
+            assert isinstance(filters, dict)
+            self.assertEqual(filters["min_mapping_quality"], 30)
             self.assertEqual(table.column("count").to_pylist(), [1, 0, 0])
 
     def test_cli_extract_round_trip(self) -> None:
@@ -463,7 +473,7 @@ class TestExtractAlignment(unittest.TestCase):
             )
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertIn("opening alignment", result.output)
-            self.assertIn("binned contig chr1", result.output)
+            self.assertIn("extract QC summary", result.output)
             self.assertIn("writing sample parquet", result.output)
 
     def test_extract_debug_logs_each_step(self) -> None:
@@ -482,8 +492,7 @@ class TestExtractAlignment(unittest.TestCase):
                 )
             messages = "\n".join(captured.output)
             self.assertIn("opening alignment", messages)
-            self.assertIn("already has an index", messages)
-            self.assertIn("binned contig chr1", messages)
+            self.assertIn("extract QC summary", messages)
             self.assertIn("writing sample parquet", messages)
 
 
@@ -534,45 +543,18 @@ class TestParallelBinning(unittest.TestCase):
             run(ExtractConfig(bam_path, prefix, bin_size=100, threads=3))
 
             table = read_sample_parquet(parquet_path(prefix))
-            metadata = decode_metadata(table.schema.metadata)
+            smeta = SampleMetadata.from_table(table)
+            self.assertEqual(smeta.contig_order, ("chr1", "chr2", "chr3"))
+            codes, names, _, _ = reconstruct_sample_grid(smeta)
             self.assertEqual(
-                metadata["reference_identity"]["contig_order"],
+                list(dict.fromkeys(names[int(c)] for c in codes)),
                 ["chr1", "chr2", "chr3"],
             )
-            self.assertEqual(
-                dict.fromkeys(table.column("contig").to_pylist()),
-                dict.fromkeys(["chr1", "chr2", "chr3"]),
-            )
-            self.assertEqual(metadata["qc"]["reads_kept"], 5)
+            self.assertEqual(smeta.qc["reads_kept"], 5)
 
     def test_threads_must_be_positive(self) -> None:
         with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
             ExtractConfig(Path("a.bam"), Path("out"), bin_size=100, threads=0)
-
-    def test_thread_budget_splits_workers_and_decode_threads(self) -> None:
-        cases = (
-            (1, 24, 1, 1),
-            (8, 1, 1, 8),
-            (8, 24, 4, 2),
-            (16, 24, 8, 2),
-            (4, 24, 2, 2),
-            (3, 24, 3, 1),
-            (8, 3, 3, 2),
-        )
-        for budget, n_tasks, workers, decode in cases:
-            with self.subTest(budget=budget, n_tasks=n_tasks):
-                self.assertEqual(
-                    split_thread_budget(budget, n_tasks), (workers, decode)
-                )
-                self.assertLessEqual(workers * decode, budget)
-
-    def test_open_alignment_forwards_htslib_threads(self) -> None:
-        with patch("ccnv.io.alignments.pysam.AlignmentFile") as alignment_file:
-            from ccnv.io.alignments import open_alignment
-
-            open_alignment(Path("sample.bam"), "bam", None, threads=4)
-            alignment_file.assert_called_once()
-            self.assertEqual(alignment_file.call_args.kwargs["threads"], 4)
 
 
 class TestCanonicalContigs(unittest.TestCase):
@@ -595,8 +577,22 @@ class TestCanonicalContigs(unittest.TestCase):
         )
         self.assertEqual(tuple(contig.name for contig in layout), ("chr1", "chrM"))
 
-    def test_canonical_spellings_are_kept(self) -> None:
-        for name in ("chr1", "chr22", "chrX", "chrY", "1", "22", "X", "Y", "CHR7", "y"):
+    def test_canonical_spellings_including_non_human_autosomes_are_kept(self) -> None:
+        for name in (
+            "chr1",
+            "chr22",
+            "chr23",
+            "chr38",
+            "chrX",
+            "chrY",
+            "1",
+            "22",
+            "38",
+            "X",
+            "Y",
+            "CHR7",
+            "y",
+        ):
             with self.subTest(name=name):
                 self.assertTrue(is_canonical_contig(name))
 
@@ -611,7 +607,7 @@ class TestCanonicalContigs(unittest.TestCase):
             "chrMT",
             "M",
             "MT",
-            "chr23",
+            "chr0",
             "0",
             "scaffold-A",
         ):
@@ -645,16 +641,15 @@ class TestCanonicalContigs(unittest.TestCase):
             run(ExtractConfig(bam_path, prefix, bin_size=100))
 
             table = read_sample_parquet(parquet_path(prefix))
-            metadata = decode_metadata(table.schema.metadata)
-            self.assertEqual(set(table.column("contig").to_pylist()), {"chr1"})
-            self.assertEqual(metadata["contig_lengths"], {"chr1": 200})
-            self.assertEqual(metadata["reference_identity"]["contig_order"], ["chr1"])
-            self.assertEqual(metadata["qc"]["reads_seen"], 1)
-            self.assertEqual(metadata["qc"]["reads_kept"], 1)
-            self.assertEqual(metadata["qc"]["effective_reads_examined"], 1)
-            self.assertEqual(metadata["qc"]["effective_reads_kept"], 1)
-            self.assertEqual(metadata["qc"]["autosomal_reads_kept"], 1)
-            self.assertEqual(metadata["qc"]["sex_reads_kept"], 0)
+            smeta = SampleMetadata.from_table(table)
+            self.assertEqual(smeta.contig_order, ("chr1",))
+            self.assertEqual(smeta.contig_lengths, {"chr1": 200})
+            self.assertEqual(smeta.qc["reads_seen"], 1)
+            self.assertEqual(smeta.qc["reads_kept"], 1)
+            self.assertEqual(smeta.qc["effective_reads_examined"], 1)
+            self.assertEqual(smeta.qc["effective_reads_kept"], 1)
+            self.assertEqual(smeta.qc["autosomal_reads_kept"], 1)
+            self.assertEqual(smeta.qc["sex_reads_kept"], 0)
 
     def test_all_contigs_keeps_every_header_contig(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -677,12 +672,9 @@ class TestCanonicalContigs(unittest.TestCase):
             run(ExtractConfig(bam_path, prefix, bin_size=100, all_contigs=True))
 
             table = read_sample_parquet(parquet_path(prefix))
-            metadata = decode_metadata(table.schema.metadata)
-            self.assertEqual(
-                metadata["reference_identity"]["contig_order"],
-                ["chr1", "chrM", "scaffold-A"],
-            )
-            self.assertEqual(metadata["qc"]["reads_kept"], 3)
+            smeta = SampleMetadata.from_table(table)
+            self.assertEqual(smeta.contig_order, ("chr1", "chrM", "scaffold-A"))
+            self.assertEqual(smeta.qc["reads_kept"], 3)
 
     def test_header_without_canonical_contigs_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -708,6 +700,8 @@ class TestEffectiveReadMetrics(unittest.TestCase):
         self.assertEqual(qc["effective_reads_kept"], 0)
         self.assertEqual(qc["autosomal_reads_kept"], 0)
         self.assertEqual(qc["sex_reads_kept"], 0)
+        self.assertEqual(qc["mate_dedup_skipped"], 0)
+        self.assertEqual(qc["reads_filtered"], 0)
 
     def test_normalize_chr(self) -> None:
         cases = {
@@ -762,8 +756,7 @@ class TestEffectiveReadMetrics(unittest.TestCase):
             run(ExtractConfig(bam_path, prefix, bin_size=100))
 
             table = read_sample_parquet(parquet_path(prefix))
-            metadata = decode_metadata(table.schema.metadata)
-            qc = metadata["qc"]
+            qc = SampleMetadata.from_table(table).qc
 
             self.assertEqual(qc["reads_seen"], 10)
             self.assertEqual(qc["reads_kept"], 8)
@@ -796,8 +789,7 @@ class TestEffectiveReadMetrics(unittest.TestCase):
             run(ExtractConfig(bam_path, prefix, bin_size=100, all_contigs=True))
 
             table = read_sample_parquet(parquet_path(prefix))
-            metadata = decode_metadata(table.schema.metadata)
-            qc = metadata["qc"]
+            qc = SampleMetadata.from_table(table).qc
 
             self.assertEqual(qc["reads_seen"], 3)
             self.assertEqual(qc["reads_kept"], 3)
@@ -807,69 +799,53 @@ class TestEffectiveReadMetrics(unittest.TestCase):
             self.assertEqual(qc["sex_reads_kept"], 1)
             self.assertEqual(set(qc), set(QC_COUNTERS))
 
-    def test_stream_contig_fragments_bounds_and_overflow_protection(self) -> None:
-        from ccnv.extract import _ContigTask, bin_contig_with_handle
-        from ccnv.io.alignments import stream_contig_fragments
-
+    def test_paired_fragment_length_bounds_and_dyad_midpoint_binning(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "test.bam"
             header = {
                 "HD": {"VN": "1.6", "SO": "coordinate"},
                 "SQ": [{"SN": "chr1", "LN": 100_000}],
             }
+            # r1: tlen=20 (<30: counted in count, excluded from paired_count/frag_len_sum)
             r1 = _read("r1", 0, 100, 60)
-            r1.is_paired = True
-            r1.is_proper_pair = True
+            r1.flag = 0x1 | 0x2 | 0x20 | 0x40
+            r1.next_reference_id = 0
+            r1.next_reference_start = 110
             r1.template_length = 20
 
+            # r2: tlen=167 ([30, 600]: counted in count and paired_count/frag_len_sum)
             r2 = _read("r2", 0, 200, 60)
-            r2.is_paired = True
-            r2.is_proper_pair = True
+            r2.flag = 0x1 | 0x2 | 0x20 | 0x40
+            r2.next_reference_id = 0
+            r2.next_reference_start = 357
             r2.template_length = 167
 
+            # r3: tlen=700 (>600: counted in count, excluded from paired_count/frag_len_sum)
             r3 = _read("r3", 0, 300, 60)
-            r3.is_paired = True
-            r3.is_proper_pair = True
+            r3.flag = 0x1 | 0x2 | 0x20 | 0x40
+            r3.next_reference_id = 0
+            r3.next_reference_start = 990
             r3.template_length = 700
 
+            # r4: tlen=70_000 at start=400 -> dyad midpoint 35_400 lands in bin 35
             r4 = _read("r4", 0, 400, 60)
-            r4.is_paired = True
-            r4.is_proper_pair = True
+            r4.flag = 0x1 | 0x2 | 0x20 | 0x40
+            r4.next_reference_id = 0
+            r4.next_reference_start = 70_390
             r4.template_length = 70_000
 
             _write_bam(bam_path, [r1, r2, r3, r4], header=header, index=True)
-
-            with pysam.AlignmentFile(str(bam_path), "rb") as handle:
-                frags = list(
-                    stream_contig_fragments(
-                        handle,
-                        "chr1",
-                        ReadFilters(),
-                        contig_length=100_000,
-                        min_frag_len=30,
-                        max_frag_len=600,
-                    )
-                )
-                lengths = [item[3] for item in frags]
-                self.assertEqual(lengths, [0, 167, 0, 0])
-                self.assertEqual(frags[3][1], 400)
-                self.assertEqual(frags[3][2], 70_400)
-                self.assertEqual(frags[3][0], 35_400)
-
-                task = _ContigTask(
-                    path=bam_path,
-                    fmt="bam",
-                    fasta=None,
-                    name="chr1",
-                    length=100_000,
-                    bin_size=1000,
-                    filters=ReadFilters(),
-                    decode_threads=0,
-                    min_frag_len=30,
-                    max_frag_len=600,
-                )
-                result = bin_contig_with_handle(handle, task)
-                self.assertEqual(result.counts.sum(), 4)
+            table = extract_sample_table(
+                ExtractConfig(bam_path, Path(tmpdir) / "out", bin_size=1000)
+            )
+            counts = table.column("count").to_numpy()
+            paired_counts = table.column("paired_count").to_numpy()
+            frag_len_sums = table.column("frag_len_sum").to_numpy()
+            self.assertEqual(int(counts.sum()), 4)
+            self.assertEqual(int(counts[0]), 3)
+            self.assertEqual(int(counts[35]), 1)
+            self.assertEqual(int(paired_counts.sum()), 1)
+            self.assertEqual(int(frag_len_sums[0]), 167)
 
 
 class TestExtractPublishedCram(unittest.TestCase):
@@ -894,27 +870,32 @@ class TestExtractPublishedCram(unittest.TestCase):
             )
             self.assertEqual(result.exit_code, 0, result.output)
             table = read_sample_parquet(parquet_path(prefix))
-            metadata = decode_metadata(table.schema.metadata)
+            smeta = SampleMetadata.from_table(table)
+            codes, names, starts, ends = reconstruct_sample_grid(smeta)
             self.assertEqual(table.num_rows, 468)
-            self.assertEqual(set(table.column("contig").to_pylist()), {"chr21"})
-            self.assertEqual(table.column("start").to_pylist()[0], 0)
-            self.assertEqual(table.column("end").to_pylist()[-1], CHR21_LENGTH)
+            self.assertEqual(names, ("chr21",))
+            self.assertEqual(int(codes.max()), 0)
+            self.assertEqual(int(starts[0]), 0)
+            self.assertEqual(int(ends[-1]), CHR21_LENGTH)
             self.assertGreater(sum(table.column("count").to_pylist()), 0)
-            self.assertEqual(metadata["contig_lengths"], {"chr21": CHR21_LENGTH})
-            self.assertEqual(metadata["bin_size"], PUBLISHED_BIN_SIZE)
-            self.assertEqual(metadata["source_identity"]["format"], "cram")
-            self.assertEqual(metadata["qc"]["reads_kept"], 524_785)
-            self.assertEqual(metadata["qc"]["effective_reads_kept"], 524_785)
-            self.assertEqual(metadata["qc"]["autosomal_reads_kept"], 524_785)
-            self.assertEqual(metadata["qc"]["sex_reads_kept"], 0)
+            self.assertEqual(smeta.contig_lengths, {"chr21": CHR21_LENGTH})
+            self.assertEqual(smeta.bin_size, PUBLISHED_BIN_SIZE)
+            self.assertEqual(smeta.source_identity["format"], "cram")
+            self.assertEqual(smeta.qc["reads_kept"], 524_785)
+            self.assertEqual(smeta.qc["effective_reads_kept"], 524_785)
+            self.assertEqual(smeta.qc["autosomal_reads_kept"], 524_785)
+            self.assertEqual(smeta.qc["sex_reads_kept"], 0)
 
-            # Fragmentomics schema and metadata assertions
-            self.assertIn("fragment_lengths", table.column_names)
+            self.assertIn("frag_bands", table.column_names)
+            self.assertIn("paired_count", table.column_names)
+            self.assertIn("frag_len_sum", table.column_names)
+            self.assertIn("short_frag_count", table.column_names)
             self.assertIn("endpoint_count", table.column_names)
             self.assertIn("frag_gc_sum", table.column_names)
+            assert table.schema.metadata is not None
             self.assertIn(FRAGMENTOMICS_METADATA_KEY, table.schema.metadata)
-            frag_meta = FragmentomicsMetadata(
-                **json.loads(
+            frag_meta = FragmentomicsMetadata.from_dict(
+                json.loads(
                     table.schema.metadata[FRAGMENTOMICS_METADATA_KEY].decode("utf-8")
                 )
             )

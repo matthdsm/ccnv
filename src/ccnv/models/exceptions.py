@@ -17,8 +17,16 @@ class PredictError(CcnvError):
     """Raised when prediction or segmentation fails."""
 
 
+class BinCompatibilityError(ReferenceError, PredictError):
+    """Raised when sample and target bin grids cannot be reconciled without upsampling."""
+
+
 class SchemaError(CcnvError):
     """Raised when an artifact violates a storage contract."""
+
+
+class SchemaVersionError(SchemaError):
+    """Raised when an artifact uses an unsupported or legacy schema version."""
 
 
 class ExtractError(CcnvError):
@@ -35,6 +43,7 @@ class ReferenceQCError(CcnvError):
 
 __all__ = [
     "AlignmentError",
+    "BinCompatibilityError",
     "CcnvError",
     "CovariateError",
     "ExtractError",
@@ -42,4 +51,5 @@ __all__ = [
     "ReferenceError",
     "ReferenceQCError",
     "SchemaError",
+    "SchemaVersionError",
 ]
