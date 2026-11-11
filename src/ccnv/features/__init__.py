@@ -27,8 +27,10 @@ from ccnv.features.cohort import (
 )
 from ccnv.features.covariates import (
     DEFAULT_MIN_MAPPABILITY,
+    build_exogenous_covariate_basis,
     correct_covariate_bias,
     covariate_features,
+    fit_poisson_covariate_trends,
     mask_covariates,
     validate_min_mappability,
 )
@@ -58,6 +60,7 @@ __all__ = [
     "annotate_prenatal_segments",
     "bin_counts",
     "bin_intervals",
+    "build_exogenous_covariate_basis",
     "classify_sca",
     "cohort_from_fasta",
     "compute_bin_exposure",
@@ -70,6 +73,7 @@ __all__ = [
     "extract_sample_fragmentomics",
     "extract_segment_fragment_lengths",
     "fit_cohort_fragmentomics_model",
+    "fit_poisson_covariate_trends",
     "fit_prenatal_models",
     "fuse_active_fetal_fraction",
     "infer_germline_sex_2d",

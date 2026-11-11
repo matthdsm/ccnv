@@ -48,7 +48,9 @@ from ccnv.stats.prenatal_math import (
 from ccnv.stats.regression import (
     apply_1d_correction,
     build_1d_basis,
+    build_exogenous_covariate_basis,
     build_joint_covariate_basis,
+    fit_poisson_covariate_trends,
     fit_sample_trend,
 )
 from ccnv.stats.segmentation import (
@@ -72,6 +74,7 @@ __all__ = [
     "align_histogram",
     "apply_1d_correction",
     "build_1d_basis",
+    "build_exogenous_covariate_basis",
     "build_fragmentomic_feature_vector",
     "build_joint_covariate_basis",
     "build_signal_space_features",
@@ -90,6 +93,7 @@ __all__ = [
     "fit_ffa_logit_ensemble",
     "fit_lasso_fista",
     "fit_pca",
+    "fit_poisson_covariate_trends",
     "fit_preface_logit_ensemble",
     "fit_prototype_graph",
     "fit_rprop_mlp",

@@ -220,6 +220,21 @@ class TestCovariateRegression(unittest.TestCase):
         np.testing.assert_allclose(np.mean(feats, axis=0), [0.0, 0.0], atol=1e-12)
         np.testing.assert_allclose(np.std(feats, axis=0), [1.0, 1.0], atol=1e-12)
 
+        ref_frag_len = np.array([162.0, 165.0, 168.0, 199.0, 171.0])
+        ref_ep_rate = np.array([0.09, 0.11, 0.13, 0.50, 0.15])
+        feats_exog = covariate_features(
+            usable,
+            gc=gc,
+            mappability=mappability,
+            ref_frag_len=ref_frag_len,
+            ref_ep_rate=ref_ep_rate,
+        )
+        self.assertIsNotNone(feats_exog)
+        assert feats_exog is not None
+        self.assertEqual(feats_exog.shape, (4, 4))
+        np.testing.assert_allclose(np.mean(feats_exog, axis=0), 0.0, atol=1e-12)
+        np.testing.assert_allclose(np.std(feats_exog, axis=0), 1.0, atol=1e-12)
+
     def test_build_joint_covariate_basis_captures_gc_mappability_interaction(
         self,
     ) -> None:
