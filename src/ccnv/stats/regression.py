@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import math
+import sys
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import Final
 
 import numpy as np
@@ -339,6 +341,8 @@ def _fit_single_sample_poisson(
     sf_val: float,
     exp_fit: NDArray[np.float64],
     x_fit: NDArray[np.float64],
+    *,
+    suppress_warnings: bool = True,
 ) -> tuple[float, NDArray[np.float64]]:
     """Fit zero-inclusive offset-equivalent Poisson GLM with outlier Winsorization."""
     if not np.all(np.isfinite(c_fit)) or np.any(c_fit < 0.0):
@@ -387,8 +391,10 @@ def _fit_single_sample_poisson(
         log_rate = float(np.clip(math.log(rate), -_POISSON_EXP_CLIP, _POISSON_EXP_CLIP))
         return log_rate, zero_coef
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
+    warn_ctx = warnings.catch_warnings() if suppress_warnings else nullcontext()
+    with warn_ctx:
+        if suppress_warnings:
+            warnings.simplefilter("ignore", ConvergenceWarning)
         reg = PoissonRegressor(
             alpha=_POISSON_ALPHA,
             max_iter=_POISSON_MAX_ITER,
@@ -499,16 +505,28 @@ def fit_poisson_covariate_trends(
     x_fit = np.ascontiguousarray(design[fit_rel_idx], dtype=np.float64)
     n_features = x_fit.shape[1]
 
+    workers = min(threads, n_samples)
+    worker_suppress = workers > 1 and bool(
+        getattr(sys.flags, "context_aware_warnings", 0)
+    )
+
     def _fit_idx(s_idx: int) -> tuple[float, NDArray[np.float64]]:
         c_col = np.asarray(counts_2d[fit_abs_idx, s_idx], dtype=np.float64)
-        return _fit_single_sample_poisson(c_col, float(sf_arr[s_idx]), exp_fit, x_fit)
+        return _fit_single_sample_poisson(
+            c_col,
+            float(sf_arr[s_idx]),
+            exp_fit,
+            x_fit,
+            suppress_warnings=worker_suppress,
+        )
 
-    workers = min(threads, n_samples)
-    if workers <= 1:
-        fitted = [_fit_idx(s_idx) for s_idx in range(n_samples)]
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            fitted = list(pool.map(_fit_idx, range(n_samples)))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        if workers <= 1:
+            fitted = [_fit_idx(s_idx) for s_idx in range(n_samples)]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                fitted = list(pool.map(_fit_idx, range(n_samples)))
 
     intercepts = np.array([pair[0] for pair in fitted], dtype=np.float64)
     if n_features == 0:

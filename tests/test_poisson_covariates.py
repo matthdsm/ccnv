@@ -1,6 +1,7 @@
 import inspect
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -313,6 +314,27 @@ class TestPoissonCovariates(unittest.TestCase):
             fit_poisson_covariate_trends(
                 counts_k0, np.array([-1.0, 1.0]), exposure, usable, empty_basis
             )
+
+    def test_multithreaded_fit_preserves_global_warnings_filters(self) -> None:
+        rng = np.random.default_rng(314)
+        n_bins, n_samples = 4_000, 16
+        usable = np.ones(n_bins, dtype=np.bool_)
+        gc = rng.uniform(0.30, 0.65, size=n_bins).astype(np.float32)
+        exposure = np.ones(n_bins, dtype=np.float32)
+        sf = np.ones(n_samples, dtype=np.float64)
+        rate = 12.0 * np.exp(-6.0 * np.square(gc.astype(np.float64) - 0.45))
+        counts = rng.poisson(rate[:, np.newaxis] * sf[np.newaxis, :]).astype(np.float32)
+        basis = build_exogenous_covariate_basis(usable, bin_size=5_000, gc=gc)
+
+        filters_before = list(warnings.filters)
+        try:
+            for _ in range(3):
+                fit_poisson_covariate_trends(
+                    counts, sf, exposure, usable, basis, threads=4
+                )
+            self.assertEqual(list(warnings.filters), filters_before)
+        finally:
+            warnings.filters[:] = filters_before
 
 
 if __name__ == "__main__":
