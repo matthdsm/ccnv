@@ -533,6 +533,39 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
             )
             del cohort_mmap, mmap_ro
 
+    def test_single_sex_labeled_cohort_with_swapped_label_preserves_clean_cutoff(
+        self,
+    ) -> None:
+        # 19 XY labeled M + 1 XY mislabeled F -> quarantined swap must not pollute cf/cutoff
+        m_karyo = [("XY", 1.0, 1.0, "M")] * 19 + [("XY_as_F", 1.0, 1.0, "F")]
+        m_cohort, m_usable, m_entries = _simulate_human_sex_cohort(m_karyo, seed=205)
+        m_explicit = tuple("male" if e.sex == "M" else "female" for e in m_entries)
+        m_inf = infer_germline_sex_2d(
+            m_cohort, m_usable, min_group_size=5, explicit_labels=m_explicit
+        )
+        self.assertTrue(m_inf.passed)
+        self.assertFalse(bool(np.any(m_inf.quarantined_mask[:19])))
+        self.assertTrue(bool(m_inf.quarantined_mask[19]))
+        assert m_inf.cutoff is not None
+        m_fracs = np.asarray(m_inf.fractions)[:19]
+        self.assertLess(m_inf.cutoff, float(np.min(m_fracs)) * 0.7)
+        self.assertTrue(bool(np.all(m_fracs > m_inf.cutoff)))
+
+        # 19 XX labeled F + 1 XX mislabeled M -> quarantined swap must not pollute cm/cutoff
+        f_karyo = [("XX", 2.0, 0.0, "F")] * 19 + [("XX_as_M", 2.0, 0.0, "M")]
+        f_cohort, f_usable, f_entries = _simulate_human_sex_cohort(f_karyo, seed=206)
+        f_explicit = tuple("male" if e.sex == "M" else "female" for e in f_entries)
+        f_inf = infer_germline_sex_2d(
+            f_cohort, f_usable, min_group_size=5, explicit_labels=f_explicit
+        )
+        self.assertTrue(f_inf.passed)
+        self.assertFalse(bool(np.any(f_inf.quarantined_mask[:19])))
+        self.assertTrue(bool(f_inf.quarantined_mask[19]))
+        assert f_inf.cutoff is not None
+        f_fracs = np.asarray(f_inf.fractions)[:19]
+        self.assertGreater(f_inf.cutoff, float(np.max(f_fracs)) * 2.5)
+        self.assertTrue(bool(np.all(f_fracs <= f_inf.cutoff)))
+
 
 def _simulate_human_sex_cohort(
     karyotypes: list[tuple[str, float, float, str]],

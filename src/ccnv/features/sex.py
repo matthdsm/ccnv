@@ -400,16 +400,12 @@ def infer_germline_sex_2d(
             has_m=has_m,
         )
         lbl_arr = np.asarray(lbl_tup)
-        cf = (
-            (lbl_arr == "female") & ~q_mask
-            if np.any((lbl_arr == "female") & ~q_mask)
-            else (lbl_arr == "female")
-        )
-        cm = (
-            (lbl_arr == "male") & ~q_mask
-            if np.any((lbl_arr == "male") & ~q_mask)
-            else (lbl_arr == "male")
-        )
+        cf_clean = (lbl_arr == "female") & ~q_mask
+        cm_clean = (lbl_arr == "male") & ~q_mask
+        if np.any(cf_clean) or np.any(cm_clean):
+            cf, cm = cf_clean, cm_clean
+        else:
+            cf, cm = lbl_arr == "female", lbl_arr == "male"
         if np.any(cf) and np.any(cm):
             max_f = float(np.max(y_fracs[cf]))
             min_m = float(np.min(y_fracs[cm]))
