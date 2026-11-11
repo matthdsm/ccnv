@@ -95,12 +95,47 @@ def _mad(values: NDArray[np.floating]) -> float:
     return float(np.median(np.abs(arr - np.median(arr)))) if arr.size > 0 else 0.0
 
 
+def _sum_counts_by_sample(
+    counts: NDArray[np.floating] | NDArray[np.integer],
+    row_mask: NDArray[np.bool_] | None = None,
+    *,
+    chunk_rows: int | None = None,
+) -> NDArray[np.float64]:
+    """Sum sample columns in bounded row slices without materializing boolean row copies."""
+    n_bins, n_samples = counts.shape
+    totals = np.zeros(n_samples, dtype=np.float64)
+    if n_bins == 0 or n_samples == 0:
+        return totals
+    step = (
+        chunk_rows
+        if chunk_rows is not None and chunk_rows > 0
+        else max(1024, (64 * 1024 * 1024) // max(n_samples, 1))
+    )
+    for r0 in range(0, n_bins, step):
+        r1 = min(r0 + step, n_bins)
+        if row_mask is None:
+            totals += np.sum(counts[r0:r1], axis=0, dtype=np.float64)
+        else:
+            m_sub = row_mask[r0:r1]
+            if np.any(m_sub):
+                totals += np.sum(
+                    counts[r0:r1],
+                    axis=0,
+                    dtype=np.float64,
+                    where=m_sub[:, np.newaxis],
+                )
+    return totals
+
+
 def _ellipse_quarantine_2d(
     d_x: NDArray[np.float64],
     d_y: NDArray[np.float64],
     f_core: NDArray[np.bool_],
     m_core: NDArray[np.bool_],
-) -> tuple[NDArray[np.bool_], NDArray[np.bool_], NDArray[np.bool_]]:
+    *,
+    has_f: bool = True,
+    has_m: bool = True,
+) -> tuple[NDArray[np.bool_], NDArray[np.bool_]]:
     def _dist2(core: NDArray[np.bool_]) -> NDArray[np.float64]:
         mx = float(np.median(d_x[core]))
         my = float(np.median(d_y[core]))
@@ -112,11 +147,29 @@ def _ellipse_quarantine_2d(
         )
         return ((d_x - mx) / sx) ** 2 + ((d_y - my) / sy) ** 2
 
-    df = _dist2(f_core)
-    dm = _dist2(m_core)
-    in_f = (df <= 1.0) & (df < dm)
-    in_m = (dm <= 1.0) & (dm < df)
-    return in_f, in_m, ~(in_f | in_m)
+    inf_arr = np.full(d_x.shape, np.inf, dtype=np.float64)
+    df = _dist2(f_core) if has_f else inf_arr
+    dm = _dist2(m_core) if has_m else inf_arr
+    return (df <= 1.0) & (df < dm), (dm <= 1.0) & (dm < df)
+
+
+def _quarantine_for_labels(
+    labels: Sequence[SexLabel],
+    in_f: NDArray[np.bool_],
+    in_m: NDArray[np.bool_],
+    f_core: NDArray[np.bool_],
+    cand_xy: NDArray[np.bool_],
+    *,
+    has_x: bool,
+    has_f: bool,
+    has_m: bool,
+) -> NDArray[np.bool_]:
+    if not (has_f or has_m):
+        return np.zeros(len(labels), dtype=np.bool_)
+    is_male = np.asarray([lbl == "male" for lbl in labels], dtype=np.bool_)
+    ok_f = in_f if has_f else (f_core if has_x else ~is_male)
+    ok_m = in_m if has_m else (cand_xy if has_x else is_male)
+    return ~np.where(is_male, ok_m, ok_f)
 
 
 def _merge_explicit_sexes(
@@ -210,7 +263,7 @@ def infer_germline_sex_2d(
     if usable_arr.shape != (n_bins,):
         raise InvalidInputError("usable length must match cohort bin count")
     empty_q = np.zeros(n_samples, dtype=np.bool_)
-    lib_totals = np.sum(cohort.counts, axis=0, dtype=np.float64)
+    lib_totals = _sum_counts_by_sample(cohort.counts)
     if np.any(lib_totals <= 0):
         raise ReferenceError("every sample must have a positive total count")
 
@@ -235,7 +288,7 @@ def infer_germline_sex_2d(
     auto_raw = np.isin(c_arr, auto_names)
     auto_mask = auto_raw & usable_arr if np.any(auto_raw & usable_arr) else auto_raw
     exp_auto = float(np.sum(exposure[auto_mask]))
-    sum_auto = np.sum(cohort.counts[auto_mask], axis=0, dtype=np.float64)
+    sum_auto = _sum_counts_by_sample(cohort.counts, auto_mask)
     if exp_auto <= 0.0 or np.any(sum_auto <= 0.0):
         return SexInference(None, None, (), False, "zero autosomal depth", empty_q)
     rate_auto = sum_auto / exp_auto
@@ -243,15 +296,18 @@ def infer_germline_sex_2d(
     y_nonpar = nonpar_contig_mask(
         c_arr == y_name, cohort.starts, cohort.ends, cohort.contig_lengths[y_name]
     )
-    y_fracs = np.sum(cohort.counts[y_nonpar], axis=0, dtype=np.float64) / lib_totals
+    y_fracs = _sum_counts_by_sample(cohort.counts, y_nonpar) / lib_totals
     recorded = tuple(float(v) for v in y_fracs)
-    y_mask = y_nonpar & usable_arr if np.any(y_nonpar & usable_arr) else y_nonpar
-    exp_y = max(float(np.sum(exposure[y_mask])), 1e-6)
-    raw_dy = (
-        2.0
-        * (np.sum(cohort.counts[y_mask], axis=0, dtype=np.float64) / exp_y)
-        / rate_auto
+    exp_y_nonpar = float(np.sum(exposure[y_nonpar]))
+    y_usable = y_nonpar & usable_arr
+    y_mask = (
+        y_usable
+        if exp_y_nonpar > 0.0
+        and float(np.sum(exposure[y_usable])) >= 0.20 * exp_y_nonpar
+        else y_nonpar
     )
+    exp_y = max(float(np.sum(exposure[y_mask])), 1e-6)
+    raw_dy = 2.0 * (_sum_counts_by_sample(cohort.counts, y_mask) / exp_y) / rate_auto
 
     has_x = len(x_names) > 0
     if has_x:
@@ -262,11 +318,7 @@ def infer_germline_sex_2d(
             )
         x_mask = x_nonpar & usable_arr if np.any(x_nonpar & usable_arr) else x_nonpar
         exp_x = max(float(np.sum(exposure[x_mask])), 1e-6)
-        d_x = (
-            2.0
-            * (np.sum(cohort.counts[x_mask], axis=0, dtype=np.float64) / exp_x)
-            / rate_auto
-        )
+        d_x = 2.0 * (_sum_counts_by_sample(cohort.counts, x_mask) / exp_x) / rate_auto
         cand_xy = (np.abs(d_x - 1.0) < 0.45) & (raw_dy > 0.20)
         y_scale = (
             float(np.median(raw_dy[cand_xy]))
@@ -277,6 +329,7 @@ def infer_germline_sex_2d(
     else:
         d_x = np.ones(n_samples, dtype=np.float64)
         d_y = raw_dy
+        cand_xy = empty_q
 
     dx_tup = tuple(float(v) for v in d_x)
     dy_tup = tuple(float(v) for v in d_y)
@@ -292,22 +345,33 @@ def infer_germline_sex_2d(
         if med_my0 > 0.0
         else empty_q
     )
-    has_2d = (
-        int(np.count_nonzero(f_core)) >= min_group_size
-        and int(np.count_nonzero(m_core)) >= min_group_size
+    has_f = int(np.count_nonzero(f_core)) >= min_group_size
+    has_m = int(np.count_nonzero(m_core)) >= min_group_size
+    in_f, in_m = (
+        _ellipse_quarantine_2d(d_x, d_y, f_core, m_core, has_f=has_f, has_m=has_m)
+        if (has_f or has_m)
+        else (empty_q, empty_q)
     )
 
     if cutoff is not None:
         if not math.isfinite(cutoff) or not (0.0 <= cutoff <= 1.0):
             raise ReferenceError("sex_cutoff must be a finite number in [0, 1]")
-        q_mask = (
-            _ellipse_quarantine_2d(d_x, d_y, f_core, m_core)[2] if has_2d else empty_q
-        )
         base_lbls: list[SexLabel] = [
             "male" if float(v) > cutoff else "female" for v in y_fracs
         ]
+        merged_cut = _merge_explicit_sexes(base_lbls, explicit_labels)
+        q_mask = _quarantine_for_labels(
+            merged_cut,
+            in_f,
+            in_m,
+            f_core,
+            cand_xy,
+            has_x=has_x,
+            has_f=has_f,
+            has_m=has_m,
+        )
         return SexInference(
-            _merge_explicit_sexes(base_lbls, explicit_labels),
+            merged_cut,
             float(cutoff),
             recorded,
             True,
@@ -325,8 +389,15 @@ def infer_germline_sex_2d(
         lbl_tup: tuple[SexLabel, ...] = tuple(
             "male" if x == "male" else "female" for x in explicit_labels
         )
-        q_mask = (
-            _ellipse_quarantine_2d(d_x, d_y, f_core, m_core)[2] if has_2d else empty_q
+        q_mask = _quarantine_for_labels(
+            lbl_tup,
+            in_f,
+            in_m,
+            f_core,
+            cand_xy,
+            has_x=has_x,
+            has_f=has_f,
+            has_m=has_m,
         )
         lbl_arr = np.asarray(lbl_tup)
         cf = (
@@ -362,33 +433,40 @@ def infer_germline_sex_2d(
             lbl_tup, cut_val, recorded, True, "samplesheet", q_mask, dx_tup, dy_tup
         )
 
-    if has_2d:
-        in_f, in_m, q_mask = _ellipse_quarantine_2d(d_x, d_y, f_core, m_core)
-        if (
-            int(np.count_nonzero(in_f)) >= min_group_size
-            and int(np.count_nonzero(in_m)) >= min_group_size
-        ):
-            cut_val = 0.5 * (
-                float(np.max(y_fracs[in_f])) + float(np.min(y_fracs[in_m]))
-            )
-            inferred_2d: list[SexLabel] = [
-                "female"
-                if bool(in_f[i])
-                else (
-                    "male" if bool(in_m[i]) or float(y_fracs[i]) > cut_val else "female"
-                )
-                for i in range(n_samples)
-            ]
-            return SexInference(
-                _merge_explicit_sexes(inferred_2d, explicit_labels),
-                cut_val,
-                recorded,
-                True,
-                "separated_2d",
-                q_mask,
-                dx_tup,
-                dy_tup,
-            )
+    if (
+        has_f
+        and has_m
+        and int(np.count_nonzero(in_f)) >= min_group_size
+        and int(np.count_nonzero(in_m)) >= min_group_size
+    ):
+        cut_val = 0.5 * (float(np.max(y_fracs[in_f])) + float(np.min(y_fracs[in_m])))
+        inferred_2d: list[SexLabel] = [
+            "female"
+            if bool(in_f[i])
+            else ("male" if bool(in_m[i]) or float(y_fracs[i]) > cut_val else "female")
+            for i in range(n_samples)
+        ]
+        merged_2d = _merge_explicit_sexes(inferred_2d, explicit_labels)
+        q_mask = _quarantine_for_labels(
+            merged_2d,
+            in_f,
+            in_m,
+            f_core,
+            cand_xy,
+            has_x=has_x,
+            has_f=has_f,
+            has_m=has_m,
+        )
+        return SexInference(
+            merged_2d,
+            cut_val,
+            recorded,
+            True,
+            "separated_2d",
+            q_mask,
+            dx_tup,
+            dy_tup,
+        )
 
     base = infer_sample_sexes(y_fracs, min_group_size=min_group_size)
     if not base.passed or base.labels is None:

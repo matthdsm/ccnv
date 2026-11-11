@@ -363,6 +363,247 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
             self.assertEqual(in_xy.sex, "male")
             self.assertEqual(in_xy.branches, (BRANCH_AUTOSOMAL, BRANCH_MALE_SEX))
 
+    def test_single_sex_all_male_labeled_quarantines_xxy_and_mloy(self) -> None:
+        karyotypes = [("XY", 1.0, 1.0, "M")] * 18 + [
+            ("XXY", 2.0, 1.0, "M"),
+            ("mLOY", 1.0, 0.35, "M"),
+        ]
+        cohort, usable, entries = _simulate_human_sex_cohort(karyotypes, seed=201)
+        sex_inf = infer_germline_sex_2d(
+            cohort,
+            usable,
+            min_group_size=5,
+            explicit_labels=tuple("male" for _ in entries),
+        )
+        self.assertTrue(sex_inf.passed)
+        self.assertFalse(bool(np.any(sex_inf.quarantined_mask[:18])))
+        self.assertTrue(bool(sex_inf.quarantined_mask[18]))  # XXY
+        self.assertTrue(bool(sex_inf.quarantined_mask[19]))  # mLOY
+        assert sex_inf.cutoff is not None
+        self.assertLess(
+            sex_inf.cutoff, float(np.min(np.asarray(sex_inf.fractions)[:18]))
+        )
+
+        sex_cut = infer_germline_sex_2d(cohort, usable, min_group_size=5, cutoff=0.005)
+        self.assertTrue(bool(sex_cut.quarantined_mask[18]))
+        self.assertTrue(bool(sex_cut.quarantined_mask[19]))
+
+        ref_tbl = build_reference_table(
+            cohort,
+            ReferenceConfig(
+                samples=tuple(e.filepath for e in entries),
+                entries=entries,
+                prefix=Path("ref_all_m"),
+                pca_components=2,
+                nearest_bins=4,
+                min_cohort_size=5,
+                min_sex_group_size=5,
+            ),
+        )
+        meta = ReferenceMetadata.from_table(ref_tbl)
+        assert meta.sex_inference is not None
+        self.assertEqual(meta.sex_inference.get("quarantined_indices"), [18, 19])
+
+    def test_single_sex_all_female_labeled_quarantines_xo_and_ignores_chry_xtr(
+        self,
+    ) -> None:
+        karyotypes = [("XX", 2.0, 0.0, "F")] * 19 + [("XO", 1.0, 0.0, "F")]
+        cohort, usable, entries = _simulate_human_sex_cohort(
+            karyotypes, seed=202, xtr_mismap_frac=0.18
+        )
+        sex_inf = infer_germline_sex_2d(
+            cohort,
+            usable,
+            min_group_size=5,
+            explicit_labels=tuple("female" for _ in entries),
+        )
+        self.assertTrue(sex_inf.passed)
+        self.assertFalse(bool(np.any(sex_inf.quarantined_mask[:19])))
+        self.assertTrue(bool(sex_inf.quarantined_mask[19]))  # XO
+        self.assertLess(float(np.max(np.asarray(sex_inf.d_y)[:19])), 0.05)
+        assert sex_inf.cutoff is not None
+        max_f_frac = float(np.max(np.asarray(sex_inf.fractions)[:19]))
+        self.assertGreater(sex_inf.cutoff, max_f_frac * 2.5)
+
+        ref_tbl = build_reference_table(
+            cohort,
+            ReferenceConfig(
+                samples=tuple(e.filepath for e in entries),
+                entries=entries,
+                prefix=Path("ref_all_f"),
+                pca_components=2,
+                nearest_bins=4,
+                min_cohort_size=5,
+                min_sex_group_size=5,
+            ),
+        )
+        meta = ReferenceMetadata.from_table(ref_tbl)
+        assert meta.sex_inference is not None
+        self.assertEqual(meta.sex_inference.get("quarantined_indices"), [19])
+
+    def test_mixed_labeled_cohort_quarantines_sex_label_swaps(self) -> None:
+        # 10 XX labeled F, 10 XY labeled M, 1 XY mislabeled F (idx 20), 1 XX mislabeled M (idx 21)
+        karyotypes = (
+            [("XX", 2.0, 0.0, "F")] * 10
+            + [("XY", 1.0, 1.0, "M")] * 10
+            + [("XY_as_F", 1.0, 1.0, "F"), ("XX_as_M", 2.0, 0.0, "M")]
+        )
+        cohort, usable, entries = _simulate_human_sex_cohort(karyotypes, seed=203)
+        explicit = tuple("male" if e.sex == "M" else "female" for e in entries)
+        sex_inf = infer_germline_sex_2d(
+            cohort, usable, min_group_size=5, explicit_labels=explicit
+        )
+        self.assertTrue(sex_inf.passed)
+        self.assertFalse(bool(np.any(sex_inf.quarantined_mask[:20])))
+        self.assertTrue(bool(sex_inf.quarantined_mask[20]))  # XY swapped to F
+        self.assertTrue(bool(sex_inf.quarantined_mask[21]))  # XX swapped to M
+        assert sex_inf.cutoff is not None
+        fracs = np.asarray(sex_inf.fractions)
+        self.assertGreater(sex_inf.cutoff, float(np.max(fracs[:10])))
+        self.assertLess(sex_inf.cutoff, float(np.min(fracs[10:20])))
+
+        ref_tbl = build_reference_table(
+            cohort,
+            ReferenceConfig(
+                samples=tuple(e.filepath for e in entries),
+                entries=entries,
+                prefix=Path("ref_swapped"),
+                pca_components=2,
+                nearest_bins=4,
+                min_cohort_size=5,
+                min_sex_group_size=5,
+            ),
+        )
+        meta = ReferenceMetadata.from_table(ref_tbl)
+        assert meta.sex_inference is not None
+        self.assertEqual(meta.sex_inference.get("quarantined_indices"), [20, 21])
+
+    def test_infer_germline_sex_2d_streams_memmap_counts_chunked(self) -> None:
+        from ccnv.features.sex import _sum_counts_by_sample
+
+        karyotypes = (
+            [("XX", 2.0, 0.0, "F")] * 6
+            + [("XY", 1.0, 1.0, "M")] * 6
+            + [("XXY", 2.0, 1.0, "M")]
+        )
+        cohort_ram, usable, _ = _simulate_human_sex_cohort(karyotypes, seed=204)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mmap_path = Path(tmpdir) / "cohort_counts.mmap"
+            mmap_w = np.memmap(
+                mmap_path,
+                dtype=np.float32,
+                mode="w+",
+                shape=cohort_ram.counts.shape,
+                order="F",
+            )
+            mmap_w[:] = cohort_ram.counts
+            mmap_w.flush()
+            del mmap_w
+
+            mmap_ro = np.memmap(
+                mmap_path,
+                dtype=np.float32,
+                mode="r",
+                shape=cohort_ram.counts.shape,
+                order="F",
+            )
+            cohort_mmap = Cohort(
+                counts=mmap_ro,
+                contigs=cohort_ram.contigs,
+                starts=cohort_ram.starts,
+                ends=cohort_ram.ends,
+                contig_lengths=cohort_ram.contig_lengths,
+                bin_size=cohort_ram.bin_size,
+                identities=cohort_ram.identities,
+                paths=cohort_ram.paths,
+            )
+            inf_ram = infer_germline_sex_2d(cohort_ram, usable, min_group_size=5)
+            inf_mmap = infer_germline_sex_2d(cohort_mmap, usable, min_group_size=5)
+            self.assertEqual(inf_mmap.labels, inf_ram.labels)
+            self.assertAlmostEqual(
+                float(inf_mmap.cutoff or 0.0), float(inf_ram.cutoff or 0.0), places=12
+            )
+            np.testing.assert_array_equal(
+                inf_mmap.quarantined_mask, inf_ram.quarantined_mask
+            )
+            np.testing.assert_allclose(
+                _sum_counts_by_sample(mmap_ro, usable, chunk_rows=32),
+                np.sum(cohort_ram.counts[usable], axis=0, dtype=np.float64),
+                rtol=1e-12,
+            )
+            del cohort_mmap, mmap_ro
+
+
+def _simulate_human_sex_cohort(
+    karyotypes: list[tuple[str, float, float, str]],
+    *,
+    seed: int,
+    xtr_mismap_frac: float = 0.002,
+) -> tuple[Cohort, np.ndarray, tuple[SamplesheetEntry, ...]]:
+    rng = np.random.default_rng(seed)
+    bin_size = 500_000
+    contig_lengths = {
+        "chr1": 60_000_000,
+        "chr2": 60_000_000,
+        "chrX": 60_000_000,
+        "chrY": 58_000_000,
+    }
+    contigs_list: list[str] = []
+    starts_list: list[int] = []
+    ends_list: list[int] = []
+    for cname, clen in contig_lengths.items():
+        for s in range(0, clen, bin_size):
+            contigs_list.append(cname)
+            starts_list.append(s)
+            ends_list.append(min(s + bin_size, clen))
+
+    contigs_arr = np.asarray(contigs_list, dtype=object)
+    starts_arr = np.asarray(starts_list, dtype=np.int64)
+    ends_arr = np.asarray(ends_list, dtype=np.int64)
+    n_bins = starts_arr.size
+    n_samples = len(karyotypes)
+
+    is_auto = np.isin(contigs_arr, ["chr1", "chr2"])
+    is_x = contigs_arr == "chrX"
+    is_y = contigs_arr == "chrY"
+    is_x_par = is_x & ((starts_arr < 2_500_000) | (ends_arr > 59_500_000))
+    is_y_par = is_y & ((starts_arr < 2_500_000) | (ends_arr > 57_500_000))
+    is_y_het = is_y & (starts_arr >= 28_000_000) & (ends_arr <= 57_000_000)
+    is_y_xtr = is_y & (starts_arr >= 4_000_000) & (ends_arr <= 6_000_000)  # 2 Mb XTR
+
+    counts = np.zeros((n_bins, n_samples), dtype=np.float32)
+    for s_idx, (_, ploidy_x, ploidy_y, _) in enumerate(karyotypes):
+        diploid_mu = 400.0 * rng.uniform(0.85, 1.20)
+        mu = np.zeros(n_bins, dtype=np.float64)
+        mu[is_auto] = diploid_mu
+        mu[is_x_par] = diploid_mu
+        mu[is_y_par] = 0.0
+        mu[is_x & ~is_x_par] = diploid_mu * (ploidy_x / 2.0)
+        mu[is_y & ~is_y_par & ~is_y_het] = diploid_mu * (ploidy_y / 2.0)
+        mu[is_y_xtr] += diploid_mu * xtr_mismap_frac
+        counts[:, s_idx] = rng.poisson(mu).astype(np.float32)
+
+    cohort = Cohort(
+        counts=counts,
+        contigs=tuple(contigs_list),
+        starts=starts_arr,
+        ends=ends_arr,
+        contig_lengths=contig_lengths,
+        bin_size=bin_size,
+        identities=tuple({"id": f"s_{i}"} for i in range(n_samples)),
+        paths=tuple(Path(f"s_{i}.ccnv") for i in range(n_samples)),
+    )
+    exposure = compute_bin_exposure(starts_arr, ends_arr, bin_size)
+    _, contig_codes = np.unique(contigs_arr.astype(str), return_inverse=True)
+    usable = mask_low_coverage_per_contig(
+        counts, contig_codes.astype(np.int16), exposure
+    )
+    entries = tuple(
+        SamplesheetEntry(filepath=Path(f"s_{i}.ccnv"), sex="M" if lbl == "M" else "F")
+        for i, (_, _, _, lbl) in enumerate(karyotypes)
+    )
+    return cohort, usable, entries
+
 
 if __name__ == "__main__":
     unittest.main()
