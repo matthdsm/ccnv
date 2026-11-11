@@ -130,6 +130,8 @@ def _extract_contig_grid(
 ]:
     """Map caller bin arrays to `(contig, length)` specs and output slices."""
     n = starts.size
+    if len(contigs) != n or ends.size != n:
+        raise CovariateError("contig, start, and end arrays must have equal length")
     if n == 0:
         return [], 1, []
 
@@ -165,6 +167,7 @@ def _extract_contig_grid(
         is_full_grid = (
             c_starts.size == n_core
             and int(c_starts[0]) == 0
+            and int(c_ends[-1]) == contig_len
             and (
                 n_core == 1
                 or (
@@ -175,7 +178,12 @@ def _extract_contig_grid(
         )
         if is_full_grid:
             bin_idx = None
-        elif bool(np.all(c_starts % bin_size == 0)):
+        elif (
+            bool(np.all(c_starts >= 0))
+            and bool(np.all(c_starts % bin_size == 0))
+            and bool(np.all(c_ends > c_starts))
+            and bool(np.all(c_ends == np.minimum(c_starts + bin_size, contig_len)))
+        ):
             bin_idx = (c_starts // bin_size).astype(np.intp)
         else:
             raise CovariateError(
@@ -293,10 +301,10 @@ def _load_bed_gc(
         df = pl.read_csv(
             resolved,
             has_header=False,
-            separator="\t",
+            separator="\x00",
+            quote_char=None,
             comment_prefix="#",
             infer_schema=False,
-            truncate_ragged_lines=True,
         )
     except pl.exceptions.NoDataError:
         df = pl.DataFrame()
@@ -304,39 +312,30 @@ def _load_bed_gc(
         raise CovariateError(f"failed to read GC track {resolved}: {error}") from error
 
     if df.height > 0:
-        if df.width == 1:
-            col0 = df.columns[0]
-            df = df.filter(pl.col(col0).str.strip_chars().str.len_bytes() > 0)
-            if df.height > 0:
-                df = df.select(
-                    pl.col(col0)
-                    .str.strip_chars()
-                    .str.replace_all(r"\s+", "\t")
-                    .str.split_exact("\t", 3)
-                    .struct.rename_fields(
-                        ["column_1", "column_2", "column_3", "column_4"]
-                    )
-                    .alias("_parts")
-                ).unnest("_parts")
-        elif df.width < 4:
-            raise CovariateError(f"{resolved}: expected at least 4 columns")
-
-        c1, c2, c3, c4 = df.columns[0], df.columns[1], df.columns[2], df.columns[3]
-        df = df.select(
-            pl.col(c1).str.strip_chars().alias("contig"),
-            pl.col(c2).str.strip_chars().alias("start_s"),
-            pl.col(c3).str.strip_chars().alias("end_s"),
-            pl.col(c4).str.strip_chars().alias("val_s"),
-        ).filter(
-            pl.col("contig").is_not_null()
-            & (pl.col("contig").str.len_bytes() > 0)
-            & ~pl.col("contig").str.starts_with("track")
-            & ~pl.col("contig").str.starts_with("browser")
+        col0 = df.columns[0]
+        df = df.select(pl.col(col0).str.strip_chars().alias("line")).filter(
+            pl.col("line").is_not_null()
+            & (pl.col("line").str.len_bytes() > 0)
+            & ~pl.col("line").str.starts_with("#")
+            & ~pl.col("line").str.starts_with("track")
+            & ~pl.col("line").str.starts_with("browser")
         )
-
         if df.height > 0:
+            df = df.select(
+                pl.col("line")
+                .str.replace_all(r"\s+", "\t")
+                .str.split_exact("\t", 3)
+                .struct.rename_fields(["contig", "start_s", "end_s", "val_s"])
+                .alias("_parts")
+            ).unnest("_parts")
+
             first_s = df.item(0, "start_s")
-            if isinstance(first_s, str) and not first_s.lstrip("-").isdigit():
+            first_v = df.item(0, "val_s")
+            if (
+                isinstance(first_s, str)
+                and isinstance(first_v, str)
+                and not first_s.lstrip("-").isdigit()
+            ):
                 df = df.slice(1)
 
         if df.height > 0:

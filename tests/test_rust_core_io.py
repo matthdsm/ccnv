@@ -23,8 +23,8 @@ from ccnv._core import (
     scan_fasta_gc_quantiles,
     write_bgzf_indexed,
 )
-from ccnv.io.tracks import load_gc_track
-from ccnv.models import AlignmentError
+from ccnv.io.tracks import load_gc_track, load_mappability_track
+from ccnv.models import AlignmentError, CovariateError
 from ccnv.stats.fragmentomics import encode_kmer_4
 
 
@@ -524,6 +524,132 @@ class TestRustCoreIO(unittest.TestCase):
                 self.assertEqual(
                     list(tbx_csi.fetch("chr1", 600_000_000, 600_005_000)),
                     ["chr1\t600000000\t600005000"],
+                )
+
+    def test_bgzf_parallel_batch_boundary_crossing_and_canonical_eof_frames(
+        self,
+    ) -> None:
+        bgzf_eof = (
+            b"\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff"
+            b"\x06\x00\x42\x43\x02\x00\x1b\x00\x03\x00"
+            b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bed_gz = root / "batch_boundary.bed.gz"
+            # 80,000 rows (~2.65 MB uncompressed > 32 * 65,280 = 2,088,960 bytes)
+            rows = [b"#contig\tstart\tend\tlog2_ratio\n"]
+            boundary_row_idx = 0
+            cum_len = len(rows[0])
+            for idx in range(80_000):
+                s = idx * 100
+                e = s + 100
+                line = f"chr1\t{s}\t{e}\t{idx * 0.001:.6f}\n".encode()
+                if cum_len < 2_088_960 <= cum_len + len(line):
+                    boundary_row_idx = idx
+                cum_len += len(line)
+                rows.append(line)
+            self.assertGreater(cum_len, 2_400_000)
+            self.assertGreater(boundary_row_idx, 0)
+
+            payload = b"".join(rows)
+            chunks = [payload[i : i + 31_337] for i in range(0, len(payload), 31_337)]
+            idx_tbi = write_bgzf_indexed(
+                str(bed_gz), "bed", ["chr1"], 10_000_000, chunks, 2
+            )
+            self.assertTrue(idx_tbi.endswith(".tbi"))
+
+            b_start = boundary_row_idx * 100
+            b_end = b_start + 100
+            with pysam.TabixFile(str(bed_gz)) as tbx:
+                self.assertEqual(
+                    list(tbx.fetch("chr1", b_start, b_end)),
+                    [f"chr1\t{b_start}\t{b_end}\t{boundary_row_idx * 0.001:.6f}"],
+                )
+                self.assertEqual(
+                    list(tbx.fetch("chr1", 7_999_900, 8_000_000)),
+                    [f"chr1\t7999900\t8000000\t{79999 * 0.001:.6f}"],
+                )
+
+            raw = bed_gz.read_bytes()
+            self.assertTrue(raw.endswith(bgzf_eof))
+            self.assertFalse(raw.endswith(bgzf_eof * 2))
+
+            pos = 0
+            frame_isizes: list[int] = []
+            while pos < len(raw):
+                self.assertEqual(raw[pos : pos + 4], b"\x1f\x8b\x08\x04")
+                bsize = int.from_bytes(raw[pos + 16 : pos + 18], "little") + 1
+                isize = int.from_bytes(raw[pos + bsize - 4 : pos + bsize], "little")
+                frame_isizes.append(isize)
+                pos += bsize
+            self.assertEqual(pos, len(raw))
+            self.assertGreater(len(frame_isizes), 33)
+            self.assertTrue(all(sz > 0 for sz in frame_isizes[:-1]))
+            self.assertEqual(frame_isizes[-1], 0)
+
+    def test_load_gc_track_bedgraph_with_ucsc_track_and_browser_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bedgraph_path = root / "ucsc_gc.bedgraph"
+            bedgraph_path.write_text(
+                "# UCSC GC track\n"
+                "browser position chr1:1-20000\n"
+                'track type=bedGraph name="GC" description="GC fraction"\n'
+                "chr1\t0\t5000\t0.44\n"
+                "chr1\t5000\t10000\t0.51\n"
+                "chr1\t10000\t15000\t0.39\n"
+                "chr1\t15000\t20000\t0.48\tignored_extra\n",
+                encoding="utf-8",
+            )
+            contigs = ["chr1", "chr1", "chr1", "chr1"]
+            starts = np.array([0, 5_000, 10_000, 15_000], dtype=np.int64)
+            ends = np.array([5_000, 10_000, 15_000, 20_000], dtype=np.int64)
+            gc_track, n_mask = load_gc_track(bedgraph_path, contigs, starts, ends)
+            np.testing.assert_allclose(gc_track, [0.44, 0.51, 0.39, 0.48], atol=1e-6)
+            self.assertFalse(bool(np.any(n_mask)))
+
+    def test_extract_contig_grid_rejects_mismatched_or_nonuniform_ends(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fa_path = _make_fasta(
+                root / "grid.fa",
+                {"chr1": "ACGT" * 2_500, "chr2": "GGCC" * 2_500},
+            )
+            bw_path = root / "grid.bw"
+            bw = pyBigWig.open(str(bw_path), "w")
+            assert bw is not None
+            try:
+                bw.addHeader([("chr1", 10_000), ("chr2", 10_000)])
+                bw.addEntries(
+                    ["chr1", "chr2"], [0, 0], ends=[10_000, 10_000], values=[0.9, 0.8]
+                )
+            finally:
+                bw.close()
+
+            # Case 1: starts=[0, 2500] aligned to bin_size=2500, but ends=[2500, 7500] spans 5000 bp
+            with self.assertRaises(CovariateError):
+                load_gc_track(
+                    fa_path,
+                    ["chr1", "chr1"],
+                    np.array([0, 2_500], dtype=np.int64),
+                    np.array([2_500, 7_500], dtype=np.int64),
+                )
+            with self.assertRaises(CovariateError):
+                load_mappability_track(
+                    bw_path,
+                    ["chr1", "chr1"],
+                    np.array([0, 2_500], dtype=np.int64),
+                    np.array([2_500, 7_500], dtype=np.int64),
+                )
+
+            # Case 2: multi-contig mixing 5 kb bins on chr1 with a 10 kb bin on chr2
+            with self.assertRaises(CovariateError):
+                load_mappability_track(
+                    bw_path,
+                    ["chr1", "chr1", "chr2"],
+                    np.array([0, 5_000, 0], dtype=np.int64),
+                    np.array([5_000, 10_000, 10_000], dtype=np.int64),
                 )
 
 

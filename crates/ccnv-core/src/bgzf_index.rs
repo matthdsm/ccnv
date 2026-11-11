@@ -241,7 +241,7 @@ struct ParallelBgzfBatcher {
     global_block_idx: usize,
     cur_block: Vec<u8>,
     ready_blocks: Vec<Vec<u8>>,
-    block_base_idx: usize,
+    block_offsets: Vec<u64>,
     pending_lines: Vec<PendingLine>,
 }
 
@@ -258,7 +258,7 @@ impl ParallelBgzfBatcher {
             global_block_idx: 0,
             cur_block: Vec::with_capacity(BGZF_MAX_PAYLOAD),
             ready_blocks: Vec::with_capacity(PARALLEL_BATCH_BLOCKS),
-            block_base_idx: 0,
+            block_offsets: vec![0],
             pending_lines: Vec::new(),
         })
     }
@@ -334,49 +334,45 @@ impl ParallelBgzfBatcher {
                 blocks_to_compress
                     .par_iter()
                     .map(|payload| {
-                        let mut encoded = Vec::with_capacity(payload.len() + 64);
-                        {
-                            let mut w = bgzf::io::Writer::new(&mut encoded);
-                            w.write_all(payload)
-                                .map_err(|e| format!("BGZF compress error: {e}"))?;
-                            w.flush().map_err(|e| format!("BGZF flush error: {e}"))?;
-                        }
-                        Ok(encoded)
+                        let mut w = bgzf::io::Writer::new(Vec::with_capacity(payload.len() + 64));
+                        w.write_all(payload)
+                            .map_err(|e| format!("BGZF compress error: {e}"))?;
+                        w.flush().map_err(|e| format!("BGZF flush error: {e}"))?;
+                        Ok(w.into_inner())
                     })
                     .collect()
             })
         });
         let compressed = compressed_blocks.map_err(PyIOError::new_err)?;
 
-        let mut block_offsets = Vec::with_capacity(compressed.len() + 1);
         for blk in &compressed {
-            block_offsets.push(self.file_offset);
             self.out
                 .write_all(blk)
                 .map_err(|e| PyIOError::new_err(format!("BGZF disk write error: {e}")))?;
             self.file_offset += blk.len() as u64;
+            self.block_offsets.push(self.file_offset);
         }
-        block_offsets.push(self.file_offset);
 
-        let max_flushed_block = self.block_base_idx + compressed.len();
+        let max_flushed_block = self.block_offsets.len() - 1;
         let mut remaining_lines = Vec::new();
         for line in self.pending_lines.drain(..) {
             let end_ready = line.end_block < max_flushed_block
                 || (line.end_block == max_flushed_block && line.end_uncompressed == 0);
             if end_ready {
-                let s_rel = line.start_block - self.block_base_idx;
-                let e_rel = line.end_block - self.block_base_idx;
-                let vp_start = VirtualPosition::new(block_offsets[s_rel], line.start_uncompressed)
-                    .ok_or_else(|| PyValueError::new_err("BGZF virtual position overflow"))?;
-                let vp_end = VirtualPosition::new(block_offsets[e_rel], line.end_uncompressed)
-                    .ok_or_else(|| PyValueError::new_err("BGZF virtual position overflow"))?;
+                let vp_start = VirtualPosition::new(
+                    self.block_offsets[line.start_block],
+                    line.start_uncompressed,
+                )
+                .ok_or_else(|| PyValueError::new_err("BGZF virtual position overflow"))?;
+                let vp_end =
+                    VirtualPosition::new(self.block_offsets[line.end_block], line.end_uncompressed)
+                        .ok_or_else(|| PyValueError::new_err("BGZF virtual position overflow"))?;
                 sink.add_line(preset, &line.raw_without_nl, Chunk::new(vp_start, vp_end))?;
             } else {
                 remaining_lines.push(line);
             }
         }
         self.pending_lines = remaining_lines;
-        self.block_base_idx = max_flushed_block;
         Ok(())
     }
 
