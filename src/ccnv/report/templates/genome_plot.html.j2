@@ -110,6 +110,20 @@
     flex: 1;
     width: 100%;
     min-height: 0;
+    position: relative;
+  }
+  #bin-tooltip {
+    display: none;
+    position: fixed;
+    z-index: 9999;
+    pointer-events: none;
+    background: rgba(15, 23, 42, 0.92);
+    color: #f8fafc;
+    padding: 6px 9px;
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.35;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
   }
 </style>
 </head>
@@ -144,6 +158,7 @@
   </div>
 </div>
 <div id="plot"></div>
+<div id="bin-tooltip"></div>
 <script id="ccnv-data" type="application/json">{{ payload_json | safe }}</script>
 <script>
 (() => {
@@ -156,8 +171,8 @@
     return new T(u8.buffer);
   };
   const binC = b64(D.bins.c, Uint16Array);
-  const binS = b64(D.bins.s, Int32Array);
-  const binE = b64(D.bins.e, Int32Array);
+  const binS = b64(D.bins.s, Uint32Array);
+  const binE = b64(D.bins.e, Uint32Array);
   const binR = b64(D.bins.r, Float32Array);
   const binZ = b64(D.bins.z, Float32Array);
   const N = D.n_bins;
@@ -174,13 +189,22 @@
   }
   if (totalLen <= 0) totalLen = 1;
 
-  const binX = new Float64Array(N);
-  const binHover = new Array(N);
+  const Y_LIM = 2.5;
+  const clampY = v => Math.max(-Y_LIM, Math.min(Y_LIM, v));
+
+  const binX = new Float32Array(N);
+  const binY = new Float32Array(N);
   for (let i = 0; i < N; i++) {
     const ci = binC[i];
     binX[i] = offsets[ci] + 0.5 * (binS[i] + binE[i]);
-    binHover[i] = `${D.contigs[ci]}:${binS[i].toLocaleString()}-${binE[i].toLocaleString()}<br>Log2R: ${binR[i].toFixed(3)} | Z: ${binZ[i].toFixed(2)}`;
+    binY[i] = clampY(binR[i]);
   }
+
+  const escHtml = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const formatBinHover = i => {
+    const ci = binC[i];
+    return `${escHtml(D.contigs[ci])}:${binS[i].toLocaleString()}-${binE[i].toLocaleString()}<br>Log2R: ${binR[i].toFixed(3)} | Z: ${binZ[i].toFixed(2)}`;
+  };
 
   const zInput = document.getElementById("z-input");
   const rInput = document.getElementById("r-input");
@@ -315,17 +339,13 @@
     }
   }
 
-  const Y_LIM = 2.5;
-  const clampY = v => Math.max(-Y_LIM, Math.min(Y_LIM, v));
-
-  const mkScatter = (name, x, y, text, color, size, op) => ({
+  const mkScatter = (name, x, y, color, size, op) => ({
     type: "scattergl",
     mode: "markers",
     name,
     x,
     y,
-    text,
-    hoverinfo: "text",
+    hoverinfo: "none",
     marker: { color, size, opacity: op },
     showlegend: false
   });
@@ -342,14 +362,54 @@
     showlegend: false
   });
 
+  const clsBuf = new Int8Array(N);
+  let binTraceIdx = [new Uint32Array(0), new Uint32Array(0), new Uint32Array(0)];
+
   const buildTraces = (zT, rT) => {
-    const binBuckets = { 0: { x: [], y: [], t: [] }, 1: { x: [], y: [], t: [] }, [-1]: { x: [], y: [], t: [] } };
+    let n0 = 0;
+    let n1 = 0;
+    let nNeg = 0;
     for (let i = 0; i < N; i++) {
-      const b = binBuckets[classify(binR[i], binZ[i], zT, rT)] || binBuckets[0];
-      b.x.push(binX[i]);
-      b.y.push(clampY(binR[i]));
-      b.t.push(binHover[i]);
+      const c = classify(binR[i], binZ[i], zT, rT);
+      clsBuf[i] = c;
+      if (c === 1) n1++;
+      else if (c === -1) nNeg++;
+      else n0++;
     }
+
+    const x0Arr = new Float32Array(n0);
+    const y0Arr = new Float32Array(n0);
+    const i0Arr = new Uint32Array(n0);
+    const x1Arr = new Float32Array(n1);
+    const y1Arr = new Float32Array(n1);
+    const i1Arr = new Uint32Array(n1);
+    const xNegArr = new Float32Array(nNeg);
+    const yNegArr = new Float32Array(nNeg);
+    const iNegArr = new Uint32Array(nNeg);
+
+    let p0 = 0;
+    let p1 = 0;
+    let pNeg = 0;
+    for (let i = 0; i < N; i++) {
+      const c = clsBuf[i];
+      if (c === 1) {
+        x1Arr[p1] = binX[i];
+        y1Arr[p1] = binY[i];
+        i1Arr[p1] = i;
+        p1++;
+      } else if (c === -1) {
+        xNegArr[pNeg] = binX[i];
+        yNegArr[pNeg] = binY[i];
+        iNegArr[pNeg] = i;
+        pNeg++;
+      } else {
+        x0Arr[p0] = binX[i];
+        y0Arr[p0] = binY[i];
+        i0Arr[p0] = i;
+        p0++;
+      }
+    }
+    binTraceIdx = [i0Arr, i1Arr, iNegArr];
 
     const segBuckets = {
       neutral: { x: [], y: [], t: [] },
@@ -402,9 +462,9 @@
     }
 
     const traces = [
-      mkScatter("Bins (Neutral)", binBuckets[0].x, binBuckets[0].y, binBuckets[0].t, "#94a3b8", 3.5, 0.7),
-      mkScatter("Bins (Gain)", binBuckets[1].x, binBuckets[1].y, binBuckets[1].t, "#e11d48", 4.5, 0.85),
-      mkScatter("Bins (Loss)", binBuckets[-1].x, binBuckets[-1].y, binBuckets[-1].t, "#16a34a", 4.5, 0.85),
+      mkScatter("Bins (Neutral)", x0Arr, y0Arr, "#94a3b8", 3.5, 0.7),
+      mkScatter("Bins (Gain)", x1Arr, y1Arr, "#e11d48", 4.5, 0.85),
+      mkScatter("Bins (Loss)", xNegArr, yNegArr, "#16a34a", 4.5, 0.85),
       mkLines("Segments (Neutral)", segBuckets.neutral.x, segBuckets.neutral.y, segBuckets.neutral.t, "#1e293b", 2.2),
       mkLines("Segments (Gain)", segBuckets.gain.x, segBuckets.gain.y, segBuckets.gain.t, "#c43c39", 3),
       mkLines("Segments (Loss)", segBuckets.loss.x, segBuckets.loss.y, segBuckets.loss.t, "#3c8c5a", 3),
@@ -475,17 +535,55 @@
   }
 
   const plotEl = document.getElementById("plot");
+  const tooltipEl = document.getElementById("bin-tooltip");
   const config = { responsive: true, scrollZoom: true, displaylogo: false };
-  Plotly.newPlot(plotEl, buildTraces(D.z_thresh, D.r_thresh), layout, config);
+
+  const attachHoverHandlers = () => {
+    if (!plotEl || typeof plotEl.on !== "function") return;
+    plotEl.on("plotly_hover", ev => {
+      const pt = ev && ev.points && ev.points[0];
+      if (!pt || pt.curveNumber > 2) {
+        tooltipEl.style.display = "none";
+        return;
+      }
+      const idxArr = binTraceIdx[pt.curveNumber];
+      const pointIdx = pt.pointNumber !== undefined ? pt.pointNumber : pt.pointIndex;
+      if (!idxArr || pointIdx === undefined || pointIdx < 0 || pointIdx >= idxArr.length) {
+        tooltipEl.style.display = "none";
+        return;
+      }
+      tooltipEl.innerHTML = formatBinHover(idxArr[pointIdx]);
+      if (ev.event) {
+        tooltipEl.style.left = `${ev.event.clientX + 12}px`;
+        tooltipEl.style.top = `${ev.event.clientY + 12}px`;
+      }
+      tooltipEl.style.display = "block";
+    });
+    plotEl.on("plotly_unhover", () => {
+      tooltipEl.style.display = "none";
+    });
+  };
+
+  Plotly.newPlot(plotEl, buildTraces(D.z_thresh, D.r_thresh), layout, config).then(attachHoverHandlers);
 
   const updateThresholds = () => {
     const zT = Math.max(0, parseFloat(zInput.value) || 0);
     const rT = Math.max(0, parseFloat(rInput.value) || 0);
     layout.xaxis.range = plotEl.layout.xaxis.range;
+    tooltipEl.style.display = "none";
     Plotly.react(plotEl, buildTraces(zT, rT), layout, config);
   };
-  zInput.addEventListener("input", updateThresholds);
-  rInput.addEventListener("input", updateThresholds);
+
+  let thresholdTimer = null;
+  const scheduleThresholdUpdate = () => {
+    if (thresholdTimer !== null) clearTimeout(thresholdTimer);
+    thresholdTimer = setTimeout(() => {
+      thresholdTimer = null;
+      updateThresholds();
+    }, 100);
+  };
+  zInput.addEventListener("input", scheduleThresholdUpdate);
+  rInput.addEventListener("input", scheduleThresholdUpdate);
 
   const parseBp = s => {
     const clean = s.replace(/,/g, "").trim().toLowerCase();

@@ -454,7 +454,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             sample = _write_sample(root / "s1.ccnv")
             reference = _write_reference(root / "ref.ccnv")
 
-            # Default: vcf=True
+            # Default: vcf=True, bins_vcf=False
             with patch("ccnv.cli.run_predict") as run:
                 result = CliRunner().invoke(
                     app, ["predict", str(sample), str(reference)]
@@ -462,6 +462,28 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0, result.output)
                 config = run.call_args.args[0]
                 self.assertTrue(config.vcf)
+                self.assertFalse(config.bins_vcf)
+
+            # Explicit --bins-vcf and -t/--threads
+            with patch("ccnv.cli.run_predict") as run:
+                result = CliRunner().invoke(
+                    app,
+                    ["predict", str(sample), str(reference), "--bins-vcf", "-t", "3"],
+                )
+                self.assertEqual(result.exit_code, 0, result.output)
+                config = run.call_args.args[0]
+                self.assertTrue(config.vcf)
+                self.assertTrue(config.bins_vcf)
+                self.assertEqual(config.threads, 3)
+
+            # Explicit --no-bins-vcf
+            with patch("ccnv.cli.run_predict") as run:
+                result = CliRunner().invoke(
+                    app, ["predict", str(sample), str(reference), "--no-bins-vcf"]
+                )
+                self.assertEqual(result.exit_code, 0, result.output)
+                config = run.call_args.args[0]
+                self.assertFalse(config.bins_vcf)
 
             # Explicit --no-vcf
             with patch("ccnv.cli.run_predict") as run:

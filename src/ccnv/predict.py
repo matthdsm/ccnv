@@ -214,6 +214,8 @@ def run(config: PredictConfig) -> PredictionOutputs:
         contig_lengths=inputs.contig_lengths,
         plot=config.plot,
         vcf=config.vcf,
+        bins_vcf=config.bins_vcf,
+        threads=config.threads,
         cytobands=cytobands_track,
         z_threshold=config.z_threshold,
         ratio_threshold=config.ratio_threshold,

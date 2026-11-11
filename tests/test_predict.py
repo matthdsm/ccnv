@@ -742,16 +742,16 @@ class TestPredictPublishedCrams(unittest.TestCase):
                 Path(str(bins_bed) + ".tbi"),
                 Path(str(segments_bed) + ".tbi"),
                 Path(str(calls_bed) + ".tbi"),
-                bins_vcf,
                 segments_vcf,
                 calls_vcf,
-                Path(str(bins_vcf) + ".tbi"),
                 Path(str(segments_vcf) + ".tbi"),
                 Path(str(calls_vcf) + ".tbi"),
                 plot_html,
                 qc_json,
             ):
                 self.assertTrue(path.is_file(), path)
+            self.assertFalse(bins_vcf.exists())
+            self.assertFalse(Path(str(bins_vcf) + ".tbi").exists())
             self.assertFalse(Path(f"{predict_prefix}_bins.ccnv").exists())
             self.assertFalse(Path(f"{predict_prefix}_segments.ccnv").exists())
 
@@ -782,11 +782,28 @@ class TestPredictPublishedCrams(unittest.TestCase):
                 CALLS_BED_HEADER,
             )
 
-            with pysam.TabixFile(str(bins_vcf)) as tb:
+            self.assertGreater(plot_html.stat().st_size, 0)
+
+            opt_in_prefix = root / "prediction_with_bins"
+            result_bins = runner.invoke(
+                app,
+                [
+                    "predict",
+                    str(sample_a),
+                    str(parquet_path(reference_prefix)),
+                    "--prefix",
+                    str(opt_in_prefix),
+                    "--bins-vcf",
+                    "--no-plot",
+                ],
+            )
+            self.assertEqual(result_bins.exit_code, 0, result_bins.output)
+            opt_in_bins_vcf = Path(f"{opt_in_prefix}_bins.vcf.gz")
+            self.assertTrue(opt_in_bins_vcf.is_file())
+            self.assertTrue(Path(f"{opt_in_bins_vcf}.tbi").is_file())
+            with pysam.TabixFile(str(opt_in_bins_vcf)) as tb:
                 records = list(tb.fetch("chr21", 0, CHR21_LENGTH))
                 self.assertEqual(len(records), 468)
-
-            self.assertGreater(plot_html.stat().st_size, 0)
 
     def test_normalize_branch_zero_null_std_mad_fallback(self) -> None:
         pids, pweights = _proto_arrays(4)

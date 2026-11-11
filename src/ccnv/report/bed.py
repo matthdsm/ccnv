@@ -1,20 +1,27 @@
-"""Formatted BED generation with bgzip compression and tabix indexing."""
+"""Formatted BED generation with single-pass Rust BGZF compression and Tabix/CSI indexing."""
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Final
 
 import numpy as np
-import pysam
+import polars as pl
 
+from ccnv._core import write_bgzf_indexed
 from ccnv.models import BinResult, SegmentResult, natural_sort_key
 
+type BinResults = Sequence[BinResult]
+
+BED_CHUNK_ROWS: Final[int] = 65_536
+
 __all__ = [
+    "BED_CHUNK_ROWS",
     "BINS_BED_HEADER",
     "CALLS_BED_HEADER",
     "PRENATAL_CALLS_BED_HEADER",
     "PRENATAL_SEGMENTS_BED_HEADER",
     "SEGMENTS_BED_HEADER",
+    "BinResults",
     "bin_bed_rows",
     "calls_bed_rows",
     "format_bed_float",
@@ -24,7 +31,9 @@ __all__ = [
     "sort_bin_result",
     "sort_bin_results",
     "sort_segments",
+    "write_bins_bed_streaming",
     "write_compressed_bed",
+    "write_segments_bed_streaming",
 ]
 
 BINS_BED_HEADER: Final[tuple[str, ...]] = (
@@ -89,6 +98,34 @@ PRENATAL_CALLS_BED_HEADER: Final[tuple[str, ...]] = (
     "frag_llr_size",
     "origin_call",
 )
+
+
+def _validate_threads(threads: int) -> None:
+    if isinstance(threads, bool) or threads < 1:
+        raise ValueError("threads must be a positive integer")
+
+
+def _finite_or_nan(value: float) -> float:
+    return float(value) if np.isfinite(value) else float("nan")
+
+
+def _optional_bed_float(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return float(value) if np.isfinite(value) else float("nan")
+
+
+def _merge_contig_bounds(
+    seen_contigs: dict[str, None],
+    max_end: int,
+    contig_lengths: Mapping[str, int] | None,
+) -> tuple[list[str], int]:
+    if contig_lengths:
+        for contig_name in sorted(contig_lengths, key=natural_sort_key):
+            seen_contigs.setdefault(contig_name, None)
+        cl_max = max(contig_lengths.values(), default=0)
+        max_end = max(max_end, cl_max)
+    return list(seen_contigs.keys()), max_end
 
 
 def format_bed_float(value: float) -> str:
@@ -244,13 +281,249 @@ def calls_bed_rows(
     )
 
 
-def write_compressed_bed(
-    gz_path: Path, header: tuple[str, ...], rows: Iterable[tuple[object, ...]]
+def write_bins_bed_streaming(
+    gz_path: Path,
+    bin_results: BinResults,
+    *,
+    contig_lengths: Mapping[str, int] | None = None,
+    threads: int = 1,
 ) -> Path:
-    """Write tab-delimited records to a bgzipped file with tabix index."""
-    with pysam.BGZFile(str(gz_path), "wb") as bgz:
-        bgz.write(("\t".join(header) + "\n").encode("utf-8"))
-        for row in rows:
-            bgz.write(("\t".join(str(value) for value in row) + "\n").encode("utf-8"))
-    pysam.tabix_index(str(gz_path), preset="bed", force=True)
+    """Stream bin evidence in 65,536-row Polars TSV slices to Rust BGZF+Tabix/CSI."""
+    _validate_threads(threads)
+    ordered_results = sort_bin_results(tuple(bin_results))
+
+    seen_contigs: dict[str, None] = {}
+    max_end = 0
+    for res in ordered_results:
+        for contig_name in dict.fromkeys(res.contigs):
+            seen_contigs[contig_name] = None
+        if res.ends.size > 0:
+            res_max = int(np.max(res.ends))
+            max_end = max(max_end, res_max)
+    contig_names, max_end = _merge_contig_bounds(seen_contigs, max_end, contig_lengths)
+
+    def _chunks() -> Iterator[bytes]:
+        yield ("\t".join(BINS_BED_HEADER) + "\n").encode("utf-8")
+        for res in ordered_results:
+            n_rows = len(res.contigs)
+            for offset in range(0, n_rows, BED_CHUNK_ROWS):
+                stop = min(offset + BED_CHUNK_ROWS, n_rows)
+                r_raw = res.ratios[offset:stop]
+                z_raw = res.zscores[offset:stop]
+                w_raw = res.weights[offset:stop]
+                df = pl.DataFrame(
+                    {
+                        "contig": pl.Series(
+                            "contig", res.contigs[offset:stop], dtype=pl.String
+                        ),
+                        "start": np.asarray(res.starts[offset:stop], dtype=np.int64),
+                        "end": np.asarray(res.ends[offset:stop], dtype=np.int64),
+                        "ratio": np.where(np.isfinite(r_raw), r_raw, np.nan).astype(
+                            np.float64, copy=False
+                        ),
+                        "zscore": np.where(np.isfinite(z_raw), z_raw, np.nan).astype(
+                            np.float64, copy=False
+                        ),
+                        "weight": np.where(np.isfinite(w_raw), w_raw, np.nan).astype(
+                            np.float64, copy=False
+                        ),
+                        "reference_size": np.asarray(
+                            res.reference_sizes[offset:stop], dtype=np.int64
+                        ),
+                        "masked": np.asarray(res.masked[offset:stop], dtype=np.bool_),
+                    }
+                ).select(
+                    pl.col("contig"),
+                    pl.col("start"),
+                    pl.col("end"),
+                    pl.concat_str(
+                        [
+                            pl.col("contig"),
+                            pl.lit(":"),
+                            pl.col("start").cast(pl.String),
+                            pl.lit("-"),
+                            pl.col("end").cast(pl.String),
+                        ]
+                    ).alias("id"),
+                    pl.col("ratio"),
+                    pl.col("zscore"),
+                    pl.col("weight"),
+                    pl.col("reference_size"),
+                    pl.col("masked"),
+                    pl.lit(res.branch, dtype=pl.String).alias("branch"),
+                )
+                csv_str = df.write_csv(
+                    None,
+                    separator="\t",
+                    include_header=False,
+                    float_precision=6,
+                    null_value=".",
+                    quote_style="never",
+                )
+                yield csv_str.encode("utf-8")
+
+    write_bgzf_indexed(
+        str(gz_path),
+        "bed",
+        contig_names,
+        max_end,
+        _chunks(),
+        threads,
+    )
+    return gz_path
+
+
+def write_segments_bed_streaming(
+    gz_path: Path,
+    segments: Sequence[SegmentResult],
+    *,
+    calls_only: bool = False,
+    is_prenatal: bool = False,
+    contig_lengths: Mapping[str, int] | None = None,
+    threads: int = 1,
+) -> Path:
+    """Stream segment or call records in 65,536-row Polars TSV slices to Rust BGZF+Tabix/CSI."""
+    _validate_threads(threads)
+    items = [s for s in sort_segments(segments) if not calls_only or s.call is not None]
+    if calls_only:
+        header = PRENATAL_CALLS_BED_HEADER if is_prenatal else CALLS_BED_HEADER
+    else:
+        header = PRENATAL_SEGMENTS_BED_HEADER if is_prenatal else SEGMENTS_BED_HEADER
+
+    seen_contigs: dict[str, None] = {}
+    max_end = 0
+    for item in items:
+        seen_contigs[item.contig] = None
+        if item.end > max_end:
+            max_end = int(item.end)
+    contig_names, max_end = _merge_contig_bounds(seen_contigs, max_end, contig_lengths)
+
+    def _chunks() -> Iterator[bytes]:
+        yield ("\t".join(header) + "\n").encode("utf-8")
+        for offset in range(0, len(items), BED_CHUNK_ROWS):
+            batch = items[offset : offset + BED_CHUNK_ROWS]
+            cols: dict[str, pl.Series] = {
+                "contig": pl.Series(
+                    "contig", [s.contig for s in batch], dtype=pl.String
+                ),
+                "start": pl.Series(
+                    "start", [int(s.start) for s in batch], dtype=pl.Int64
+                ),
+                "end": pl.Series("end", [int(s.end) for s in batch], dtype=pl.Int64),
+                "ratio": pl.Series(
+                    "ratio", [_finite_or_nan(s.ratio) for s in batch], dtype=pl.Float64
+                ),
+                "zscore": pl.Series(
+                    "zscore",
+                    [_finite_or_nan(s.zscore) for s in batch],
+                    dtype=pl.Float64,
+                ),
+            }
+            if calls_only:
+                cols["type"] = pl.Series(
+                    "type", [s.call or "" for s in batch], dtype=pl.String
+                )
+            else:
+                cols["weight"] = pl.Series(
+                    "weight",
+                    [_finite_or_nan(s.weight) for s in batch],
+                    dtype=pl.Float64,
+                )
+                cols["bin_count"] = pl.Series(
+                    "bin_count", [int(s.bin_count) for s in batch], dtype=pl.Int64
+                )
+                cols["call"] = pl.Series(
+                    "call", [s.call or "" for s in batch], dtype=pl.String
+                )
+            if is_prenatal:
+                cols["expected_ratio"] = pl.Series(
+                    "expected_ratio",
+                    [_optional_bed_float(s.expected_ratio) for s in batch],
+                    dtype=pl.Float64,
+                )
+                cols["implied_ff"] = pl.Series(
+                    "implied_ff",
+                    [_optional_bed_float(s.implied_ff) for s in batch],
+                    dtype=pl.Float64,
+                )
+                cols["discordant"] = pl.Series(
+                    "discordant", [bool(s.discordant) for s in batch], dtype=pl.Boolean
+                )
+                cols["discordance_reason"] = pl.Series(
+                    "discordance_reason",
+                    [s.discordance_reason or "" for s in batch],
+                    dtype=pl.String,
+                )
+                cols["frag_short_ratio"] = pl.Series(
+                    "frag_short_ratio",
+                    [_optional_bed_float(s.frag_short_ratio) for s in batch],
+                    dtype=pl.Float64,
+                )
+                cols["frag_llr_size"] = pl.Series(
+                    "frag_llr_size",
+                    [_optional_bed_float(s.frag_llr_size) for s in batch],
+                    dtype=pl.Float64,
+                )
+                cols["origin_call"] = pl.Series(
+                    "origin_call",
+                    [s.origin_call or "" for s in batch],
+                    dtype=pl.String,
+                )
+            csv_str = pl.DataFrame(cols).write_csv(
+                None,
+                separator="\t",
+                include_header=False,
+                float_precision=6,
+                null_value="",
+                quote_style="never",
+            )
+            yield csv_str.encode("utf-8")
+
+    write_bgzf_indexed(
+        str(gz_path),
+        "bed",
+        contig_names,
+        max_end,
+        _chunks(),
+        threads,
+    )
+    return gz_path
+
+
+def write_compressed_bed(
+    gz_path: Path,
+    header: Sequence[str],
+    rows: Iterable[Sequence[object]],
+    *,
+    contig_lengths: Mapping[str, int] | None = None,
+    threads: int = 1,
+) -> Path:
+    """Write tab-delimited records to a BGZF-compressed file with Tabix/CSI index."""
+    _validate_threads(threads)
+    row_list = rows if isinstance(rows, Sequence) else list(rows)
+    seen_contigs: dict[str, None] = {}
+    max_end = 0
+    for row in row_list:
+        seen_contigs[str(row[0])] = None
+        end_val = int(str(row[2]))
+        max_end = max(max_end, end_val)
+    contig_names, max_end = _merge_contig_bounds(seen_contigs, max_end, contig_lengths)
+
+    def _chunks() -> Iterator[bytes]:
+        yield ("\t".join(header) + "\n").encode("utf-8")
+        for offset in range(0, len(row_list), BED_CHUNK_ROWS):
+            batch = row_list[offset : offset + BED_CHUNK_ROWS]
+            block = "".join(
+                "\t".join(str(value) for value in row) + "\n" for row in batch
+            )
+            yield block.encode("utf-8")
+
+    write_bgzf_indexed(
+        str(gz_path),
+        "bed",
+        contig_names,
+        max_end,
+        _chunks(),
+        threads,
+    )
     return gz_path

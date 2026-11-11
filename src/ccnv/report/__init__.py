@@ -19,16 +19,18 @@ from ccnv.report.bed import (
     PRENATAL_CALLS_BED_HEADER,
     PRENATAL_SEGMENTS_BED_HEADER,
     SEGMENTS_BED_HEADER,
-    bin_bed_rows,
-    calls_bed_rows,
-    segment_bed_rows,
+    BinResults,
     sort_bin_result,
     sort_bin_results,
     sort_segments,
+    write_bins_bed_streaming,
     write_compressed_bed,
+    write_segments_bed_streaming,
 )
 from ccnv.report.html import (
+    DEFAULT_MAX_PLOT_BINS,
     PLOTLY_CDN_URL,
+    decimate_bins_m4,
     encode_b64,
     render_genome_plot,
     write_genome_plot,
@@ -37,6 +39,7 @@ from ccnv.report.vcf import (
     build_vcf_header,
     write_bins_vcf,
     write_segments_vcf,
+    write_vcf_streaming,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,23 +47,30 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "BINS_BED_HEADER",
     "CALLS_BED_HEADER",
+    "DEFAULT_MAX_PLOT_BINS",
     "PLOTLY_CDN_URL",
     "PRENATAL_CALLS_BED_HEADER",
     "PRENATAL_SEGMENTS_BED_HEADER",
     "SEGMENTS_BED_HEADER",
+    "BinResults",
     "PredictionOutputs",
     "build_vcf_header",
+    "decimate_bins_m4",
     "encode_b64",
     "natural_sort_key",
     "render_genome_plot",
     "sort_bin_result",
     "sort_bin_results",
     "sort_segments",
+    "write_bins_bed_streaming",
     "write_bins_vcf",
     "write_compressed_bed",
+    "write_deliverables",
     "write_genome_plot",
     "write_outputs",
+    "write_segments_bed_streaming",
     "write_segments_vcf",
+    "write_vcf_streaming",
 ]
 
 
@@ -72,6 +82,8 @@ def write_outputs(
     plot: bool,
     vcf: bool = True,
     *,
+    bins_vcf: bool = False,
+    threads: int = 1,
     cytobands: Sequence[Cytoband] | None = None,
     z_threshold: float = 3.0,
     ratio_threshold: float | None = None,
@@ -79,7 +91,7 @@ def write_outputs(
     mode: AnalysisMode = "germline",
     qc_json_path: Path | None = None,
 ) -> PredictionOutputs:
-    """Write compressed BED evidence, VCFs, and an interactive HTML plot."""
+    """Write compressed BED evidence, optional VCFs, and an interactive HTML plot."""
     prefix.parent.mkdir(parents=True, exist_ok=True)
     bins = sort_bin_results(bins)
     segments = sort_segments(segments)
@@ -91,45 +103,56 @@ def write_outputs(
     calls = [item for item in segments if item.call is not None]
     total_bins = sum(b.starts.size for b in bins)
     is_prenatal = mode == "prenatal"
-    seg_header = PRENATAL_SEGMENTS_BED_HEADER if is_prenatal else SEGMENTS_BED_HEADER
-    call_header = PRENATAL_CALLS_BED_HEADER if is_prenatal else CALLS_BED_HEADER
 
     logger.debug(
         "writing prediction outputs to prefix %s "
-        "(%d bins, %d segments, %d calls, mode=%s)",
+        "(%d bins, %d segments, %d calls, mode=%s, threads=%d)",
         prefix,
         total_bins,
         len(segments),
         len(calls),
         mode,
+        threads,
     )
-    write_compressed_bed(bins_bed, BINS_BED_HEADER, bin_bed_rows(bins))
-    write_compressed_bed(
-        segments_bed, seg_header, segment_bed_rows(segments, is_prenatal=is_prenatal)
+    write_bins_bed_streaming(
+        bins_bed, bins, contig_lengths=contig_lengths, threads=threads
     )
-    write_compressed_bed(
+    write_segments_bed_streaming(
+        segments_bed,
+        segments,
+        calls_only=False,
+        is_prenatal=is_prenatal,
+        contig_lengths=contig_lengths,
+        threads=threads,
+    )
+    write_segments_bed_streaming(
         calls_bed,
-        call_header,
-        calls_bed_rows(calls, is_prenatal=is_prenatal),
+        calls,
+        calls_only=True,
+        is_prenatal=is_prenatal,
+        contig_lengths=contig_lengths,
+        threads=threads,
     )
-    bins_vcf: Path | None = None
-    segments_vcf: Path | None = None
-    calls_vcf: Path | None = None
+
+    bins_vcf_path: Path | None = None
+    segments_vcf_path: Path | None = None
+    calls_vcf_path: Path | None = None
     if vcf:
-        bins_vcf = Path(f"{prefix}_bins.vcf.gz")
-        segments_vcf = Path(f"{prefix}_segments.vcf.gz")
-        calls_vcf = Path(f"{prefix}_calls.vcf.gz")
-        write_bins_vcf(
-            bins_vcf,
-            build_vcf_header(
-                contig_lengths,
+        if bins_vcf:
+            bins_vcf_path = Path(f"{prefix}_bins.vcf.gz")
+            write_bins_vcf(
+                bins_vcf_path,
+                build_vcf_header(
+                    contig_lengths,
+                    sample_name,
+                    "bins",
+                    extra_contigs=(c for r in bins for c in dict.fromkeys(r.contigs)),
+                ),
+                bins,
                 sample_name,
-                "bins",
-                extra_contigs=(c for r in bins for c in r.contigs),
-            ),
-            bins,
-            sample_name,
-        )
+                contig_lengths=contig_lengths,
+                threads=threads,
+            )
         seg_header_vcf = build_vcf_header(
             contig_lengths,
             sample_name,
@@ -137,21 +160,28 @@ def write_outputs(
             extra_contigs=(s.contig for s in segments),
             prenatal_result=prenatal_result if is_prenatal else None,
         )
+        segments_vcf_path = Path(f"{prefix}_segments.vcf.gz")
+        calls_vcf_path = Path(f"{prefix}_calls.vcf.gz")
         write_segments_vcf(
-            segments_vcf,
+            segments_vcf_path,
             seg_header_vcf,
             segments,
             sample_name,
             is_prenatal=is_prenatal,
+            contig_lengths=contig_lengths,
+            threads=threads,
         )
         write_segments_vcf(
-            calls_vcf,
+            calls_vcf_path,
             seg_header_vcf,
-            segments,
+            calls,
             sample_name,
             calls_only=True,
             is_prenatal=is_prenatal,
+            contig_lengths=contig_lengths,
+            threads=threads,
         )
+
     logger.debug(
         "wrote %s, %s, %s",
         bins_bed.name,
@@ -175,11 +205,14 @@ def write_outputs(
         segments_bed=segments_bed,
         calls_bed=calls_bed,
         plot_html=plot_path,
-        bins_vcf=bins_vcf,
-        segments_vcf=segments_vcf,
-        calls_vcf=calls_vcf,
+        bins_vcf=bins_vcf_path,
+        segments_vcf=segments_vcf_path,
+        calls_vcf=calls_vcf_path,
         bins=bins,
         segments=segments,
         qc_json_path=qc_json_path,
         prenatal_result=prenatal_result,
     )
+
+
+write_deliverables = write_outputs

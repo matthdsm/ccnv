@@ -131,10 +131,13 @@ class TestVcfReport(unittest.TestCase):
             sample_name="TEST_SAMPLE",
             record_type="segments",
         )
-        self.assertIn("TEST_SAMPLE", list(header.samples))
-        self.assertIn("chr1", list(header.contigs))
-        self.assertIn("LOG2R", list(header.formats))
-        self.assertIn("SVTYPE", list(header.info))
+        self.assertEqual(header[0], "##fileformat=VCFv4.2")
+        self.assertTrue(
+            any("##contig=<ID=chr1,length=1000>" in line for line in header)
+        )
+        self.assertTrue(any("##FORMAT=<ID=LOG2R," in line for line in header))
+        self.assertTrue(any("##INFO=<ID=SVTYPE," in line for line in header))
+        self.assertTrue(header[-1].endswith("\tTEST_SAMPLE"))
 
     def test_write_segments_vcf(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -228,10 +231,29 @@ class TestWriteOutputs(unittest.TestCase):
             self.assertTrue(res.bins_bed.is_file())
             self.assertTrue(res.segments_bed.is_file())
             self.assertTrue(res.calls_bed.is_file())
-            self.assertIsNotNone(res.bins_vcf)
+            self.assertIsNone(res.bins_vcf)
+            self.assertFalse(Path(f"{prefix}_bins.vcf.gz").exists())
+            self.assertIsNotNone(res.segments_vcf)
+            self.assertIsNotNone(res.calls_vcf)
             self.assertIsNotNone(res.plot_html)
-            self.assertTrue(res.bins_vcf.is_file())
+            assert res.segments_vcf is not None
+            assert res.plot_html is not None
+            self.assertTrue(res.segments_vcf.is_file())
             self.assertTrue(res.plot_html.is_file())
+
+            prefix_bins = Path(tmpdir) / "deliverable_with_bins"
+            res_bins = write_outputs(
+                prefix_bins,
+                bins,
+                segs,
+                contig_lengths={"chr1": 1000},
+                plot=False,
+                vcf=True,
+                bins_vcf=True,
+            )
+            self.assertIsNotNone(res_bins.bins_vcf)
+            assert res_bins.bins_vcf is not None
+            self.assertTrue(res_bins.bins_vcf.is_file())
 
 
 class TestHtmlReport(unittest.TestCase):
