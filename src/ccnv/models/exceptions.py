@@ -25,11 +25,16 @@ class ExtractError(CcnvError):
     """Raised when extraction cannot proceed with the given inputs."""
 
 
+class AlignmentError(ExtractError):
+    """Raised when BAM or CRAM header, index, or record reading fails."""
+
+
 class ReferenceQCError(CcnvError):
     """Raised when reference quality control checks fail."""
 
 
 __all__ = [
+    "AlignmentError",
     "CcnvError",
     "CovariateError",
     "ExtractError",

@@ -16,12 +16,7 @@ import pyarrow as pa
 import pysam
 
 from ccnv.features.binning import bin_contig_fragments, bin_intervals
-from ccnv.io.alignments import (
-    alignment_format,
-    ensure_index,
-    open_alignment,
-    stream_contig_fragments,
-)
+from ccnv.io.alignments import alignment_format, rejection_reason
 from ccnv.io.parquet import write_sample_parquet
 from ccnv.models import (
     FRAGMENTOMICS_METADATA_KEY,
@@ -41,6 +36,7 @@ from ccnv.stats.fragmentomics import (
     FRAG_MAX_LEN,
     FRAG_MIN_LEN,
     FRAG_NUM_BINS,
+    encode_kmer_4,
     estimate_sample_landmarks,
 )
 
@@ -83,6 +79,146 @@ class _ContigBinResult:
 
 
 _WORKER_HANDLES: dict[tuple[str, str, str | None, int], pysam.AlignmentFile] = {}
+
+
+def open_alignment(
+    path: Path,
+    fmt: str | None = None,
+    fasta: Path | None = None,
+    threads: int = 1,
+) -> pysam.AlignmentFile:
+    """Open an indexed BAM/CRAM file during transitional v1 extraction."""
+    if fmt is None:
+        fmt = alignment_format(path)
+    decode_threads = max(1, threads)
+    if fmt == "cram":
+        if fasta is None:
+            raise ExtractError(
+                f"{path} is CRAM and requires a reference FASTA. "
+                "Pass --fasta /path/to/reference.fa (indexed with samtools faidx)."
+            )
+        if not fasta.is_file():
+            raise ExtractError(f"CRAM reference FASTA not found: {fasta}")
+        return pysam.AlignmentFile(
+            str(path),
+            "rc",
+            reference_filename=str(fasta),
+            threads=decode_threads,
+        )
+    return pysam.AlignmentFile(str(path), "rb", threads=decode_threads)
+
+
+def ensure_index(
+    path: Path,
+    fmt: str | None = None,
+    handle: pysam.AlignmentFile | None = None,
+    fasta: Path | None = None,
+    threads: int = 1,
+) -> pysam.AlignmentFile:
+    """Verify an alignment index exists during transitional v1 extraction."""
+    if fmt is None:
+        fmt = alignment_format(path)
+    if handle is None:
+        handle = open_alignment(path, fmt, fasta, threads=threads)
+    if handle.has_index():
+        return handle
+    handle.close()
+    kind = "CRAM" if fmt == "cram" else "BAM"
+    try:
+        pysam.index(str(path))
+    except (OSError, ValueError, pysam.SamtoolsError) as error:
+        raise ExtractError(
+            f"failed to create {kind} index for {path}: {error}"
+        ) from error
+    new_handle = open_alignment(path, fmt, fasta, threads=threads)
+    if new_handle.has_index():
+        return new_handle
+    new_handle.close()
+    raise ExtractError(f"failed to create {kind} index for {path}")
+
+
+def stream_contig_fragments(
+    handle: pysam.AlignmentFile,
+    contig: str,
+    filters: ReadFilters,
+    *,
+    contig_length: int | None = None,
+    min_frag_len: int = 30,
+    max_frag_len: int = 600,
+    qc: dict[str, int] | None = None,
+) -> Iterator[tuple[int, int, int, int, float, int, bool]]:
+    """Stream filtered fragments for transitional v1 extraction."""
+    for read in handle.fetch(contig):
+        if qc is not None:
+            qc["reads_seen"] += 1
+        reason = rejection_reason(read, filters)
+        if reason is not None:
+            if qc is not None:
+                qc[reason] += 1
+            continue
+        if read.is_paired:
+            tlen = int(read.template_length)
+            if tlen <= 0:
+                continue
+            start = int(read.reference_start)
+            if contig_length is not None and start >= contig_length:
+                if qc is not None:
+                    qc["filter_no_start"] += 1
+                continue
+            length = tlen if (min_frag_len <= tlen <= min(max_frag_len, 65535)) else 0
+            end = (
+                min(contig_length - 1, start + tlen)
+                if contig_length is not None
+                else start + tlen
+            )
+            midpoint = (
+                min(contig_length - 1, start + tlen // 2)
+                if contig_length is not None
+                else start + tlen // 2
+            )
+            is_paired = True
+        else:
+            start = int(read.reference_start)
+            if contig_length is not None and start >= contig_length:
+                if qc is not None:
+                    qc["filter_no_start"] += 1
+                continue
+            midpoint = start
+            read_end = (
+                int(read.reference_end)
+                if read.reference_end is not None
+                else start + (read.query_length or 100)
+            )
+            end = (
+                min(contig_length - 1, read_end)
+                if contig_length is not None
+                else read_end
+            )
+            length = 0
+            is_paired = False
+
+        seq = read.query_sequence
+        if seq:
+            gc_count = seq.count("G") + seq.count("g") + seq.count("C") + seq.count("c")
+            gc_frac = float(gc_count / len(seq))
+        else:
+            gc_frac = 0.4
+
+        motif_code = -1
+        cig = read.cigartuples
+        if seq and len(seq) >= 4 and cig:
+            if not read.is_reverse and cig[0][0] in (0, 7, 8):
+                kmer = encode_kmer_4(seq[:4])
+                if kmer is not None:
+                    motif_code = kmer
+            elif read.is_reverse and cig[-1][0] in (0, 7, 8):
+                kmer = encode_kmer_4(seq[-4:], reverse_complement=True)
+                if kmer is not None:
+                    motif_code = kmer
+
+        if qc is not None:
+            qc["reads_kept"] += 1
+        yield (midpoint, start, end, length, gc_frac, motif_code, is_paired)
 
 
 def split_thread_budget(budget: int, n_tasks: int) -> tuple[int, int]:

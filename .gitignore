@@ -19,3 +19,7 @@ docs/designs
 RESEARCH.md
 # zensical site
 site/
+target/
+*.so
+*.dylib
+*.pyd

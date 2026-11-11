@@ -9,10 +9,9 @@ import pyarrow as pa
 
 from ccnv.io.alignments import (
     alignment_format,
-    open_alignment,
     read_alignment_header,
     rejection_reason,
-    stream_contig_reads,
+    validate_alignment_inputs,
 )
 from ccnv.io.parquet import (
     is_sample_parquet,
@@ -32,6 +31,7 @@ from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
+    AlignmentError,
     ArtifactKind,
     Cytoband,
     ExtractError,
@@ -70,20 +70,6 @@ class FakeRead:
         self.is_proper_pair = is_proper_pair
 
 
-class FakeHandle:
-    """Mock pysam AlignmentFile handle."""
-
-    def __init__(
-        self, reads: list[FakeRead], references: list[str], lengths: list[int]
-    ) -> None:
-        self.reads = reads
-        self.references = references
-        self.lengths = lengths
-
-    def fetch(self, contig: str) -> list[FakeRead]:
-        return self.reads
-
-
 class TestAlignmentsIO(unittest.TestCase):
     def test_alignment_format_valid(self) -> None:
         self.assertEqual(alignment_format(Path("sample.bam")), "bam")
@@ -92,20 +78,25 @@ class TestAlignmentsIO(unittest.TestCase):
         self.assertEqual(alignment_format(Path("sample.CRAM")), "cram")
 
     def test_alignment_format_invalid(self) -> None:
+        with self.assertRaises(AlignmentError):
+            alignment_format(Path("sample.sam"))
         with self.assertRaises(ExtractError):
             alignment_format(Path("sample.sam"))
 
-    def test_open_alignment_cram_missing_fasta(self) -> None:
-        with self.assertRaises(ExtractError):
-            open_alignment(Path("sample.cram"), fmt="cram", fasta=None)
+    def test_validate_alignment_cram_missing_fasta(self) -> None:
+        with self.assertRaises(AlignmentError):
+            validate_alignment_inputs(Path("sample.cram"), fasta=None)
 
-    def test_open_alignment_cram_nonexistent_fasta(self) -> None:
-        with self.assertRaises(ExtractError):
-            open_alignment(
+    def test_validate_alignment_cram_nonexistent_fasta(self) -> None:
+        with self.assertRaises(AlignmentError):
+            validate_alignment_inputs(
                 Path("sample.cram"),
-                fmt="cram",
                 fasta=Path("/nonexistent/reference.fa"),
             )
+
+    def test_validate_alignment_missing_bam(self) -> None:
+        with self.assertRaises(AlignmentError):
+            read_alignment_header(Path("/nonexistent/sample.bam"))
 
     def test_rejection_reason(self) -> None:
         filters = ReadFilters(
@@ -140,42 +131,6 @@ class TestAlignmentsIO(unittest.TestCase):
             rejection_reason(FakeRead(is_paired=True, is_proper_pair=False), filters),
             "filter_improper_pair",
         )
-
-    def test_read_alignment_header(self) -> None:
-        handle = FakeHandle([], ["chr1", "chr2"], [1000, 2000])
-        names, lengths = read_alignment_header(handle)  # type: ignore[arg-type]
-        self.assertEqual(names, ("chr1", "chr2"))
-        self.assertEqual(lengths, (1000, 2000))
-
-    def test_stream_contig_reads(self) -> None:
-        reads = [
-            FakeRead(reference_start=50, mapping_quality=60),
-            FakeRead(reference_start=150, mapping_quality=5),  # drops mapq
-            FakeRead(reference_start=250, mapping_quality=60),
-            FakeRead(reference_start=1200, mapping_quality=60),  # beyond contig length
-        ]
-        handle = FakeHandle(reads, ["chr1"], [1000])
-        qc: dict[str, int] = {
-            "reads_seen": 0,
-            "reads_kept": 0,
-            "filter_mapq": 0,
-            "filter_no_start": 0,
-        }
-        filters = ReadFilters(min_mapping_quality=20)
-        starts = list(
-            stream_contig_reads(
-                handle,  # type: ignore[arg-type]
-                "chr1",
-                filters,
-                contig_length=1000,
-                qc=qc,
-            )
-        )
-        self.assertEqual(starts, [50, 250])
-        self.assertEqual(qc["reads_seen"], 4)
-        self.assertEqual(qc["reads_kept"], 2)
-        self.assertEqual(qc["filter_mapq"], 1)
-        self.assertEqual(qc["filter_no_start"], 1)
 
 
 class TestParquetIO(unittest.TestCase):

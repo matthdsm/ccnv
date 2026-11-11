@@ -1,25 +1,48 @@
-"""Alignment file streaming, index verification, and read filtering."""
+"""Alignment format validation, header inspection, and binned Rust streaming."""
 
-import logging
-from collections.abc import Iterator
+from __future__ import annotations
+
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Protocol
 
-import pysam
-
-from ccnv.models import ExtractError, ReadFilters
-from ccnv.stats.fragmentomics import encode_kmer_4
-
-logger = logging.getLogger(__name__)
+from ccnv._core import (
+    read_alignment_header as _read_alignment_header_core,
+)
+from ccnv._core import (
+    scan_alignment_bins as _scan_alignment_bins_core,
+)
+from ccnv.models import AlignmentError, ReadFilters
 
 __all__ = [
+    "AlignmentReadLike",
     "alignment_format",
-    "ensure_index",
-    "open_alignment",
     "read_alignment_header",
     "rejection_reason",
-    "stream_contig_fragments",
-    "stream_contig_reads",
+    "scan_alignment_bins",
+    "validate_alignment_inputs",
 ]
+
+
+class AlignmentReadLike(Protocol):
+    """Structural protocol for per-read filter inspection."""
+
+    @property
+    def reference_start(self) -> int | None: ...
+    @property
+    def mapping_quality(self) -> int: ...
+    @property
+    def is_unmapped(self) -> bool: ...
+    @property
+    def is_secondary(self) -> bool: ...
+    @property
+    def is_supplementary(self) -> bool: ...
+    @property
+    def is_duplicate(self) -> bool: ...
+    @property
+    def is_paired(self) -> bool: ...
+    @property
+    def is_proper_pair(self) -> bool: ...
 
 
 def alignment_format(path: Path) -> str:
@@ -29,78 +52,79 @@ def alignment_format(path: Path) -> str:
         return "bam"
     if suffix == ".cram":
         return "cram"
-    raise ExtractError(f"{path} must be BAM or CRAM (found suffix {path.suffix!r})")
+    raise AlignmentError(f"{path} must be BAM or CRAM (found suffix {path.suffix!r})")
 
 
-def open_alignment(
-    path: Path,
-    fmt: str | None = None,
-    fasta: Path | None = None,
-    threads: int = 1,
-) -> pysam.AlignmentFile:
-    """Open an indexed BAM/CRAM file with configured decode threads."""
-    if fmt is None:
-        fmt = alignment_format(path)
-    decode_threads = max(1, threads)
+def validate_alignment_inputs(
+    path: Path | str,
+    fasta: Path | str | None = None,
+) -> tuple[str, Path, Path | None]:
+    """Validate alignment path and mandatory reference FASTA for CRAM inputs."""
+    resolved = Path(path).expanduser()
+    fmt = alignment_format(resolved)
     if fmt == "cram":
         if fasta is None:
-            raise ExtractError(
-                f"{path} is CRAM and requires a reference FASTA. "
-                "Pass --fasta /path/to/reference.fa (indexed with samtools faidx)."
+            raise AlignmentError(
+                f"{resolved} is CRAM and requires a reference FASTA. "
+                "Pass --fasta /path/to/reference.fa."
             )
-        if not fasta.is_file():
-            raise ExtractError(f"CRAM reference FASTA not found: {fasta}")
-        return pysam.AlignmentFile(
-            str(path),
-            "rc",
-            reference_filename=str(fasta),
-            threads=decode_threads,
-        )
-    return pysam.AlignmentFile(str(path), "rb", threads=decode_threads)
+        resolved_fasta = Path(fasta).expanduser()
+        if not resolved_fasta.is_file():
+            raise AlignmentError(f"CRAM reference FASTA not found: {resolved_fasta}")
+    else:
+        resolved_fasta = Path(fasta).expanduser() if fasta is not None else None
+        if resolved_fasta is not None and not resolved_fasta.is_file():
+            raise AlignmentError(f"reference FASTA not found: {resolved_fasta}")
 
-
-def ensure_index(
-    path: Path,
-    fmt: str | None = None,
-    handle: pysam.AlignmentFile | None = None,
-    fasta: Path | None = None,
-    threads: int = 1,
-) -> pysam.AlignmentFile:
-    """Verify an alignment index exists, generating one on-the-fly if missing."""
-    if fmt is None:
-        fmt = alignment_format(path)
-    if handle is None:
-        handle = open_alignment(path, fmt, fasta, threads=threads)
-    if handle.has_index():
-        logger.debug("%s already has an index", path)
-        return handle
-    handle.close()
-    kind = "CRAM" if fmt == "cram" else "BAM"
-
-    logger.debug("creating %s index for %s", kind, path)
-    try:
-        pysam.index(str(path))
-    except Exception as error:
-        raise ExtractError(
-            f"failed to create {kind} index for {path}: {error}"
-        ) from error
-    new_handle = open_alignment(path, fmt, fasta, threads=threads)
-    if new_handle.has_index():
-        return new_handle
-    new_handle.close()
-    raise ExtractError(f"failed to create {kind} index for {path}")
+    if not resolved.is_file():
+        raise AlignmentError(f"alignment not found: {resolved}")
+    return fmt, resolved, resolved_fasta
 
 
 def read_alignment_header(
-    handle: pysam.AlignmentFile,
-) -> tuple[tuple[str, ...], tuple[int, ...]]:
-    """Return contig names and lengths declared in the alignment header."""
-    names = tuple(str(r) for r in handle.references)
-    lengths = tuple(int(length) for length in handle.lengths)
-    return names, lengths
+    path: Path | str,
+    fasta: Path | str | None = None,
+) -> list[tuple[str, int]]:
+    """Return ordered `(contig, length)` pairs declared in a BAM/CRAM header."""
+    _, resolved, resolved_fasta = validate_alignment_inputs(path, fasta)
+    return _read_alignment_header_core(
+        str(resolved),
+        str(resolved_fasta) if resolved_fasta is not None else None,
+    )
 
 
-def rejection_reason(read: pysam.AlignedSegment, filters: ReadFilters) -> str | None:
+def scan_alignment_bins(
+    path: Path | str,
+    contigs: Sequence[tuple[str, int]],
+    bin_size: int,
+    filters: ReadFilters | None = None,
+    *,
+    threads: int = 1,
+    fasta: Path | str | None = None,
+    collect_bands: bool = True,
+    se_fragment_length: int = 0,
+) -> dict[str, object]:
+    """Scan BAM or CRAM alignments into per-bin summary arrays via `ccnv._core`."""
+    _, resolved, resolved_fasta = validate_alignment_inputs(path, fasta)
+    active_filters = filters if filters is not None else ReadFilters()
+    return _scan_alignment_bins_core(
+        str(resolved),
+        contigs,
+        bin_size,
+        active_filters.min_mapping_quality,
+        active_filters.require_proper_pair,
+        threads,
+        str(resolved_fasta) if resolved_fasta is not None else None,
+        collect_bands,
+        se_fragment_length,
+        exclude_duplicates=active_filters.exclude_duplicates,
+        exclude_secondary=active_filters.exclude_secondary,
+        exclude_supplementary=active_filters.exclude_supplementary,
+        exclude_unmapped=active_filters.exclude_unmapped,
+    )
+
+
+def rejection_reason(read: AlignmentReadLike, filters: ReadFilters) -> str | None:
     """Return the first matching QC counter name, or None if kept."""
     if filters.exclude_unmapped and read.is_unmapped:
         return "filter_unmapped"
@@ -118,118 +142,3 @@ def rejection_reason(read: pysam.AlignedSegment, filters: ReadFilters) -> str | 
     if int(read.mapping_quality) < filters.min_mapping_quality:
         return "filter_mapq"
     return None
-
-
-def stream_contig_reads(
-    handle: pysam.AlignmentFile,
-    contig: str,
-    filters: ReadFilters,
-    *,
-    contig_length: int | None = None,
-    qc: dict[str, int] | None = None,
-) -> Iterator[int]:
-    """Iterate 0-based reference starts of reads passing filters on a contig."""
-    for read in handle.fetch(contig):
-        if qc is not None:
-            qc["reads_seen"] += 1
-        reason = rejection_reason(read, filters)
-        if reason is not None:
-            if qc is not None:
-                qc[reason] += 1
-            continue
-        start = int(read.reference_start)
-        if contig_length is not None and start >= contig_length:
-            if qc is not None:
-                qc["filter_no_start"] += 1
-            continue
-        if qc is not None:
-            qc["reads_kept"] += 1
-        yield start
-
-
-def stream_contig_fragments(
-    handle: pysam.AlignmentFile,
-    contig: str,
-    filters: ReadFilters,
-    *,
-    contig_length: int | None = None,
-    min_frag_len: int = 30,
-    max_frag_len: int = 600,
-    qc: dict[str, int] | None = None,
-) -> Iterator[tuple[int, int, int, int, float, int, bool]]:
-    """Stream filtered fragments for a contig, yielding (midpoint, start, end, length, gc, motif, is_paired)."""
-    for read in handle.fetch(contig):
-        if qc is not None:
-            qc["reads_seen"] += 1
-        reason = rejection_reason(read, filters)
-        if reason is not None:
-            if qc is not None:
-                qc[reason] += 1
-            continue
-
-        if read.is_paired:
-            tlen = int(read.template_length)
-            if tlen <= 0:
-                continue
-            start = int(read.reference_start)
-            if contig_length is not None and start >= contig_length:
-                if qc is not None:
-                    qc["filter_no_start"] += 1
-                continue
-            length = tlen if (min_frag_len <= tlen <= min(max_frag_len, 65535)) else 0
-            end = (
-                min(contig_length - 1, start + tlen)
-                if contig_length is not None
-                else start + tlen
-            )
-            midpoint = (
-                min(contig_length - 1, start + tlen // 2)
-                if contig_length is not None
-                else start + tlen // 2
-            )
-            is_paired = True
-        else:
-            start = int(read.reference_start)
-            if contig_length is not None and start >= contig_length:
-                if qc is not None:
-                    qc["filter_no_start"] += 1
-                continue
-            midpoint = start
-            read_end = (
-                int(read.reference_end)
-                if read.reference_end is not None
-                else start + (read.query_length or 100)
-            )
-            end = (
-                min(contig_length - 1, read_end)
-                if contig_length is not None
-                else read_end
-            )
-            length = 0
-            is_paired = False
-
-        seq = read.query_sequence
-        if seq:
-            gc_count = seq.count("G") + seq.count("g") + seq.count("C") + seq.count("c")
-            gc_frac = float(gc_count / len(seq))
-        else:
-            gc_frac = 0.4
-
-        motif_code = -1
-        cig = read.cigartuples
-        if seq and len(seq) >= 4 and cig:
-            if not read.is_reverse:
-                if cig[0][0] in (0, 7, 8):
-                    kmer = encode_kmer_4(seq[:4])
-                    if kmer is not None:
-                        motif_code = kmer
-            else:
-                if cig[-1][0] in (0, 7, 8):
-                    kmer = encode_kmer_4(seq[-4:], reverse_complement=True)
-                    if kmer is not None:
-                        motif_code = kmer
-
-        if qc is not None:
-            qc["reads_kept"] += 1
-
-        yield (midpoint, start, end, length, gc_frac, motif_code, is_paired)

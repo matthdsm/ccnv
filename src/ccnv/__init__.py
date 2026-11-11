@@ -2,21 +2,31 @@
 
 from __future__ import annotations
 
-from ccnv.extract import ExtractError, run_extract
+from typing import TYPE_CHECKING
+
 from ccnv.models import (
+    AlignmentError,
     ExtractConfig,
+    ExtractError,
     PredictConfig,
+    PredictError,
     ReadFilters,
     ReferenceConfig,
+    ReferenceError,
     ReferenceQCConfig,
+    ReferenceQCError,
 )
-from ccnv.predict import PredictError, run_predict
-from ccnv.ref_qc import ReferenceQCError, run_reference_qc
-from ccnv.reference import ReferenceError, run_reference
+
+if TYPE_CHECKING:
+    from ccnv.extract import run_extract as run_extract
+    from ccnv.predict import run_predict as run_predict
+    from ccnv.ref_qc import run_reference_qc as run_reference_qc
+    from ccnv.reference import run_reference as run_reference
 
 __version__ = "0.1.0dev"
 
 __all__ = [
+    "AlignmentError",
     "ExtractConfig",
     "ExtractError",
     "PredictConfig",
@@ -32,3 +42,24 @@ __all__ = [
     "run_reference",
     "run_reference_qc",
 ]
+
+
+def __getattr__(name: str) -> object:
+    """Lazily resolve top-level pipeline orchestrators on demand."""
+    if name == "run_extract":
+        from ccnv.extract import run_extract
+
+        return run_extract
+    if name == "run_predict":
+        from ccnv.predict import run_predict
+
+        return run_predict
+    if name == "run_reference":
+        from ccnv.reference import run_reference
+
+        return run_reference
+    if name == "run_reference_qc":
+        from ccnv.ref_qc import run_reference_qc
+
+        return run_reference_qc
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

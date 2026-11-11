@@ -24,6 +24,7 @@ from ccnv.models.domain import (
     select_layout,
 )
 from ccnv.models.exceptions import (
+    AlignmentError,
     CcnvError,
     CovariateError,
     ExtractError,
@@ -94,6 +95,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "SUPPORTED_SCHEMA_VERSIONS",
     "ActiveFFSource",
+    "AlignmentError",
     "AnalysisMode",
     "ArtifactKind",
     "BinResult",
