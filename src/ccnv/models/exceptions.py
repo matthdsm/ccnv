@@ -9,6 +9,10 @@ class ReferenceError(CcnvError):
     """Raised when reference construction, validation, or cohort aggregation fails."""
 
 
+class InvalidInputError(ReferenceError, ValueError):
+    """Raised when count matrix or bin coordinate input validation fails."""
+
+
 class CovariateError(CcnvError):
     """Raised when GC or mappability covariate calculation or loading fails."""
 
@@ -47,6 +51,7 @@ __all__ = [
     "CcnvError",
     "CovariateError",
     "ExtractError",
+    "InvalidInputError",
     "PredictError",
     "ReferenceError",
     "ReferenceQCError",

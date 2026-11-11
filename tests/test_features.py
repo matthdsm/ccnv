@@ -102,8 +102,8 @@ class TestFeaturesCohort(unittest.TestCase):
     def test_normalize_depth(self) -> None:
         counts = np.array([[10.0, 20.0], [30.0, 60.0]], dtype=np.float64)
         norm = normalize_depth(counts)
-        np.testing.assert_allclose(norm[:, 0], [0.25, 0.75])
-        np.testing.assert_allclose(norm[:, 1], [0.25, 0.75])
+        np.testing.assert_allclose(norm[:, 0], [15.0, 45.0])
+        np.testing.assert_allclose(norm[:, 1], [15.0, 45.0])
 
     def test_normalize_depth_zero_sum_fails(self) -> None:
         counts = np.array([[0.0, 10.0], [0.0, 20.0]])

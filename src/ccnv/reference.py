@@ -18,9 +18,10 @@ from ccnv.features.cohort import (
     SexInference,
     SexLabel,
     cohort_from_fasta,
-    infer_sample_sexes,
+    compute_bin_exposure,
+    infer_germline_sex_2d,
     load_and_assemble_cohort,
-    mask_low_coverage,
+    mask_low_coverage_per_contig,
     normalize_depth,
 )
 from ccnv.features.covariates import (
@@ -275,8 +276,21 @@ def build_reference_table(
             reason="prenatal_model",
         )
     else:
+        _, cohort_c_ids = np.unique(
+            np.asarray(cohort.contigs, dtype=str), return_inverse=True
+        )
+        cohort_exp = compute_bin_exposure(cohort.starts, cohort.ends, cohort.bin_size)
+        cohort_usable = mask_covariates(
+            mask_low_coverage_per_contig(
+                cohort.counts, cohort_c_ids.astype(np.int16), cohort_exp
+            ),
+            gc=cohort_gc,
+            mappability=cohort_map,
+            n_mask=cohort_n_mask,
+            min_mappability=config.min_mappability,
+        )
         sexes, sex_source, inference, signal = _resolve_sexes(
-            cohort, config, sex_contigs
+            cohort, config, sex_contigs, cohort_usable
         )
 
     branch_tables: list[pa.Table] = []
@@ -305,12 +319,20 @@ def build_reference_table(
     _add_branch(BRANCH_AUTOSOMAL, np.arange(cohort.counts.shape[1]), autosomes)
     if sex_contigs and sexes is not None:
         labels = np.asarray(sexes)
+        clean = (
+            ~inference.quarantined_mask
+            if (
+                inference is not None
+                and inference.quarantined_mask.shape == (cohort.counts.shape[1],)
+            )
+            else np.ones(cohort.counts.shape[1], dtype=np.bool_)
+        )
         if (
-            female_indices := np.flatnonzero(labels == "female")
+            female_indices := np.flatnonzero((labels == "female") & clean)
         ).size >= config.min_sex_group_size:
             _add_branch(BRANCH_FEMALE_SEX, female_indices, sex_contigs)
         if (
-            male_indices := np.flatnonzero(labels == "male")
+            male_indices := np.flatnonzero((labels == "male") & clean)
         ).size >= config.min_sex_group_size:
             _add_branch(BRANCH_MALE_SEX, male_indices, sex_contigs)
     if config.mode == "prenatal":
@@ -363,13 +385,18 @@ def build_reference_table(
         if isinstance(raw_f, Mapping):
             first_filters = {str(k): v for k, v in raw_f.items()}
 
+    resolved_sex_cutoff = (
+        config.sex_cutoff
+        if config.sex_cutoff is not None
+        else (inference.cutoff if inference is not None and inference.passed else None)
+    )
     model_metadata: dict[str, object] = {
         "bin_size": cohort.bin_size,
         "branches": built_branches,
         "autosomal_contigs": list(autosomes),
         "sex_contigs": list(sex_contigs),
         "sex_signal_contig": signal,
-        "sex_cutoff": config.sex_cutoff,
+        "sex_cutoff": resolved_sex_cutoff,
         "sex_source": sex_source,
         "sample_sexes": list(sexes) if sexes is not None else None,
         "sex_inference": {
@@ -377,6 +404,9 @@ def build_reference_table(
             "cutoff": inference.cutoff,
             "fractions": list(inference.fractions),
             "reason": inference.reason,
+            "quarantined_indices": [
+                int(i) for i in np.flatnonzero(inference.quarantined_mask)
+            ],
         }
         if inference
         else None,
@@ -492,39 +522,40 @@ def _resolve_contig_roles(
 
 
 def _resolve_sexes(
-    cohort: Cohort, config: ReferenceConfig, sex_contigs: tuple[str, ...]
+    cohort: Cohort,
+    config: ReferenceConfig,
+    sex_contigs: tuple[str, ...],
+    usable: NDArray[np.bool_],
 ) -> tuple[tuple[SexLabel, ...] | None, str, SexInference | None, str | None]:
-    """Resolve sample sex assignments from samplesheet or coverage inference."""
+    """Resolve sample sex assignments, 2D outlier quarantine, and signal cutoff."""
     signal = _resolve_sex_signal(cohort, config)
     if not sex_contigs or signal is None:
         return None, "none", None, signal
-    if (
-        config.entries
-        and len(config.entries) == cohort.counts.shape[1]
-        and all(e.sex in ("M", "F") for e in config.entries)
-    ):
-        return (
-            tuple("male" if e.sex == "M" else "female" for e in config.entries),
-            "samplesheet",
-            None,
-            signal,
+    explicit: tuple[SexLabel | None, ...] | None = (
+        tuple(
+            "male" if e.sex == "M" else ("female" if e.sex == "F" else None)
+            for e in config.entries
         )
-    inference = infer_sample_sexes(
-        _contig_fractions(cohort, signal),
-        config.min_sex_group_size,
-        cutoff=config.sex_cutoff,
+        if config.entries and len(config.entries) == cohort.counts.shape[1]
+        else None
     )
+    all_labeled = explicit is not None and all(x is not None for x in explicit)
+    inference = infer_germline_sex_2d(
+        cohort,
+        usable,
+        min_group_size=config.min_sex_group_size,
+        signal_contig=signal,
+        cutoff=config.sex_cutoff,
+        explicit_labels=explicit,
+    )
+    if all_labeled and explicit is not None:
+        lbls: tuple[SexLabel, ...] = tuple(
+            "male" if x == "male" else "female" for x in explicit
+        )
+        return lbls, "samplesheet", inference, signal
     if not inference.passed or inference.labels is None:
         return None, "none", inference, signal
-    labels: list[SexLabel] = (
-        [
-            "male" if e.sex == "M" else "female" if e.sex == "F" else lbl
-            for lbl, e in zip(inference.labels, config.entries, strict=False)
-        ]
-        if config.entries and len(config.entries) == len(inference.labels)
-        else list(inference.labels)
-    )
-    return tuple(labels), "inferred", inference, signal
+    return inference.labels, "inferred", inference, signal
 
 
 def _resolve_sex_signal(cohort: Cohort, config: ReferenceConfig) -> str | None:
@@ -535,15 +566,6 @@ def _resolve_sex_signal(cohort: Cohort, config: ReferenceConfig) -> str | None:
     if req not in avail:
         raise ReferenceError(f"unknown sex-signal contig {req!r}")
     return req
-
-
-def _contig_fractions(cohort: Cohort, contig: str) -> NDArray[np.float64]:
-    """Calculate per-sample fractional depth for a specific contig."""
-    totals = np.asarray(cohort.counts, dtype=np.float64).sum(axis=0)
-    if np.any(totals <= 0):
-        raise ReferenceError("every sample must have a positive total count")
-    sub = np.asarray(cohort.counts[np.isin(cohort.contigs, [contig])], dtype=np.float64)
-    return sub.sum(axis=0) / totals
 
 
 def _build_branch_table(
@@ -563,13 +585,22 @@ def _build_branch_table(
     if not np.any(selected):
         raise ReferenceError(f"branch {branch!r} has no bins")
     counts = np.asarray(cohort.counts[np.ix_(selected, sample_index)], dtype=np.float64)
+    if np.any(np.sum(counts, axis=0) <= 0):
+        raise ReferenceError(f"branch {branch!r} has a zero-coverage sample")
+    contig_subset = np.array(cohort.contigs, dtype=object)[selected]
+    uniq_c = list(dict.fromkeys(str(c) for c in contig_subset))
+    c_map = {name: idx for idx, name in enumerate(uniq_c)}
+    c_codes = np.array([c_map[str(c)] for c in contig_subset], dtype=np.int16)
+    branch_starts = cohort.starts[selected]
+    branch_ends = cohort.ends[selected]
+    branch_exp = compute_bin_exposure(branch_starts, branch_ends, cohort.bin_size)
     branch_gc = cohort_gc[selected] if cohort_gc is not None else None
     branch_map = (
         cohort_mappability[selected] if cohort_mappability is not None else None
     )
     branch_n = cohort_n_mask[selected] if cohort_n_mask is not None else None
     usable = mask_covariates(
-        mask_low_coverage(normalize_depth(counts)),
+        mask_low_coverage_per_contig(counts, c_codes, branch_exp),
         gc=branch_gc,
         mappability=branch_map,
         n_mask=branch_n,
@@ -591,7 +622,13 @@ def _build_branch_table(
         cohort.ref_ep_rate[selected] if cohort.ref_ep_rate is not None else None
     )
     normalized = correct_covariate_bias(
-        normalize_depth(counts, mask=usable),
+        normalize_depth(
+            counts,
+            mask=usable,
+            contigs=c_codes,
+            starts=branch_starts,
+            ends=branch_ends,
+        ),
         usable,
         gc=branch_gc,
         mappability=branch_map,
@@ -601,7 +638,6 @@ def _build_branch_table(
     corrected, pca_mean, pca_loadings = fit_pca(
         normalized[usable], config.pca_components
     )
-    contig_subset = np.array(cohort.contigs, dtype=object)[selected]
     _, contig_ids = np.unique(
         np.asarray(contig_subset[usable], dtype=str), return_inverse=True
     )
@@ -700,10 +736,6 @@ def _build_branch_table(
     branch_null_mean[usable] = null_mean_u
     branch_bio_disp = np.zeros(n_bins, dtype=np.float32)
     branch_bio_disp[usable] = bio_disp_u
-
-    uniq_c = list(dict.fromkeys(str(c) for c in contig_subset))
-    c_map = {name: idx for idx, name in enumerate(uniq_c)}
-    c_codes = np.array([c_map[str(c)] for c in contig_subset], dtype=np.int16)
 
     schema = build_reference_schema(raw_rank)
     return pa.table(

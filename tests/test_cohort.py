@@ -138,7 +138,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
 
         sparse = np.array([[10.0, 0.0], [0.0, 20.0]], dtype=np.float64)
         normed = normalize_depth(sparse)
-        np.testing.assert_allclose(normed.sum(axis=0), [1.0, 1.0], rtol=1e-12)
+        np.testing.assert_allclose(normed.sum(axis=0), [15.0, 15.0], rtol=1e-12)
 
     def test_rebin_cohort_polars_fast_path_coarsening(self) -> None:
         from ccnv.features.cohort import Cohort, rebin_cohort

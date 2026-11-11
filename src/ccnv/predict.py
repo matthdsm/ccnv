@@ -30,6 +30,7 @@ from ccnv.features.fragmentomics import (
 )
 from ccnv.features.prenatal import annotate_prenatal_segments, predict_prenatal
 from ccnv.features.rebinning import rebin_sample_buffers, rebin_sample_sketch
+from ccnv.features.sex import infer_single_sample_sex
 from ccnv.io.parquet import (
     align_sample_grid_indices,
     extract_reference_branch_arrays,
@@ -60,11 +61,9 @@ from ccnv.models import (
     PrenatalModelMetadata,
     ReferenceMetadata,
     SampleBuffers,
-    SampleMetadata,
     SchemaError,
     SegmentResult,
     decode_metadata,
-    reconstruct_sample_grid,
     validate_sample_table,
     validate_schema,
 )
@@ -880,61 +879,10 @@ def _resolve_sample_sex(
     metadata: dict[str, object],
     branches: set[object],
 ) -> Sex | None:
-    """Infer sample genetic sex from sex-signal contig coverage against reference cutoff."""
+    """Infer sample genetic sex from non-PAR sex-signal coverage against reference cutoff."""
     if requested != "autosomal":
         return requested
-    if not ({BRANCH_FEMALE_SEX, BRANCH_MALE_SEX} & branches):
-        return None
-    model = metadata.get("model")
-    if (
-        not isinstance(model, dict)
-        or not isinstance(model.get("sex_inference"), dict)
-        or not isinstance(model.get("sex_signal_contig"), str)
-    ):
-        raise PredictError("cannot infer sample sex; pass --sex female or --sex male")
-    cutoff = model["sex_inference"].get("cutoff")
-    if not isinstance(cutoff, int | float):
-        raise PredictError("cannot infer sample sex; pass --sex female or --sex male")
-    counts = (
-        np.asarray(sample.count, dtype=np.float64)
-        if isinstance(sample, SampleBuffers)
-        else np.asarray(
-            sample.column("count").combine_chunks().to_numpy(zero_copy_only=False),
-            dtype=np.float64,
-        )
-    )
-    total = float(np.sum(counts))
-    if total <= 0:
-        raise PredictError("sample has zero total coverage")
-    signal = str(model["sex_signal_contig"])
-    if not isinstance(sample, SampleBuffers) and "contig" in sample.column_names:
-        contigs = np.asarray(
-            sample.column("contig").combine_chunks().to_numpy(zero_copy_only=False),
-            dtype=object,
-        )
-        sig_sum = float(np.sum(counts[contigs == signal]))
-    else:
-        s_meta = (
-            sample.meta
-            if isinstance(sample, SampleBuffers)
-            else SampleMetadata.from_schema(sample.schema)
-        )
-        codes, names, _, _ = reconstruct_sample_grid(s_meta)
-        sig_sum = (
-            float(np.sum(counts[codes == names.index(signal)]))
-            if signal in names
-            else 0.0
-        )
-    fraction = sig_sum / total
-    sex: Sex = "male" if fraction > float(cutoff) else "female"
-    logger.debug(
-        "inferred sample sex as %s (signal %s fraction=%.4f vs cutoff=%.4f)",
-        sex,
-        signal,
-        fraction,
-        float(cutoff),
-    )
-    return sex
+    return infer_single_sample_sex(sample, metadata, branches)
 
 
 def _validate_config(config: PredictConfig) -> None:

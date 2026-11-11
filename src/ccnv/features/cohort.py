@@ -12,18 +12,30 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 from numpy.typing import NDArray
 
-from ccnv.features.binning import build_uniform_fasta_grid, rebin_counts_matrix
+from ccnv.features.binning import (
+    build_uniform_fasta_grid,
+    compute_bin_exposure,
+    rebin_counts_matrix,
+)
 from ccnv.features.rebinning import rebin_sample_sketch
+from ccnv.features.sex import (
+    SexInference,
+    SexLabel,
+    infer_germline_sex_2d,
+    infer_sample_sexes,
+    nonpar_contig_mask,
+)
 from ccnv.models import (
     NUM_FRAG_BANDS,
     BinCompatibilityError,
+    InvalidInputError,
     ReferenceError,
     SampleMetadata,
     SamplesheetEntry,
@@ -35,9 +47,7 @@ from ccnv.models import (
 )
 
 logger = logging.getLogger(__name__)
-SexLabel = Literal["female", "male"]
 _MASK_FRACTION: Final[float] = 0.05
-_SEPARATION_MAD_MULTIPLIER: Final[float] = 4.0
 _DEFAULT_FRAG_LEN_BP: Final[float] = 167.0
 
 __all__ = [
@@ -46,10 +56,15 @@ __all__ = [
     "SexInference",
     "SexLabel",
     "cohort_from_fasta",
+    "compute_bin_exposure",
     "estimate_size_factors",
+    "estimate_superblock_size_factors",
+    "infer_germline_sex_2d",
     "infer_sample_sexes",
     "load_and_assemble_cohort",
     "mask_low_coverage",
+    "mask_low_coverage_per_contig",
+    "nonpar_contig_mask",
     "normalize_depth",
     "rebin_cohort",
     "rebin_sample_table",
@@ -76,21 +91,6 @@ class Cohort:
 
 
 @dataclass(frozen=True, slots=True)
-class SexInference:
-    """Deterministic sex assignments, or a rejected inference."""
-
-    labels: tuple[SexLabel, ...] | None
-    cutoff: float | None
-    fractions: tuple[float, ...]
-    passed: bool
-    reason: str
-
-
-class InvalidInputError(ReferenceError, ValueError):
-    """Raised when count matrix input validation fails."""
-
-
-@dataclass(frozen=True, slots=True)
 class _StreamedSample:
     index: int
     path: Path
@@ -109,19 +109,154 @@ def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
     return rebin_sample_sketch(table, target_bin_size)
 
 
-def estimate_size_factors(
-    counts: NDArray[np.floating],
-    mask: NDArray[np.bool_] | None = None,
+def _encode_contig_ids(
+    contigs: NDArray[np.integer]
+    | Sequence[str]
+    | NDArray[np.str_]
+    | NDArray[np.object_],
+    expected_len: int,
+) -> NDArray[np.int64]:
+    if isinstance(contigs, np.ndarray) and np.issubdtype(contigs.dtype, np.integer):
+        c_ids = np.asarray(contigs, dtype=np.int64)
+    else:
+        c_arr = np.asarray(contigs, dtype=str)
+        if c_arr.shape != (expected_len,):
+            raise InvalidInputError("contigs length must match counts row count")
+        _, c_ids = np.unique(c_arr, return_inverse=True)
+        c_ids = c_ids.astype(np.int64, copy=False)
+    if c_ids.shape != (expected_len,):
+        raise InvalidInputError("contigs length must match counts row count")
+    return c_ids
+
+
+def _size_factors_from_blocks(
+    block_sums: NDArray[np.float64], *, has_mask: bool
 ) -> NDArray[np.float64]:
-    """Estimate DESeq2 median-of-ratios size factors for each sample."""
-    matrix = np.asarray(counts, dtype=np.float64)
-    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] == 0:
+    totals = block_sums.sum(axis=0)
+    if np.any(~np.isfinite(totals)) or np.any(totals <= 0):
+        suffix = " on usable bins" if has_mask else ""
+        raise InvalidInputError(
+            f"Total read count is zero for at least one sample{suffix}."
+        )
+    ref_block = block_sums.mean(axis=1, keepdims=True)
+    valid = ref_block[:, 0] > 0
+    raw_sf = np.median(block_sums[valid] / ref_block[valid], axis=0)
+    total_ref = float(np.sum(ref_block[valid]))
+    fallback = totals / total_ref if total_ref > 0 else np.ones_like(totals)
+    sparse_two = int(np.count_nonzero(valid)) <= 2 and bool(
+        np.any(block_sums[valid] == 0)
+    )
+    raw_sf = (
+        fallback
+        if sparse_two
+        else np.where(~np.isfinite(raw_sf) | (raw_sf <= 0), fallback, raw_sf)
+    )
+    med = float(np.median(raw_sf))
+    if not math.isfinite(med) or med <= 0.0:
+        raw_sf = fallback
+        med = float(np.median(raw_sf))
+    return raw_sf / med
+
+
+def estimate_superblock_size_factors(
+    counts: NDArray[np.floating] | NDArray[np.integer],
+    contigs: NDArray[np.integer]
+    | Sequence[str]
+    | NDArray[np.str_]
+    | NDArray[np.object_],
+    starts: NDArray[np.integer],
+    ends: NDArray[np.integer],
+    usable: NDArray[np.bool_],
+    *,
+    block_bp: int = 1_000_000,
+) -> NDArray[np.float64]:
+    """Estimate DESeq2 median-of-ratios size factors over per-contig 1 Mb super-blocks."""
+    if counts.ndim != 2 or 0 in counts.shape:
         raise InvalidInputError("Counts matrix must be a non-empty 2D array.")
+    if not isinstance(block_bp, int) or isinstance(block_bp, bool) or block_bp <= 0:
+        raise InvalidInputError("block_bp must be a positive integer")
+    n_bins, n_samples = counts.shape
+    chunk_rows = max(1024, (64 * 1024 * 1024) // max(n_samples, 1))
+    for r0 in range(0, n_bins, chunk_rows):
+        if np.any(counts[r0 : r0 + chunk_rows] < 0):
+            raise InvalidInputError("Counts matrix cannot contain negative values.")
+
+    usable_arr = np.asarray(usable, dtype=np.bool_)
+    if usable_arr.shape != (n_bins,):
+        raise InvalidInputError("usable length must match counts row count")
+    u_idx = np.flatnonzero(usable_arr)
+    if u_idx.size == 0:
+        raise InvalidInputError("No usable bins remaining after mask.")
+
+    c_ids = _encode_contig_ids(contigs, n_bins)
+    s_arr, e_arr = np.asarray(starts, dtype=np.int64), np.asarray(ends, dtype=np.int64)
+    if s_arr.shape != (n_bins,) or e_arr.shape != (n_bins,):
+        raise InvalidInputError("starts and ends must match counts row count")
+    widths = e_arr - s_arr
+    if np.any(widths < 0):
+        raise InvalidInputError("bin widths cannot be negative")
+
+    bin_size = max(1, int(np.max(widths)))
+    bins_per_block = max(10, round(max(int(block_bp), 10 * bin_size) / bin_size))
+    half_k = max(1, bins_per_block // 2)
+    u_c = c_ids[u_idx]
+    run_cuts = np.concatenate(
+        ([0], np.flatnonzero(u_c[1:] != u_c[:-1]) + 1, [u_idx.size])
+    )
+    starts_list: list[int] = []
+    for r_idx in range(run_cuts.size - 1):
+        r0, r1 = int(run_cuts[r_idx]), int(run_cuts[r_idx + 1])
+        cuts = (
+            [r0] if r1 - r0 <= bins_per_block else list(range(r0, r1, bins_per_block))
+        )
+        if len(cuts) > 1 and (r1 - cuts[-1]) < half_k:
+            cuts.pop()
+        starts_list.extend(cuts)
+
+    b_starts = np.asarray(starts_list, dtype=np.int64)
+    b_ends = np.concatenate((b_starts[1:], [u_idx.size]))
+    block_sums = np.empty((b_starts.size, n_samples), dtype=np.float64)
+    b0 = 0
+    while b0 < b_starts.size:
+        b1 = b0 + 1
+        while b1 < b_starts.size and int(b_ends[b1 - 1] - b_starts[b0]) < chunk_rows:
+            b1 += 1
+        u0, u1 = int(b_starts[b0]), int(b_ends[b1 - 1])
+        sub = np.asarray(counts[u_idx[u0:u1]], dtype=np.float64)
+        block_sums[b0:b1] = np.add.reduceat(sub, b_starts[b0:b1] - u0, axis=0)
+        b0 = b1
+    return _size_factors_from_blocks(block_sums, has_mask=True)
+
+
+def estimate_size_factors(
+    counts: NDArray[np.floating] | NDArray[np.integer],
+    mask: NDArray[np.bool_] | None = None,
+    *,
+    contigs: NDArray[np.integer] | Sequence[str] | None = None,
+    starts: NDArray[np.integer] | None = None,
+    ends: NDArray[np.integer] | None = None,
+    block_bp: int = 1_000_000,
+) -> NDArray[np.float64]:
+    """Estimate median-normalized DESeq2 size factors for each sample."""
+    arr = np.asarray(counts)
+    if arr.ndim != 2 or 0 in arr.shape:
+        raise InvalidInputError("Counts matrix must be a non-empty 2D array.")
+    if contigs is not None and starts is not None and ends is not None:
+        usable = (
+            np.ones(arr.shape[0], dtype=np.bool_)
+            if mask is None
+            else np.asarray(mask, dtype=np.bool_)
+        )
+        return estimate_superblock_size_factors(
+            arr, contigs, starts, ends, usable, block_bp=block_bp
+        )
+
+    matrix = np.asarray(arr, dtype=np.float64)
     if np.any(matrix < 0):
         raise InvalidInputError("Counts matrix cannot contain negative values.")
     if mask is not None:
         mask_arr = np.asarray(mask, dtype=np.bool_)
-        if mask_arr.ndim != 1 or mask_arr.shape[0] != matrix.shape[0]:
+        if mask_arr.shape != (matrix.shape[0],):
             raise InvalidInputError("mask length must match counts row count")
         sub = matrix[mask_arr]
         if sub.shape[0] == 0:
@@ -129,37 +264,43 @@ def estimate_size_factors(
     else:
         sub = matrix
 
+    if sub.shape[0] >= 1000:
+        cuts = np.arange(0, sub.shape[0], 1000, dtype=np.int64)
+        if cuts.size > 1 and (sub.shape[0] - int(cuts[-1])) < 500:
+            cuts = cuts[:-1]
+        return _size_factors_from_blocks(
+            np.add.reduceat(sub, cuts, axis=0), has_mask=mask is not None
+        )
+
     totals = sub.sum(axis=0)
     if np.any(totals <= 0):
         suffix = " on usable bins" if mask is not None else ""
         raise InvalidInputError(
             f"Total read count is zero for at least one sample{suffix}."
         )
-
     pos_rows = np.all(sub > 0, axis=1)
     if np.count_nonzero(pos_rows) >= 1:
-        log_geomean = np.mean(np.log(sub[pos_rows]), axis=1, keepdims=True)
-        raw_sf = np.exp(np.median(np.log(sub[pos_rows]) - log_geomean, axis=0))
+        log_gm = np.mean(np.log(sub[pos_rows]), axis=1, keepdims=True)
+        raw_sf = np.exp(np.median(np.log(sub[pos_rows]) - log_gm, axis=0))
     else:
-        pos_meds = [float(np.median(c[c > 0])) if np.any(c > 0) else 0.0 for c in sub.T]
-        raw_sf = (
-            np.asarray(pos_meds, dtype=np.float64)
-            if all(m > 0 for m in pos_meds)
-            else totals.astype(np.float64)
-        )
-    return raw_sf / np.exp(np.log(raw_sf).mean())
+        raw_sf = totals.astype(np.float64)
+    return raw_sf / float(np.median(raw_sf))
 
 
 def normalize_depth(
-    counts: NDArray[np.floating],
+    counts: NDArray[np.floating] | NDArray[np.integer],
     mask: NDArray[np.bool_] | None = None,
+    *,
+    contigs: NDArray[np.integer] | Sequence[str] | None = None,
+    starts: NDArray[np.integer] | None = None,
+    ends: NDArray[np.integer] | None = None,
+    block_bp: int = 1_000_000,
 ) -> NDArray[np.float64]:
-    """Normalize sample count matrix using DESeq2 median-of-ratios depth scaling."""
-    matrix = np.asarray(counts, dtype=np.float64)
-    sf = estimate_size_factors(matrix, mask=mask)
-    sub = matrix[mask] if mask is not None else matrix
-    s = sf * float(np.median(sub.sum(axis=0) / sf))
-    return matrix / s[np.newaxis, :]
+    """Normalize sample counts on true per-bin read-count scale preserving median library depth."""
+    sf = estimate_size_factors(
+        counts, mask=mask, contigs=contigs, starts=starts, ends=ends, block_bp=block_bp
+    )
+    return np.asarray(counts, dtype=np.float64) / sf[np.newaxis, :]
 
 
 def mask_low_coverage(normalized: NDArray[np.floating]) -> NDArray[np.bool_]:
@@ -171,56 +312,46 @@ def mask_low_coverage(normalized: NDArray[np.floating]) -> NDArray[np.bool_]:
     return per_bin > (_MASK_FRACTION * float(np.median(positive)))
 
 
-def _mad(values: NDArray[np.floating]) -> float:
-    arr = np.asarray(values, dtype=np.float64)
-    return float(np.median(np.abs(arr - np.median(arr)))) if arr.size > 0 else 0.0
+def mask_low_coverage_per_contig(
+    counts: NDArray[np.floating] | NDArray[np.integer],
+    contigs: NDArray[np.integer]
+    | Sequence[str]
+    | NDArray[np.str_]
+    | NDArray[np.object_],
+    exposure: NDArray[np.floating],
+    *,
+    min_fraction: float = _MASK_FRACTION,
+) -> NDArray[np.bool_]:
+    """Mask bins per contig where exposure-adjusted depth falls below min_fraction of positive median."""
+    if not math.isfinite(min_fraction) or not (0.0 <= min_fraction < 1.0):
+        raise InvalidInputError("min_fraction must be a finite number in [0, 1)")
+    arr = np.asarray(counts)
+    if arr.ndim == 1:
+        totals = np.asarray(arr, dtype=np.float64)
+    elif arr.ndim == 2:
+        totals = np.sum(arr, axis=1, dtype=np.float64)
+    else:
+        raise InvalidInputError("counts must be a 1D or 2D array")
 
+    n_bins = totals.shape[0]
+    exp_arr = np.asarray(exposure, dtype=np.float64)
+    if exp_arr.shape != (n_bins,):
+        raise InvalidInputError("exposure length must match counts row count")
+    c_ids = _encode_contig_ids(contigs, n_bins)
+    if n_bins == 0:
+        return np.empty(0, dtype=np.bool_)
 
-def infer_sample_sexes(
-    fractions: NDArray[np.floating],
-    min_group_size: int,
-    min_separation: float = 0.0,
-    cutoff: float | None = None,
-) -> SexInference:
-    """Split Y-like fractions into female/male groups when separation is clear."""
-    values = np.asarray(fractions, dtype=np.float64)
-    recorded = tuple(float(v) for v in values)
-    if min_group_size < 1:
-        raise ReferenceError("min_sex_group_size must be a positive integer")
-    if cutoff is not None:
-        if not math.isfinite(cutoff) or cutoff < 0.0 or cutoff > 1.0:
-            raise ReferenceError("sex_cutoff must be a finite number in [0, 1]")
-        labels = tuple("male" if float(v) > cutoff else "female" for v in values)
-        return SexInference(labels, float(cutoff), recorded, True, "cutoff")
-    if values.size < 2 * min_group_size:
-        return SexInference(
-            None, None, recorded, False, "cohort is too small for sex inference"
-        )
-
-    order = np.argsort(values, kind="mergesort")
-    sorted_vals = values[order]
-    gaps = np.diff(sorted_vals)[min_group_size - 1 : values.size - min_group_size]
-    if gaps.size == 0 or float(np.max(gaps)) <= 0:
-        return SexInference(
-            None, None, recorded, False, "sex-signal fractions are not separable"
-        )
-    best_rel = int(np.argmax(gaps))
-    best_split = min_group_size + best_rel
-    low, high = sorted_vals[:best_split], sorted_vals[best_split:]
-    spread = max(_mad(low), _mad(high), 1e-12)
-    cutoff_val = float((low[-1] + high[0]) / 2.0)
-    if float(gaps[best_rel]) < max(min_separation, _SEPARATION_MAD_MULTIPLIER * spread):
-        return SexInference(
-            None,
-            cutoff_val,
-            recorded,
-            False,
-            "sex-signal groups are not sufficiently separated",
-        )
-    labels_list: list[SexLabel] = ["female"] * values.size
-    for idx in order[best_split:]:
-        labels_list[int(idx)] = "male"
-    return SexInference(tuple(labels_list), cutoff_val, recorded, True, "separated")
+    pos = np.isfinite(exp_arr) & (exp_arr > 0.0) & np.isfinite(totals) & (totals > 0.0)
+    rate = np.where(pos, totals / np.maximum(exp_arr, 1e-6), 0.0)
+    keep = np.zeros(n_bins, dtype=np.bool_)
+    for c_val in np.unique(c_ids):
+        on_c = c_ids == c_val
+        pos_rates = rate[on_c & pos]
+        if pos_rates.size > 0:
+            keep[on_c] = pos[on_c] & (
+                rate[on_c] > min_fraction * float(np.median(pos_rates))
+            )
+    return keep
 
 
 def _extract_streamed_sample(

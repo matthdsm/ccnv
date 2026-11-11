@@ -8,14 +8,35 @@ import numpy as np
 import pyarrow as pa
 from numpy.typing import NDArray
 
+from ccnv.models.exceptions import InvalidInputError
+
 __all__ = [
     "bin_contig_fragments",
     "bin_counts",
     "bin_intervals",
     "build_uniform_fasta_grid",
+    "compute_bin_exposure",
     "rebin_counts",
     "rebin_counts_matrix",
 ]
+
+
+def compute_bin_exposure(
+    starts: NDArray[np.integer],
+    ends: NDArray[np.integer],
+    bin_size: int,
+) -> NDArray[np.float32]:
+    """Compute geometric bin-width exposure a_i = (end_i - start_i) / bin_size."""
+    if not isinstance(bin_size, int) or isinstance(bin_size, bool) or bin_size <= 0:
+        raise InvalidInputError("bin_size must be a positive integer")
+    s_arr = np.asarray(starts, dtype=np.int64)
+    e_arr = np.asarray(ends, dtype=np.int64)
+    if s_arr.ndim != 1 or s_arr.shape != e_arr.shape:
+        raise InvalidInputError("starts and ends must be aligned 1D arrays")
+    widths = e_arr - s_arr
+    if np.any(widths < 0):
+        raise InvalidInputError("bin widths cannot be negative")
+    return (widths.astype(np.float64) / float(bin_size)).astype(np.float32)
 
 
 def bin_intervals(
