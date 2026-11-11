@@ -15,7 +15,7 @@ from ccnv.models import (
     SegmentResult,
     natural_sort_key,
 )
-from ccnv.report.bed import sort_bin_results, sort_segments
+from ccnv.report.bed import iter_contig_bin_chunks
 
 VCF_CHUNK_ROWS: Final[int] = 65_536
 _CONTIG_HEADER_RE: Final[re.Pattern[str]] = re.compile(
@@ -69,13 +69,12 @@ def _merge_vcf_contig_bounds(
     hdr_contigs, max_len = _extract_header_contigs(header_lines)
     max_len = max(max_len, record_max_end)
     seen_contigs: dict[str, None] = dict.fromkeys(hdr_contigs)
-    for contig_name in record_contigs:
-        seen_contigs.setdefault(contig_name, None)
+    extra_contigs = set(record_contigs)
     if contig_lengths:
-        for contig_name in sorted(contig_lengths, key=natural_sort_key):
-            seen_contigs.setdefault(contig_name, None)
-        cl_max = max(contig_lengths.values(), default=0)
-        max_len = max(max_len, cl_max)
+        extra_contigs.update(contig_lengths.keys())
+        max_len = max(max_len, max(contig_lengths.values(), default=0))
+    for contig_name in sorted(extra_contigs, key=natural_sort_key):
+        seen_contigs.setdefault(contig_name, None)
     return list(seen_contigs.keys()), max_len
 
 
@@ -209,92 +208,87 @@ def write_bins_vcf(
     """Write bin-level copy ratios to a compressed, indexed VCFv4.2 in 65,536-row chunks."""
     if not sample_name:
         raise ValueError("sample_name must be non-empty")
-    ordered_results = sort_bin_results(tuple(results))
     record_max = max(
-        (int(np.max(res.ends)) for res in ordered_results if res.ends.size > 0),
+        (int(np.max(res.ends)) for res in results if res.ends.size > 0),
         default=0,
     )
     contig_names, max_len = _merge_vcf_contig_bounds(
         header,
-        (c for res in ordered_results for c in dict.fromkeys(res.contigs)),
+        (c for res in results for c in dict.fromkeys(res.contigs)),
         record_max,
         contig_lengths,
     )
 
     def _body_chunks() -> Iterator[bytes]:
-        for res in ordered_results:
-            n_rows = len(res.contigs)
-            for offset in range(0, n_rows, VCF_CHUNK_ROWS):
-                stop = min(offset + VCF_CHUNK_ROWS, n_rows)
-                starts_0 = np.asarray(res.starts[offset:stop], dtype=np.int64)
-                ends_0 = np.asarray(res.ends[offset:stop], dtype=np.int64)
-                df = pl.DataFrame(
-                    {
-                        "chrom": pl.Series(
-                            "chrom", res.contigs[offset:stop], dtype=pl.String
-                        ),
-                        "start0": starts_0,
-                        "end0": ends_0,
-                        "ratio": np.asarray(res.ratios[offset:stop], dtype=np.float64),
-                        "zscore": np.asarray(
-                            res.zscores[offset:stop], dtype=np.float64
-                        ),
-                        "weight": np.asarray(
-                            res.weights[offset:stop], dtype=np.float64
-                        ),
-                        "ref_size": np.asarray(
-                            res.reference_sizes[offset:stop], dtype=np.int64
-                        ),
-                        "masked": np.asarray(res.masked[offset:stop], dtype=np.bool_),
-                    }
-                ).select(
-                    pl.col("chrom"),
-                    (pl.col("start0") + 1).alias("pos"),
-                    pl.concat_str(
-                        [
-                            pl.col("chrom"),
-                            pl.lit(":"),
-                            pl.col("start0").cast(pl.String),
-                            pl.lit("-"),
-                            pl.col("end0").cast(pl.String),
-                        ]
-                    ).alias("id"),
-                    pl.lit("N", dtype=pl.String).alias("ref"),
-                    pl.lit("<CNV>", dtype=pl.String).alias("alt"),
-                    pl.lit(None, dtype=pl.String).alias("qual"),
-                    pl.when(pl.col("masked"))
-                    .then(pl.lit("MASKED"))
-                    .otherwise(pl.lit("PASS"))
-                    .alias("filter"),
-                    pl.concat_str(
-                        [
-                            pl.lit("END="),
-                            pl.col("end0").cast(pl.String),
-                            pl.lit(f";SVTYPE=CNV;BRANCH={res.branch}"),
-                        ]
-                    ).alias("info"),
-                    pl.lit("LOG2R:ZSCORE:WEIGHT:REF_SIZE", dtype=pl.String).alias(
-                        "format"
-                    ),
-                    pl.concat_str(
-                        [
-                            _fmt_vcf_float_expr("ratio"),
-                            _fmt_vcf_float_expr("zscore"),
-                            _fmt_vcf_float_expr("weight"),
-                            pl.col("ref_size").cast(pl.String),
-                        ],
-                        separator=":",
-                    ).alias("sample"),
+        for chunk in iter_contig_bin_chunks(
+            results, contig_names, chunk_rows=VCF_CHUNK_ROWS
+        ):
+            cols: dict[str, object] = {
+                "start0": chunk.starts,
+                "end0": chunk.ends,
+                "ratio": chunk.ratios,
+                "zscore": chunk.zscores,
+                "weight": chunk.weights,
+                "ref_size": chunk.reference_sizes,
+                "masked": chunk.masked,
+            }
+            if isinstance(chunk.branch, str):
+                info_expr = pl.concat_str(
+                    [
+                        pl.lit("END="),
+                        pl.col("end0").cast(pl.String),
+                        pl.lit(f";SVTYPE=CNV;BRANCH={chunk.branch}"),
+                    ]
                 )
-                csv_str = df.write_csv(
-                    None,
-                    separator="\t",
-                    include_header=False,
-                    float_precision=6,
-                    null_value=".",
-                    quote_style="never",
+            else:
+                cols["branch"] = pl.Series("branch", chunk.branch, dtype=pl.String)
+                info_expr = pl.concat_str(
+                    [
+                        pl.lit("END="),
+                        pl.col("end0").cast(pl.String),
+                        pl.lit(";SVTYPE=CNV;BRANCH="),
+                        pl.col("branch"),
+                    ]
                 )
-                yield csv_str.encode("utf-8")
+            df = pl.DataFrame(cols).select(
+                pl.lit(chunk.contig, dtype=pl.String).alias("chrom"),
+                (pl.col("start0") + 1).alias("pos"),
+                pl.concat_str(
+                    [
+                        pl.lit(f"{chunk.contig}:"),
+                        pl.col("start0").cast(pl.String),
+                        pl.lit("-"),
+                        pl.col("end0").cast(pl.String),
+                    ]
+                ).alias("id"),
+                pl.lit("N", dtype=pl.String).alias("ref"),
+                pl.lit("<CNV>", dtype=pl.String).alias("alt"),
+                pl.lit(None, dtype=pl.String).alias("qual"),
+                pl.when(pl.col("masked"))
+                .then(pl.lit("MASKED"))
+                .otherwise(pl.lit("PASS"))
+                .alias("filter"),
+                info_expr.alias("info"),
+                pl.lit("LOG2R:ZSCORE:WEIGHT:REF_SIZE", dtype=pl.String).alias("format"),
+                pl.concat_str(
+                    [
+                        _fmt_vcf_float_expr("ratio"),
+                        _fmt_vcf_float_expr("zscore"),
+                        _fmt_vcf_float_expr("weight"),
+                        pl.col("ref_size").cast(pl.String),
+                    ],
+                    separator=":",
+                ).alias("sample"),
+            )
+            csv_str = df.write_csv(
+                None,
+                separator="\t",
+                include_header=False,
+                float_precision=6,
+                null_value=".",
+                quote_style="never",
+            )
+            yield csv_str.encode("utf-8")
 
     return write_vcf_streaming(
         gz_path,
@@ -320,13 +314,15 @@ def write_segments_vcf(
     """Write segment-level calls and metrics to a compressed, indexed VCFv4.2."""
     if not sample_name:
         raise ValueError("sample_name must be non-empty")
-    items = [s for s in sort_segments(results) if not calls_only or s.call is not None]
+    filtered = [s for s in results if not calls_only or s.call is not None]
     contig_names, max_len = _merge_vcf_contig_bounds(
         header,
-        (item.contig for item in items),
-        max((int(item.end) for item in items), default=0),
+        (item.contig for item in filtered),
+        max((int(item.end) for item in filtered), default=0),
         contig_lengths,
     )
+    contig_rank = {c: idx for idx, c in enumerate(contig_names)}
+    items = sorted(filtered, key=lambda s: (contig_rank[s.contig], s.start, s.end))
 
     def _body_chunks() -> Iterator[bytes]:
         for offset in range(0, len(items), VCF_CHUNK_ROWS):

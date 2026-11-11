@@ -23,12 +23,15 @@ from ccnv.report import (
     PRENATAL_CALLS_BED_HEADER,
     PRENATAL_SEGMENTS_BED_HEADER,
     SEGMENTS_BED_HEADER,
+    build_vcf_header,
     decimate_bins_m4,
     natural_sort_key,
     write_bins_bed_streaming,
+    write_bins_vcf,
     write_deliverables,
     write_genome_plot,
     write_outputs,
+    write_segments_vcf,
     write_vcf_streaming,
 )
 
@@ -714,22 +717,50 @@ class TestReport(unittest.TestCase):
             )
 
 
+def _make_bin_result(
+    branch: str,
+    contigs: tuple[str, ...],
+    starts: object,
+    ends: object,
+    ratios: object = 0.2,
+    zscores: object = 2.0,
+    *,
+    weights: object = 1.0,
+    ref_size: object = 12,
+    masked: object = False,
+) -> BinResult:
+    n = len(contigs)
+    return BinResult(
+        branch=branch,
+        contigs=contigs,
+        starts=np.asarray(starts, dtype=np.int64),
+        ends=np.asarray(ends, dtype=np.int64),
+        ratios=np.broadcast_to(np.asarray(ratios, dtype=np.float64), (n,)).copy(),
+        zscores=np.broadcast_to(np.asarray(zscores, dtype=np.float64), (n,)).copy(),
+        weights=np.broadcast_to(np.asarray(weights, dtype=np.float64), (n,)).copy(),
+        reference_sizes=np.broadcast_to(
+            np.asarray(ref_size, dtype=np.int64), (n,)
+        ).copy(),
+        masked=np.broadcast_to(np.asarray(masked, dtype=np.bool_), (n,)).copy(),
+    )
+
+
 class TestScalableReports(unittest.TestCase):
     def test_default_skips_bins_vcf_and_segments_calls_vcf_parse_in_pysam(
         self,
     ) -> None:
         contig_lengths = {"chr1": 200_000, "chr2": 150_000}
         bins = (
-            BinResult(
-                branch="autosomal",
-                contigs=("chr1", "chr1", "chr2"),
-                starts=np.array([0, 100_000, 0], dtype=np.int64),
-                ends=np.array([100_000, 200_000, 150_000], dtype=np.int64),
-                ratios=np.array([0.45, np.nan, -0.55], dtype=np.float64),
-                zscores=np.array([4.2, np.inf, -3.8], dtype=np.float64),
-                weights=np.array([1.2, 0.0, 1.5], dtype=np.float64),
-                reference_sizes=np.array([12, 0, 14], dtype=np.int64),
-                masked=np.array([False, True, False], dtype=np.bool_),
+            _make_bin_result(
+                "autosomal",
+                ("chr1", "chr1", "chr2"),
+                [0, 100_000, 0],
+                [100_000, 200_000, 150_000],
+                [0.45, np.nan, -0.55],
+                [4.2, np.inf, -3.8],
+                weights=[1.2, 0.0, 1.5],
+                ref_size=[12, 0, 14],
+                masked=[False, True, False],
             ),
         )
         segments = (
@@ -753,10 +784,7 @@ class TestScalableReports(unittest.TestCase):
             )
             self.assertIsNone(outputs.bins_vcf)
             self.assertFalse(Path(f"{prefix_default}_bins.vcf.gz").exists())
-            self.assertIsNotNone(outputs.segments_vcf)
-            self.assertIsNotNone(outputs.calls_vcf)
-            assert outputs.segments_vcf is not None
-            assert outputs.calls_vcf is not None
+            assert outputs.segments_vcf is not None and outputs.calls_vcf is not None
 
             with pysam.VariantFile(str(outputs.segments_vcf)) as vf:
                 recs = list(vf)
@@ -768,12 +796,10 @@ class TestScalableReports(unittest.TestCase):
                 self.assertIsNone(recs[1].samples["default_out"]["ZSCORE"])
 
             with pysam.VariantFile(str(outputs.calls_vcf)) as vf:
-                call_recs = list(vf)
-                self.assertEqual(len(call_recs), 2)
+                self.assertEqual(len(list(vf)), 2)
 
-            prefix_opt_in = Path(tmpdir) / "opt_in_out"
             outputs_bins = write_outputs(
-                prefix_opt_in,
+                Path(tmpdir) / "opt_in_out",
                 bins,
                 segments,
                 contig_lengths,
@@ -782,7 +808,6 @@ class TestScalableReports(unittest.TestCase):
                 bins_vcf=True,
                 threads=2,
             )
-            self.assertIsNotNone(outputs_bins.bins_vcf)
             assert outputs_bins.bins_vcf is not None
             with pysam.VariantFile(str(outputs_bins.bins_vcf)) as vf:
                 bin_recs = list(vf)
@@ -793,41 +818,36 @@ class TestScalableReports(unittest.TestCase):
     def test_streaming_bed_and_vcf_multi_chunk_and_csi_above_512mb(self) -> None:
         n = 70_000
         starts = np.arange(n, dtype=np.int64) * 100
-        ends = starts + 100
         ratios = np.linspace(-0.5, 0.5, n, dtype=np.float64)
         ratios[65_536] = np.nan
-        zscores = ratios * 4.0
-        weights = np.ones(n, dtype=np.float64)
-        ref_sizes = np.full(n, 20, dtype=np.int64)
         masked = np.zeros(n, dtype=np.bool_)
         masked[65_536] = True
-        bin_res = BinResult(
-            branch="autosomal",
-            contigs=("chr1",) * n,
-            starts=starts,
-            ends=ends,
-            ratios=ratios,
-            zscores=zscores,
-            weights=weights,
-            reference_sizes=ref_sizes,
+        bin_res = _make_bin_result(
+            "autosomal",
+            ("chr1",) * n,
+            starts,
+            starts + 100,
+            ratios,
+            ratios * 4.0,
             masked=masked,
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             bed_gz = root / "chunked_bins.bed.gz"
-            out_bed = write_bins_bed_streaming(bed_gz, (bin_res,), threads=2)
-            self.assertEqual(out_bed, bed_gz)
+            self.assertEqual(
+                write_bins_bed_streaming(bed_gz, (bin_res,), threads=2), bed_gz
+            )
             self.assertTrue(Path(f"{bed_gz}.tbi").is_file())
 
             with pysam.TabixFile(str(bed_gz)) as tbx:
                 hit = list(tbx.fetch("chr1", 65_536 * 100, 65_537 * 100))
                 self.assertEqual(len(hit), 1)
                 fields = hit[0].split("\t")
-                self.assertEqual(fields[4], "NaN")
-                self.assertEqual(fields[8], "true")
-                tail = list(tbx.fetch("chr1", 69_999 * 100, 70_000 * 100))
-                self.assertEqual(len(tail), 1)
+                self.assertEqual((fields[4], fields[8]), ("NaN", "true"))
+                self.assertEqual(
+                    len(list(tbx.fetch("chr1", 69_999 * 100, 70_000 * 100))), 1
+                )
 
             csi_vcf = root / "giant.vcf.gz"
             hdr = [
@@ -871,29 +891,19 @@ class TestScalableReports(unittest.TestCase):
         n = 500_000
         rng = np.random.default_rng(11)
         starts = np.arange(n, dtype=np.int64) * 100
-        ends = starts + 100
         ratios = rng.normal(0.0, 0.15, size=n).astype(np.float64)
         zscores = rng.normal(0.0, 0.8, size=n).astype(np.float64)
         ratios[250_000] = 0.95
         zscores[250_000] = 7.2
         bins = (
-            BinResult(
-                branch="autosomal",
-                contigs=("chr1",) * n,
-                starts=starts,
-                ends=ends,
-                ratios=ratios,
-                zscores=zscores,
-                weights=np.ones(n, dtype=np.float64),
-                reference_sizes=np.full(n, 16, dtype=np.int64),
-                masked=np.zeros(n, dtype=np.bool_),
+            _make_bin_result(
+                "autosomal", ("chr1",) * n, starts, starts + 100, ratios, zscores
             ),
         )
-        contig_lengths = {"chr1": n * 100}
 
         with tempfile.TemporaryDirectory() as tmpdir:
             html_path = Path(tmpdir) / "big_plot.html"
-            write_genome_plot(html_path, bins, (), contig_lengths)
+            write_genome_plot(html_path, bins, (), {"chr1": n * 100})
             content = html_path.read_text(encoding="utf-8")
 
         payload = _extract_payload(content)
@@ -904,11 +914,68 @@ class TestScalableReports(unittest.TestCase):
         assert isinstance(bins_dict, dict)
         s_arr = np.frombuffer(base64.b64decode(bins_dict["s"]), dtype="<u4")
         self.assertIn(250_000 * 100, set(s_arr.tolist()))
-        self.assertIn("Uint32Array", content)
-        self.assertIn("Float32Array", content)
-        self.assertIn("plotly_hover", content)
-        self.assertIn("100", content)
+        for token in ("Uint32Array", "Float32Array", "plotly_hover", "100"):
+            self.assertIn(token, content)
         self.assertNotIn("const binHover = new Array", content)
+
+    def test_interleaved_multibranch_csi_and_custom_vcf_header_order(self) -> None:
+        cl = {"chr1": 700_000_000, "chrX": 156_000_000, "scaffold_1": 50_000}
+        auto_c = ("chr1", "chr1", "scaffold_1")
+        bins = (
+            _make_bin_result("autosomal", auto_c, [0, 5000, 0], [2500, 10000, 5000]),
+            _make_bin_result("female_sex", ("chrX",), [0], [5000], 0.4, 3.5),
+            _make_bin_result("par_shared", ("chr1",), [2500], [5000], 0.15, 1.5),
+        )
+        segments = (
+            SegmentResult("scaffold_1", 0, 5_000, -0.1, -1.0, 1.0, 1, None),
+            SegmentResult("chr1", 0, 10_000, 0.5, 4.2, 1.0, 3, "gain"),
+            SegmentResult("chrX", 0, 5_000, 0.4, 3.5, 1.0, 1, "gain"),
+        )
+        custom_contigs = (
+            "##contig=<ID=scaffold_1,length=50000>",
+            "##contig=<ID=chrX,length=156000000>",
+            "##contig=<ID=chr1,length=700000000>",
+        )
+        nat_order = ["chr1", "chr1", "chr1", "chrX", "scaffold_1"]
+        branches_chr1 = ["autosomal", "par_shared", "autosomal"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bed_path = root / "multi_bins.bed.gz"
+            write_bins_bed_streaming(bed_path, bins, contig_lengths=cl)
+            self.assertTrue(Path(f"{bed_path}.csi").is_file())
+            with gzip.open(bed_path, "rt") as h:
+                bed_rows = [ln.split("\t") for ln in h.read().splitlines()[1:]]
+            self.assertEqual([r[0] for r in bed_rows], nat_order)
+            self.assertEqual([int(r[1]) for r in bed_rows[:3]], [0, 2_500, 5_000])
+            self.assertEqual([r[9] for r in bed_rows[:3]], branches_chr1)
+
+            bins_vcf = root / "multi_bins.vcf.gz"
+            hdr_b = build_vcf_header(cl, "S1", "bins")
+            write_bins_vcf(bins_vcf, hdr_b, bins, "S1", contig_lengths=cl)
+            self.assertTrue(Path(f"{bins_vcf}.csi").is_file())
+            with pysam.VariantFile(str(bins_vcf)) as vf:
+                recs = list(vf)
+                self.assertEqual([r.chrom for r in recs], nat_order)
+                self.assertEqual([r.info["BRANCH"] for r in recs[:3]], branches_chr1)
+                self.assertEqual(len(list(vf.fetch("chrX", 0, 5_000))), 1)
+
+            base_seg = build_vcf_header({}, "S1", "segments")
+            c_seg_hdr = (*base_seg[:3], *custom_contigs, *base_seg[3:])
+            seg_vcf = root / "custom_order_segments.vcf.gz"
+            write_segments_vcf(seg_vcf, c_seg_hdr, segments, "S1", contig_lengths=cl)
+            self.assertTrue(Path(f"{seg_vcf}.csi").is_file())
+            with pysam.VariantFile(str(seg_vcf)) as vf:
+                self.assertEqual([r.chrom for r in vf], ["scaffold_1", "chrX", "chr1"])
+                self.assertEqual(len(list(vf.fetch("chr1", 0, 10_000))), 1)
+
+            base_bin = build_vcf_header({}, "S1", "bins")
+            c_bin_hdr = (*base_bin[:3], *custom_contigs, *base_bin[3:])
+            c_bins_vcf = root / "custom_order_bins.vcf.gz"
+            write_bins_vcf(c_bins_vcf, c_bin_hdr, bins, "S1", contig_lengths=cl)
+            self.assertTrue(Path(f"{c_bins_vcf}.csi").is_file())
+            with pysam.VariantFile(str(c_bins_vcf)) as vf:
+                expected_c = ["scaffold_1", "chrX", "chr1", "chr1", "chr1"]
+                self.assertEqual([r.chrom for r in vf], expected_c)
 
 
 if __name__ == "__main__":
