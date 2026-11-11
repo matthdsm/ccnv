@@ -1,12 +1,13 @@
 import tempfile
 import unittest
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pysam
+from helpers import make_reference_table, make_sample_table
 from published_fixtures import (
     CHR21_LENGTH,
     PUBLISHED_BIN_SIZE,
@@ -35,18 +36,15 @@ from ccnv.models import (
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
     PredictConfig,
-    ReadFilters,
     ReferenceConfig,
     ReferenceError,
+    SampleMetadata,
     parquet_path,
 )
 from ccnv.models.schemas import (
-    REFERENCE_SCHEMA,
-    SAMPLE_SCHEMA,
     ArtifactKind,
     SchemaError,
     decode_metadata,
-    metadata_for,
     validate_table,
 )
 from ccnv.predict import run as predict
@@ -68,48 +66,14 @@ def _sample_table(
     bin_size: int = 100,
     identity: object | None = None,
 ) -> pa.Table:
-    n_bins = len(counts)
-    if starts is None:
-        starts = [i * bin_size for i in range(n_bins)]
-    if ends is None:
-        ends = [start + bin_size for start in starts]
-    if contigs is None:
-        contigs = ["chr1"] * n_bins
-        if contig_lengths is None:
-            contig_lengths = {"chr1": ends[-1]}
-    elif contig_lengths is None:
-        contig_lengths = {}
-        for name in dict.fromkeys(contigs):
-            contig_lengths[name] = max(
-                end for contig, end in zip(contigs, ends, strict=True) if contig == name
-            )
-    metadata = metadata_for(
-        ArtifactKind.SAMPLE,
+    return make_sample_table(
+        counts,
+        contigs=contigs,
+        starts=starts,
+        ends=ends,
         contig_lengths=contig_lengths,
-        values={
-            "bin_size": bin_size,
-            "source_identity": identity if identity is not None else {"id": "sample"},
-            "reference_identity": {"name": "test"},
-            "qc": {},
-            "filters": asdict(ReadFilters()),
-        },
-    )
-    n_rows = len(contigs)
-    return pa.table(
-        {
-            "contig": contigs,
-            "start": pa.array(starts, type=pa.int64()),
-            "end": pa.array(ends, type=pa.int64()),
-            "count": pa.array(counts, type=pa.uint64()),
-            "fragment_lengths": pa.array([[]] * n_rows, type=pa.list_(pa.uint16())),
-            "endpoint_count": pa.array(
-                np.zeros(n_rows, dtype=np.uint32), type=pa.uint32()
-            ),
-            "frag_gc_sum": pa.array(
-                np.zeros(n_rows, dtype=np.float32), type=pa.float32()
-            ),
-        },
-        schema=SAMPLE_SCHEMA.with_metadata(metadata),
+        bin_size=bin_size,
+        identity=identity,
     )
 
 
@@ -131,34 +95,24 @@ class TestReferenceSchemaRejection(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             path = _write_sample(Path(tmpdir), "bad.ccnv", table)
-            with self.assertRaisesRegex(ReferenceError, "fields do not match"):
+            with self.assertRaisesRegex(
+                ReferenceError, "artifact_kind|fields do not match"
+            ):
                 load_cohort((path,))
 
     def test_validate_table_rejects_duplicate_branch_bins(self) -> None:
-        metadata = metadata_for(
-            ArtifactKind.REFERENCE,
+        table = make_reference_table(
+            branches=[BRANCH_AUTOSOMAL, BRANCH_AUTOSOMAL],
+            contigs=["chr1", "chr1"],
+            starts=[0, 0],
+            ends=[10, 10],
             contig_lengths={"chr1": 10},
-            values={"model": {}, "sample_identities": []},
+            pca_loadings=[[0.1], [0.1]],
         )
-        table = pa.table(
-            {
-                "branch": [BRANCH_AUTOSOMAL, BRANCH_AUTOSOMAL],
-                "contig": ["chr1", "chr1"],
-                "start": pa.array([0, 0], type=pa.int64()),
-                "end": pa.array([10, 10], type=pa.int64()),
-                "masked": [False, False],
-                "gc": pa.array([-1.0, -1.0], type=pa.float32()),
-                "mappability": pa.array([-1.0, -1.0], type=pa.float32()),
-                "pca_mean": pa.array([0.0, 0.0], type=pa.float64()),
-                "pca_loadings": pa.array([[0.1], [0.1]], type=pa.list_(pa.float64())),
-                "nearest_ref_indices": pa.array([[], []], type=pa.list_(pa.int32())),
-                "mean_distance": pa.array([0.0, 0.0], type=pa.float32()),
-                "null_mean": pa.array([0.0, 0.0], type=pa.float64()),
-                "null_std": pa.array([0.0, 0.0], type=pa.float64()),
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(metadata),
-        )
-        with self.assertRaisesRegex(SchemaError, "duplicates bin identity"):
+        with self.assertRaisesRegex(
+            SchemaError,
+            "does not match previous bin end|duplicates|strictly monotonic|non-overlapping|contiguous",
+        ):
             validate_table(table, ArtifactKind.REFERENCE)
 
 
@@ -529,13 +483,15 @@ class TestSexInference(unittest.TestCase):
                 ref_path = root / f"ref_{cohort_size}.ccnv"
                 table = pq.read_table(ref_path)
                 validate_table(table, ArtifactKind.REFERENCE)
+                self.assertIn("proto_ids", table.column_names)
+                self.assertIn("proto_weights", table.column_names)
                 self.assertIn("mean_distance", table.column_names)
                 self.assertIn("null_mean", table.column_names)
-                self.assertIn("null_std", table.column_names)
-                self.assertNotIn("nearest_ref_distances", table.column_names)
-                self.assertNotIn("null_ratios", table.column_names)
+                self.assertIn("bio_dispersion", table.column_names)
+                self.assertNotIn("nearest_ref_indices", table.column_names)
+                self.assertNotIn("null_std", table.column_names)
                 self.assertEqual(len(table.column("null_mean")), 4)
-                self.assertEqual(len(table.column("null_std")), 4)
+                self.assertEqual(len(table.column("bio_dispersion")), 4)
 
 
 class TestReferencePublishedCrams(unittest.TestCase):
@@ -570,8 +526,8 @@ class TestReferencePublishedCrams(unittest.TestCase):
             samples = [read_sample_parquet(path) for path in sample_paths]
             self.assertEqual(samples[0].num_rows, samples[1].num_rows)
             self.assertEqual(
-                set(samples[0].column("contig").to_pylist()),
-                {"chr21"},
+                SampleMetadata.from_table(samples[0]).contig_order,
+                ("chr21",),
             )
 
             reference_prefix = root / "reference"

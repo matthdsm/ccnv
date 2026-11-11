@@ -27,6 +27,9 @@ class SamplesheetEntry:
             )
 
 
+SampleEntry = SamplesheetEntry
+
+
 @dataclass(frozen=True, slots=True)
 class Contig:
     """A contig exactly as declared by an alignment header."""

@@ -220,6 +220,34 @@ def validate_reference_table(
     return _impl(table, check_rows=check_rows)
 
 
+def fixed_size_list_to_numpy[ScalarT: np.generic](
+    col: pa.Array | pa.ChunkedArray,
+    list_size: int,
+    dtype: type[ScalarT],
+) -> NDArray[ScalarT]:
+    """Extract a FixedSizeListArray or ChunkedArray into a 2D (N, list_size) NumPy array."""
+    arr = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
+    n = len(arr)
+    np_dtype = np.dtype(dtype)
+    if n == 0 or list_size == 0:
+        return np.empty((n, list_size), dtype=np_dtype)
+    is_float = bool(np.issubdtype(np_dtype, np.floating))
+    if arr.null_count == n:
+        return np.full((n, list_size), np.nan if is_float else 0, dtype=np_dtype)
+    if not isinstance(arr, pa.FixedSizeListArray):
+        raise SchemaError(f"expected FixedSizeListArray, found {type(arr).__name__}")
+    child = arr.values.slice(arr.offset * list_size, n * list_size)
+    if child.null_count > 0 and not is_float:
+        child = pc.fill_null(child, 0)
+    flat = child.to_numpy(zero_copy_only=False)
+    out: NDArray[ScalarT] = np.asarray(flat, dtype=np_dtype).reshape(n, list_size)
+    if arr.null_count > 0:
+        out = out.copy()
+        null_mask = arr.is_null().to_numpy(zero_copy_only=False)
+        out[null_mask] = np.nan if is_float else 0
+    return out
+
+
 def validate_table(table: pa.Table, kind: ArtifactKind) -> None:
     """Validate schema plus canonical coordinate bounds and row identity."""
     from ccnv.models.validation import validate_table as _impl
@@ -257,6 +285,7 @@ __all__ = [
     "build_reference_schema",
     "decode_metadata",
     "encode_metadata",
+    "fixed_size_list_to_numpy",
     "metadata_for",
     "reconstruct_sample_grid",
     "validate_metadata",

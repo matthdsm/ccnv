@@ -3,21 +3,20 @@
 from __future__ import annotations
 
 import logging
-import warnings
-from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final, Literal, overload
 
 import numpy as np
 import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import scipy.stats
 from numpy.typing import ArrayLike, NDArray
 from sklearn.linear_model import HuberRegressor
 
-from ccnv.features.cohort import rebin_sample_table
+from ccnv.extract import extract_for_predict, extracted_to_sample_table
 from ccnv.features.covariates import (
     correct_covariate_bias,
     mask_covariates,
@@ -30,14 +29,26 @@ from ccnv.features.fragmentomics import (
     resolve_fragmentomics_compatibility,
 )
 from ccnv.features.prenatal import annotate_prenatal_segments, predict_prenatal
-from ccnv.io.parquet import load_sample_or_extract, read_reference_parquet
+from ccnv.features.rebinning import rebin_sample_sketch
+from ccnv.io.parquet import (
+    align_sample_grid_indices,
+    extract_reference_branch_arrays,
+    read_reference_parquet,
+    read_sample_parquet,
+    unique_dictionary_contigs,
+)
 from ccnv.io.tracks import load_cytobands_track, load_gc_track, load_mappability_track
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
+    BRANCH_PRENATAL_AUTOSOMAL,
+    BRANCH_PRENATAL_FFY,
     DEFAULT_MIN_MAPPABILITY,
+    NUM_PROTOTYPES_PER_BIN,
     AnalysisMode,
+    ArtifactKind,
+    BinCompatibilityError,
     BinResult,
     CallType,
     CovariateError,
@@ -46,12 +57,18 @@ from ccnv.models import (
     PredictError,
     PredictionOutputs,
     PrenatalModelMetadata,
+    ReferenceMetadata,
+    SampleMetadata,
+    SchemaError,
     SegmentResult,
-    bin_coordinates,
     decode_metadata,
+    reconstruct_sample_grid,
+    validate_sample_table,
+    validate_schema,
 )
 from ccnv.qc.predict import build_predict_qc_payload, write_predict_qc_json
 from ccnv.report import write_outputs
+from ccnv.stats.neighbors import evaluate_loco_prototype_baseline
 from ccnv.stats.segmentation import (
     compute_contig_rho1,
     evaluate_stouffer_segment_scores,
@@ -67,7 +84,9 @@ __all__ = [
     "PredictError",
     "PredictionInput",
     "ProjectedCoverage",
+    "build_branch_model",
     "call_segment",
+    "extract_for_predict",
     "load_inputs",
     "normalize_branch",
     "project_coverage",
@@ -95,14 +114,14 @@ class BranchModel:
     counts: NDArray[np.float64]
     masked: NDArray[np.bool_]
     pca_mean: NDArray[np.float64]
-    pca_loadings: NDArray[np.float64]
-    nearest_indices: tuple[NDArray[np.int32] | NDArray[np.int64], ...]
+    pca_loadings: NDArray[np.float32]
+    proto_ids: NDArray[np.uint16]
+    proto_weights: NDArray[np.float16]
     mean_distance: NDArray[np.float32]
     null_mean: NDArray[np.float64]
     null_std: NDArray[np.float64]
     gc: NDArray[np.floating] | None = None
     mappability: NDArray[np.floating] | None = None
-    nearest_distances: tuple[NDArray[np.float32], ...] = ()
     mean_frag_len: NDArray[np.floating] | None = None
     endpoint_ratio: NDArray[np.floating] | None = None
 
@@ -126,6 +145,7 @@ def run(config: PredictConfig) -> PredictionOutputs:
         sex=config.sex,
         mode=config.mode,
         fasta=config.fasta,
+        threads=config.threads,
     )
     raw_sample = inputs.sample
     prenatal_meta: PrenatalModelMetadata | None = None
@@ -207,51 +227,78 @@ def load_inputs(
     sex: Literal["autosomal", "female", "male"] = "autosomal",
     mode: AnalysisMode = "germline",
     fasta: Path | None = None,
+    threads: int = 1,
 ) -> PredictionInput:
-    """Load and validate sample and reference tables against each other."""
+    """Load and validate sample and selective reference branches against each other."""
     try:
-        reference = read_reference_parquet(reference_path)
+        ref_schema = pq.read_schema(reference_path)
+        validate_schema(ref_schema, ArtifactKind.REFERENCE)
+        ref_meta_obj = ReferenceMetadata.from_schema(ref_schema)
+        raw_ref_meta = decode_metadata(ref_schema.metadata)
     except Exception as err:
         raise PredictError(f"failed to read reference {reference_path}: {err}") from err
 
-    ref_meta = decode_metadata(reference.schema.metadata)
-    ref_model = ref_meta.get("model", {})
-    ref_bin_size = (
-        int(ref_model.get("bin_size", 5000)) if isinstance(ref_model, Mapping) else 5000
-    )
-    try:
-        sample = load_sample_or_extract(sample_path, fasta=fasta, bin_size=ref_bin_size)
-    except Exception as err:
-        raise PredictError(f"failed to read sample {sample_path}: {err}") from err
+    if sample_path.suffix.lower() in {".bam", ".cram"}:
+        need_bands = (
+            mode == "prenatal"
+            or ref_meta_obj.fragmentomics_corrected
+            or ref_meta_obj.flat
+        )
+        extracted = extract_for_predict(
+            sample_path,
+            ref_meta_obj,
+            threads=threads,
+            fasta=fasta,
+            collect_bands=need_bands,
+        )
+        sample = extracted_to_sample_table(extracted)
+    else:
+        try:
+            sample = read_sample_parquet(sample_path)
+        except Exception as err:
+            raise PredictError(f"failed to read sample {sample_path}: {err}") from err
 
-    sample_meta = decode_metadata(sample.schema.metadata)
-    ref_mode = (
-        ref_model.get("mode", "germline")
-        if isinstance(ref_model, Mapping)
-        else "germline"
-    )
-    if mode == "prenatal" and ref_mode != "prenatal":
+    if mode == "prenatal" and ref_meta_obj.mode != "prenatal":
         msg = (
             "reference was built in germline mode and lacks prenatal models; "
             "rebuild reference with --mode prenatal or run predict with --mode germline"
         )
         raise PredictError(msg)
-    if mode == "germline" and ref_mode == "prenatal":
+    if mode == "germline" and ref_meta_obj.mode == "prenatal":
         logger.warning(
             "reference was built in prenatal mode; "
             "prenatal models are ignored in germline mode"
         )
-    sample_lens, ref_lens = _contig_lengths(sample_meta), _contig_lengths(ref_meta)
-    branch_vals = set(reference.column("branch").unique().to_pylist())
+
+    branch_vals: set[object] = set(ref_meta_obj.branches)
+    if not branch_vals:
+        try:
+            b_tbl = pq.read_table(reference_path, columns=["branch"])
+            branch_vals = {
+                str(v)
+                for v in pc.unique(b_tbl.column("branch")).to_pylist()
+                if v is not None
+            }
+        except Exception as err:
+            raise PredictError(
+                f"failed to read reference {reference_path}: {err}"
+            ) from err
+
     if BRANCH_AUTOSOMAL not in branch_vals:
         raise PredictError("reference has no autosomal branch")
+
     if mode == "prenatal":
         branches = [BRANCH_AUTOSOMAL] + (
             [BRANCH_FEMALE_SEX] if BRANCH_FEMALE_SEX in branch_vals else []
         )
-        chosen_sex = "female" if BRANCH_FEMALE_SEX in branch_vals else None
+        chosen_sex: Sex | None = "female" if BRANCH_FEMALE_SEX in branch_vals else None
+        read_branches = [
+            b
+            for b in (*branches, BRANCH_PRENATAL_AUTOSOMAL, BRANCH_PRENATAL_FFY)
+            if b in branch_vals
+        ]
     else:
-        chosen_sex = _resolve_sample_sex(sex, sample, ref_meta, branch_vals)
+        chosen_sex = _resolve_sample_sex(sex, sample, raw_ref_meta, branch_vals)
         branches = [BRANCH_AUTOSOMAL]
         if chosen_sex is not None:
             sex_branch = (
@@ -261,41 +308,44 @@ def load_inputs(
                 raise PredictError(f"reference has no {sex_branch!r} branch")
             if sex_branch in branch_vals:
                 branches.append(sex_branch)
-    reference_bin_size = (
-        ref_model.get("bin_size") if isinstance(ref_model, dict) else None
-    )
-    sample_bin_size = sample_meta.get("bin_size")
-    if (
-        isinstance(reference_bin_size, int)
-        and isinstance(sample_bin_size, int)
-        and sample_bin_size != reference_bin_size
-    ):
+        read_branches = list(branches)
+
+    sample_meta_obj = validate_sample_table(sample)
+    if sample_meta_obj.bin_size != ref_meta_obj.bin_size:
         logger.debug(
             "rebinning sample from %d bp to reference bin size %d bp",
-            sample_bin_size,
-            reference_bin_size,
+            sample_meta_obj.bin_size,
+            ref_meta_obj.bin_size,
         )
-        sample = rebin_sample_table(sample, reference_bin_size)
+        try:
+            sample = rebin_sample_sketch(sample, ref_meta_obj.bin_size)
+        except BinCompatibilityError as err:
+            raise PredictError(str(err)) from err
+        sample_meta_obj = validate_sample_table(sample)
+
+    try:
+        reference, _ = read_reference_parquet(
+            reference_path, branches=read_branches, check_rows=False
+        )
+    except Exception as err:
+        raise PredictError(f"failed to read reference {reference_path}: {err}") from err
+
     resolve_fragmentomics_compatibility(sample, reference)
     active_ref = reference.filter(
-        pc.is_in(reference.column("branch"), pa.array(branches))
+        pc.is_in(reference.column("branch"), pa.array(branches, type=pa.string()))
     )
-    for contig_name in set(active_ref.column("contig").unique().to_pylist()):
+    active_contigs = unique_dictionary_contigs(active_ref.column("contig"))
+    sample_lens = sample_meta_obj.contig_lengths
+    ref_lens = dict(ref_meta_obj.contig_lengths)
+    missing_contigs = [c for c in active_contigs if c not in sample_lens]
+    if missing_contigs:
+        raise PredictError(
+            f"sample is missing reference bins on contig(s): {', '.join(missing_contigs)}"
+        )
+    for contig_name in active_contigs:
         if sample_lens.get(contig_name) != ref_lens.get(contig_name):
             raise PredictError(f"contig length mismatch for {contig_name!r}")
-    sample_active = sample.filter(
-        pc.is_in(
-            sample.column("contig"),
-            pa.array(list(set(active_ref.column("contig").unique().to_pylist()))),
-        )
-    )
-    if sample_active.num_rows != active_ref.num_rows and (
-        missing := sorted(
-            set(bin_coordinates(active_ref)) - set(bin_coordinates(sample))
-        )
-    ):
-        contigs = ", ".join(dict.fromkeys(item[0] for item in missing))
-        raise PredictError(f"sample is missing reference bins on contig(s): {contigs}")
+
     return PredictionInput(
         sample=sample,
         reference=reference,
@@ -305,95 +355,86 @@ def load_inputs(
     )
 
 
-def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel:
-    """Build dense NumPy arrays for one reference branch."""
-    ref_b = inputs.reference.filter(pc.equal(inputs.reference.column("branch"), branch))
-    if ref_b.num_rows == 0:
-        raise PredictError(f"branch {branch!r} has no reference rows")
+@overload
+def build_branch_model(inputs: PredictionInput, branch: str) -> BranchModel: ...
 
-    ref_pl = pl.from_arrow(ref_b)
-    sm_pl = pl.from_arrow(inputs.sample)
-    use_frag = resolve_fragmentomics_compatibility(inputs.sample, inputs.reference)
-    if use_frag:
-        f_len, e_rat = extract_bin_fragmentomic_covariates(inputs.sample)
-        sm_pl = sm_pl.with_columns(
-            pl.Series("mean_frag_len", f_len),
-            pl.Series("endpoint_ratio", e_rat),
-        )
-        sm_cols = ["contig", "start", "end", "count", "mean_frag_len", "endpoint_ratio"]
+
+@overload
+def build_branch_model(
+    inputs: pa.Table,
+    branch: str,
+    ref_meta: ReferenceMetadata | None = None,
+) -> BranchModel: ...
+
+
+def build_branch_model(
+    inputs: PredictionInput | pa.Table,
+    branch: str,
+    ref_meta: ReferenceMetadata | None = None,
+) -> BranchModel:
+    """Build dense zero-copy NumPy arrays for one reference branch."""
+    if isinstance(inputs, PredictionInput):
+        ref_table = inputs.reference
+        sample_table: pa.Table | None = inputs.sample
+        resolved_meta = ReferenceMetadata.from_schema(ref_table.schema)
     else:
-        sm_cols = ["contig", "start", "end", "count"]
-
-    joined = ref_pl.select(["contig", "start", "end"]).join(
-        sm_pl.select(sm_cols),
-        on=["contig", "start", "end"],
-        how="left",
-        maintain_order="left",
-    )
-    if joined["count"].null_count() != 0 or joined.height != ref_pl.height:
-        raise PredictError(f"branch {branch!r} bin count mismatch")
-
-    mean_frag_len = (
-        joined["mean_frag_len"].to_numpy().astype(np.float64) if use_frag else None
-    )
-    endpoint_ratio = (
-        joined["endpoint_ratio"].to_numpy().astype(np.float64) if use_frag else None
-    )
-
-    c_vals = ref_pl["contig"].to_list()
-    starts = ref_pl["start"].to_numpy().astype(np.int64)
-    ends = ref_pl["end"].to_numpy().astype(np.int64)
-    counts = joined["count"].to_numpy().astype(np.float64)
-    masked = ref_pl["masked"].to_numpy().astype(np.bool_)
-    gc_col = ref_pl["gc"].to_numpy().astype(np.float32)
-    map_col = ref_pl["mappability"].to_numpy().astype(np.float32)
-    gc = gc_col if np.any(gc_col >= 0) else None
-    map_ = map_col if np.any(map_col >= 0) else None
-    unmasked = ~masked
-    pca_m = ref_pl["pca_mean"].to_numpy().astype(np.float64)[unmasked]
-    raw_ld = [
-        item
-        for item, keep in zip(
-            ref_b.column("pca_loadings").to_pylist(), unmasked, strict=True
+        ref_table = inputs
+        sample_table = None
+        resolved_meta = (
+            ref_meta
+            if ref_meta is not None
+            else ReferenceMetadata.from_schema(ref_table.schema)
         )
-        if keep
-    ]
-    pca_ld = (
-        np.asarray(raw_ld, dtype=np.float64).T
-        if raw_ld and raw_ld[0]
-        else np.empty((0, int(np.count_nonzero(unmasked))), dtype=np.float64)
-    )
-    raw_nbrs = [
-        item
-        for item, keep in zip(
-            ref_b.column("nearest_ref_indices").to_pylist(), unmasked, strict=True
+
+    arrs = extract_reference_branch_arrays(ref_table, branch, resolved_meta)
+    if sample_table is not None:
+        try:
+            if (
+                "count" in sample_table.schema.names
+                and sample_table.schema.field("count").type == pa.float64()
+            ):
+                s_meta = SampleMetadata.from_table(sample_table)
+                if sample_table.num_rows != s_meta.expected_num_bins:
+                    raise PredictError("weighted sample row count mismatch")
+            else:
+                s_meta = validate_sample_table(sample_table)
+        except SchemaError as err:
+            raise PredictError(str(err)) from err
+        s_idx = align_sample_grid_indices(
+            s_meta, arrs.contigs, arrs.starts, arrs.ends, branch
         )
-        if keep
-    ]
-    nearest_idx = tuple(np.asarray(nbrs, dtype=np.int32) for nbrs in raw_nbrs)
-    mean_dist = ref_pl["mean_distance"].to_numpy().astype(np.float32)[unmasked]
-    nearest_dst = tuple(
-        np.full(nbrs.shape, dist, dtype=np.float32)
-        for nbrs, dist in zip(nearest_idx, mean_dist, strict=True)
-    )
-    null_m = ref_pl["null_mean"].to_numpy().astype(np.float64)[unmasked]
-    null_s = ref_pl["null_std"].to_numpy().astype(np.float64)[unmasked]
+        s_counts = (
+            sample_table.column("count").combine_chunks().to_numpy(zero_copy_only=False)
+        )
+        counts = s_counts[s_idx].astype(np.float64)
+        if resolve_fragmentomics_compatibility(sample_table, ref_table):
+            f_len, e_rat = extract_bin_fragmentomic_covariates(sample_table)
+            mean_frag_len: NDArray[np.floating] | None = f_len[s_idx].astype(np.float64)
+            endpoint_ratio: NDArray[np.floating] | None = e_rat[s_idx].astype(
+                np.float64
+            )
+        else:
+            mean_frag_len, endpoint_ratio = None, None
+    else:
+        counts = np.zeros(arrs.starts.size, dtype=np.float64)
+        mean_frag_len, endpoint_ratio = None, None
+
     return BranchModel(
         branch=branch,
-        contigs=tuple(c_vals),
-        starts=starts,
-        ends=ends,
+        contigs=arrs.contigs,
+        starts=arrs.starts,
+        ends=arrs.ends,
         counts=counts,
-        masked=masked,
-        pca_mean=pca_m,
-        pca_loadings=pca_ld,
-        nearest_indices=nearest_idx,
-        mean_distance=mean_dist,
-        null_mean=null_m,
-        null_std=null_s,
-        gc=gc,
-        mappability=map_,
-        nearest_distances=nearest_dst,
+        masked=arrs.masked,
+        pca_mean=arrs.pca_mean,
+        pca_loadings=arrs.pca_loadings,
+        proto_ids=arrs.proto_ids,
+        proto_weights=arrs.proto_weights,
+        mean_distance=arrs.mean_distance,
+        null_mean=arrs.null_mean,
+        null_std=arrs.null_std,
+        gc=arrs.gc,
+        mappability=arrs.mappability,
         mean_frag_len=mean_frag_len,
         endpoint_ratio=endpoint_ratio,
     )
@@ -451,14 +492,15 @@ def project_coverage(
     active_subset = covariate_usable[unmasked_reference_bins] & np.isfinite(selected)
     reconstruction = model.pca_mean.copy()
     n_active = int(np.count_nonzero(active_subset))
+    loadings_f64 = np.asarray(model.pca_loadings, dtype=np.float64)
     rank = (
-        int(np.linalg.matrix_rank(model.pca_loadings[:, active_subset].T))
-        if model.pca_loadings.size > 0
+        int(np.linalg.matrix_rank(loadings_f64[:, active_subset].T))
+        if loadings_f64.size > 0
         else 0
     )
     if n_active > rank > 0:
         subset_centered = selected[active_subset] - model.pca_mean[active_subset]
-        X = model.pca_loadings[:, active_subset].T
+        X = loadings_f64[:, active_subset].T
         coeffs = None
         if n_active >= max(rank + 2, 4) and float(np.std(subset_centered)) > 1e-12:
             try:
@@ -474,7 +516,7 @@ def project_coverage(
                 coeffs = None
         if coeffs is None:
             coeffs, *_ = np.linalg.lstsq(X, subset_centered, rcond=None)
-        reconstruction = (coeffs @ model.pca_loadings) + model.pca_mean
+        reconstruction = (coeffs @ loadings_f64) + model.pca_mean
 
     corrected = np.full(normalized.shape, np.nan, dtype=np.float64)
     valid = active_subset & np.isfinite(reconstruction) & (reconstruction > 0)
@@ -489,7 +531,7 @@ def project_coverage(
 
 
 def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
-    """Calculate within-sample log2 ratios, null z-scores, and segment weights."""
+    """Calculate within-sample LOCO prototype log2 ratios, null z-scores, and weights."""
     logger.debug("normalizing branch %s (%d bins)", model.branch, model.counts.size)
     try:
         gc_override, n_mask_override = (
@@ -514,51 +556,37 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
         min_mappability=config.min_mappability,
     )
     unmasked_indices = np.flatnonzero(~model.masked)
-    U = unmasked_indices.size
+    u_count = unmasked_indices.size
     corrected = projected.corrected[unmasked_indices]
     ratios = np.full(model.counts.shape, np.nan)
     zscores = np.full(model.counts.shape, np.nan)
     weights = np.zeros(model.counts.shape)
     reference_sizes = np.zeros(model.counts.shape, dtype=np.int64)
 
-    filtered_neighbors = tuple(
-        neighbors[neighbors != i] for i, neighbors in enumerate(model.nearest_indices)
-    )
-    max_k = max((nbrs.size for nbrs in filtered_neighbors), default=0)
-
-    if max_k == 0:
-        neighbor_matrix = np.full((U, 0), U, dtype=np.int32)
+    if u_count > 0:
+        _, contig_ids = np.unique(
+            np.asarray(model.contigs, dtype=str)[unmasked_indices],
+            return_inverse=True,
+        )
+        pids_u = model.proto_ids[unmasked_indices]
+        pw_u = model.proto_weights[unmasked_indices]
     else:
-        neighbor_matrix = np.full((U, max_k), U, dtype=np.int32)
-        for i, nbrs in enumerate(filtered_neighbors):
-            if nbrs.size > 0:
-                neighbor_matrix[i, : nbrs.size] = nbrs
+        contig_ids = np.empty(0, dtype=np.int64)
+        pids_u = np.empty((0, NUM_PROTOTYPES_PER_BIN), dtype=np.uint16)
+        pw_u = np.empty((0, NUM_PROTOTYPES_PER_BIN), dtype=np.float16)
 
     eligible = np.isfinite(corrected) & (corrected > 0)
     local_ratios = np.full(corrected.shape, np.nan)
     local_zscores = np.full(corrected.shape, np.nan)
-    CHUNK_SIZE = 25_000
 
     for iteration in range(config.mask_repeats):
-        active_padded = np.full(U + 1, np.nan, dtype=np.float64)
-        active_padded[:U] = np.where(eligible, corrected, np.nan)
-
-        if max_k > 0:
-            usable_nbr_counts = np.zeros(U, dtype=np.int64)
-            baselines = np.full(U, np.nan, dtype=np.float64)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                for start_idx in range(0, U, CHUNK_SIZE):
-                    end_idx = min(start_idx + CHUNK_SIZE, U)
-                    chunk_vals = active_padded[neighbor_matrix[start_idx:end_idx]]
-                    usable_nbr_counts[start_idx:end_idx] = np.sum(
-                        np.isfinite(chunk_vals), axis=1
-                    )
-                    baselines[start_idx:end_idx] = np.nanmedian(chunk_vals, axis=1)
-        else:
-            usable_nbr_counts = np.zeros(U, dtype=np.int64)
-            baselines = np.full(U, np.nan, dtype=np.float64)
-
+        active_vals = np.where(eligible, corrected, np.nan)
+        baselines, usable_nbr_counts = evaluate_loco_prototype_baseline(
+            active_vals,
+            contig_ids,
+            pids_u,
+            pw_u,
+        )
         reference_sizes[unmasked_indices] = usable_nbr_counts
 
         valid_bins = (
@@ -570,7 +598,6 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
         )
         local_ratios[:] = np.nan
         local_zscores[:] = np.nan
-
         local_ratios[valid_bins] = np.log2(
             corrected[valid_bins] / baselines[valid_bins]
         )
@@ -869,18 +896,30 @@ def _resolve_sample_sex(
     cutoff = model["sex_inference"].get("cutoff")
     if not isinstance(cutoff, int | float):
         raise PredictError("cannot infer sample sex; pass --sex female or --sex male")
-    contigs, counts = (
-        np.asarray(sample.column("contig").to_pylist(), dtype=object),
-        np.asarray(
-            sample.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
-        ),
+    counts = np.asarray(
+        sample.column("count").combine_chunks().to_numpy(zero_copy_only=False),
+        dtype=np.float64,
     )
     total = float(np.sum(counts))
     if total <= 0:
         raise PredictError("sample has zero total coverage")
     signal = str(model["sex_signal_contig"])
-    fraction = float(np.sum(counts[contigs == signal]) / total)
-    sex = "male" if fraction > float(cutoff) else "female"
+    if "contig" in sample.column_names:
+        contigs = np.asarray(
+            sample.column("contig").combine_chunks().to_numpy(zero_copy_only=False),
+            dtype=object,
+        )
+        sig_sum = float(np.sum(counts[contigs == signal]))
+    else:
+        s_meta = SampleMetadata.from_schema(sample.schema)
+        codes, names, _, _ = reconstruct_sample_grid(s_meta)
+        sig_sum = (
+            float(np.sum(counts[codes == names.index(signal)]))
+            if signal in names
+            else 0.0
+        )
+    fraction = sig_sum / total
+    sex: Sex = "male" if fraction > float(cutoff) else "female"
     logger.debug(
         "inferred sample sex as %s (signal %s fraction=%.4f vs cutoff=%.4f)",
         sex,
@@ -889,14 +928,6 @@ def _resolve_sample_sex(
         float(cutoff),
     )
     return sex
-
-
-def _contig_lengths(metadata: dict[str, object]) -> dict[str, int]:
-    """Extract contig lengths dictionary from reference metadata."""
-    val = metadata.get("contig_lengths")
-    if not isinstance(val, dict):
-        raise PredictError("artifact metadata has no contig lengths")
-    return {str(c): int(length) for c, length in val.items()}
 
 
 def _validate_config(config: PredictConfig) -> None:

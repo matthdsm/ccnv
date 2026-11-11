@@ -32,6 +32,7 @@ from ccnv.features.prenatal import (
     classify_sca,
 )
 from ccnv.models import (
+    BinCompatibilityError,
     CovariateError,
     FetalFractionResult,
     PrenatalModelMetadata,
@@ -145,12 +146,12 @@ class TestFeaturesCohort(unittest.TestCase):
         np.testing.assert_allclose(cohort.counts[:, 1], [10.0, 20.0])
 
     def test_rebin_sample_table(self) -> None:
-        t = make_sample_table([10, 20], contig_lengths={"chr1": 200}, bin_size=100)
-        rebinned = rebin_sample_table(t, target_bin_size=50)
-        self.assertEqual(rebinned.num_rows, 4)
-        np.testing.assert_allclose(
-            rebinned.column("count").to_numpy(), [5.0, 5.0, 10.0, 10.0]
-        )
+        t = make_sample_table([5, 5, 10, 10], contig_lengths={"chr1": 200}, bin_size=50)
+        rebinned = rebin_sample_table(t, target_bin_size=100)
+        self.assertEqual(rebinned.num_rows, 2)
+        np.testing.assert_allclose(rebinned.column("count").to_numpy(), [10, 20])
+        with self.assertRaises(BinCompatibilityError):
+            rebin_sample_table(t, target_bin_size=25)
 
 
 class TestFeaturesCovariates(unittest.TestCase):
@@ -210,16 +211,8 @@ class TestFeaturesPrenatal(unittest.TestCase):
             yfrac_threshold=0.002,
             ffy_intercept=0.0,
             ffy_slope=1.0,
-            mlp_w1=[[0.1, 0.2]],
-            mlp_b1=[0.0, 0.0],
-            mlp_w2=[[0.3], [0.4]],
-            mlp_b2=[0.0],
-            mlp_skew_intercept=0.0,
-            mlp_skew_slope=1.0,
             olm_weights=[0.1],
             olm_bias=0.0,
-            olm_skew_intercept=0.0,
-            olm_skew_slope=1.0,
             ffx_intercept=2.0,
             ffx_slope=-2.0,
             female_chrx_ratio_mean=1.0,

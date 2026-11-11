@@ -551,6 +551,8 @@ def predict(
     prefix: Annotated[
         Path | None,
         typer.Option(
+            "--prefix",
+            "-o",
             help="Output path prefix for BED, VCF, and HTML deliverables",
         ),
     ] = None,
@@ -619,6 +621,22 @@ def predict(
             "--vcf/--no-vcf", help="Write VCFv4.2 outputs for bins and segments"
         ),
     ] = True,
+    bins_vcf: Annotated[
+        bool,
+        typer.Option(
+            "--bins-vcf/--no-bins-vcf",
+            help="Write bin-level VCFv4.2 output when --vcf is enabled",
+        ),
+    ] = False,
+    threads: Annotated[
+        int,
+        typer.Option(
+            "--threads",
+            "-t",
+            min=1,
+            help="Worker threads for direct BAM/CRAM streaming and deliverable generation",
+        ),
+    ] = DEFAULT_THREADS,
     fasta: FastaOption = None,
     mappability: MappabilityOption = None,
     gc: GcOption = None,
@@ -630,11 +648,12 @@ def predict(
 
     configure_logging(loglevel)
     cli_logger.debug(
-        "starting predict: sample=%s, reference=%s, sex=%s, mode=%s",
+        "starting predict: sample=%s, reference=%s, sex=%s, mode=%s, threads=%d",
         sample,
         reference,
         sex.value,
         mode.value,
+        threads,
     )
     started = perf_counter()
     try:
@@ -652,12 +671,14 @@ def predict(
                 max_blacklist_gap=max_blacklist_gap,
                 plot=plot,
                 vcf=vcf,
+                bins_vcf=bins_vcf,
                 cytobands=cytobands,
                 mappability=mappability,
                 gc=gc,
                 fasta=fasta,
                 min_mappability=min_mappability,
                 mode=cast(AnalysisModeLiteral, mode.value),
+                threads=threads,
             )
         )
 

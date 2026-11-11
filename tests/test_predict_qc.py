@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pyarrow as pa
 
-from ccnv.models import ReadFilters
+from ccnv.models import NUM_FRAG_BANDS, ReadFilters
 from ccnv.models.results import FetalFractionResult, SCAResult, SegmentResult
 from ccnv.models.schemas import (
     SAMPLE_SCHEMA,
@@ -28,6 +28,7 @@ def _make_sample_table() -> pa.Table:
         contig_lengths=contig_lengths,
         values={
             "bin_size": 100,
+            "contig_order": ["chr1", "chr2", "chrX"],
             "source_identity": {"path": "/data/test_sample.bam", "format": "bam"},
             "reference_identity": {"id": "genome"},
             "qc": {
@@ -48,13 +49,13 @@ def _make_sample_table() -> pa.Table:
     )
     return pa.table(
         {
-            "contig": ["chr1", "chr1", "chr2", "chrX"],
-            "start": pa.array([0, 100, 0, 0], type=pa.int64()),
-            "end": pa.array([100, 200, 100, 100], type=pa.int64()),
-            "count": pa.array([250, 250, 300, 50], type=pa.uint64()),
-            "fragment_lengths": pa.array([[], [], [], []], type=pa.list_(pa.uint16())),
+            "count": pa.array([250, 250, 300, 50], type=pa.uint32()),
+            "paired_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
+            "frag_len_sum": pa.array([0, 0, 0, 0], type=pa.uint64()),
+            "short_frag_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
             "endpoint_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
             "frag_gc_sum": pa.array([0.0, 0.0, 0.0, 0.0], type=pa.float32()),
+            "frag_bands": pa.nulls(4, type=pa.list_(pa.uint32(), NUM_FRAG_BANDS)),
         },
         schema=SAMPLE_SCHEMA.with_metadata(metadata),
     )

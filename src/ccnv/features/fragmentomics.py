@@ -6,11 +6,17 @@ import json
 from collections.abc import Mapping, Sequence
 
 import numpy as np
-import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 from numpy.typing import NDArray
 
+from ccnv._core import FRAG_BAND_EDGES
+from ccnv.models import (
+    NUM_FRAG_BANDS,
+    SampleMetadata,
+    fixed_size_list_to_numpy,
+    reconstruct_sample_grid,
+)
 from ccnv.models.exceptions import PredictError
 from ccnv.models.results import ActiveFFSource
 from ccnv.models.schemas import (
@@ -44,7 +50,22 @@ __all__ = [
     "is_paired_sample_metadata",
     "resolve_fragmentomics_compatibility",
     "score_segment_origin",
+    "score_segment_table_origin",
 ]
+
+
+def _band_weights_from_curve(
+    weights_571: NDArray[np.floating],
+    shift_bp: float,
+) -> NDArray[np.float64]:
+    std_grid = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
+    edges = np.asarray(FRAG_BAND_EDGES, dtype=np.int64)
+    band_w = np.ones(NUM_FRAG_BANDS, dtype=np.float64)
+    for k in range(NUM_FRAG_BANDS):
+        lengths = np.arange(edges[k], edges[k + 1], dtype=np.float64) - shift_bp
+        clipped = np.clip(lengths, FRAG_MIN_LEN, FRAG_MAX_LEN)
+        band_w[k] = float(np.mean(np.interp(clipped, std_grid, weights_571)))
+    return band_w
 
 
 def evaluate_weighted_coverage(
@@ -52,47 +73,42 @@ def evaluate_weighted_coverage(
     weights_571: NDArray[np.floating],
     shift_bp: float = 0.0,
 ) -> NDArray[np.float64]:
-    """Map fragment lengths through a 65,536-entry lookup table in <20 ms.
-
-    Falls back to unweighted table counts when fragment_lengths is absent or empty.
-    """
+    """Evaluate Fisher-weighted per-bin coverage from Schema v2.0.0 frag_bands."""
     counts = np.asarray(
         table.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
     )
-    if "fragment_lengths" not in table.column_names:
+    if table.num_rows == 0 or "frag_bands" not in table.column_names:
         return counts
 
-    frag_col = table.column("fragment_lengths").combine_chunks()
-    if not isinstance(frag_col, pa.ListArray):
+    bands_col = table.column("frag_bands").combine_chunks()
+    if bands_col.null_count == table.num_rows:
         return counts
 
-    values = np.asarray(frag_col.values)
-    if values.size == 0:
-        return counts
-
-    offsets = np.asarray(frag_col.offsets)
-    std_grid = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
-    all_l = np.arange(65536, dtype=np.float64)
-    w_lut = np.ones(65536, dtype=np.float32)
-
-    valid = (all_l - shift_bp >= FRAG_MIN_LEN) & (all_l - shift_bp <= FRAG_MAX_LEN)
-    w_lut[valid] = np.interp(all_l[valid] - shift_bp, std_grid, weights_571).astype(
-        np.float32
+    band_w = _band_weights_from_curve(weights_571, shift_bp)
+    bands_2d = fixed_size_list_to_numpy(bands_col, NUM_FRAG_BANDS, np.uint32).astype(
+        np.float64
     )
+    if bands_col.null_count == 0:
+        paired_in_range = np.sum(bands_2d, axis=1)
+        if not np.any(paired_in_range > 0):
+            return counts
+        return (bands_2d @ band_w) + np.maximum(counts - paired_in_range, 0.0)
 
-    cum = np.empty(values.size + 1, dtype=np.float64)
-    cum[0] = 0.0
-    np.cumsum(w_lut[values], out=cum[1:])
-    return cum[offsets[1:]] - cum[offsets[:-1]]
+    valid_mask = ~pc.is_null(bands_col).to_numpy(zero_copy_only=False)
+    valid_2d = bands_2d[valid_mask]
+    out = counts.copy()
+    paired_sub = np.sum(valid_2d, axis=1)
+    if np.any(paired_sub > 0):
+        out[valid_mask] = (valid_2d @ band_w) + np.maximum(
+            counts[valid_mask] - paired_sub, 0.0
+        )
+    return out
 
 
 def extract_bin_fragmentomic_covariates(
     table: pa.Table,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compute per-bin mean fragment length and cleavage endpoint protection ratio.
-
-    Imputes zero-coverage bins with the sample-wide median fragment length.
-    """
+    """Compute per-bin mean fragment length and cleavage endpoint protection ratio."""
     n_rows = table.num_rows
     counts = (
         np.asarray(
@@ -102,31 +118,26 @@ def extract_bin_fragmentomic_covariates(
         else np.zeros(n_rows, dtype=np.float64)
     )
 
-    # 1. Per-bin mean fragment length
     mean_lens = np.full(n_rows, CANONICAL_CHROMATOSOME_BP, dtype=np.float64)
-    if "fragment_lengths" in table.column_names:
-        frag_col = table.column("fragment_lengths").combine_chunks()
-        if isinstance(frag_col, pa.ListArray):
-            values = np.asarray(frag_col.values, dtype=np.float64)
-            if values.size > 0:
-                offsets = np.asarray(frag_col.offsets)
-                known = values > 0.0
-                cum_sum = np.empty(values.size + 1, dtype=np.float64)
-                cum_sum[0] = 0.0
-                np.cumsum(np.where(known, values, 0.0), out=cum_sum[1:])
-                cum_cnt = np.empty(values.size + 1, dtype=np.int64)
-                cum_cnt[0] = 0
-                np.cumsum(known, dtype=np.int64, out=cum_cnt[1:])
-                sum_lens = cum_sum[offsets[1:]] - cum_sum[offsets[:-1]]
-                bin_counts = cum_cnt[offsets[1:]] - cum_cnt[offsets[:-1]]
-                has_reads = bin_counts > 0
-                if np.any(has_reads):
-                    computed = sum_lens[has_reads] / bin_counts[has_reads]
-                    mean_lens[has_reads] = computed
-                    sample_median = float(np.median(computed))
-                    mean_lens[~has_reads] = sample_median
+    if (
+        "frag_len_sum" in table.column_names
+        and "paired_count" in table.column_names
+        and n_rows > 0
+    ):
+        flen_sum = np.asarray(
+            table.column("frag_len_sum").to_numpy(zero_copy_only=False),
+            dtype=np.float64,
+        )
+        paired_cnt = np.asarray(
+            table.column("paired_count").to_numpy(zero_copy_only=False),
+            dtype=np.float64,
+        )
+        has_reads = paired_cnt > 0.0
+        if np.any(has_reads):
+            computed = flen_sum[has_reads] / paired_cnt[has_reads]
+            mean_lens[has_reads] = computed
+            mean_lens[~has_reads] = float(np.median(computed))
 
-    # 2. Cleavage endpoint ratio: E_i / max(C_i, 1)
     if "endpoint_count" in table.column_names:
         ep_counts = np.asarray(
             table.column("endpoint_count").to_numpy(zero_copy_only=False),
@@ -175,23 +186,36 @@ def extract_segment_fragment_lengths(
     start: int,
     end: int,
 ) -> NDArray[np.uint16]:
-    """Extract and concatenate fragment lengths within [start, end) on contig."""
-    if "fragment_lengths" not in table.column_names:
+    """Reconstruct representative fragment lengths within [start, end) from frag_bands."""
+    if table.num_rows == 0 or "frag_bands" not in table.column_names:
         return np.empty(0, dtype=np.uint16)
-    c_arr = table.column("contig")
-    s_arr = table.column("start")
-    e_arr = table.column("end")
-    mask = pc.and_(
-        pc.equal(c_arr, contig),
-        pc.and_(pc.greater(e_arr, start), pc.less(s_arr, end)),
-    )
-    sub_table = table.filter(mask)
-    if sub_table.num_rows == 0:
+    bands_col = table.column("frag_bands").combine_chunks()
+    if bands_col.null_count == table.num_rows:
         return np.empty(0, dtype=np.uint16)
-    frag_col = sub_table.column("fragment_lengths").combine_chunks()
-    if not isinstance(frag_col, pa.ListArray):
+
+    sample_meta = SampleMetadata.from_table(table)
+    codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(sample_meta)
+    try:
+        c_code = names.index(contig)
+    except ValueError:
         return np.empty(0, dtype=np.uint16)
-    return np.asarray(frag_col.values, dtype=np.uint16)
+
+    mask = (codes == c_code) & (ends_u32 > start) & (starts_u32 < end)
+    if not np.any(mask):
+        return np.empty(0, dtype=np.uint16)
+
+    sub_col = bands_col.filter(pa.array(mask, type=pa.bool_()))
+    if len(sub_col) == 0 or sub_col.null_count == len(sub_col):
+        return np.empty(0, dtype=np.uint16)
+
+    bands_2d = fixed_size_list_to_numpy(sub_col, NUM_FRAG_BANDS, np.uint32)
+    band_counts = np.sum(bands_2d, axis=0, dtype=np.int64)
+    if not np.any(band_counts > 0):
+        return np.empty(0, dtype=np.uint16)
+
+    edges = np.asarray(FRAG_BAND_EDGES, dtype=np.int64)
+    midpoints = ((edges[:-1] + edges[1:] - 1) // 2).astype(np.uint16)
+    return np.repeat(midpoints, band_counts)
 
 
 def fuse_active_fetal_fraction(
@@ -233,7 +257,6 @@ def fuse_active_fetal_fraction(
             return active_ff, source
         return float(max(0.0, ffa)), "FFA"
 
-    # Female (XX) or other SCA
     if ff_size is not None and abs(ffa - ff_size) <= tolerance:
         var_ffa = max(float(prenatal_meta.ffa_std), 1e-4) ** 2
         var_size = max(float(prenatal_meta.ff_size_std), 1e-4) ** 2
@@ -281,6 +304,88 @@ def score_segment_origin(
     return float(sr), float(llr), origin
 
 
+def score_segment_table_origin(
+    table: pa.Table,
+    contig: str,
+    start: int,
+    end: int,
+    shift_bp: float,
+    p_fetal: Sequence[float] | NDArray[np.floating],
+    p_maternal: Sequence[float] | NDArray[np.floating],
+    active_ff: float,
+    is_gain: bool,
+    has_call: bool,
+) -> tuple[float | None, float | None, str | None]:
+    """Evaluate segment short-fragment ratio, multinomial band LLR, and origin from frag_bands."""
+    if table.num_rows == 0 or "frag_bands" not in table.column_names:
+        return None, None, None
+    bands_col = table.column("frag_bands").combine_chunks()
+    if bands_col.null_count == table.num_rows:
+        return None, None, None
+
+    sample_meta = SampleMetadata.from_table(table)
+    codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(sample_meta)
+    if contig not in names:
+        return None, None, None
+    mask = (codes == names.index(contig)) & (ends_u32 > start) & (starts_u32 < end)
+    if not np.any(mask):
+        return None, None, None
+
+    sub_col = bands_col.filter(pa.array(mask, type=pa.bool_()))
+    if len(sub_col) == 0 or sub_col.null_count == len(sub_col):
+        return None, None, None
+    band_counts = fixed_size_list_to_numpy(sub_col, NUM_FRAG_BANDS, np.uint32).sum(
+        axis=0, dtype=np.float64
+    )
+    total = float(np.sum(band_counts))
+    if total <= 0.0:
+        return None, None, None
+
+    edges = np.asarray(FRAG_BAND_EDGES, dtype=np.int64)
+    short_bands = edges[1:] <= 151
+    sr = float(np.sum(band_counts[short_bands]) / total)
+
+    pf = np.asarray(p_fetal, dtype=np.float64)
+    pm = np.asarray(p_maternal, dtype=np.float64)
+    pf_band = np.zeros(NUM_FRAG_BANDS, dtype=np.float64)
+    pm_band = np.zeros(NUM_FRAG_BANDS, dtype=np.float64)
+    for k in range(NUM_FRAG_BANDS):
+        bp = np.arange(int(edges[k]), int(edges[k + 1]), dtype=np.float64)
+        idx = (
+            np.clip(np.round(bp - shift_bp), FRAG_MIN_LEN, FRAG_MAX_LEN).astype(int)
+            - FRAG_MIN_LEN
+        )
+        pf_band[k] = float(np.sum(pf[idx]))
+        pm_band[k] = float(np.sum(pm[idx]))
+
+    f = float(np.clip(active_ff, 0.01, 0.40))
+    if is_gain:
+        f_fet, f_mat = (1.5 * f) / (1.0 + 0.5 * f), f / (1.0 + 0.5 * (1.0 - f))
+    else:
+        f_fet, f_mat = (0.5 * f) / (1.0 - 0.5 * f), f / (1.0 - 0.5 * (1.0 - f))
+
+    p_f_eval = f_fet * pf_band + (1.0 - f_fet) * pm_band
+    p_m_eval = f_mat * pf_band + (1.0 - f_mat) * pm_band
+    llr = float(
+        np.sum(
+            band_counts
+            * np.log(np.maximum(p_f_eval, 1e-12) / np.maximum(p_m_eval, 1e-12))
+        )
+    )
+    origin = (
+        (
+            "FETAL_CONFIRMED"
+            if llr > 2.0
+            else "MATERNAL_CONFIRMED"
+            if llr < -2.0
+            else "INDETERMINATE"
+        )
+        if has_call
+        else None
+    )
+    return sr, llr, origin
+
+
 def fit_cohort_fragmentomics_model(
     frag_metas: Sequence[FragmentomicsMetadata | None],
     is_male_arr: NDArray[np.bool_],
@@ -305,7 +410,7 @@ def fit_cohort_fragmentomics_model(
 
     auto_aligned = np.zeros((n_samples, FRAG_NUM_BINS), dtype=np.float64)
     chry_aligned = np.zeros((n_samples, FRAG_NUM_BINS), dtype=np.float64)
-    X_frag = np.zeros((n_samples, 36), dtype=np.float64)
+    x_frag = np.zeros((n_samples, 36), dtype=np.float64)
 
     for i, meta in enumerate(frag_metas):
         assert meta is not None
@@ -317,7 +422,7 @@ def fit_cohort_fragmentomics_model(
             np.asarray(meta.hist_chry, dtype=np.float64),
             meta.sizing_shift_bp,
         )
-        X_frag[i] = build_fragmentomic_feature_vector(meta)
+        x_frag[i] = build_fragmentomic_feature_vector(meta)
 
     p_fetal, p_maternal = deconvolve_fetal_maternal_densities(
         auto_aligned,
@@ -339,7 +444,7 @@ def fit_cohort_fragmentomics_model(
         )
 
     w_frag, b_frag, m_frag, s_frag, loocv_std = fit_ff_fragmentomics_ensemble(
-        X_frag[valid_mask],
+        x_frag[valid_mask],
         target_ffa[valid_mask],
     )
 
@@ -359,55 +464,85 @@ def align_reference_to_weighted_sample(
     sample: pa.Table,
     weighted_sample: pa.Table,
 ) -> pa.Table:
-    """Calibrate reference pca_mean to the Fisher-weighted sample baseline without per-bin cancellation."""
+    """Calibrate reference pca_mean to the Fisher-weighted sample baseline."""
     u_counts = np.asarray(
         sample.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
     )
     w_counts = np.asarray(
         weighted_sample.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
     )
-    sm_coords = pl.DataFrame(
-        {
-            "contig": sample.column("contig").to_pylist(),
-            "start": sample.column("start").to_numpy(),
-            "end": sample.column("end").to_numpy(),
-            "u_count": u_counts,
-            "w_count": w_counts,
-        }
-    )
-    ref_df = pl.from_arrow(reference)
-    joined_ref = ref_df.join(
-        sm_coords,
-        on=["contig", "start", "end"],
-        how="left",
-        maintain_order="left",
-    )
-    matched = joined_ref["u_count"].is_not_null() & joined_ref["w_count"].is_not_null()
-    candidate_df = joined_ref.filter(matched)
-    if "branch" in candidate_df.columns:
-        auto_df = candidate_df.filter(pl.col("branch") == "autosomal")
-        if auto_df.height > 0:
-            candidate_df = auto_df
-    if "masked" in candidate_df.columns:
-        unmasked_df = candidate_df.filter(~pl.col("masked").cast(pl.Boolean))
-        if unmasked_df.height > 0:
-            candidate_df = unmasked_df
+    s_meta = SampleMetadata.from_table(sample)
+    s_codes, s_names, s_starts, s_ends = reconstruct_sample_grid(s_meta)
+    coord_to_idx: dict[tuple[str, int, int], int] = {
+        (s_names[int(c)], int(st), int(en)): idx
+        for idx, (c, st, en) in enumerate(zip(s_codes, s_starts, s_ends, strict=True))
+    }
 
-    u_matched = candidate_df["u_count"].to_numpy()
-    w_matched = candidate_df["w_count"].to_numpy()
-    pos = (u_matched > 0.0) & np.isfinite(u_matched) & np.isfinite(w_matched)
+    ref_branch = reference.column("branch").combine_chunks()
+    ref_contig = reference.column("contig").combine_chunks()
+    b_vals = (
+        ref_branch.dictionary.to_pylist()
+        if isinstance(ref_branch, pa.DictionaryArray)
+        else []
+    )
+    b_idx = (
+        ref_branch.indices.to_numpy(zero_copy_only=False)
+        if isinstance(ref_branch, pa.DictionaryArray)
+        else np.empty(0, dtype=np.int8)
+    )
+    c_vals = (
+        ref_contig.dictionary.to_pylist()
+        if isinstance(ref_contig, pa.DictionaryArray)
+        else []
+    )
+    c_idx = (
+        ref_contig.indices.to_numpy(zero_copy_only=False)
+        if isinstance(ref_contig, pa.DictionaryArray)
+        else np.empty(0, dtype=np.int16)
+    )
+    r_starts = reference.column("start").to_numpy(zero_copy_only=False)
+    r_ends = reference.column("end").to_numpy(zero_copy_only=False)
+    r_masked = reference.column("masked").to_numpy(zero_copy_only=False)
+
+    n_ref = reference.num_rows
+    matched_mask = np.zeros(n_ref, dtype=np.bool_)
+    sample_indices = np.full(n_ref, -1, dtype=np.intp)
+    for r_i in range(n_ref):
+        key = (str(c_vals[int(c_idx[r_i])]), int(r_starts[r_i]), int(r_ends[r_i]))
+        s_i = coord_to_idx.get(key, -1)
+        if s_i >= 0:
+            matched_mask[r_i] = True
+            sample_indices[r_i] = s_i
+
+    is_auto = np.array(
+        [str(b_vals[int(b_idx[i])]) == "autosomal" for i in range(n_ref)],
+        dtype=np.bool_,
+    )
+    cand = matched_mask & is_auto & (~r_masked)
+    if not np.any(cand):
+        cand = matched_mask & (~r_masked)
+    if not np.any(cand):
+        cand = matched_mask
+
     baseline_scale = 1.0
-    if np.any(pos):
-        med = float(np.median(w_matched[pos] / u_matched[pos]))
-        if np.isfinite(med) and med > 0.0:
-            baseline_scale = med
+    if np.any(cand):
+        u_m = u_counts[sample_indices[cand]]
+        w_m = w_counts[sample_indices[cand]]
+        pos = (u_m > 0.0) & np.isfinite(u_m) & np.isfinite(w_m)
+        if np.any(pos):
+            med = float(np.median(w_m[pos] / u_m[pos]))
+            if np.isfinite(med) and med > 0.0:
+                baseline_scale = med
 
-    matched_mask = matched.to_numpy()
-    old_pca_mean = np.asarray(reference.column("pca_mean").to_numpy(), dtype=np.float64)
-    new_pca_mean = np.where(matched_mask, old_pca_mean * baseline_scale, old_pca_mean)
+    old_pca_mean = np.asarray(
+        reference.column("pca_mean").to_numpy(zero_copy_only=False), dtype=np.float64
+    )
+    new_pca_mean = np.where(
+        matched_mask, old_pca_mean * baseline_scale, old_pca_mean
+    ).astype(np.float32)
     pca_idx = reference.schema.get_field_index("pca_mean")
     return reference.set_column(
-        pca_idx, "pca_mean", pa.array(new_pca_mean, type=pa.float64())
+        pca_idx, "pca_mean", pa.array(new_pca_mean, type=pa.float32())
     )
 
 
@@ -420,13 +555,18 @@ def apply_prenatal_fisher_weighting(
         prenatal_meta is None
         or prenatal_meta.p_fetal_density is None
         or prenatal_meta.p_maternal_density is None
-        or "fragment_lengths" not in sample.column_names
+        or "frag_bands" not in sample.column_names
+        or sample.num_rows == 0
     ):
         return sample
 
-    frag_col = sample.column("fragment_lengths").combine_chunks()
-    if isinstance(frag_col, pa.ListArray) and len(frag_col.values) == 0:
+    bands_col = sample.column("frag_bands").combine_chunks()
+    if bands_col.null_count == sample.num_rows:
         return sample
+    if "paired_count" in sample.column_names:
+        total_paired = int(pc.sum(sample.column("paired_count")).as_py() or 0)
+        if total_paired == 0:
+            return sample
 
     frag_meta = extract_sample_fragmentomics(decode_metadata(sample.schema.metadata))
     shift_bp = frag_meta.sizing_shift_bp if frag_meta is not None else 0.0
@@ -466,18 +606,15 @@ def is_paired_sample_metadata(metadata: Mapping[object, object] | None) -> bool:
 
 
 def resolve_fragmentomics_compatibility(sample: pa.Table, reference: pa.Table) -> bool:
-    """Validate sample vs reference fragmentomic correction settings and return whether to apply them."""
+    """Validate sample vs reference fragmentomic correction settings."""
     sample_meta = decode_metadata(sample.schema.metadata)
     frag_meta = extract_sample_fragmentomics(sample_meta)
     if frag_meta is not None:
         sample_has_frag = bool(frag_meta.paired_end)
     elif is_paired_sample_metadata(sample_meta):
         sample_has_frag = True
-    elif "fragment_lengths" in sample.column_names:
-        frag_col = sample.column("fragment_lengths").combine_chunks()
-        sample_has_frag = (
-            isinstance(frag_col, pa.ListArray) and len(frag_col.values) > 0
-        )
+    elif "frag_bands" in sample.column_names and sample.num_rows > 0:
+        sample_has_frag = sample.column("frag_bands").null_count < sample.num_rows
     else:
         sample_has_frag = False
 

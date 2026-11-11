@@ -1,89 +1,54 @@
 import json
 import tempfile
 import unittest
-from dataclasses import asdict
 from pathlib import Path
 
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-from ccnv.io.samplesheet import load_samplesheet
-from ccnv.models import ReadFilters, SamplesheetEntry
-from ccnv.models.exceptions import ReferenceError
-from ccnv.models.schemas import (
-    REFERENCE_SCHEMA,
-    SAMPLE_SCHEMA,
-    ArtifactKind,
-    metadata_for,
+from helpers import (
+    make_reference_table,
+    write_synthetic_reference,
+    write_synthetic_sample,
 )
+
+from ccnv.features.cohort import load_and_assemble_cohort
+from ccnv.io.samplesheet import load_samplesheet
+from ccnv.models import SamplesheetEntry
+from ccnv.models.exceptions import ReferenceError
 
 
 def _write_sample(path: Path) -> Path:
-    metadata = metadata_for(
-        ArtifactKind.SAMPLE,
+    write_synthetic_sample(
+        path,
+        [1],
+        contigs=["chr1"],
+        starts=[0],
+        ends=[100],
         contig_lengths={"chr1": 100},
-        values={
-            "bin_size": 100,
-            "source_identity": {"id": path.stem},
-            "reference_identity": {"name": "test"},
-            "qc": {},
-            "filters": asdict(ReadFilters()),
-        },
+        bin_size=100,
+        identity={"id": path.stem},
     )
-    table = pa.table(
-        {
-            "contig": ["chr1"],
-            "start": pa.array([0], type=pa.int64()),
-            "end": pa.array([100], type=pa.int64()),
-            "count": pa.array([1], type=pa.uint64()),
-            "fragment_lengths": pa.array([[]], type=pa.list_(pa.uint16())),
-            "endpoint_count": pa.array([0], type=pa.uint32()),
-            "frag_gc_sum": pa.array([0.0], type=pa.float32()),
-        },
-        schema=SAMPLE_SCHEMA.with_metadata(metadata),
-    )
-    pq.write_table(table, path)
     return path.resolve()
 
 
 def _write_reference(path: Path) -> Path:
-    metadata = metadata_for(
-        ArtifactKind.REFERENCE,
+    table = make_reference_table(
+        branches=["autosomal"],
+        contigs=["chr1"],
+        starts=[0],
+        ends=[100],
         contig_lengths={"chr1": 100},
-        values={
-            "sample_identities": [{"path": "s1.ccnv"}],
-            "model": {
-                "bin_size": 100,
-                "pca_components": 1,
-                "nearest_bins": 1,
-                "min_cohort_size": 1,
-                "min_sex_group_size": 1,
-                "mode": "germline",
-            },
-            "sex_contigs": ["chrX", "chrY"],
-            "sex_signal_contigs": ["chrX", "chrY"],
-            "sex_cutoff": 0.5,
+        pca_loadings=[[0.1]],
+        model={
+            "bin_size": 100,
+            "branches": ["autosomal"],
+            "pca_components": 1,
+            "nearest_bins": 1,
+            "min_cohort_size": 1,
+            "min_sex_group_size": 1,
+            "mode": "germline",
         },
+        sample_identities=[{"path": "s1.ccnv"}],
     )
-    table = pa.table(
-        {
-            "contig": ["chr1"],
-            "start": pa.array([0], type=pa.int64()),
-            "end": pa.array([100], type=pa.int64()),
-            "branch": ["autosomal"],
-            "masked": pa.array([False], type=pa.bool_()),
-            "gc": pa.array([0.5], type=pa.float32()),
-            "mappability": pa.array([1.0], type=pa.float32()),
-            "pca_mean": pa.array([1.0], type=pa.float32()),
-            "pca_loadings": pa.array([[0.1]], type=pa.list_(pa.float32())),
-            "nearest_ref_indices": pa.array([[0]], type=pa.list_(pa.int32())),
-            "mean_distance": pa.array([0.0], type=pa.float32()),
-            "null_mean": pa.array([1.0], type=pa.float32()),
-            "null_std": pa.array([0.1], type=pa.float32()),
-        },
-        schema=REFERENCE_SCHEMA.with_metadata(metadata),
-    )
-    pq.write_table(table, path)
+    write_synthetic_reference(path, table)
     return path.resolve()
 
 
@@ -316,8 +281,9 @@ class TestSamplesheet(unittest.TestCase):
 
             sheet = root / "sheet.yaml"
             sheet.write_text(f"- filepath: {corrupt.name}\n", encoding="utf-8")
+            entries = load_samplesheet(sheet)
             with self.assertRaises(ReferenceError) as ctx:
-                load_samplesheet(sheet)
+                load_and_assemble_cohort(entries)
             self.assertIn("cannot read sample Parquet", str(ctx.exception))
 
     def test_non_sample_parquet_file(self) -> None:
@@ -327,9 +293,10 @@ class TestSamplesheet(unittest.TestCase):
 
             sheet = root / "sheet.yaml"
             sheet.write_text(f"- filepath: {ref_parquet.name}\n", encoding="utf-8")
+            entries = load_samplesheet(sheet)
             with self.assertRaises(ReferenceError) as ctx:
-                load_samplesheet(sheet)
-            self.assertIn("invalid sample Parquet", str(ctx.exception))
+                load_and_assemble_cohort(entries)
+            self.assertIn("artifact_kind", str(ctx.exception))
 
     def test_duplicate_sample_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

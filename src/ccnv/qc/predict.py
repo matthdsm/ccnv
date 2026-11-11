@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -26,6 +25,20 @@ __all__ = [
 ]
 
 
+def _int_metric(
+    mapping: Mapping[str, object],
+    key: str,
+    *,
+    fallback_key: str | None = None,
+) -> int:
+    val = mapping.get(key)
+    if val is None and fallback_key is not None:
+        val = mapping.get(fallback_key)
+    if isinstance(val, int | float) and not isinstance(val, bool):
+        return int(val)
+    return 0
+
+
 def build_predict_qc_payload(
     mode: AnalysisMode,
     sample_table: pa.Table,
@@ -35,7 +48,9 @@ def build_predict_qc_payload(
     """Construct structured QC metrics for a prediction invocation."""
     sample_meta = decode_metadata(sample_table.schema.metadata)
     qc_meta_raw = sample_meta.get("qc")
-    qc_meta: Mapping[str, Any] = qc_meta_raw if isinstance(qc_meta_raw, Mapping) else {}
+    qc_meta: Mapping[str, object] = (
+        qc_meta_raw if isinstance(qc_meta_raw, Mapping) else {}
+    )
 
     counts = (
         sample_table.column("count").to_numpy(zero_copy_only=False).astype(np.float64)
@@ -46,29 +61,23 @@ def build_predict_qc_payload(
     mean_bin_count = float(np.mean(counts)) if total_bins > 0 else 0.0
     median_bin_count = float(np.median(counts)) if total_bins > 0 else 0.0
 
-    effective_reads_examined = int(
-        qc_meta.get(
-            "effective_reads_examined",
-            qc_meta.get("reads_seen", 0),
-        )
+    effective_reads_examined = _int_metric(
+        qc_meta, "effective_reads_examined", fallback_key="reads_seen"
     )
-    effective_reads_kept = int(
-        qc_meta.get(
-            "effective_reads_kept",
-            qc_meta.get("reads_kept", 0),
-        )
+    effective_reads_kept = _int_metric(
+        qc_meta, "effective_reads_kept", fallback_key="reads_kept"
     )
-    autosomal_reads_kept = int(qc_meta.get("autosomal_reads_kept", 0))
-    sex_reads_kept = int(qc_meta.get("sex_reads_kept", 0))
+    autosomal_reads_kept = _int_metric(qc_meta, "autosomal_reads_kept")
+    sex_reads_kept = _int_metric(qc_meta, "sex_reads_kept")
 
     filter_drops = {
-        "unmapped": int(qc_meta.get("filter_unmapped", 0)),
-        "mapq": int(qc_meta.get("filter_mapq", 0)),
-        "duplicate": int(qc_meta.get("filter_duplicate", 0)),
-        "secondary": int(qc_meta.get("filter_secondary", 0)),
-        "supplementary": int(qc_meta.get("filter_supplementary", 0)),
-        "improper_pair": int(qc_meta.get("filter_improper_pair", 0)),
-        "no_start": int(qc_meta.get("filter_no_start", 0)),
+        "unmapped": _int_metric(qc_meta, "filter_unmapped"),
+        "mapq": _int_metric(qc_meta, "filter_mapq"),
+        "duplicate": _int_metric(qc_meta, "filter_duplicate"),
+        "secondary": _int_metric(qc_meta, "filter_secondary"),
+        "supplementary": _int_metric(qc_meta, "filter_supplementary"),
+        "improper_pair": _int_metric(qc_meta, "filter_improper_pair"),
+        "no_start": _int_metric(qc_meta, "filter_no_start"),
     }
 
     read_metrics: dict[str, object] = {

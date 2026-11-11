@@ -23,13 +23,20 @@ class TestCohortCompatibility(unittest.TestCase):
 
     def test_rejects_coordinate_mismatch(self) -> None:
         left = make_sample_table(
-            [10, 10], ends=[100, 200], contig_lengths={"chr1": 200}
+            [10, 10],
+            contigs=["chr1", "chr2"],
+            starts=[0, 0],
+            ends=[100, 100],
+            contig_lengths={"chr1": 100, "chr2": 100},
+            bin_size=100,
         )
         right = make_sample_table(
             [10, 10],
-            starts=[0, 80],
-            ends=[80, 200],
-            contig_lengths={"chr1": 200},
+            contigs=["chr2", "chr1"],
+            starts=[0, 0],
+            ends=[100, 100],
+            contig_lengths={"chr1": 100, "chr2": 100},
+            bin_size=100,
         )
         with self.assertRaisesRegex(ReferenceError, "bin coordinates"):
             validate_cohort((left, right))
@@ -177,43 +184,46 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
 
     def test_rebin_sample_table_polars_fast_path(self) -> None:
         from ccnv.features.cohort import rebin_sample_table
+        from ccnv.models import SampleMetadata, reconstruct_sample_grid
 
         table = make_sample_table(
-            [10.0, 20.0, 30.0, 40.0],
-            contigs=["chr1", "chr1", "chr1", "chr1"],
-            starts=[0, 50, 100, 150],
-            ends=[50, 100, 150, 180],
+            [10, 20, 30, 40, 0, 0],
+            contigs=["chr1", "chr1", "chr1", "chr1", "chr2", "chr2"],
+            starts=[0, 50, 100, 150, 0, 50],
+            ends=[50, 100, 150, 180, 50, 100],
             contig_lengths={"chr1": 180, "chr2": 100},
             bin_size=50,
         )
         rebinned = rebin_sample_table(table, 100)
-        self.assertEqual(rebinned.column("start").to_pylist(), [0, 100, 0])
-        self.assertEqual(rebinned.column("end").to_pylist(), [100, 180, 100])
-        self.assertEqual(rebinned.column("count").to_pylist(), [30.0, 70.0, 0.0])
-        self.assertEqual(
-            rebinned.column("contig").to_pylist(), ["chr1", "chr1", "chr2"]
+        codes, names, starts, ends = reconstruct_sample_grid(
+            SampleMetadata.from_table(rebinned)
         )
+        self.assertEqual(starts.tolist(), [0, 100, 0])
+        self.assertEqual(ends.tolist(), [100, 180, 100])
+        self.assertEqual(rebinned.column("count").to_pylist(), [30, 70, 0])
+        self.assertEqual([names[int(c)] for c in codes], ["chr1", "chr1", "chr2"])
 
     def test_rebin_sample_table_boundary_crossing_overlap_redistribution(self) -> None:
         from ccnv.features.cohort import rebin_sample_table
+        from ccnv.models import SampleMetadata, reconstruct_sample_grid
 
-        # Interval [45, 75) crosses target boundary at 50
+        # Non-nested coarsening 20 bp -> 50 bp across 140 bp contig (7 bins -> 3 bins)
         table = make_sample_table(
-            [20.0, 30.0, 40.0],
-            contigs=["chr1", "chr1", "chr1"],
-            starts=[10, 45, 90],
-            ends=[30, 75, 110],
-            contig_lengths={"chr1": 150},
+            [20, 10, 30, 0, 40, 0, 0],
+            contigs=["chr1"] * 7,
+            starts=[0, 20, 40, 60, 80, 100, 120],
+            ends=[20, 40, 60, 80, 100, 120, 140],
+            contig_lengths={"chr1": 140},
             bin_size=20,
         )
         rebinned = rebin_sample_table(table, 50)
-        self.assertEqual(rebinned.column("start").to_pylist(), [0, 50, 100])
-        self.assertEqual(rebinned.column("end").to_pylist(), [50, 100, 150])
-        # Bin 0..50 gets [10, 30) (len 20, count 20) + 5/30 of [45, 75) (count 5) = 25.0
-        # Bin 50..100 gets 25/30 of [45, 75) (count 25) + 10/20 of [90, 110) (count 20) = 45.0
-        # Bin 100..150 gets 10/20 of [90, 110) (count 20) = 20.0
+        _, _, starts, ends = reconstruct_sample_grid(
+            SampleMetadata.from_table(rebinned)
+        )
+        self.assertEqual(starts.tolist(), [0, 50, 100])
+        self.assertEqual(ends.tolist(), [50, 100, 140])
         np.testing.assert_allclose(
-            rebinned.column("count").to_numpy(), [25.0, 45.0, 20.0]
+            rebinned.column("count").to_numpy(), [45.0, 55.0, 0.0]
         )
 
     def test_rebin_cohort_boundary_crossing_overlap_redistribution(self) -> None:
@@ -239,6 +249,12 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
 
     def test_rebin_sample_table_preserves_fragmentomic_columns(self) -> None:
         from ccnv.features.cohort import rebin_sample_table
+        from ccnv.models import (
+            NUM_FRAG_BANDS,
+            SampleMetadata,
+            fixed_size_list_to_numpy,
+            reconstruct_sample_grid,
+        )
 
         # Coarsen 50 bp -> 100 bp
         table = make_sample_table(
@@ -255,27 +271,28 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
 
         rebinned = rebin_sample_table(table, 100)
         self.assertEqual(rebinned.num_rows, 2)
-        self.assertEqual(rebinned.column("start").to_pylist(), [0, 100])
-        self.assertEqual(rebinned.column("end").to_pylist(), [100, 200])
-
-        # Counts summed
-        np.testing.assert_allclose(rebinned.column("count").to_pylist(), [30.0, 70.0])
-        # Fragment lengths concatenated
-        self.assertEqual(
-            rebinned.column("fragment_lengths").to_pylist(),
-            [[120, 130, 140], [150, 160, 170]],
+        _, _, starts, ends = reconstruct_sample_grid(
+            SampleMetadata.from_table(rebinned)
         )
-        # Endpoint counts summed
+        self.assertEqual(starts.tolist(), [0, 100])
+        self.assertEqual(ends.tolist(), [100, 200])
+
+        np.testing.assert_allclose(rebinned.column("count").to_pylist(), [30, 70])
+        self.assertEqual(rebinned.column("paired_count").to_pylist(), [3, 3])
+        self.assertEqual(rebinned.column("frag_len_sum").to_pylist(), [390, 480])
+        bands = fixed_size_list_to_numpy(
+            rebinned.column("frag_bands"), NUM_FRAG_BANDS, np.uint32
+        )
+        self.assertEqual(bands.sum(axis=1).tolist(), [3, 3])
         self.assertEqual(rebinned.column("endpoint_count").to_pylist(), [3, 3])
-        # Frag GC sums summed
         np.testing.assert_allclose(
             rebinned.column("frag_gc_sum").to_pylist(), [1.2, 1.4], rtol=1e-5
         )
 
     def test_rebin_sample_table_drops_null_elements_in_fragment_lengths(self) -> None:
         from ccnv.features.cohort import rebin_sample_table
+        from ccnv.models import NUM_FRAG_BANDS, fixed_size_list_to_numpy
 
-        # Coarsen 50 bp -> 100 bp with an explicit Arrow null element inside list
         table = make_sample_table(
             [10, 20],
             contigs=["chr1", "chr1"],
@@ -285,48 +302,32 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             bin_size=50,
             fragment_lengths=[[120, 130], [140]],
         )
-        frag_idx = table.schema.get_field_index("fragment_lengths")
+        frag_idx = table.schema.get_field_index("frag_bands")
+        orig_bands = table.column("frag_bands").to_pylist()
         table = table.set_column(
             frag_idx,
-            pa.field("fragment_lengths", pa.list_(pa.uint16()), nullable=False),
-            pa.array([[120, None, 130], [140]], type=pa.list_(pa.uint16())),
+            pa.field(
+                "frag_bands", pa.list_(pa.uint32(), NUM_FRAG_BANDS), nullable=True
+            ),
+            pa.array([None, orig_bands[1]], type=pa.list_(pa.uint32(), NUM_FRAG_BANDS)),
         )
         rebinned = rebin_sample_table(table, 100)
-        self.assertEqual(
-            rebinned.column("fragment_lengths").to_pylist(),
-            [[120, 130, 140]],
+        bands = fixed_size_list_to_numpy(
+            rebinned.column("frag_bands"), NUM_FRAG_BANDS, np.uint32
         )
-        # Also verify empty target bin produces [] without nulls and preserves target-grid order
-        sparse = make_sample_table(
-            [10, 20],
-            contigs=["chr2", "chr1"],
-            starts=[50, 0],
-            ends=[100, 50],
-            contig_lengths={"chr1": 200, "chr2": 100},
-            bin_size=50,
-            fragment_lengths=[[150], [140]],
-        )
-        rebinned_sparse = rebin_sample_table(sparse, 100)
-        self.assertEqual(
-            rebinned_sparse.column("contig").to_pylist(),
-            ["chr1", "chr1", "chr2"],
-        )
-        self.assertEqual(
-            rebinned_sparse.column("start").to_pylist(),
-            [0, 100, 0],
-        )
-        self.assertEqual(
-            rebinned_sparse.column("fragment_lengths").to_pylist(),
-            [[140], [], [150]],
-        )
+        self.assertEqual(int(bands.sum()), 1)
 
     def test_rebin_sample_table_non_nested_drops_fragmentomic_metadata_with_warning(
         self,
     ) -> None:
         import json
+        from dataclasses import asdict
 
         from ccnv.features.cohort import rebin_sample_table
-        from ccnv.models.schemas import FRAGMENTOMICS_METADATA_KEY
+        from ccnv.models.schemas import (
+            FRAGMENTOMICS_METADATA_KEY,
+            FragmentomicsMetadata,
+        )
 
         table = make_sample_table(
             [10, 20, 30],
@@ -335,42 +336,52 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             ends=[20, 40, 60],
             contig_lengths={"chr1": 60},
             bin_size=20,
+            fragment_lengths=[[150], [150], [150]],
         )
-        meta_dict = dict(table.schema.metadata)
-        meta_dict[FRAGMENTOMICS_METADATA_KEY] = json.dumps(
-            {"paired_end": True}
-        ).encode()
+        frag_meta = FragmentomicsMetadata(
+            paired_end=True,
+            total_paired_fragments=3,
+            chromatosome_mode_bp=166.0,
+            core_shoulder_bp=143.0,
+            sizing_shift_bp=0.0,
+            self_referenced_peak_ratio=0.35,
+            dinucleosome_fraction=0.05,
+            high_mw_fraction=0.01,
+            helical_10bp_amplitude=0.04,
+            helical_10bp_phase=1.0,
+            motif_diversity_score=0.90,
+            hist_autosomal=[0] * 571,
+            hist_chry=[0] * 571,
+            hist_chrx=[0] * 571,
+            end_motif_counts=[1] * 256,
+        )
+        meta_dict = dict(table.schema.metadata or {})
+        meta_dict[FRAGMENTOMICS_METADATA_KEY] = json.dumps(asdict(frag_meta)).encode()
         table_with_frag = table.replace_schema_metadata(meta_dict)
 
-        with self.assertLogs("ccnv.features.cohort", level="WARNING") as cm:
+        with self.assertLogs("ccnv.features.rebinning", level="WARNING") as cm:
             rebinned = rebin_sample_table(table_with_frag, 50)
 
-        self.assertTrue(
-            any("dropping fragmentomic metadata" in msg for msg in cm.output)
-        )
+        self.assertTrue(any("clears fragmentomic channels" in msg for msg in cm.output))
         self.assertNotIn(FRAGMENTOMICS_METADATA_KEY, rebinned.schema.metadata or {})
 
     def test_cohort_rejects_mixed_single_and_paired_end(self) -> None:
-        import json
-
         from ccnv.features.cohort import validate_cohort
-        from ccnv.models.schemas import FRAGMENTOMICS_METADATA_KEY
 
         # Sample 1: paired-end
-        s1 = make_sample_table([10, 20], contig_lengths={"chr1": 200}, bin_size=100)
-        s1_meta = dict(s1.schema.metadata)
-        s1_meta[FRAGMENTOMICS_METADATA_KEY] = json.dumps({"paired_end": True}).encode(
-            "utf-8"
+        s1 = make_sample_table(
+            [10, 20],
+            contig_lengths={"chr1": 200},
+            bin_size=100,
+            fragment_lengths=[[150], [150]],
         )
-        s1 = s1.replace_schema_metadata(s1_meta)
-
         # Sample 2: single-end
-        s2 = make_sample_table([10, 20], contig_lengths={"chr1": 200}, bin_size=100)
-        s2_meta = dict(s2.schema.metadata)
-        s2_meta[FRAGMENTOMICS_METADATA_KEY] = json.dumps({"paired_end": False}).encode(
-            "utf-8"
+        s2 = make_sample_table(
+            [10, 20],
+            contig_lengths={"chr1": 200},
+            bin_size=100,
+            fragment_lengths=None,
         )
-        s2 = s2.replace_schema_metadata(s2_meta)
 
         with self.assertRaisesRegex(
             ReferenceError,
@@ -405,7 +416,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             cram, fasta=fasta, bin_size=PUBLISHED_BIN_SIZE
         )
         self.assertEqual(cram_table.num_rows, 468)
-        self.assertIn("fragment_lengths", cram_table.column_names)
+        self.assertIn("frag_bands", cram_table.column_names)
         self.assertIn("endpoint_count", cram_table.column_names)
         self.assertIn("frag_gc_sum", cram_table.column_names)
 

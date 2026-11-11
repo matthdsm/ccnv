@@ -20,11 +20,14 @@ from ccnv.models import (
     BRANCH_MALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
+    NUM_PROTOTYPES_PER_BIN,
     ReferenceQCError,
     ReferenceQCOutputs,
     decode_metadata,
+    fixed_size_list_to_numpy,
 )
 from ccnv.qc.sample import sanitize_qc_payload
+from ccnv.stats.neighbors import evaluate_loco_prototype_baseline
 
 DEFAULT_MIN_REF_BINS: Final[int] = 150
 OUTLIER_N_SIGMA: Final[float] = 3.0
@@ -254,10 +257,28 @@ def compute_branch_qc(
         .to_numpy(zero_copy_only=False)
         .astype(np.float64)
     )
-    indices_col = unmasked_table.column("nearest_ref_indices").combine_chunks()
-    offsets = indices_col.offsets.to_numpy()
-    n_refs = (offsets[1:] - offsets[:-1]).astype(np.int64)
-    contigs = np.asarray(unmasked_table.column("contig"))
+    pids = fixed_size_list_to_numpy(
+        unmasked_table.column("proto_ids"), NUM_PROTOTYPES_PER_BIN, np.uint16
+    )
+    pweights = fixed_size_list_to_numpy(
+        unmasked_table.column("proto_weights"), NUM_PROTOTYPES_PER_BIN, np.float16
+    )
+    contig_col = unmasked_table.column("contig").combine_chunks()
+    if isinstance(contig_col, pa.DictionaryArray):
+        vocab = [str(v) for v in contig_col.dictionary.to_pylist()]
+        c_codes = contig_col.indices.to_numpy(zero_copy_only=False)
+        contigs = [vocab[int(c)] for c in c_codes]
+    else:
+        contigs = [str(v) for v in contig_col.to_numpy(zero_copy_only=False)]
+        _, c_codes = np.unique(np.asarray(contigs, dtype=str), return_inverse=True)
+
+    _, n_refs = evaluate_loco_prototype_baseline(
+        np.ones(n_unmasked, dtype=np.float64),
+        c_codes,
+        pids,
+        pweights,
+    )
+    eff_min_refs = min(min_ref_bins, max(1, n_unmasked // 2))
     valid = np.isfinite(mean_d)
     n_valid = int(np.sum(valid))
     if n_valid == 0:
@@ -279,12 +300,12 @@ def compute_branch_qc(
         cutoff_outlier = mean_of_means
         n_mean_outlier = 0
     outlier_pct = float(100.0 * n_mean_outlier / n_valid)
-    n_low_refs = int(np.sum(n_refs < min_ref_bins))
+    n_low_refs = int(np.sum(n_refs < eff_min_refs))
 
     sig_metrics = None
     if branch_name == BRANCH_MALE_SEX and signal_contig:
         sig_metrics = compute_signal_contig_metrics(
-            contigs, signal_contig, mean_d, n_refs, cutoff_outlier, min_ref_bins
+            contigs, signal_contig, mean_d, n_refs, cutoff_outlier, eff_min_refs
         )
 
     metrics: dict[str, object] = {
@@ -301,9 +322,9 @@ def compute_branch_qc(
     }
 
     if branch_name == BRANCH_MALE_SEX:
-        verdict, message = evaluate_male_verdict(metrics, min_ref_bins)
+        verdict, message = evaluate_male_verdict(metrics, eff_min_refs)
     else:
-        verdict, message = evaluate_autosomal_or_female_verdict(metrics, min_ref_bins)
+        verdict, message = evaluate_autosomal_or_female_verdict(metrics, eff_min_refs)
 
     metrics["verdict"] = verdict
     metrics["message"] = message
@@ -349,8 +370,8 @@ def run_reference_qc_on_table(
     messages: list[str] = []
 
     cnv_branch_names = tuple(
-        b
-        for b in dict.fromkeys(table.column("branch").to_pylist())
+        str(b)
+        for b in pc.unique(table.column("branch")).to_pylist()
         if b in (BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX)
     )
     logger.debug(

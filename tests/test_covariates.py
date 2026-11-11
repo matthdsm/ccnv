@@ -2,14 +2,13 @@ import gzip
 import json
 import tempfile
 import unittest
-from dataclasses import asdict
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
 import pyarrow.parquet as pq
 import pyBigWig
 import pysam
+from helpers import write_synthetic_sample
 from typer.testing import CliRunner
 
 from ccnv.cli import app
@@ -27,16 +26,10 @@ from ccnv.io.tracks import (
 from ccnv.models import (
     CovariateError,
     PredictConfig,
-    ReadFilters,
     ReferenceConfig,
     parquet_path,
 )
-from ccnv.models.schemas import (
-    SAMPLE_SCHEMA,
-    ArtifactKind,
-    decode_metadata,
-    metadata_for,
-)
+from ccnv.models.schemas import decode_metadata
 from ccnv.predict import run as run_predict
 from ccnv.reference import run as run_reference
 
@@ -78,36 +71,16 @@ def _write_sample_parquet(
     contig_lengths: dict[str, int],
     bin_size: int = 100,
 ) -> Path:
-    metadata = metadata_for(
-        ArtifactKind.SAMPLE,
+    return write_synthetic_sample(
+        path,
+        counts,
+        contigs=contigs,
+        starts=starts,
+        ends=ends,
         contig_lengths=contig_lengths,
-        values={
-            "bin_size": bin_size,
-            "source_identity": {"id": path.stem},
-            "reference_identity": {"name": "test"},
-            "qc": {},
-            "filters": asdict(ReadFilters()),
-        },
+        bin_size=bin_size,
+        identity={"id": path.stem},
     )
-    n_bins = len(contigs)
-    table = pa.table(
-        {
-            "contig": contigs,
-            "start": pa.array(starts, type=pa.int64()),
-            "end": pa.array(ends, type=pa.int64()),
-            "count": pa.array(counts, type=pa.uint64()),
-            "fragment_lengths": pa.array([[]] * n_bins, type=pa.list_(pa.uint16())),
-            "endpoint_count": pa.array(
-                np.zeros(n_bins, dtype=np.uint32), type=pa.uint32()
-            ),
-            "frag_gc_sum": pa.array(
-                np.zeros(n_bins, dtype=np.float32), type=pa.float32()
-            ),
-        },
-        schema=SAMPLE_SCHEMA.with_metadata(metadata),
-    )
-    pq.write_table(table, path)
-    return path
 
 
 class TestTrackLoadingAndMasking(unittest.TestCase):

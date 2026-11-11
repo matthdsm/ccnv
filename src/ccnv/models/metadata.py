@@ -488,6 +488,8 @@ class ReferenceMetadata:
     mappability_corrected: bool = False
     fragmentomics_corrected: bool = False
     min_mappability: float = DEFAULT_MIN_MAPPABILITY
+    branch_pca_ranks: dict[str, int] | None = None
+    filters: dict[str, object] | None = None
     schema_version: str = SCHEMA_VERSION
     coordinate_system: str = COORDINATE_SYSTEM
     prenatal: PrenatalModelMetadata | None = None
@@ -499,7 +501,10 @@ class ReferenceMetadata:
             _check_pos_int(self.prenatal_bin_size, "prenatal_bin_size")
         _check_nonneg_int(self.pca_components, "pca_components")
         _check_nonneg_int(self.nearest_bins, "nearest_bins")
-        _check_pos_int(self.max_batch_memory_mb, "max_batch_memory_mb")
+        _check_nonneg_int(self.max_batch_memory_mb, "max_batch_memory_mb")
+        if self.branch_pca_ranks is not None:
+            for b_name, b_rank in self.branch_pca_ranks.items():
+                _check_nonneg_int(b_rank, f"branch_pca_ranks[{b_name!r}]")
         if not (0.0 <= self.min_mappability <= 1.0):
             raise ValueError(
                 f"min_mappability must be within [0.0, 1.0], got {self.min_mappability!r}"
@@ -586,6 +591,18 @@ class ReferenceMetadata:
             )
             raw_sexes = model.get("sample_sexes")
             raw_cutoff = model.get("sex_cutoff")
+            raw_ranks = model.get("branch_pca_ranks")
+            branch_pca_ranks: dict[str, int] | None = None
+            if raw_ranks is not None:
+                if not isinstance(raw_ranks, Mapping):
+                    raise TypeError("branch_pca_ranks must be a mapping")
+                branch_pca_ranks = {
+                    str(k): _req_int(v, "branch_pca_rank") for k, v in raw_ranks.items()
+                }
+            raw_filters = model.get("filters")
+            filters = (
+                None if raw_filters is None else _opt_obj_dict(raw_filters, "filters")
+            )
             return cls(
                 bin_size=_req_int(model.get("bin_size", DEFAULT_BIN_SIZE), "bin_size"),
                 contig_lengths=contig_lengths,
@@ -643,6 +660,8 @@ class ReferenceMetadata:
                     model.get("min_mappability", DEFAULT_MIN_MAPPABILITY),
                     "min_mappability",
                 ),
+                branch_pca_ranks=branch_pca_ranks,
+                filters=filters,
                 schema_version=schema_version,
                 coordinate_system=str(data.get("coordinate_system", COORDINATE_SYSTEM)),
                 prenatal=prenatal_meta,

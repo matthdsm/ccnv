@@ -239,9 +239,10 @@ class TestParquetIO(unittest.TestCase):
                 schema=ref_schema,
             )
             write_reference_parquet(table, path)
-            loaded = read_reference_parquet(path)
+            loaded, ref_meta = read_reference_parquet(path)
             self.assertEqual(loaded.num_rows, 1)
             self.assertEqual(loaded.column("branch").to_pylist(), [BRANCH_AUTOSOMAL])
+            self.assertEqual(ref_meta.bin_size, 100)
 
 
 class TestTracksIO(unittest.TestCase):

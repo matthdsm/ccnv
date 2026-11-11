@@ -23,25 +23,29 @@ from ccnv.features.cohort import (
 )
 from ccnv.features.fragmentomics import (
     extract_sample_fragmentomics,
-    extract_segment_fragment_lengths,
     fit_cohort_fragmentomics_model,
     fuse_active_fetal_fraction,
-    score_segment_origin,
+    score_segment_table_origin,
 )
 from ccnv.models import (
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
-    REFERENCE_SCHEMA,
+    NUM_GC_QUANTILES,
+    NUM_PROTOTYPES_PER_BIN,
     FetalFractionResult,
     FetalSex,
     PrenatalModelMetadata,
+    SampleMetadata,
     SamplesheetEntry,
     SCACall,
     SCAResult,
     SegmentResult,
+    build_reference_schema,
     decode_metadata,
+    fixed_size_list_to_numpy,
     is_autosome_name,
     normalize_chr,
+    reconstruct_sample_grid,
 )
 from ccnv.stats.fragmentomics import predict_ff_fragmentomics
 from ccnv.stats.pca import pca_irlba_numpy
@@ -88,45 +92,88 @@ def _build_prenatal_branch_table(
     ends: NDArray[np.int64],
     masked: NDArray[np.bool_],
     pca_mean: NDArray[np.float64],
-    pca_loadings: list[list[float]] | None = None,
+    pca_loadings: list[list[float]] | NDArray[np.floating] | None = None,
     null_mean: NDArray[np.float64] | None = None,
 ) -> pa.Table:
-    """Build a prenatal branch table containing coordinates and null models."""
+    """Build a Schema v2.0.0 prenatal branch table."""
     n_bins = len(contigs)
+    if pca_loadings is not None:
+        ld_arr = np.asarray(pca_loadings, dtype=np.float32)
+        if ld_arr.ndim == 1:
+            ld_arr = ld_arr[:, np.newaxis]
+        pca_rank = int(ld_arr.shape[1]) if ld_arr.size > 0 else 0
+    else:
+        ld_arr = np.empty((n_bins, 0), dtype=np.float32)
+        pca_rank = 0
+
+    schema = build_reference_schema(pca_rank)
+    uniq_c = list(dict.fromkeys(contigs))
+    c_map = {name: idx for idx, name in enumerate(uniq_c)}
+    c_codes = np.array([c_map[c] for c in contigs], dtype=np.int16)
+
+    branch_col = pa.DictionaryArray.from_arrays(
+        pa.array(np.zeros(n_bins, dtype=np.int8), type=pa.int8()),
+        pa.array([branch], type=pa.string()),
+    )
+    contig_col = pa.DictionaryArray.from_arrays(
+        pa.array(c_codes, type=pa.int16()),
+        pa.array(uniq_c, type=pa.string())
+        if uniq_c
+        else pa.array([], type=pa.string()),
+    )
+    loadings_col: pa.Array = (
+        pa.nulls(n_bins, type=pa.list_(pa.float32(), 0))
+        if pca_rank == 0
+        else pa.FixedSizeListArray.from_arrays(
+            pa.array(ld_arr.ravel(), type=pa.float32()), pca_rank
+        )
+    )
+    proto_ids_col = pa.FixedSizeListArray.from_arrays(
+        pa.array(np.zeros(n_bins * NUM_PROTOTYPES_PER_BIN, dtype=np.uint16)),
+        NUM_PROTOTYPES_PER_BIN,
+    )
+    proto_w_col = pa.FixedSizeListArray.from_arrays(
+        pa.array(np.zeros(n_bins * NUM_PROTOTYPES_PER_BIN, dtype=np.float16)),
+        NUM_PROTOTYPES_PER_BIN,
+    )
+
     return pa.table(
         {
-            "branch": pa.array([branch] * n_bins, type=pa.string()),
-            "contig": pa.array(contigs, type=pa.string()),
-            "start": pa.array(starts, type=pa.int64()),
-            "end": pa.array(ends, type=pa.int64()),
-            "masked": pa.array(masked, type=pa.bool_()),
-            "gc": pa.array(np.zeros(n_bins, dtype=np.float32), type=pa.float32()),
-            "mappability": pa.array(
-                np.zeros(n_bins, dtype=np.float32), type=pa.float32()
+            "branch": branch_col,
+            "contig": contig_col,
+            "start": np.asarray(starts, dtype=np.uint32),
+            "end": np.asarray(ends, dtype=np.uint32),
+            "masked": np.asarray(masked, dtype=np.bool_),
+            "gc": np.zeros(n_bins, dtype=np.float32),
+            "mappability": np.zeros(n_bins, dtype=np.float32),
+            "gc_quantiles": pa.nulls(
+                n_bins, type=pa.list_(pa.float32(), NUM_GC_QUANTILES)
             ),
-            "pca_mean": pa.array(pca_mean, type=pa.float64()),
-            "pca_loadings": pa.array(
-                pca_loadings
-                if pca_loadings is not None
-                else [[] for _ in range(n_bins)],
-                type=pa.list_(pa.float64()),
-            ),
-            "nearest_ref_indices": pa.array(
-                [[] for _ in range(n_bins)], type=pa.list_(pa.int32())
-            ),
-            "mean_distance": pa.array(
-                np.zeros(n_bins, dtype=np.float32), type=pa.float32()
-            ),
-            "null_mean": pa.array(
-                null_mean
+            "ref_frag_len": np.full(n_bins, -1.0, dtype=np.float32),
+            "ref_ep_rate": np.full(n_bins, -1.0, dtype=np.float32),
+            "pca_mean": np.asarray(pca_mean, dtype=np.float32),
+            "pca_loadings": loadings_col,
+            "proto_ids": proto_ids_col,
+            "proto_weights": proto_w_col,
+            "mean_distance": np.zeros(n_bins, dtype=np.float32),
+            "null_mean": (
+                np.asarray(null_mean, dtype=np.float32)
                 if null_mean is not None
-                else np.zeros(n_bins, dtype=np.float64),
-                type=pa.float64(),
+                else np.zeros(n_bins, dtype=np.float32)
             ),
-            "null_std": pa.array(np.zeros(n_bins, dtype=np.float64), type=pa.float64()),
+            "bio_dispersion": np.zeros(n_bins, dtype=np.float32),
         },
-        schema=REFERENCE_SCHEMA,
+        schema=schema,
     )
+
+
+def _decode_dict_strings(col: pa.ChunkedArray) -> list[str]:
+    arr = col.combine_chunks()
+    if isinstance(arr, pa.DictionaryArray):
+        vocab = [str(x) for x in arr.dictionary.to_pylist()]
+        codes = arr.indices.to_numpy(zero_copy_only=False)
+        return [vocab[int(c)] for c in codes]
+    return [str(x) for x in arr.to_numpy(zero_copy_only=False)]
 
 
 def _align_sample_to_ref(
@@ -142,7 +189,7 @@ def _align_sample_to_ref(
     if len(sample_contigs) == 0:
         return np.full(ref_n, -1, dtype=np.int32)
 
-    ref_c = [normalize_chr(str(c)) for c in ref_table.column("contig").to_pylist()]
+    ref_c = [normalize_chr(c) for c in _decode_dict_strings(ref_table.column("contig"))]
     ref_s = np.asarray(
         ref_table.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
     )
@@ -580,6 +627,7 @@ def fit_prenatal_models(
         null_mean=mean_features,
     )
 
+    auto_rank = int(pca_rotation.shape[1]) if pca_rotation.ndim == 2 else 0
     chry_indices = np.flatnonzero(chry_mask_5k)
     prenatal_ffy_table = _build_prenatal_branch_table(
         branch=BRANCH_PRENATAL_FFY,
@@ -588,6 +636,7 @@ def fit_prenatal_models(
         ends=e_5k[chry_indices],
         masked=~informative_mask,
         pca_mean=ffy_weights,
+        pca_loadings=np.zeros((len(chry_indices), auto_rank), dtype=np.float32),
     )
 
     return (
@@ -606,7 +655,11 @@ def predict_prenatal(
 ) -> FetalFractionResult:
     """Predict fetal sex, FFY, FFA, FFX, SCA status, and active fetal fraction."""
     # 1. Extract reference branches
-    ref_branches = reference_table.column("branch").to_pylist()
+    ref_branches = {
+        str(v)
+        for v in pc.unique(reference_table.column("branch")).to_pylist()
+        if v is not None
+    }
     if BRANCH_PRENATAL_FFY not in ref_branches:
         raise ValueError(f"reference table is missing '{BRANCH_PRENATAL_FFY}' branch")
     if BRANCH_PRENATAL_AUTOSOMAL not in ref_branches:
@@ -621,14 +674,12 @@ def predict_prenatal(
         pc.equal(reference_table.column("branch"), BRANCH_PRENATAL_AUTOSOMAL)
     )
 
-    # 2. Evaluate chry_score and fetal sex from 5 kb sample table
-    sample_c = [str(x) for x in sample_table.column("contig").to_pylist()]
-    sample_s = np.asarray(
-        sample_table.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    sample_e = np.asarray(
-        sample_table.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
+    # 2. Evaluate chry_score and fetal sex from sample sketch grid
+    s_meta = SampleMetadata.from_table(sample_table)
+    s_codes, s_names, s_starts_u32, s_ends_u32 = reconstruct_sample_grid(s_meta)
+    sample_c = [s_names[int(c)] for c in s_codes]
+    sample_s = s_starts_u32.astype(np.int64)
+    sample_e = s_ends_u32.astype(np.int64)
     sample_w = sample_e - sample_s
     sample_counts = np.asarray(
         sample_table.column("count").to_numpy(zero_copy_only=False),
@@ -657,7 +708,6 @@ def predict_prenatal(
         )
         weights = np.where(~ref_ffy_masked, ref_ffy_weights, 0.0)
 
-        # Coordinate matching
         ref_ffy_s = np.asarray(
             ffy_ref.column("start").to_numpy(zero_copy_only=False),
             dtype=np.int64,
@@ -686,13 +736,11 @@ def predict_prenatal(
 
     # 4. Rebin sample to 100 kb for FFA and FFX
     sample_100k = rebin_sample_table(sample_table, prenatal_meta.prenatal_bin_size)
-    c_100k = [str(x) for x in sample_100k.column("contig").to_pylist()]
-    s_100k = np.asarray(
-        sample_100k.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    e_100k = np.asarray(
-        sample_100k.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
+    s100_meta = SampleMetadata.from_table(sample_100k)
+    c100_codes, c100_names, s100_u32, e100_u32 = reconstruct_sample_grid(s100_meta)
+    c_100k = [c100_names[int(c)] for c in c100_codes]
+    s_100k = s100_u32.astype(np.int64)
+    e_100k = e100_u32.astype(np.int64)
     w_100k = e_100k - s_100k
     counts_100k = np.asarray(
         sample_100k.column("count").to_numpy(zero_copy_only=False),
@@ -706,7 +754,6 @@ def predict_prenatal(
         counts_100k, w_100k, auto_mask_100k, prenatal_meta.prenatal_bin_size
     )
 
-    # Autosomal log2 ratios on auto_ref bins
     exp_counts = r_auto_100k * w_100k[auto_mask_100k]
     ratio_auto = counts_100k[auto_mask_100k] / exp_counts
     log2_ratios = np.log2(np.where(ratio_auto > 0, ratio_auto, np.nan))
@@ -719,9 +766,17 @@ def predict_prenatal(
         auto_ref.column("pca_mean").to_numpy(zero_copy_only=False),
         dtype=np.float64,
     )
-    ref_pca_rotation = np.array(
-        auto_ref.column("pca_loadings").to_pylist(), dtype=np.float64
-    )
+    ld_col = auto_ref.column("pca_loadings").combine_chunks()
+    ld_type = ld_col.type
+    assert isinstance(ld_type, pa.FixedSizeListType)
+    n_olm = len(prenatal_meta.olm_weights)
+    ref_pca_rotation = np.zeros((auto_ref.num_rows, n_olm), dtype=np.float64)
+    if ld_type.list_size > 0 and auto_ref.num_rows > 0 and n_olm > 0:
+        full_ld = fixed_size_list_to_numpy(ld_col, ld_type.list_size, np.float32)
+        k_copy = min(n_olm, ld_type.list_size)
+        ref_pca_rotation[:, :k_copy] = np.nan_to_num(
+            full_ld[:, :k_copy].astype(np.float64), nan=0.0
+        )
 
     ref_auto_s = np.asarray(
         auto_ref.column("start").to_numpy(zero_copy_only=False),
@@ -884,14 +939,14 @@ def annotate_prenatal_segments(
         frag_llr_size = None
         origin_call = None
         if sample_table is not None and p_fetal is not None and p_maternal is not None:
-            lengths = extract_segment_fragment_lengths(
-                sample_table, seg.contig, seg.start, seg.end
-            )
             is_gain = (
                 seg.call.lower() == "gain" if seg.call is not None else (seg.ratio >= 0)
             )
-            frag_short_ratio, frag_llr_size, origin_call = score_segment_origin(
-                lengths,
+            frag_short_ratio, frag_llr_size, origin_call = score_segment_table_origin(
+                sample_table,
+                seg.contig,
+                seg.start,
+                seg.end,
                 shift_bp,
                 p_fetal,
                 p_maternal,

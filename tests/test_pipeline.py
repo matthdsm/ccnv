@@ -14,7 +14,7 @@ from ccnv.models import (
     ReferenceConfig,
     parquet_path,
 )
-from ccnv.models.schemas import decode_metadata
+from ccnv.models.schemas import SampleMetadata, decode_metadata, reconstruct_sample_grid
 from ccnv.predict import run as predict
 from ccnv.reference import run as reference
 from ccnv.report import (
@@ -102,13 +102,11 @@ class TestInstalledPipelineContract(unittest.TestCase):
                 metadata["reference_identity"]["contig_order"],
                 [name for name, _ in CONTIGS],
             )
-            self.assertIn("chr10", sample.column("contig").to_pylist())
+            sample_meta = SampleMetadata.from_table(sample)
+            codes, names, _starts, ends = reconstruct_sample_grid(sample_meta)
+            self.assertIn("chr10", names)
             self.assertEqual(
-                sample.filter(
-                    np.asarray(sample.column("contig").to_pylist()) == "plasmid-Y"
-                )
-                .column("end")
-                .to_pylist()[-1],
+                int(ends[codes == names.index("plasmid-Y")][-1]),
                 930,
             )
 

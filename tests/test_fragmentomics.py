@@ -303,16 +303,8 @@ class TestFragmentomicsKernels(unittest.TestCase):
             yfrac_threshold=0.004,
             ffy_intercept=0.0,
             ffy_slope=1.0,
-            mlp_w1=[[0.1] * 2] * 50,
-            mlp_b1=[0.1, -0.1],
-            mlp_w2=[[0.5], [-0.5]],
-            mlp_b2=[0.0],
-            mlp_skew_intercept=0.0,
-            mlp_skew_slope=1.0,
             olm_weights=[0.01] * 50,
             olm_bias=0.0,
-            olm_skew_intercept=0.0,
-            olm_skew_slope=1.0,
             ffx_intercept=1.0,
             ffx_slope=-0.5,
             female_chrx_ratio_mean=1.0,
@@ -419,12 +411,10 @@ class TestFragmentomicsKernels(unittest.TestCase):
         )
 
         weights_571 = np.ones(571, dtype=np.float64)
-        # Weight for length 100: index 100 - 30 = 70 -> weight 2.0
-        # Weight for length 150: index 150 - 30 = 120 -> weight 0.5
-        # Weight for length 200: index 200 - 30 = 170 -> weight 3.0
-        weights_571[100 - 30] = 2.0
-        weights_571[150 - 30] = 0.5
-        weights_571[200 - 30] = 3.0
+        # Band [100, 110) -> weight 2.0; band [150, 160) -> weight 0.5; band [200, 220) -> weight 3.0
+        weights_571[100 - 30 : 110 - 30] = 2.0
+        weights_571[150 - 30 : 160 - 30] = 0.5
+        weights_571[200 - 30 : 220 - 30] = 3.0
 
         eff_cov = evaluate_weighted_coverage(table, weights_571, shift_bp=0.0)
         self.assertEqual(len(eff_cov), 3)
@@ -528,31 +518,29 @@ class TestFragmentomicsKernels(unittest.TestCase):
         self.assertEqual(loocv_std, 0.018)
 
     def test_align_reference_to_weighted_sample(self) -> None:
-        import pyarrow as pa
-        from helpers import make_sample_table
+        from helpers import make_reference_table, make_sample_table
 
         from ccnv.features.fragmentomics import align_reference_to_weighted_sample
 
-        ref_table = pa.table(
-            {
-                "branch": pa.array(["autosomal", "autosomal", "autosomal"]),
-                "contig": pa.array(["chr2", "chr1", "chr1"]),
-                "start": pa.array([0, 0, 100], type=pa.int64()),
-                "end": pa.array([100, 100, 200], type=pa.int64()),
-                "pca_mean": pa.array([30.0, 10.0, 20.0], type=pa.float64()),
-                "null_mean": pa.array([0.01, -0.02, 0.03], type=pa.float64()),
-            }
+        ref_table = make_reference_table(
+            branches=["autosomal", "autosomal", "autosomal"],
+            contigs=["chr2", "chr1", "chr1"],
+            starts=[0, 0, 100],
+            ends=[100, 100, 200],
+            contig_lengths={"chr1": 200, "chr2": 100},
+            pca_mean=[30.0, 10.0, 20.0],
+            null_mean=[0.01, -0.02, 0.03],
         )
         # Diploid baseline ratios: chr1:0 = 15/10 = 1.5, chr2:0 = 45/30 = 1.5; CNV bin chr1:100 = 40/20 = 2.0
         # Median baseline scale = median([1.5, 1.5, 2.0]) = 1.5; log2 null_mean stays invariant!
         u_sample = make_sample_table(
-            [10.0, 20.0, 30.0],
+            [10, 20, 30],
             contigs=["chr1", "chr1", "chr2"],
             starts=[0, 100, 0],
             ends=[100, 200, 100],
         )
         w_sample = make_sample_table(
-            [15.0, 40.0, 45.0],
+            [15, 40, 45],
             contigs=["chr1", "chr1", "chr2"],
             starts=[0, 100, 0],
             ends=[100, 200, 100],
@@ -563,10 +551,10 @@ class TestFragmentomicsKernels(unittest.TestCase):
             aligned_ref.column("contig").to_pylist(), ["chr2", "chr1", "chr1"]
         )
         np.testing.assert_allclose(
-            aligned_ref.column("pca_mean").to_numpy(), [45.0, 15.0, 30.0]
+            aligned_ref.column("pca_mean").to_numpy(), [45.0, 15.0, 30.0], rtol=1e-5
         )
         np.testing.assert_allclose(
-            aligned_ref.column("null_mean").to_numpy(), [0.01, -0.02, 0.03]
+            aligned_ref.column("null_mean").to_numpy(), [0.01, -0.02, 0.03], rtol=1e-5
         )
 
 

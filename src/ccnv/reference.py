@@ -1,9 +1,10 @@
-"""Cohort validation and vectorized reference construction."""
+"""Cohort validation and vectorized Schema v2.0.0 reference construction."""
 
 from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Final
@@ -18,9 +19,9 @@ from ccnv.features.cohort import (
     SexLabel,
     cohort_from_fasta,
     infer_sample_sexes,
+    load_and_assemble_cohort,
     mask_low_coverage,
     normalize_depth,
-    validate_cohort,
 )
 from ccnv.features.covariates import (
     correct_covariate_bias,
@@ -29,30 +30,37 @@ from ccnv.features.covariates import (
     validate_min_mappability,
 )
 from ccnv.features.prenatal import fit_prenatal_models
-from ccnv.io.parquet import read_sample_tables, write_reference_parquet
+from ccnv.io.parquet import write_reference_parquet
 from ccnv.io.samplesheet import load_samplesheet
-from ccnv.io.tracks import load_gc_track, load_mappability_track, read_fasta_contigs
+from ccnv.io.tracks import (
+    load_fasta_gc_quantiles,
+    load_gc_track,
+    load_mappability_track,
+    read_fasta_contigs,
+)
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
-    REFERENCE_SCHEMA,
+    NUM_GC_QUANTILES,
+    NUM_PROTOTYPES_PER_BIN,
     ArtifactKind,
     CovariateError,
     ReferenceConfig,
     ReferenceError,
     SamplesheetEntry,
+    build_reference_schema,
+    fixed_size_list_to_numpy,
     metadata_for,
     parquet_path,
 )
 from ccnv.qc.reference import run_reference_qc_on_table
 from ccnv.stats.neighbors import (
     build_signal_space_features,
-    compute_null_models,
-    distance_cutoff,
-    select_nearest_bins,
+    compute_prototype_null_models,
+    fit_prototype_graph,
 )
 from ccnv.stats.pca import fit_pca
 
@@ -71,8 +79,8 @@ __all__ = [
 ]
 
 
-def run(config: ReferenceConfig) -> None:
-    """Validate a cohort and write a versioned reference Parquet file."""
+def run(config: ReferenceConfig) -> Path:
+    """Validate a cohort and write a versioned Schema v2.0.0 reference Parquet file."""
     _validate_config(config)
     if config.samplesheet_path is not None:
         entries = load_samplesheet(config.samplesheet_path)
@@ -100,11 +108,12 @@ def run(config: ReferenceConfig) -> None:
             else config
         )
     else:
-        sample_tables = read_sample_tables(config.samples, threads=config.threads)
-        cohort = validate_cohort(
-            sample_tables,
-            paths=config.samples,
+        cohort = load_and_assemble_cohort(
+            config.entries,
             target_bin_size=config.bin_size,
+            threads=config.threads,
+            max_batch_memory_mb=config.max_batch_memory_mb,
+            collect_prenatal_bands=(config.mode == "prenatal"),
         )
     table, path = build_reference_table(cohort, config), parquet_path(config.prefix)
     logger.debug("writing reference parquet %s (%d rows)", path, table.num_rows)
@@ -123,14 +132,76 @@ def run(config: ReferenceConfig) -> None:
             write_json=True,
             emit_stderr=True,
         )
+    return path
+
+
+def _unify_branch_table(
+    table: pa.Table,
+    *,
+    branch_code: int,
+    branch_vocab: pa.Array,
+    contig_vocab: pa.Array,
+    contig_to_code: dict[str, int],
+    p_max: int,
+) -> tuple[pa.Table, int]:
+    """Normalize branch dictionary, contig dictionary, and right-padded PCA rank."""
+    n_rows = table.num_rows
+    c_col = table.column("contig").combine_chunks()
+    if isinstance(c_col, pa.DictionaryArray):
+        local_vocab = [str(v) for v in c_col.dictionary.to_pylist()]
+        local_codes = c_col.indices.to_numpy(zero_copy_only=False)
+        mapped_c = np.array(
+            [contig_to_code[local_vocab[int(c)]] for c in local_codes],
+            dtype=np.int16,
+        )
+    else:
+        mapped_c = np.array(
+            [contig_to_code[str(v)] for v in c_col.to_numpy(zero_copy_only=False)],
+            dtype=np.int16,
+        )
+
+    ld_col = table.column("pca_loadings").combine_chunks()
+    ld_type = ld_col.type
+    assert isinstance(ld_type, pa.FixedSizeListType)
+    p_branch = ld_type.list_size
+    if p_max == 0:
+        padded_ld: pa.Array = pa.nulls(n_rows, type=pa.list_(pa.float32(), 0))
+    elif p_branch == p_max:
+        padded_ld = ld_col
+    else:
+        padded_arr = np.zeros((n_rows, p_max), dtype=np.float32)
+        if p_branch > 0 and n_rows > 0:
+            raw_ld = fixed_size_list_to_numpy(ld_col, p_branch, np.float32)
+            padded_arr[:, :p_branch] = np.nan_to_num(raw_ld, nan=0.0)
+        padded_ld = pa.FixedSizeListArray.from_arrays(
+            pa.array(padded_arr.ravel(), type=pa.float32()),
+            p_max,
+        )
+
+    unified_branch = pa.DictionaryArray.from_arrays(
+        pa.array(np.full(n_rows, branch_code, dtype=np.int8), type=pa.int8()),
+        branch_vocab,
+    )
+    unified_contig = pa.DictionaryArray.from_arrays(
+        pa.array(mapped_c, type=pa.int16()),
+        contig_vocab,
+    )
+
+    schema = build_reference_schema(p_max)
+    cols: dict[str, pa.Array | pa.ChunkedArray] = {
+        name: table.column(name) for name in schema.names
+    }
+    cols["branch"] = unified_branch
+    cols["contig"] = unified_contig
+    cols["pca_loadings"] = padded_ld
+    return pa.table(cols, schema=schema), p_branch
 
 
 def build_reference_table(
     cohort: Cohort,
     config: ReferenceConfig,
 ) -> pa.Table:
-    """Fit autosomal and optional sex-contig branches into one reference table."""
-
+    """Fit autosomal and optional sex-contig branches into one Schema v2.0.0 table."""
     if cohort.counts.shape[1] < config.min_cohort_size:
         raise ReferenceError(
             f"provide at least {config.min_cohort_size} samples to build a reference"
@@ -139,11 +210,20 @@ def build_reference_table(
         validate_min_mappability(config.min_mappability)
     except CovariateError as err:
         raise ReferenceError(str(err)) from err
-    cohort_gc, cohort_n_mask, cohort_map = None, None, None
+
+    cohort_gc: NDArray[np.float64] | None = None
+    cohort_n_mask: NDArray[np.bool_] | None = None
+    cohort_map: NDArray[np.float64] | None = None
+    cohort_gc_q: NDArray[np.float32] | None = None
     try:
         if config.gc is not None or config.fasta is not None:
+            gc_src = config.gc if config.gc is not None else config.fasta
+            assert gc_src is not None
             cohort_gc, cohort_n_mask = load_gc_track(
-                config.gc or config.fasta, cohort.contigs, cohort.starts, cohort.ends
+                gc_src, cohort.contigs, cohort.starts, cohort.ends
+            )
+            cohort_gc_q = load_fasta_gc_quantiles(
+                gc_src, cohort.contigs, cohort.starts, cohort.ends
             )
             if config.gc is not None and config.fasta is not None:
                 cohort_n_mask = (
@@ -152,12 +232,17 @@ def build_reference_table(
                         config.fasta, cohort.contigs, cohort.starts, cohort.ends
                     )[1]
                 )
+                if cohort_gc_q is None:
+                    cohort_gc_q = load_fasta_gc_quantiles(
+                        config.fasta, cohort.contigs, cohort.starts, cohort.ends
+                    )
         if config.mappability is not None:
             cohort_map = load_mappability_track(
                 config.mappability, cohort.contigs, cohort.starts, cohort.ends
             )
     except CovariateError as err:
         raise ReferenceError(str(err)) from err
+
     autosomes, sex_contigs = _resolve_contig_roles(cohort, config)
     prenatal_meta, prenatal_auto, prenatal_ffy = None, None, None
     if config.mode == "prenatal":
@@ -174,9 +259,11 @@ def build_reference_table(
             seed=config.seed,
         )
 
-        sexes = tuple("male" if m else "female" for m in np.array(is_m, dtype=np.bool_))
+        sexes: tuple[SexLabel, ...] | None = tuple(
+            "male" if m else "female" for m in np.array(is_m, dtype=np.bool_)
+        )
         sex_source, signal = "prenatal_model", _resolve_sex_signal(cohort, config)
-        inference = SexInference(
+        inference: SexInference | None = SexInference(
             labels=sexes,
             cutoff=float(prenatal_meta.yfrac_threshold),
             fractions=(),
@@ -188,12 +275,14 @@ def build_reference_table(
             cohort, config, sex_contigs
         )
 
+    branch_tables: list[pa.Table] = []
+    built_branches: list[str] = []
+
     def _add_branch(
         branch_name: str,
         sample_indices: NDArray[np.integer],
         contig_names: tuple[str, ...],
     ) -> None:
-        """Construct and append a reference branch table for the given cohort subset."""
         branch_tables.append(
             _build_branch_table(
                 branch=branch_name,
@@ -204,11 +293,11 @@ def build_reference_table(
                 cohort_gc=cohort_gc,
                 cohort_mappability=cohort_map,
                 cohort_n_mask=cohort_n_mask,
+                cohort_gc_quantiles=cohort_gc_q,
             )
         )
         built_branches.append(branch_name)
 
-    branch_tables, built_branches = [], []
     _add_branch(BRANCH_AUTOSOMAL, np.arange(cohort.counts.shape[1]), autosomes)
     if sex_contigs and sexes is not None:
         labels = np.asarray(sexes)
@@ -229,7 +318,44 @@ def build_reference_table(
             if branch_table.num_rows > 0:
                 built_branches.append(branch_name)
                 branch_tables.append(branch_table)
-    model_metadata = {
+
+    p_max = 0
+    for bt in branch_tables:
+        lt = bt.schema.field("pca_loadings").type
+        assert isinstance(lt, pa.FixedSizeListType)
+        p_max = max(p_max, lt.list_size)
+
+    all_contigs_vocab = list(cohort.contig_lengths.keys())
+    for c in cohort.contigs:
+        if c not in cohort.contig_lengths:
+            all_contigs_vocab.append(c)
+    contig_to_code = {name: idx for idx, name in enumerate(all_contigs_vocab)}
+    branch_vocab_arr = pa.array(built_branches, type=pa.string())
+    contig_vocab_arr = pa.array(all_contigs_vocab, type=pa.string())
+
+    unified_tables: list[pa.Table] = []
+    branch_pca_ranks: dict[str, int] = {}
+    for b_idx, (b_name, bt) in enumerate(
+        zip(built_branches, branch_tables, strict=True)
+    ):
+        u_tbl, p_b = _unify_branch_table(
+            bt,
+            branch_code=b_idx,
+            branch_vocab=branch_vocab_arr,
+            contig_vocab=contig_vocab_arr,
+            contig_to_code=contig_to_code,
+            p_max=p_max,
+        )
+        unified_tables.append(u_tbl)
+        branch_pca_ranks[b_name] = 0 if b_name == BRANCH_PRENATAL_FFY else p_b
+
+    first_filters: dict[str, object] | None = None
+    if cohort.sample_metadata:
+        raw_f = cohort.sample_metadata[0].get("filters")
+        if isinstance(raw_f, Mapping):
+            first_filters = {str(k): v for k, v in raw_f.items()}
+
+    model_metadata: dict[str, object] = {
         "bin_size": cohort.bin_size,
         "branches": built_branches,
         "autosomal_contigs": list(autosomes),
@@ -252,9 +378,11 @@ def build_reference_table(
         "flat": config.fasta is not None,
         "gc_corrected": (config.gc is not None) or (config.fasta is not None),
         "mappability_corrected": config.mappability is not None,
-        "fragmentomics_corrected": (cohort.mean_frag_len is not None)
-        or (cohort.endpoint_ratio is not None),
+        "fragmentomics_corrected": (cohort.ref_frag_len is not None)
+        or (cohort.ref_ep_rate is not None),
         "min_mappability": config.min_mappability,
+        "branch_pca_ranks": branch_pca_ranks,
+        "filters": first_filters,
         "mode": config.mode,
         **(
             {"prenatal_bin_size": config.prenatal_bin_size}
@@ -271,7 +399,7 @@ def build_reference_table(
             else {}
         ),
     }
-    return pa.concat_tables(branch_tables).replace_schema_metadata(
+    return pa.concat_tables(unified_tables).replace_schema_metadata(
         metadata_for(
             ArtifactKind.REFERENCE, contig_lengths=cohort.contig_lengths, values=values
         )
@@ -300,12 +428,13 @@ def _validate_config(config: ReferenceConfig) -> None:
     for val, name in [
         (config.pca_components, "pca_components"),
         (config.nearest_bins, "nearest_bins"),
-        (config.max_batch_memory_mb, "max_batch_memory_mb"),
         (config.min_cohort_size, "min_cohort_size"),
         (config.min_sex_group_size, "min_sex_group_size"),
     ]:
         if val < 1:
             raise ReferenceError(f"{name} must be a positive integer")
+    if config.max_batch_memory_mb < 0:
+        raise ReferenceError("max_batch_memory_mb must be a non-negative integer")
     try:
         validate_min_mappability(config.min_mappability)
     except CovariateError as err:
@@ -346,8 +475,9 @@ def _resolve_contig_roles(
         raise ReferenceError(f"unknown autosomal contig(s): {unknown_auto}")
     if set(autosomes) & set(sex_contigs):
         overlap = ", ".join(sorted(set(autosomes) & set(sex_contigs)))
-        msg = f"autosomal and sex contig sets must be disjoint: {overlap}"
-        raise ReferenceError(msg)
+        raise ReferenceError(
+            f"autosomal and sex contig sets must be disjoint: {overlap}"
+        )
     if not autosomes:
         raise ReferenceError("reference requires at least one autosomal contig")
     return autosomes, sex_contigs
@@ -376,9 +506,9 @@ def _resolve_sexes(
         config.min_sex_group_size,
         cutoff=config.sex_cutoff,
     )
-    if not inference.passed:
+    if not inference.passed or inference.labels is None:
         return None, "none", inference, signal
-    labels = (
+    labels: list[SexLabel] = (
         [
             "male" if e.sex == "M" else "female" if e.sex == "F" else lbl
             for lbl, e in zip(inference.labels, config.entries, strict=False)
@@ -401,10 +531,11 @@ def _resolve_sex_signal(cohort: Cohort, config: ReferenceConfig) -> str | None:
 
 def _contig_fractions(cohort: Cohort, contig: str) -> NDArray[np.float64]:
     """Calculate per-sample fractional depth for a specific contig."""
-    totals = cohort.counts.sum(axis=0)
+    totals = np.asarray(cohort.counts, dtype=np.float64).sum(axis=0)
     if np.any(totals <= 0):
         raise ReferenceError("every sample must have a positive total count")
-    return cohort.counts[np.isin(cohort.contigs, [contig])].sum(axis=0) / totals
+    sub = np.asarray(cohort.counts[np.isin(cohort.contigs, [contig])], dtype=np.float64)
+    return sub.sum(axis=0) / totals
 
 
 def _build_branch_table(
@@ -417,12 +548,13 @@ def _build_branch_table(
     cohort_gc: NDArray[np.float64] | None = None,
     cohort_mappability: NDArray[np.float64] | None = None,
     cohort_n_mask: NDArray[np.bool_] | None = None,
+    cohort_gc_quantiles: NDArray[np.float32] | None = None,
 ) -> pa.Table:
-    """Build a reference branch Parquet table including PCA, KDTree, and null models."""
+    """Build a Schema v2.0.0 reference branch table with PCA, Prototype Graph, and null dispersion."""
     selected = np.isin(cohort.contigs, contig_names)
     if not np.any(selected):
         raise ReferenceError(f"branch {branch!r} has no bins")
-    counts = cohort.counts[np.ix_(selected, sample_index)]
+    counts = np.asarray(cohort.counts[np.ix_(selected, sample_index)], dtype=np.float64)
     branch_gc = cohort_gc[selected] if cohort_gc is not None else None
     branch_map = (
         cohort_mappability[selected] if cohort_mappability is not None else None
@@ -438,17 +570,17 @@ def _build_branch_table(
     if not np.any(usable):
         raise ReferenceError(f"branch {branch!r} has no unmasked bins")
     logger.debug(
-        "branch %s: mask kept %d/%d bins (%.1f%%)",
+        "branch %s: mask kept %d/%d bins",
         branch,
-        np.count_nonzero(usable),
-        usable.size,
-        np.count_nonzero(usable) / usable.size * 100 if usable.size else 0.0,
+        int(np.count_nonzero(usable)),
+        int(usable.size),
     )
+
     branch_frag_len = (
-        cohort.mean_frag_len[selected] if cohort.mean_frag_len is not None else None
+        cohort.ref_frag_len[selected] if cohort.ref_frag_len is not None else None
     )
     branch_ep_ratio = (
-        cohort.endpoint_ratio[selected] if cohort.endpoint_ratio is not None else None
+        cohort.ref_ep_rate[selected] if cohort.ref_ep_rate is not None else None
     )
     normalized = correct_covariate_bias(
         normalize_depth(counts, mask=usable),
@@ -480,44 +612,31 @@ def _build_branch_table(
     profiles = build_signal_space_features(scaled_loadings, covariate_mat=cov_mat)
     if profiles.size == 0 or np.allclose(profiles, 0.0):
         profiles = corrected
+
     logger.debug(
-        "branch %s: selecting %d nearest off-contig bins (batch memory limit=%d MB)",
+        "branch %s: fitting prototype graph on %d usable bins",
         branch,
-        config.nearest_bins,
-        config.max_batch_memory_mb,
+        int(np.count_nonzero(usable)),
     )
-    nearest_idx, nearest_dist = select_nearest_bins(
-        profiles,
-        contig_ids,
-        k=config.nearest_bins,
-        max_batch_memory_mb=config.max_batch_memory_mb,
-        threads=config.threads,
+    _, pids_u, pweights_u, mdist_u = fit_prototype_graph(
+        profiles.astype(np.float32),
+        max_prototypes=2048,
+        top_r=NUM_PROTOTYPES_PER_BIN,
     )
-    null_mean, null_std = compute_null_models(
+    pca_rank = 0 if config.fasta is not None else int(pca_loadings.shape[0])
+    null_mean_u, bio_disp_u = compute_prototype_null_models(
         corrected,
-        nearest_idx,
-        threads=config.threads,
-        n_pca_components=0 if config.fasta is not None else pca_loadings.shape[0],
+        contig_ids,
+        pids_u,
+        pweights_u,
+        n_pca_components=pca_rank,
     )
     logger.debug(
         "branch %s: null models computed for %d bins",
         branch,
-        np.count_nonzero(usable),
+        int(np.count_nonzero(usable)),
     )
-    cutoff = distance_cutoff(nearest_dist, repeats=3)
-    filtered_nearest, mean_distances = [], []
-    for distance_list, index_list in zip(nearest_dist, nearest_idx, strict=True):
-        distance_array = np.asarray(distance_list, dtype=np.float64)
-        index_array = np.asarray(index_list, dtype=np.int32)
-        valid = (distance_array <= cutoff) & np.isfinite(distance_array)
-        mean_distances.append(
-            float(np.mean(np.sqrt(np.maximum(distance_array[valid], 0.0))))
-            if np.any(valid)
-            else 0.0
-        )
-        filtered_nearest.append(
-            np.sort(index_array[valid]).tolist() if np.any(valid) else []
-        )
+
     n_bins = int(np.count_nonzero(selected))
     output_gc = (
         np.where(np.isfinite(branch_gc), branch_gc, -1.0).astype(np.float32)
@@ -529,48 +648,89 @@ def _build_branch_table(
         if branch_map is not None
         else np.full(n_bins, -1.0, dtype=np.float32)
     )
-    branch_pca_mean = np.zeros(n_bins, dtype=np.float64)
-    branch_mean_dist = np.zeros(n_bins, dtype=np.float32)
-    branch_null_mean = np.zeros(n_bins, dtype=np.float64)
-    branch_null_std = np.zeros(n_bins, dtype=np.float64)
-    (
-        branch_pca_mean[usable],
-        branch_mean_dist[usable],
-        branch_null_mean[usable],
-        branch_null_std[usable],
-    ) = (
-        pca_mean,
-        mean_distances,
-        null_mean,
-        null_std,
+    gc_q_col: pa.Array = (
+        pa.FixedSizeListArray.from_arrays(
+            pa.array(cohort_gc_quantiles[selected].ravel(), type=pa.float32()),
+            NUM_GC_QUANTILES,
+        )
+        if cohort_gc_quantiles is not None
+        else pa.nulls(n_bins, type=pa.list_(pa.float32(), NUM_GC_QUANTILES))
     )
-    full_pca_loadings = [
-        pca_loadings[:, u_idx].tolist() if usable[bin_idx] else []
-        for bin_idx, u_idx in zip(range(n_bins), np.cumsum(usable) - 1, strict=True)
-    ]
-    full_nearest_indices = [
-        filtered_nearest[u_idx] if usable[bin_idx] else []
-        for bin_idx, u_idx in zip(range(n_bins), np.cumsum(usable) - 1, strict=True)
-    ]
+    output_frag_len = (
+        np.where(np.isfinite(branch_frag_len), branch_frag_len, -1.0).astype(np.float32)
+        if branch_frag_len is not None
+        else np.full(n_bins, -1.0, dtype=np.float32)
+    )
+    output_ep_rate = (
+        np.where(np.isfinite(branch_ep_ratio), branch_ep_ratio, -1.0).astype(np.float32)
+        if branch_ep_ratio is not None
+        else np.full(n_bins, -1.0, dtype=np.float32)
+    )
+
+    branch_pca_mean = np.zeros(n_bins, dtype=np.float32)
+    branch_pca_mean[usable] = pca_mean.astype(np.float32)
+
+    raw_rank = int(pca_loadings.shape[0])
+    if raw_rank == 0:
+        loadings_col: pa.Array = pa.nulls(n_bins, type=pa.list_(pa.float32(), 0))
+    else:
+        full_ld = np.zeros((n_bins, raw_rank), dtype=np.float32)
+        full_ld[usable] = pca_loadings.T.astype(np.float32)
+        loadings_col = pa.FixedSizeListArray.from_arrays(
+            pa.array(full_ld.ravel(), type=pa.float32()),
+            raw_rank,
+        )
+
+    full_pids = np.zeros((n_bins, NUM_PROTOTYPES_PER_BIN), dtype=np.uint16)
+    full_pids[usable] = pids_u
+    full_pweights = np.zeros((n_bins, NUM_PROTOTYPES_PER_BIN), dtype=np.float16)
+    full_pweights[usable] = pweights_u
+
+    branch_mean_dist = np.zeros(n_bins, dtype=np.float32)
+    branch_mean_dist[usable] = mdist_u
+    branch_null_mean = np.zeros(n_bins, dtype=np.float32)
+    branch_null_mean[usable] = null_mean_u
+    branch_bio_disp = np.zeros(n_bins, dtype=np.float32)
+    branch_bio_disp[usable] = bio_disp_u
+
+    uniq_c = list(dict.fromkeys(str(c) for c in contig_subset))
+    c_map = {name: idx for idx, name in enumerate(uniq_c)}
+    c_codes = np.array([c_map[str(c)] for c in contig_subset], dtype=np.int16)
+
+    schema = build_reference_schema(raw_rank)
     return pa.table(
         {
-            "branch": pa.array([branch] * n_bins, type=pa.string()),
-            "contig": pa.array(contig_subset.tolist(), type=pa.string()),
-            "start": pa.array(cohort.starts[selected], type=pa.int64()),
-            "end": pa.array(cohort.ends[selected], type=pa.int64()),
-            "masked": pa.array(~usable, type=pa.bool_()),
-            "gc": pa.array(output_gc, type=pa.float32()),
-            "mappability": pa.array(output_map, type=pa.float32()),
-            "pca_mean": pa.array(branch_pca_mean, type=pa.float64()),
-            "pca_loadings": pa.array(full_pca_loadings, type=pa.list_(pa.float64())),
-            "nearest_ref_indices": pa.array(
-                full_nearest_indices, type=pa.list_(pa.int32())
+            "branch": pa.DictionaryArray.from_arrays(
+                pa.array(np.zeros(n_bins, dtype=np.int8), type=pa.int8()),
+                pa.array([branch], type=pa.string()),
             ),
-            "mean_distance": pa.array(branch_mean_dist, type=pa.float32()),
-            "null_mean": pa.array(branch_null_mean, type=pa.float64()),
-            "null_std": pa.array(branch_null_std, type=pa.float64()),
+            "contig": pa.DictionaryArray.from_arrays(
+                pa.array(c_codes, type=pa.int16()),
+                pa.array(uniq_c, type=pa.string()),
+            ),
+            "start": cohort.starts[selected].astype(np.uint32),
+            "end": cohort.ends[selected].astype(np.uint32),
+            "masked": ~usable,
+            "gc": output_gc,
+            "mappability": output_map,
+            "gc_quantiles": gc_q_col,
+            "ref_frag_len": output_frag_len,
+            "ref_ep_rate": output_ep_rate,
+            "pca_mean": branch_pca_mean,
+            "pca_loadings": loadings_col,
+            "proto_ids": pa.FixedSizeListArray.from_arrays(
+                pa.array(full_pids.ravel(), type=pa.uint16()),
+                NUM_PROTOTYPES_PER_BIN,
+            ),
+            "proto_weights": pa.FixedSizeListArray.from_arrays(
+                pa.array(full_pweights.ravel(), type=pa.float16()),
+                NUM_PROTOTYPES_PER_BIN,
+            ),
+            "mean_distance": branch_mean_dist,
+            "null_mean": branch_null_mean,
+            "bio_dispersion": branch_bio_disp,
         },
-        schema=REFERENCE_SCHEMA,
+        schema=schema,
     )
 
 

@@ -10,11 +10,17 @@ import numpy as np
 import pyarrow as pa
 
 from ccnv._core import FRAG_BAND_EDGES
-from ccnv.io.parquet import write_sample_parquet
-from ccnv.models import NUM_FRAG_BANDS, ReadFilters
+from ccnv.io.parquet import write_reference_parquet, write_sample_parquet
+from ccnv.models import (
+    NUM_FRAG_BANDS,
+    NUM_GC_QUANTILES,
+    NUM_PROTOTYPES_PER_BIN,
+    ReadFilters,
+)
 from ccnv.models.schemas import (
     SAMPLE_SCHEMA,
     ArtifactKind,
+    build_reference_schema,
     metadata_for,
 )
 
@@ -162,6 +168,187 @@ def write_synthetic_sample(
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     write_sample_parquet(table, path)
+    return path
+
+
+def make_reference_table(
+    *,
+    branches: Sequence[str],
+    contigs: Sequence[str],
+    starts: Sequence[int] | np.ndarray,
+    ends: Sequence[int] | np.ndarray,
+    contig_lengths: Mapping[str, int],
+    masked: Sequence[bool] | np.ndarray | None = None,
+    gc: Sequence[float] | np.ndarray | None = None,
+    mappability: Sequence[float] | np.ndarray | None = None,
+    gc_quantiles: np.ndarray | None = None,
+    ref_frag_len: Sequence[float] | np.ndarray | None = None,
+    ref_ep_rate: Sequence[float] | np.ndarray | None = None,
+    pca_mean: Sequence[float] | np.ndarray | None = None,
+    pca_loadings: Sequence[Sequence[float]] | np.ndarray | None = None,
+    proto_ids: Sequence[Sequence[int]] | np.ndarray | None = None,
+    proto_weights: Sequence[Sequence[float]] | np.ndarray | None = None,
+    mean_distance: Sequence[float] | np.ndarray | None = None,
+    null_mean: Sequence[float] | np.ndarray | None = None,
+    bio_dispersion: Sequence[float] | np.ndarray | None = None,
+    null_std: Sequence[float] | np.ndarray | None = None,
+    metadata: dict[bytes, bytes] | None = None,
+    model: Mapping[str, object] | None = None,
+    sample_identities: Sequence[object] = (),
+    extra_metadata: Mapping[str, object] | None = None,
+) -> pa.Table:
+    """Build a Schema v2.0.0 reference table from per-bin arrays."""
+    n_rows = len(branches)
+    b_list = [str(b) for b in branches]
+    c_list = [str(c) for c in contigs]
+    b_vocab = list(dict.fromkeys(b_list)) if b_list else ["autosomal"]
+    c_vocab = list(dict.fromkeys(c_list)) if c_list else list(contig_lengths.keys())
+    b_idx = {name: i for i, name in enumerate(b_vocab)}
+    c_idx = {name: i for i, name in enumerate(c_vocab)}
+    branch_col = pa.DictionaryArray.from_arrays(
+        pa.array([b_idx[b] for b in b_list], type=pa.int8()),
+        pa.array(b_vocab, type=pa.string()),
+    )
+    contig_col = pa.DictionaryArray.from_arrays(
+        pa.array([c_idx[c] for c in c_list], type=pa.int16()),
+        pa.array(c_vocab, type=pa.string()),
+    )
+
+    if pca_loadings is None:
+        pca_rank = 0
+        pca_col: pa.Array = pa.nulls(n_rows, type=pa.list_(pa.float32(), 0))
+    else:
+        rows_list = [list(r) for r in pca_loadings]
+        pca_rank = max((len(r) for r in rows_list), default=0)
+        if pca_rank == 0:
+            pca_col = pa.nulls(n_rows, type=pa.list_(pa.float32(), 0))
+        else:
+            ld_arr = np.zeros((n_rows, pca_rank), dtype=np.float32)
+            for r_i, row_vals in enumerate(rows_list):
+                if row_vals:
+                    ld_arr[r_i, : len(row_vals)] = row_vals
+            pca_col = pa.FixedSizeListArray.from_arrays(
+                pa.array(ld_arr.ravel(), type=pa.float32()), pca_rank
+            )
+
+    if gc_quantiles is None:
+        gc_q_col: pa.Array = pa.nulls(
+            n_rows, type=pa.list_(pa.float32(), NUM_GC_QUANTILES)
+        )
+    else:
+        q_arr = np.asarray(gc_quantiles, dtype=np.float32).reshape(
+            n_rows, NUM_GC_QUANTILES
+        )
+        gc_q_col = pa.FixedSizeListArray.from_arrays(
+            pa.array(q_arr.ravel(), type=pa.float32()), NUM_GC_QUANTILES
+        )
+
+    if proto_ids is None:
+        pids_arr = np.zeros((n_rows, NUM_PROTOTYPES_PER_BIN), dtype=np.uint16)
+    else:
+        pids_arr = np.zeros((n_rows, NUM_PROTOTYPES_PER_BIN), dtype=np.uint16)
+        for r_i, p_row in enumerate(proto_ids):
+            vals = list(p_row)[:NUM_PROTOTYPES_PER_BIN]
+            if vals:
+                pids_arr[r_i, : len(vals)] = vals
+    pids_col = pa.FixedSizeListArray.from_arrays(
+        pa.array(pids_arr.ravel(), type=pa.uint16()), NUM_PROTOTYPES_PER_BIN
+    )
+
+    if proto_weights is None:
+        pw_arr = np.zeros((n_rows, NUM_PROTOTYPES_PER_BIN), dtype=np.float16)
+        if n_rows > 0:
+            pw_arr[:, 0] = np.float16(1.0)
+    else:
+        pw_arr = np.zeros((n_rows, NUM_PROTOTYPES_PER_BIN), dtype=np.float16)
+        for r_i, w_row in enumerate(proto_weights):
+            vals = list(w_row)[:NUM_PROTOTYPES_PER_BIN]
+            if vals:
+                pw_arr[r_i, : len(vals)] = vals
+    pw_col = pa.FixedSizeListArray.from_arrays(
+        pa.array(pw_arr.ravel(), type=pa.float16()), NUM_PROTOTYPES_PER_BIN
+    )
+
+    if bio_dispersion is not None:
+        disp_arr = np.asarray(bio_dispersion, dtype=np.float32)
+    elif null_std is not None:
+        disp_arr = np.square(np.asarray(null_std, dtype=np.float64)).astype(np.float32)
+    else:
+        disp_arr = np.full(n_rows, 0.01, dtype=np.float32)
+
+    if metadata is None:
+        values: dict[str, object] = {
+            "sample_identities": list(sample_identities),
+            "model": dict(model) if model is not None else {"branches": b_vocab},
+        }
+        if extra_metadata is not None:
+            values.update(extra_metadata)
+        metadata = metadata_for(
+            ArtifactKind.REFERENCE,
+            contig_lengths={str(k): int(v) for k, v in contig_lengths.items()},
+            values=values,
+        )
+
+    schema = build_reference_schema(pca_rank).with_metadata(metadata)
+    return pa.table(
+        {
+            "branch": branch_col,
+            "contig": contig_col,
+            "start": np.asarray(starts, dtype=np.uint32),
+            "end": np.asarray(ends, dtype=np.uint32),
+            "masked": (
+                np.zeros(n_rows, dtype=np.bool_)
+                if masked is None
+                else np.asarray(masked, dtype=np.bool_)
+            ),
+            "gc": (
+                np.full(n_rows, -1.0, dtype=np.float32)
+                if gc is None
+                else np.asarray(gc, dtype=np.float32)
+            ),
+            "mappability": (
+                np.full(n_rows, -1.0, dtype=np.float32)
+                if mappability is None
+                else np.asarray(mappability, dtype=np.float32)
+            ),
+            "gc_quantiles": gc_q_col,
+            "ref_frag_len": (
+                np.full(n_rows, -1.0, dtype=np.float32)
+                if ref_frag_len is None
+                else np.asarray(ref_frag_len, dtype=np.float32)
+            ),
+            "ref_ep_rate": (
+                np.full(n_rows, -1.0, dtype=np.float32)
+                if ref_ep_rate is None
+                else np.asarray(ref_ep_rate, dtype=np.float32)
+            ),
+            "pca_mean": (
+                np.ones(n_rows, dtype=np.float32)
+                if pca_mean is None
+                else np.asarray(pca_mean, dtype=np.float32)
+            ),
+            "pca_loadings": pca_col,
+            "proto_ids": pids_col,
+            "proto_weights": pw_col,
+            "mean_distance": (
+                np.full(n_rows, 0.5, dtype=np.float32)
+                if mean_distance is None
+                else np.asarray(mean_distance, dtype=np.float32)
+            ),
+            "null_mean": (
+                np.zeros(n_rows, dtype=np.float32)
+                if null_mean is None
+                else np.asarray(null_mean, dtype=np.float32)
+            ),
+            "bio_dispersion": disp_arr,
+        },
+        schema=schema,
+    )
+
+
+def write_synthetic_reference(path: Path, table: pa.Table) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_reference_parquet(table, path)
     return path
 
 

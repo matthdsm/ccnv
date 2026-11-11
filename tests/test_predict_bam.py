@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
-from helpers import make_sample_table
+from helpers import make_reference_table, make_sample_table
 from published_fixtures import (
     PUBLISHED_CRAM,
     ensure_published_fasta,
@@ -34,11 +34,9 @@ from ccnv.models.schemas import (
     BRANCH_PRENATAL_FFY,
     FRAGMENTOMICS_METADATA_KEY,
     REFERENCE_SCHEMA,
-    ArtifactKind,
     FragmentomicsMetadata,
     PrenatalModelMetadata,
     ReferenceMetadata,
-    metadata_for,
 )
 from ccnv.predict import (
     PredictionInput,
@@ -76,16 +74,14 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
                 fasta=fasta,
             )
             self.assertIsNotNone(inputs.sample)
-            self.assertIn("fragment_lengths", inputs.sample.column_names)
+            self.assertIn("frag_bands", inputs.sample.column_names)
             self.assertGreater(inputs.sample.num_rows, 0)
 
     def test_annotate_prenatal_segments_origin_fetal_and_maternal(self) -> None:
         grid_len = 571
         p_fet = np.zeros(grid_len, dtype=np.float64)
         p_mat = np.zeros(grid_len, dtype=np.float64)
-        # 143 bp -> index 143 - 30 = 113
         p_fet[113] = 1.0
-        # 166 bp -> index 166 - 30 = 136
         p_mat[136] = 1.0
 
         prenatal_meta = PrenatalModelMetadata(
@@ -93,16 +89,8 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
             yfrac_threshold=0.001,
             ffy_intercept=0.0,
             ffy_slope=1.0,
-            mlp_w1=[],
-            mlp_b1=[],
-            mlp_w2=[],
-            mlp_b2=[],
-            mlp_skew_intercept=0.0,
-            mlp_skew_slope=1.0,
             olm_weights=[],
             olm_bias=0.0,
-            olm_skew_intercept=0.0,
-            olm_skew_slope=1.0,
             ffx_intercept=2.0,
             ffx_slope=-2.0,
             female_chrx_ratio_mean=1.0,
@@ -232,29 +220,18 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
         pe_sample = pe_sample.replace_schema_metadata(pe_meta_dict)
 
         def _make_ref(model_dict: dict[str, object]) -> pa.Table:
-            return pa.table(
-                {
-                    "branch": [BRANCH_AUTOSOMAL, BRANCH_AUTOSOMAL],
-                    "contig": ["chr1", "chr1"],
-                    "start": [0, 10000],
-                    "end": [10000, 20000],
-                    "masked": [False, False],
-                    "gc": [-1.0, -1.0],
-                    "mappability": [-1.0, -1.0],
-                    "pca_mean": [100.0, 120.0],
-                    "pca_loadings": [[], []],
-                    "nearest_ref_indices": [[1], [0]],
-                    "mean_distance": [0.5, 0.5],
-                    "null_mean": [0.0, 0.0],
-                    "null_std": [0.05, 0.05],
-                },
-                schema=REFERENCE_SCHEMA.with_metadata(
-                    metadata_for(
-                        ArtifactKind.REFERENCE,
-                        contig_lengths={"chr1": 20000},
-                        values={"sample_identities": ["s1"], "model": model_dict},
-                    )
-                ),
+            return make_reference_table(
+                branches=[BRANCH_AUTOSOMAL, BRANCH_AUTOSOMAL],
+                contigs=["chr1", "chr1"],
+                starts=[0, 10000],
+                ends=[10000, 20000],
+                contig_lengths={"chr1": 20000},
+                pca_mean=[100.0, 120.0],
+                mean_distance=[0.5, 0.5],
+                null_mean=[0.0, 0.0],
+                null_std=[0.05, 0.05],
+                model=model_dict,
+                sample_identities=["s1"],
             )
 
         legacy_ref = _make_ref({"bin_size": 10000})
@@ -304,16 +281,8 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
             yfrac_threshold=0.005,
             ffy_intercept=0.0,
             ffy_slope=1.0,
-            mlp_w1=[[0.0]],
-            mlp_b1=[0.0],
-            mlp_w2=[[0.0]],
-            mlp_b2=[-2.0],
-            mlp_skew_intercept=0.0,
-            mlp_skew_slope=1.0,
             olm_weights=[0.0],
             olm_bias=-2.0,
-            olm_skew_intercept=0.0,
-            olm_skew_slope=1.0,
             ffx_intercept=2.0,
             ffx_slope=-2.0,
             female_chrx_ratio_mean=1.0,
@@ -321,44 +290,36 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
             p_fetal_density=p_fet.tolist(),
             p_maternal_density=p_mat.tolist(),
         )
-        prenatal_rows = pa.table(
-            {
-                "branch": [
-                    BRANCH_AUTOSOMAL,
-                    BRANCH_AUTOSOMAL,
-                    BRANCH_PRENATAL_AUTOSOMAL,
-                    BRANCH_PRENATAL_FFY,
-                    BRANCH_PRENATAL_FFY,
-                ],
-                "contig": ["chr1", "chr1", "chr1", "chrY", "chrY"],
-                "start": [0, 10000, 0, 0, 10000],
-                "end": [10000, 20000, 20000, 10000, 20000],
-                "masked": [False, False, False, False, False],
-                "gc": [-1.0] * 5,
-                "mappability": [-1.0] * 5,
-                "pca_mean": [100.0, 120.0, 220.0, 1.0, 1.0],
-                "pca_loadings": [[], [], [1.0], [0.5], [0.5]],
-                "nearest_ref_indices": [[1], [0], [], [], []],
-                "mean_distance": [0.5, 0.5, 0.0, 0.0, 0.0],
-                "null_mean": [0.0] * 5,
-                "null_std": [0.05, 0.05, 0.0, 0.0, 0.0],
+        prenatal_rows = make_reference_table(
+            branches=[
+                BRANCH_AUTOSOMAL,
+                BRANCH_AUTOSOMAL,
+                BRANCH_PRENATAL_AUTOSOMAL,
+                BRANCH_PRENATAL_FFY,
+                BRANCH_PRENATAL_FFY,
+            ],
+            contigs=["chr1", "chr1", "chr1", "chrY", "chrY"],
+            starts=[0, 10000, 0, 0, 10000],
+            ends=[10000, 20000, 20000, 10000, 20000],
+            contig_lengths={"chr1": 20000, "chrY": 20000},
+            pca_mean=[100.0, 120.0, 220.0, 1.0, 1.0],
+            pca_loadings=[[], [], [1.0], [0.5], [0.5]],
+            mean_distance=[0.5, 0.5, 0.0, 0.0, 0.0],
+            null_mean=[0.0] * 5,
+            null_std=[0.05, 0.05, 0.0, 0.0, 0.0],
+            model={
+                "bin_size": 10000,
+                "mode": "prenatal",
+                "prenatal_bin_size": 20000,
+                "fragmentomics_corrected": True,
+                "branch_pca_ranks": {
+                    BRANCH_AUTOSOMAL: 0,
+                    BRANCH_PRENATAL_AUTOSOMAL: 1,
+                    BRANCH_PRENATAL_FFY: 1,
+                },
             },
-            schema=REFERENCE_SCHEMA.with_metadata(
-                metadata_for(
-                    ArtifactKind.REFERENCE,
-                    contig_lengths={"chr1": 20000, "chrY": 20000},
-                    values={
-                        "sample_identities": ["s1"],
-                        "model": {
-                            "bin_size": 10000,
-                            "mode": "prenatal",
-                            "prenatal_bin_size": 20000,
-                            "fragmentomics_corrected": True,
-                        },
-                        "prenatal": prenatal_meta.to_dict(),
-                    },
-                )
-            ),
+            sample_identities=["s1"],
+            extra_metadata={"prenatal": prenatal_meta.to_dict()},
         )
         pe_prenatal_sample = make_sample_table(
             counts=[100, 120, 0, 0],

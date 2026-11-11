@@ -446,8 +446,7 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
         ref_r0 = _make_valid_reference_table(20, 10, pca_rank=0)
         with tempfile.TemporaryDirectory() as tmpdir:
             ref_pq = write_reference_parquet(ref_r0, Path(tmpdir) / "ref_r0.ccnv")
-            reloaded_r0 = read_reference_parquet(ref_pq)
-            meta_r0 = validate_reference_table(reloaded_r0)
+            reloaded_r0, meta_r0 = read_reference_parquet(ref_pq, check_rows=True)
             assert meta_r0.bin_size == 5_000
             assert reloaded_r0.num_rows == 30
 

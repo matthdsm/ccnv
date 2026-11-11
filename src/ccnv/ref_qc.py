@@ -31,8 +31,8 @@ def run_reference_qc(config: ReferenceQCConfig) -> ReferenceQCOutputs:
         raise ReferenceQCError(f"reference file not found: {ref_path}")
 
     try:
-        table = read_reference_parquet(ref_path)
-    except (OSError, pa.ArrowInvalid, SchemaError) as error:
+        table, _ = read_reference_parquet(ref_path, check_rows=True)
+    except (OSError, pa.ArrowInvalid, pa.ArrowException, SchemaError) as error:
         raise ReferenceQCError(f"failed to read {ref_path}: {error}") from error
 
     return run_reference_qc_on_table(

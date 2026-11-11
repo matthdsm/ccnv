@@ -65,25 +65,35 @@ def _is_pos_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _check_version_header(metadata: Mapping[str, object]) -> None:
-    """Fail fast with SchemaVersionError before field checks when version is unsupported."""
+def _check_version_header(
+    metadata: Mapping[str, object], kind: ArtifactKind | None = None
+) -> None:
+    """Fail fast with SchemaVersionError or wrong artifact_kind before field checks."""
     if "schema_version" in metadata:
         version = metadata["schema_version"]
         if version not in SUPPORTED_SCHEMA_VERSIONS:
             raise SchemaVersionError(
                 f"unsupported schema version {version!r}; expected {SCHEMA_VERSION!r}"
             )
+    if (
+        kind is not None
+        and "artifact_kind" in metadata
+        and metadata["artifact_kind"] != kind.value
+    ):
+        raise SchemaError(
+            f"expected artifact_kind {kind.value!r}, got {metadata['artifact_kind']!r}"
+        )
 
 
 def validate_metadata(metadata: Mapping[str, object], kind: ArtifactKind) -> None:
     """Validate required keys and cross-artifact coordinate invariants."""
-    _check_version_header(metadata)
+    _check_version_header(metadata, kind)
     required = _COMMON_METADATA | _KIND_METADATA[kind]
     missing = sorted(required - metadata.keys())
     if missing:
         raise SchemaError(f"missing {kind.value} metadata: {', '.join(missing)}")
     if metadata["artifact_kind"] != kind.value:
-        raise SchemaError(f"expected artifact kind {kind.value!r}")
+        raise SchemaError(f"expected artifact_kind {kind.value!r}")
     if metadata["coordinate_system"] != COORDINATE_SYSTEM:
         raise SchemaError(f"coordinates must be {COORDINATE_SYSTEM}")
 
@@ -203,7 +213,7 @@ def _validate_non_null_columns(table: pa.Table, expected: pa.Schema) -> None:
 def validate_schema(schema: pa.Schema, kind: ArtifactKind) -> None:
     """Validate Arrow fields and embedded file metadata."""
     metadata = decode_metadata(schema.metadata)
-    _check_version_header(metadata)
+    _check_version_header(metadata, kind)
     expected = (
         SAMPLE_SCHEMA
         if kind is ArtifactKind.SAMPLE
@@ -216,7 +226,7 @@ def validate_schema(schema: pa.Schema, kind: ArtifactKind) -> None:
 def validate_sample_table(table: pa.Table) -> SampleMetadata:
     """Validate compact Schema v2.0.0 sample table and implicit coordinate grid."""
     metadata = decode_metadata(table.schema.metadata)
-    _check_version_header(metadata)
+    _check_version_header(metadata, ArtifactKind.SAMPLE)
     _validate_arrow_fields(table.schema, SAMPLE_SCHEMA, ArtifactKind.SAMPLE)
     _validate_non_null_columns(table, SAMPLE_SCHEMA)
     validate_metadata(metadata, ArtifactKind.SAMPLE)
@@ -418,7 +428,7 @@ def validate_reference_table(
 ) -> ReferenceMetadata:
     """Validate Schema v2.0.0 reference table, metadata, and optional row intervals."""
     metadata = decode_metadata(table.schema.metadata)
-    _check_version_header(metadata)
+    _check_version_header(metadata, ArtifactKind.REFERENCE)
     expected = _expected_reference_schema(table.schema)
     _validate_arrow_fields(table.schema, expected, ArtifactKind.REFERENCE)
     _validate_non_null_columns(table, expected)

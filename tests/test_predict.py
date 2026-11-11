@@ -7,12 +7,13 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pysam
+from helpers import make_reference_table, make_sample_table
 from published_fixtures import CHR21_LENGTH, extract_published_samples
 from typer.testing import CliRunner
 
 from ccnv.cli import app
+from ccnv.io.parquet import write_reference_parquet, write_sample_parquet
 from ccnv.models import PredictConfig, ReadFilters, ReferenceConfig, parquet_path
 from ccnv.models.results import BinResult, SegmentResult
 from ccnv.models.schemas import (
@@ -21,8 +22,6 @@ from ccnv.models.schemas import (
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
     PRENATAL_METADATA_KEY,
-    REFERENCE_SCHEMA,
-    SAMPLE_SCHEMA,
     ArtifactKind,
     PrenatalModelMetadata,
     decode_metadata,
@@ -47,60 +46,40 @@ from ccnv.report import (
 )
 
 
+def _proto_arrays(n: int) -> tuple[np.ndarray, np.ndarray]:
+    pids = np.zeros((n, 4), dtype=np.uint16)
+    pweights = np.zeros((n, 4), dtype=np.float16)
+    pweights[:, 0] = np.float16(1.0)
+    return pids, pweights
+
+
 def _sample_table(*, include_chr2: bool = True) -> pa.Table:
     contigs = ["chr1", "chr2"] if include_chr2 else ["chr1"]
-    metadata = metadata_for(
-        ArtifactKind.SAMPLE,
-        contig_lengths={"chr1": 100, "chr2": 80},
-        values={
-            "bin_size": 100,
-            "source_identity": {"id": "test"},
-            "reference_identity": {"id": "genome"},
-            "qc": {},
-            "filters": asdict(ReadFilters()),
-        },
-    )
+    lengths = {"chr1": 100, "chr2": 80} if include_chr2 else {"chr1": 100}
     n_bins = len(contigs)
-    return pa.table(
-        {
-            "contig": contigs,
-            "start": pa.array([0] * n_bins, type=pa.int64()),
-            "end": pa.array([100, 80][:n_bins], type=pa.int64()),
-            "count": pa.array([10, 10][:n_bins], type=pa.uint64()),
-            "fragment_lengths": pa.array([[]] * n_bins, type=pa.list_(pa.uint16())),
-            "endpoint_count": pa.array([0] * n_bins, type=pa.uint32()),
-            "frag_gc_sum": pa.array([0.0] * n_bins, type=pa.float32()),
-        },
-        schema=SAMPLE_SCHEMA.with_metadata(metadata),
+    return make_sample_table(
+        [10, 10][:n_bins],
+        contigs=contigs,
+        starts=[0] * n_bins,
+        ends=[100, 80][:n_bins],
+        contig_lengths=lengths,
+        bin_size=100,
     )
 
 
 def _reference_table() -> pa.Table:
-    metadata = metadata_for(
-        ArtifactKind.REFERENCE,
+    return make_reference_table(
+        branches=[BRANCH_AUTOSOMAL, BRANCH_AUTOSOMAL],
+        contigs=["chr1", "chr2"],
+        starts=[0, 0],
+        ends=[100, 80],
         contig_lengths={"chr1": 100, "chr2": 80},
-        values={
-            "model": {"branches": [BRANCH_AUTOSOMAL], "bin_size": 100},
-            "sample_identities": [],
-        },
-    )
-    return pa.table(
-        {
-            "branch": [BRANCH_AUTOSOMAL, BRANCH_AUTOSOMAL],
-            "contig": ["chr1", "chr2"],
-            "start": pa.array([0, 0], type=pa.int64()),
-            "end": pa.array([100, 80], type=pa.int64()),
-            "masked": [False, False],
-            "gc": pa.array([float("nan"), float("nan")], type=pa.float32()),
-            "mappability": pa.array([float("nan"), float("nan")], type=pa.float32()),
-            "pca_mean": pa.array([0.5, 0.5], type=pa.float64()),
-            "pca_loadings": pa.array([[0.0], [0.0]], type=pa.list_(pa.float64())),
-            "nearest_ref_indices": pa.array([[1], [0]], type=pa.list_(pa.int32())),
-            "mean_distance": pa.array([1.0, 1.0], type=pa.float32()),
-            "null_mean": pa.array([0.0, 0.0], type=pa.float64()),
-            "null_std": pa.array([0.141421356, 0.141421356], type=pa.float64()),
-        },
-        schema=REFERENCE_SCHEMA.with_metadata(metadata),
+        pca_mean=[0.5, 0.5],
+        pca_loadings=[[0.0], [0.0]],
+        mean_distance=[1.0, 1.0],
+        null_mean=[0.0, 0.0],
+        null_std=[0.141421356, 0.141421356],
+        model={"branches": [BRANCH_AUTOSOMAL], "bin_size": 100},
     )
 
 
@@ -110,16 +89,9 @@ def _prenatal_reference_table() -> pa.Table:
         yfrac_threshold=0.005,
         ffy_intercept=0.0,
         ffy_slope=1.0,
-        mlp_w1=[[0.1, -0.1]],
-        mlp_b1=[0.0, 0.0],
-        mlp_w2=[[0.5], [-0.5]],
-        mlp_b2=[0.0],
-        mlp_skew_intercept=0.0,
-        mlp_skew_slope=1.0,
         olm_weights=[0.1],
-        olm_bias=0.0,
-        olm_skew_intercept=0.0,
-        olm_skew_slope=1.0,
+        olm_bias=-2.2,
+        ffa_logit_mode=True,
         ffx_intercept=1.0,
         ffx_slope=-0.5,
         female_chrx_ratio_mean=1.0,
@@ -157,13 +129,8 @@ def _prenatal_reference_table() -> pa.Table:
     contigs: list[str] = []
     starts: list[int] = []
     ends: list[int] = []
-    masked: list[bool] = []
     pca_mean: list[float] = []
     pca_loadings: list[list[float]] = []
-    nearest_ref: list[list[int]] = []
-    mean_dist: list[float] = []
-    null_mean: list[float] = []
-    null_std: list[float] = []
 
     for c in ["chr1", "chr2"]:
         for s, e in [(0, 100_000), (100_000, 200_000)]:
@@ -171,26 +138,16 @@ def _prenatal_reference_table() -> pa.Table:
             contigs.append(c)
             starts.append(s)
             ends.append(e)
-            masked.append(False)
             pca_mean.append(0.25)
             pca_loadings.append([0.0])
-            nearest_ref.append([0])
-            mean_dist.append(1.0)
-            null_mean.append(0.0)
-            null_std.append(0.1)
 
     for s, e in [(0, 100_000), (100_000, 200_000)]:
         branches.append(BRANCH_FEMALE_SEX)
         contigs.append("chrX")
         starts.append(s)
         ends.append(e)
-        masked.append(False)
         pca_mean.append(0.5)
         pca_loadings.append([0.0])
-        nearest_ref.append([0])
-        mean_dist.append(1.0)
-        null_mean.append(0.0)
-        null_std.append(0.1)
 
     for c in ["chr1", "chr2"]:
         for s, e in [(0, 100_000), (100_000, 200_000)]:
@@ -198,45 +155,35 @@ def _prenatal_reference_table() -> pa.Table:
             contigs.append(c)
             starts.append(s)
             ends.append(e)
-            masked.append(False)
             pca_mean.append(0.0)
             pca_loadings.append([0.5])
-            nearest_ref.append([0])
-            mean_dist.append(1.0)
-            null_mean.append(0.0)
-            null_std.append(0.1)
 
     for s, e in [(0, 100_000), (100_000, 200_000), (200_000, 300_000)]:
         branches.append(BRANCH_PRENATAL_FFY)
         contigs.append("chrY")
         starts.append(s)
         ends.append(e)
-        masked.append(False)
         pca_mean.append(0.33)
         pca_loadings.append([0.0])
-        nearest_ref.append([0])
-        mean_dist.append(1.0)
-        null_mean.append(0.0)
-        null_std.append(0.1)
 
     n_rows = len(branches)
-    return pa.table(
-        {
-            "branch": branches,
-            "contig": contigs,
-            "start": pa.array(starts, type=pa.int64()),
-            "end": pa.array(ends, type=pa.int64()),
-            "masked": masked,
-            "gc": pa.array([float("nan")] * n_rows, type=pa.float32()),
-            "mappability": pa.array([float("nan")] * n_rows, type=pa.float32()),
-            "pca_mean": pa.array(pca_mean, type=pa.float64()),
-            "pca_loadings": pa.array(pca_loadings, type=pa.list_(pa.float64())),
-            "nearest_ref_indices": pa.array(nearest_ref, type=pa.list_(pa.int32())),
-            "mean_distance": pa.array(mean_dist, type=pa.float32()),
-            "null_mean": pa.array(null_mean, type=pa.float64()),
-            "null_std": pa.array(null_std, type=pa.float64()),
+    return make_reference_table(
+        branches=branches,
+        contigs=contigs,
+        starts=starts,
+        ends=ends,
+        contig_lengths={
+            "chr1": 200_000,
+            "chr2": 200_000,
+            "chrX": 200_000,
+            "chrY": 300_000,
         },
-        schema=REFERENCE_SCHEMA.with_metadata(metadata),
+        pca_mean=pca_mean,
+        pca_loadings=pca_loadings,
+        mean_distance=[1.0] * n_rows,
+        null_mean=[0.0] * n_rows,
+        null_std=[0.1] * n_rows,
+        metadata=metadata,
     )
 
 
@@ -247,11 +194,32 @@ def _prenatal_sample_table() -> pa.Table:
         "chrX": 200_000,
         "chrY": 300_000,
     }
-    metadata = metadata_for(
+    contigs: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    counts: list[int] = []
+    for c, length in contig_lengths.items():
+        for s in range(0, length, 100_000):
+            contigs.append(c)
+            starts.append(s)
+            ends.append(s + 100_000)
+            counts.append(5 if c == "chrY" else 100)
+
+    tbl = make_sample_table(
+        counts,
+        contigs=contigs,
+        starts=starts,
+        ends=ends,
+        contig_lengths=contig_lengths,
+        bin_size=100_000,
+        identity={"path": "test_sample.ccnv"},
+    )
+    meta = metadata_for(
         ArtifactKind.SAMPLE,
         contig_lengths=contig_lengths,
         values={
             "bin_size": 100_000,
+            "contig_order": list(contig_lengths.keys()),
             "source_identity": {"path": "test_sample.ccnv"},
             "reference_identity": {"id": "genome"},
             "qc": {
@@ -263,39 +231,12 @@ def _prenatal_sample_table() -> pa.Table:
             "filters": asdict(ReadFilters()),
         },
     )
-    contigs: list[str] = []
-    starts: list[int] = []
-    ends: list[int] = []
-    counts: list[int] = []
-    for c, length in contig_lengths.items():
-        for s in range(0, length, 100_000):
-            contigs.append(c)
-            starts.append(s)
-            ends.append(s + 100_000)
-            cnt = 5 if c == "chrY" else 100
-            counts.append(cnt)
-
-    n_bins = len(contigs)
-    return pa.table(
-        {
-            "contig": contigs,
-            "start": pa.array(starts, type=pa.int64()),
-            "end": pa.array(ends, type=pa.int64()),
-            "count": pa.array(counts, type=pa.uint64()),
-            "fragment_lengths": pa.array([[]] * n_bins, type=pa.list_(pa.uint16())),
-            "endpoint_count": pa.array(
-                np.zeros(n_bins, dtype=np.uint32), type=pa.uint32()
-            ),
-            "frag_gc_sum": pa.array(
-                np.zeros(n_bins, dtype=np.float32), type=pa.float32()
-            ),
-        },
-        schema=SAMPLE_SCHEMA.with_metadata(metadata),
-    )
+    return tbl.replace_schema_metadata(meta)
 
 
 class TestNormalization(unittest.TestCase):
     def test_normalization_produces_aligned_finite_evidence(self) -> None:
+        pids, pweights = _proto_arrays(4)
         model = BranchModel(
             branch=BRANCH_AUTOSOMAL,
             contigs=("chr1", "chr1", "chr2", "chr2"),
@@ -304,13 +245,9 @@ class TestNormalization(unittest.TestCase):
             counts=np.array([10.0, 10.0, 10.0, 10.0]),
             masked=np.zeros(4, dtype=np.bool_),
             pca_mean=np.full(4, 0.25),
-            pca_loadings=np.zeros((1, 4)),
-            nearest_indices=(
-                np.array([2, 3]),
-                np.array([2, 3]),
-                np.array([0, 1]),
-                np.array([0, 1]),
-            ),
+            pca_loadings=np.zeros((1, 4), dtype=np.float32),
+            proto_ids=pids,
+            proto_weights=pweights,
             mean_distance=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
             null_mean=np.zeros(4, dtype=np.float64),
             null_std=np.full(4, 0.1, dtype=np.float64),
@@ -334,8 +271,7 @@ class TestNormalization(unittest.TestCase):
     ) -> None:
         from ccnv.predict import project_coverage
 
-        # 4 bins, 1 component: loading = [0.5, 0.5, 0.5, 0.5]
-        # Mean = [0.25, 0.25, 0.25, 0.25]
+        pids, pweights = _proto_arrays(4)
         model = BranchModel(
             branch=BRANCH_AUTOSOMAL,
             contigs=("chr1", "chr1", "chr2", "chr2"),
@@ -344,53 +280,41 @@ class TestNormalization(unittest.TestCase):
             counts=np.array([20.0, 30.0, 20.0, 30.0]),
             masked=np.zeros(4, dtype=np.bool_),
             pca_mean=np.full(4, 0.25),
-            pca_loadings=np.full((1, 4), 0.5),
-            nearest_indices=(
-                np.array([2, 3]),
-                np.array([2, 3]),
-                np.array([0, 1]),
-                np.array([0, 1]),
-            ),
+            pca_loadings=np.full((1, 4), 0.5, dtype=np.float32),
+            proto_ids=pids,
+            proto_weights=pweights,
             mean_distance=np.ones(4, dtype=np.float32),
             null_mean=np.zeros(4, dtype=np.float64),
             null_std=np.full(4, 0.1, dtype=np.float64),
         )
 
-        # 1. Mask bin 0 and 1 -> active_sub is [False, False, True, True]
         n_mask = np.array([True, True, False, False])
         proj = project_coverage(model, n_mask_override=n_mask)
-        # Usable count sum = 20.0 + 30.0 = 50.0 -> selected is [0.4, 0.6]
-        # sub_loadings.T is [[0.5], [0.5]]; lstsq solves c = 0.5
-        # recon = [0.5, 0.5, 0.5, 0.5]
         self.assertTrue(np.all(proj.usable == np.array([False, False, True, True])))
         self.assertAlmostEqual(proj.corrected[2], 0.4 / 0.5)
         self.assertAlmostEqual(proj.corrected[3], 0.6 / 0.5)
 
-        # 2. All bins masked -> raises PredictError (zero usable count)
         all_masked = np.ones(4, dtype=np.bool_)
         with self.assertRaises(PredictError):
             project_coverage(model, n_mask_override=all_masked)
 
-        # 3. One active bin -> n_active (1) <= rank (1) -> fallback to pca_mean copy
         one_active_mask = np.array([True, True, True, False])
         proj_one = project_coverage(model, n_mask_override=one_active_mask)
         self.assertTrue(
             np.all(proj_one.usable == np.array([False, False, False, True]))
         )
-        # Active bin 3 count 30.0, usable_total=30.0 -> normalized = 1.0
-        # n_active=1 <= rank=1 -> reconstruction is pca_mean[3] = 0.25
         self.assertAlmostEqual(proj_one.corrected[3], 1.0 / 0.25)
 
     def test_project_coverage_huber_resists_trisomy_outlier_chromosome(self) -> None:
         from ccnv.predict import project_coverage
 
-        # 20 bins: 16 diploid bins follow loading, 4 trisomic bins have +50% jump
-        loadings = np.linspace(-1.0, 1.0, 20).reshape(1, 20)
+        loadings = np.linspace(-1.0, 1.0, 20, dtype=np.float32).reshape(1, 20)
         pca_mean = np.full(20, 0.05)
         true_c = 0.02
-        counts = (pca_mean + true_c * loadings.ravel()) * 1000.0
-        counts[16:] *= 1.8  # Trisomy / amplification on last 4 bins
+        counts = (pca_mean + true_c * loadings.astype(np.float64).ravel()) * 1000.0
+        counts[16:] *= 1.8
 
+        pids, pweights = _proto_arrays(20)
         model = BranchModel(
             branch=BRANCH_AUTOSOMAL,
             contigs=("chr1",) * 16 + ("chr21",) * 4,
@@ -400,7 +324,8 @@ class TestNormalization(unittest.TestCase):
             masked=np.zeros(20, dtype=np.bool_),
             pca_mean=pca_mean,
             pca_loadings=loadings,
-            nearest_indices=tuple(np.arange(16, dtype=np.int32) for _ in range(20)),
+            proto_ids=pids,
+            proto_weights=pweights,
             mean_distance=np.ones(20, dtype=np.float32),
             null_mean=np.zeros(20, dtype=np.float64),
             null_std=np.full(20, 0.05, dtype=np.float64),
@@ -576,8 +501,8 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
             directory = Path(tmpdir)
             sample_path = directory / "sample.ccnv"
             reference_path = directory / "reference.ccnv"
-            pq.write_table(_sample_table(include_chr2=False), sample_path)
-            pq.write_table(_reference_table(), reference_path)
+            write_sample_parquet(_sample_table(include_chr2=False), sample_path)
+            write_reference_parquet(_reference_table(), reference_path)
 
             with self.assertRaisesRegex(PredictError, "missing.*chr2"):
                 load_inputs(sample_path, reference_path)
@@ -588,34 +513,17 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
             sample_path = directory / "sample.ccnv"
             reference_path = directory / "reference.ccnv"
 
-            sample_metadata = metadata_for(
-                ArtifactKind.SAMPLE,
+            sample_50 = make_sample_table(
+                [5, 5, 6, 4],
+                contigs=["chr1", "chr1", "chr2", "chr2"],
+                starts=[0, 50, 0, 50],
+                ends=[50, 100, 50, 80],
                 contig_lengths={"chr1": 100, "chr2": 80},
-                values={
-                    "bin_size": 50,
-                    "source_identity": {"id": "test"},
-                    "reference_identity": {"id": "genome"},
-                    "qc": {},
-                    "filters": asdict(ReadFilters()),
-                },
+                bin_size=50,
             )
-            sample_50 = pa.table(
-                {
-                    "contig": ["chr1", "chr1", "chr2", "chr2"],
-                    "start": pa.array([0, 50, 0, 50], type=pa.int64()),
-                    "end": pa.array([50, 100, 50, 80], type=pa.int64()),
-                    "count": pa.array([5, 5, 6, 4], type=pa.uint64()),
-                    "fragment_lengths": pa.array(
-                        [[], [], [], []], type=pa.list_(pa.uint16())
-                    ),
-                    "endpoint_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
-                    "frag_gc_sum": pa.array([0.0, 0.0, 0.0, 0.0], type=pa.float32()),
-                },
-                schema=SAMPLE_SCHEMA.with_metadata(sample_metadata),
-            )
-            pq.write_table(sample_50, sample_path)
+            write_sample_parquet(sample_50, sample_path)
             ref_table = _reference_table()
-            pq.write_table(ref_table, reference_path)
+            write_reference_parquet(ref_table, reference_path)
 
             ref_bytes_before = reference_path.read_bytes()
             ref_mtime_before = reference_path.stat().st_mtime_ns
@@ -638,33 +546,16 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
             sample_path = directory / "sample.ccnv"
             reference_path = directory / "reference.ccnv"
 
-            sample_metadata = metadata_for(
-                ArtifactKind.SAMPLE,
+            sample_mismatch = make_sample_table(
+                [10, 5, 10],
+                contigs=["chr1", "chr1", "chr2"],
+                starts=[0, 100, 0],
+                ends=[100, 150, 80],
                 contig_lengths={"chr1": 150, "chr2": 80},
-                values={
-                    "bin_size": 100,
-                    "source_identity": {"id": "test"},
-                    "reference_identity": {"id": "genome"},
-                    "qc": {},
-                    "filters": asdict(ReadFilters()),
-                },
+                bin_size=100,
             )
-            sample_mismatch = pa.table(
-                {
-                    "contig": ["chr1", "chr1", "chr2"],
-                    "start": pa.array([0, 100, 0], type=pa.int64()),
-                    "end": pa.array([100, 150, 80], type=pa.int64()),
-                    "count": pa.array([10, 5, 10], type=pa.uint64()),
-                    "fragment_lengths": pa.array(
-                        [[], [], []], type=pa.list_(pa.uint16())
-                    ),
-                    "endpoint_count": pa.array([0, 0, 0], type=pa.uint32()),
-                    "frag_gc_sum": pa.array([0.0, 0.0, 0.0], type=pa.float32()),
-                },
-                schema=SAMPLE_SCHEMA.with_metadata(sample_metadata),
-            )
-            pq.write_table(sample_mismatch, sample_path)
-            pq.write_table(_reference_table(), reference_path)
+            write_sample_parquet(sample_mismatch, sample_path)
+            write_reference_parquet(_reference_table(), reference_path)
 
             with self.assertRaisesRegex(PredictError, "contig length mismatch"):
                 load_inputs(sample_path, reference_path)
@@ -673,30 +564,7 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
         from ccnv.predict import build_branch_model
 
         ref = _reference_table()
-        bad_sample = pa.table(
-            {
-                "contig": ["chr1"],
-                "start": pa.array([0], type=pa.int64()),
-                "end": pa.array([100], type=pa.int64()),
-                "count": pa.array([10], type=pa.uint64()),
-                "fragment_lengths": pa.array([[]], type=pa.list_(pa.uint16())),
-                "endpoint_count": pa.array([0], type=pa.uint32()),
-                "frag_gc_sum": pa.array([0.0], type=pa.float32()),
-            },
-            schema=SAMPLE_SCHEMA.with_metadata(
-                metadata_for(
-                    ArtifactKind.SAMPLE,
-                    contig_lengths={"chr1": 100},
-                    values={
-                        "bin_size": 100,
-                        "source_identity": {"id": "test"},
-                        "reference_identity": {"id": "genome"},
-                        "qc": {},
-                        "filters": asdict(ReadFilters()),
-                    },
-                )
-            ),
-        )
+        bad_sample = _sample_table(include_chr2=False)
         inputs = PredictionInput(
             bad_sample,
             ref,
@@ -714,8 +582,8 @@ class TestModeGuardrails(unittest.TestCase):
             directory = Path(tmpdir)
             sample_path = directory / "sample.ccnv"
             reference_path = directory / "reference.ccnv"
-            pq.write_table(_sample_table(), sample_path)
-            pq.write_table(_reference_table(), reference_path)
+            write_sample_parquet(_sample_table(), sample_path)
+            write_reference_parquet(_reference_table(), reference_path)
 
             expected_msg = (
                 "reference was built in germline mode and lacks prenatal models; "
@@ -730,8 +598,8 @@ class TestModeGuardrails(unittest.TestCase):
             directory = Path(tmpdir)
             sample_path = directory / "sample.ccnv"
             reference_path = directory / "reference.ccnv"
-            pq.write_table(_prenatal_sample_table(), sample_path)
-            pq.write_table(_prenatal_reference_table(), reference_path)
+            write_sample_parquet(_prenatal_sample_table(), sample_path)
+            write_reference_parquet(_prenatal_reference_table(), reference_path)
 
             with self.assertLogs("ccnv.predict", level="WARNING") as cm:
                 inputs = load_inputs(sample_path, reference_path, mode="germline")
@@ -753,8 +621,8 @@ class TestPrenatalPredictPipeline(unittest.TestCase):
             sample_path = directory / "sample.ccnv"
             reference_path = directory / "reference.ccnv"
             prefix = directory / "prenatal_out"
-            pq.write_table(_prenatal_sample_table(), sample_path)
-            pq.write_table(_prenatal_reference_table(), reference_path)
+            write_sample_parquet(_prenatal_sample_table(), sample_path)
+            write_reference_parquet(_prenatal_reference_table(), reference_path)
 
             config = PredictConfig(
                 sample=sample_path,
@@ -847,7 +715,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
             with open(qc_json, encoding="utf-8") as f:
                 qc_data = json.load(f)
             self.assertEqual(qc_data["mode"], "germline")
-            self.assertEqual(qc_data["schema_version"], "1.0.0")
+            self.assertEqual(qc_data["schema_version"], "2.0.0")
 
             with gzip.open(bins_bed, "rt") as h:
                 bin_lines = h.read().splitlines()
@@ -878,6 +746,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
             self.assertGreater(plot_html.stat().st_size, 0)
 
     def test_normalize_branch_zero_null_std_mad_fallback(self) -> None:
+        pids, pweights = _proto_arrays(4)
         model = BranchModel(
             branch=BRANCH_AUTOSOMAL,
             contigs=("chr1", "chr1", "chr2", "chr2"),
@@ -886,13 +755,9 @@ class TestPredictPublishedCrams(unittest.TestCase):
             counts=np.array([20.0, 30.0, 40.0, 50.0]),
             masked=np.zeros(4, dtype=np.bool_),
             pca_mean=np.full(4, 0.25),
-            pca_loadings=np.zeros((1, 4)),
-            nearest_indices=(
-                np.array([2, 3]),
-                np.array([2, 3]),
-                np.array([0, 1]),
-                np.array([0, 1]),
-            ),
+            pca_loadings=np.zeros((1, 4), dtype=np.float32),
+            proto_ids=pids,
+            proto_weights=pweights,
             mean_distance=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
             null_mean=np.zeros(4, dtype=np.float64),
             null_std=np.zeros(4, dtype=np.float64),
@@ -908,8 +773,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(result.zscores)))
 
     def test_normalize_branch_zero_mad_fallback_to_std(self) -> None:
-        # When >50% of bins share identical ratios, MAD degenerates to 0;
-        # std fallback should produce finite, non-zero z-scores for outliers.
+        pids, pweights = _proto_arrays(6)
         model = BranchModel(
             branch=BRANCH_AUTOSOMAL,
             contigs=("chr1", "chr1", "chr1", "chr2", "chr2", "chr2"),
@@ -918,15 +782,9 @@ class TestPredictPublishedCrams(unittest.TestCase):
             counts=np.array([20.0, 20.0, 20.0, 20.0, 20.0, 80.0]),
             masked=np.zeros(6, dtype=np.bool_),
             pca_mean=np.full(6, 0.25),
-            pca_loadings=np.zeros((1, 6)),
-            nearest_indices=(
-                np.array([3, 4, 5]),
-                np.array([3, 4, 5]),
-                np.array([3, 4, 5]),
-                np.array([0, 1, 2]),
-                np.array([0, 1, 2]),
-                np.array([0, 1, 2]),
-            ),
+            pca_loadings=np.zeros((1, 6), dtype=np.float32),
+            proto_ids=pids,
+            proto_weights=pweights,
             mean_distance=np.ones(6, dtype=np.float32),
             null_mean=np.zeros(6, dtype=np.float64),
             null_std=np.zeros(6, dtype=np.float64),

@@ -1,23 +1,20 @@
 import re
 import tempfile
 import unittest
-from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
+from helpers import (
+    make_reference_table,
+    write_synthetic_reference,
+    write_synthetic_sample,
+)
 from typer.testing import CliRunner
 
 from ccnv.cli import SampleInputError, app, expand_sample_inputs
-from ccnv.models import ReadFilters
-from ccnv.models.schemas import (
-    REFERENCE_SCHEMA,
-    SAMPLE_SCHEMA,
-    ArtifactKind,
-    metadata_for,
-)
 from ccnv.reference import DEFAULT_SEX_CONTIGS, DEFAULT_SEX_SIGNAL_CONTIGS
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -581,76 +578,45 @@ def _write_samplesheet(path: Path, samples: list[Path]) -> Path:
 
 
 def _write_sample(path: Path) -> Path:
-    metadata = metadata_for(
-        ArtifactKind.SAMPLE,
+    return write_synthetic_sample(
+        path,
+        [1],
         contig_lengths={"chr1": 100},
-        values={
-            "bin_size": 100,
-            "source_identity": {"id": path.stem},
-            "reference_identity": {"name": "test"},
-            "qc": {},
-            "filters": asdict(ReadFilters()),
-        },
-    )
-    table = pa.table(
-        {
-            "contig": ["chr1"],
-            "start": pa.array([0], type=pa.int64()),
-            "end": pa.array([100], type=pa.int64()),
-            "count": pa.array([1], type=pa.uint64()),
-            "fragment_lengths": pa.array([[]], type=pa.list_(pa.uint16())),
-            "endpoint_count": pa.array([0], type=pa.uint32()),
-            "frag_gc_sum": pa.array([0.0], type=pa.float32()),
-        },
-        schema=SAMPLE_SCHEMA.with_metadata(metadata),
-    )
-    pq.write_table(table, path)
-    return path.resolve()
+        bin_size=100,
+        identity={"id": path.stem},
+    ).resolve()
 
 
 def _write_reference(path: Path) -> Path:
-    metadata = metadata_for(
-        ArtifactKind.REFERENCE,
+    table = make_reference_table(
+        branches=["autosomal"],
+        contigs=["chr1"],
+        starts=[0],
+        ends=[100],
         contig_lengths={"chr1": 100},
-        values={
-            "sample_identities": [{"path": "s1.ccnv"}],
-            "model": {
-                "bin_size": 100,
-                "branches": ["autosomal"],
-                "autosomal_contigs": ["chr1"],
-                "sex_contigs": [],
-                "sex_signal_contig": None,
-                "sex_cutoff": None,
-                "sex_source": "none",
-                "sample_sexes": None,
-                "sex_inference": None,
-                "pca_components": 1,
-                "nearest_bins": 1,
-                "max_batch_memory_mb": 64,
-                "flat": False,
-            },
+        pca_mean=[1.0],
+        pca_loadings=[[0.1]],
+        mean_distance=[0.5],
+        null_mean=[0.0],
+        bio_dispersion=[0.01],
+        sample_identities=[{"path": "s1.ccnv"}],
+        model={
+            "bin_size": 100,
+            "branches": ["autosomal"],
+            "autosomal_contigs": ["chr1"],
+            "sex_contigs": [],
+            "sex_signal_contig": None,
+            "sex_cutoff": None,
+            "sex_source": "none",
+            "sample_sexes": None,
+            "sex_inference": None,
+            "pca_components": 1,
+            "nearest_bins": 1,
+            "max_batch_memory_mb": 64,
+            "flat": False,
         },
     )
-    table = pa.table(
-        {
-            "branch": ["autosomal"],
-            "contig": ["chr1"],
-            "start": pa.array([0], type=pa.int64()),
-            "end": pa.array([100], type=pa.int64()),
-            "masked": pa.array([False], type=pa.bool_()),
-            "gc": pa.array([float("nan")], type=pa.float32()),
-            "mappability": pa.array([float("nan")], type=pa.float32()),
-            "pca_mean": pa.array([1.0], type=pa.float64()),
-            "pca_loadings": pa.array([[0.1]], type=pa.list_(pa.float64())),
-            "nearest_ref_indices": pa.array([[0]], type=pa.list_(pa.int32())),
-            "mean_distance": pa.array([0.5], type=pa.float32()),
-            "null_mean": pa.array([0.0], type=pa.float64()),
-            "null_std": pa.array([0.1], type=pa.float64()),
-        },
-        schema=REFERENCE_SCHEMA.with_metadata(metadata),
-    )
-    pq.write_table(table, path)
-    return path.resolve()
+    return write_synthetic_reference(path, table).resolve()
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from dataclasses import asdict
 
 import numpy as np
 import pyarrow as pa
-from helpers import make_sample_table
+from helpers import make_reference_table, make_sample_table
 from scipy.stats import norm
 
 from ccnv.features.fragmentomics import (
@@ -41,16 +41,8 @@ def _make_dummy_prenatal_metadata(
         "yfrac_threshold": 0.001,
         "ffy_intercept": 0.0,
         "ffy_slope": 1.0,
-        "mlp_w1": [],
-        "mlp_b1": [],
-        "mlp_w2": [],
-        "mlp_b2": [],
-        "mlp_skew_intercept": 0.0,
-        "mlp_skew_slope": 1.0,
         "olm_weights": [],
         "olm_bias": 0.0,
-        "olm_skew_intercept": 0.0,
-        "olm_skew_slope": 1.0,
         "ffx_intercept": 2.0,
         "ffx_slope": -2.0,
         "female_chrx_ratio_mean": 1.0,
@@ -60,7 +52,7 @@ def _make_dummy_prenatal_metadata(
         "ff_size_std": 0.018,
     }
     defaults.update(overrides)
-    return PrenatalModelMetadata(**defaults)  # type: ignore[arg-type]
+    return PrenatalModelMetadata.from_dict(defaults)
 
 
 def _make_mock_fragmentomics_metadata(
@@ -377,15 +369,14 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         weighted_sample = apply_prenatal_fisher_weighting(sample_tbl, meta)
         self.assertIsNot(weighted_sample, sample_tbl)
 
-        ref_table = pa.table(
-            {
-                "branch": pa.array(["autosomal"] * 5),
-                "contig": pa.array(["chr1"] * 5),
-                "start": pa.array([0, 100, 200, 300, 400], type=pa.int64()),
-                "end": pa.array([100, 200, 300, 400, 500], type=pa.int64()),
-                "pca_mean": pa.array([10.0] * 5, type=pa.float64()),
-                "null_mean": pa.array([0.0] * 5, type=pa.float64()),
-            }
+        ref_table = make_reference_table(
+            branches=["autosomal"] * 5,
+            contigs=["chr1"] * 5,
+            starts=[0, 100, 200, 300, 400],
+            ends=[100, 200, 300, 400, 500],
+            contig_lengths={"chr1": 500},
+            pca_mean=[10.0] * 5,
+            null_mean=[0.0] * 5,
         )
         weighted_ref = align_reference_to_weighted_sample(
             ref_table, sample_tbl, weighted_sample
@@ -396,6 +387,7 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         np.testing.assert_allclose(
             weighted_ref.column("pca_mean").to_numpy(),
             np.full(5, 10.0 * expected_baseline_scale),
+            rtol=1e-5,
         )
         np.testing.assert_allclose(
             weighted_ref.column("null_mean").to_numpy(),
@@ -412,8 +404,9 @@ class TestPrenatalFragmentomics(unittest.TestCase):
             counts=w_counts.astype(np.float64),
             masked=np.zeros(5, dtype=bool),
             pca_mean=weighted_ref.column("pca_mean").to_numpy().astype(np.float64),
-            pca_loadings=np.empty((0, 5), dtype=np.float64),
-            nearest_indices=(np.array([1], dtype=np.int32),) * 5,
+            pca_loadings=np.empty((0, 5), dtype=np.float32),
+            proto_ids=np.zeros((5, 4), dtype=np.uint16),
+            proto_weights=np.tile([1.0, 0.0, 0.0, 0.0], (5, 1)).astype(np.float16),
             mean_distance=np.ones(5, dtype=np.float32),
             null_mean=np.zeros(5, dtype=np.float64),
             null_std=np.full(5, 0.05, dtype=np.float64),

@@ -1,4 +1,4 @@
-"""Batched nearest-neighbor selection and null model computation."""
+"""Prototype Graph fitting, LOCO evaluation, nearest-neighbor search, and null moderation."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from numpy.typing import NDArray
 from scipy.optimize import brentq
 from scipy.spatial import KDTree
 from scipy.special import digamma, polygamma
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.exceptions import ConvergenceWarning
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +22,10 @@ _MAX_NULL_SAMPLES: Final[int] = 100
 __all__ = [
     "build_signal_space_features",
     "compute_null_models",
+    "compute_prototype_null_models",
     "distance_cutoff",
+    "evaluate_loco_prototype_baseline",
+    "fit_prototype_graph",
     "select_nearest_bins",
     "squeeze_var",
 ]
@@ -31,7 +36,7 @@ def build_signal_space_features(
     singular_values: NDArray[np.floating] | None = None,
     covariate_mat: NDArray[np.floating] | None = None,
 ) -> NDArray[np.float64]:
-    """Assemble low-dimensional signal-space feature matrix for nearest-bin search."""
+    """Assemble low-dimensional signal-space feature matrix for prototype/neighbor search."""
     loadings = np.asarray(pca_loadings, dtype=np.float64)
     if loadings.ndim == 2:
         feats = loadings.T
@@ -57,6 +62,226 @@ def build_signal_space_features(
     return np.asarray(feats, dtype=np.float64)
 
 
+def fit_prototype_graph(
+    features: NDArray[np.floating],
+    *,
+    max_prototypes: int = 2048,
+    top_r: int = 4,
+) -> tuple[
+    NDArray[np.float32],
+    NDArray[np.uint16],
+    NDArray[np.float16],
+    NDArray[np.float32],
+]:
+    """Cluster signal-space features into M <= max_prototypes prototypes and query top_r."""
+    if max_prototypes < 1 or max_prototypes > 65535:
+        raise ValueError("max_prototypes must be in [1, 65535]")
+    if top_r < 1:
+        raise ValueError("top_r must be a positive integer")
+
+    feats = np.asarray(features, dtype=np.float32)
+    if feats.ndim == 1:
+        feats = feats[:, np.newaxis]
+    if feats.ndim != 2:
+        raise ValueError("features must be a 1D or 2D array")
+
+    u_count, n_dim = feats.shape
+    if u_count == 0:
+        return (
+            np.empty((0, n_dim), dtype=np.float32),
+            np.zeros((0, top_r), dtype=np.uint16),
+            np.zeros((0, top_r), dtype=np.float16),
+            np.empty(0, dtype=np.float32),
+        )
+
+    if n_dim == 0:
+        proto_ids = np.zeros((u_count, top_r), dtype=np.uint16)
+        proto_weights = np.zeros((u_count, top_r), dtype=np.float16)
+        proto_weights[:, 0] = np.float16(1.0)
+        return (
+            np.empty((1, 0), dtype=np.float32),
+            proto_ids,
+            proto_weights,
+            np.zeros(u_count, dtype=np.float32),
+        )
+
+    scaled_cap = max(8, u_count // 64) if u_count >= 8 else u_count
+    m_count = min(max_prototypes, u_count, max(1, scaled_cap))
+    k_query = min(top_r, m_count)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=ConvergenceWarning)
+        kmeans = MiniBatchKMeans(
+            n_clusters=m_count,
+            random_state=0,
+            batch_size=min(8192, max(256, u_count)),
+            n_init=3,
+        )
+        kmeans.fit(feats)
+
+    centers = np.asarray(kmeans.cluster_centers_, dtype=np.float32)
+    tree = KDTree(centers)
+    raw_dists, raw_ids = tree.query(feats, k=k_query, p=2, workers=-1)
+    dists = np.asarray(raw_dists, dtype=np.float64).reshape(u_count, k_query)
+    ids = np.asarray(raw_ids, dtype=np.uint16).reshape(u_count, k_query)
+
+    inv_d = 1.0 / (dists + 1e-6)
+    norm_w = inv_d / np.sum(inv_d, axis=1, keepdims=True)
+    w_f16 = norm_w.astype(np.float16)
+    w_f32 = w_f16.astype(np.float32)
+    w_sum = np.maximum(np.sum(w_f32, axis=1, keepdims=True), 1e-12)
+    w_f16 = (w_f32 / w_sum).astype(np.float16)
+
+    proto_ids = np.zeros((u_count, top_r), dtype=np.uint16)
+    proto_ids[:, :k_query] = ids
+    proto_weights = np.zeros((u_count, top_r), dtype=np.float16)
+    proto_weights[:, :k_query] = w_f16
+    mean_distance = np.mean(dists, axis=1).astype(np.float32)
+    return centers, proto_ids, proto_weights, mean_distance
+
+
+def evaluate_loco_prototype_baseline(
+    values: NDArray[np.floating],
+    contig_ids: NDArray[np.integer],
+    proto_ids: NDArray[np.uint16],
+    proto_weights: NDArray[np.floating],
+) -> tuple[NDArray[np.float64], NDArray[np.int64]]:
+    """Evaluate O(U) leave-one-contig-out prototype baselines and bin support counts."""
+    vals = np.asarray(values, dtype=np.float64)
+    cids = np.asarray(contig_ids, dtype=np.int64)
+    pids = np.asarray(proto_ids, dtype=np.intp)
+    pw = np.asarray(proto_weights, dtype=np.float64)
+    u_count = vals.size
+    if u_count == 0:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
+
+    elig = np.isfinite(vals) & (vals > 0.0)
+    if not np.any(elig) or pids.size == 0:
+        return np.full(u_count, np.nan, dtype=np.float64), np.zeros(
+            u_count, dtype=np.int64
+        )
+
+    _, c_compact = np.unique(cids, return_inverse=True)
+    n_contigs = int(np.max(c_compact)) + 1
+    n_protos = int(np.max(pids)) + 1
+
+    e_idx = np.flatnonzero(elig)
+    e_prim = pids[e_idx, 0]
+    e_c = c_compact[e_idx]
+    e_v = vals[e_idx]
+
+    order = np.lexsort((e_c, e_prim))
+    s_prim = e_prim[order]
+    s_c = e_c[order]
+    s_v = e_v[order]
+
+    proto_range = np.arange(n_protos, dtype=np.intp)
+    p_starts = np.searchsorted(s_prim, proto_range, side="left")
+    p_ends = np.searchsorted(s_prim, proto_range, side="right")
+
+    full_med = np.full(n_protos, np.nan, dtype=np.float64)
+    full_cnt = (p_ends - p_starts).astype(np.int64)
+    for m in range(n_protos):
+        lo = int(p_starts[m])
+        hi = int(p_ends[m])
+        if hi > lo:
+            full_med[m] = float(np.median(s_v[lo:hi]))
+
+    loco_med = np.broadcast_to(full_med[:, np.newaxis], (n_protos, n_contigs)).copy()
+    loco_cnt = np.broadcast_to(full_cnt[:, np.newaxis], (n_protos, n_contigs)).copy()
+
+    for m in range(n_protos):
+        lo = int(p_starts[m])
+        hi = int(p_ends[m])
+        if hi - lo <= 1:
+            continue
+        c_m = s_c[lo:hi]
+        if c_m[0] == c_m[-1]:
+            # 100% of this prototype's eligible bins lie on one contig: retain full median
+            continue
+        v_m = s_v[lo:hi]
+        cuts = np.flatnonzero(c_m[1:] != c_m[:-1]) + 1
+        r_starts = [0, *cuts.tolist()]
+        r_ends = [*cuts.tolist(), int(v_m.size)]
+        for r_lo, r_hi in zip(r_starts, r_ends, strict=True):
+            ck = int(c_m[r_lo])
+            off_v = np.concatenate((v_m[:r_lo], v_m[r_hi:]))
+            loco_med[m, ck] = float(np.median(off_v))
+            loco_cnt[m, ck] = int(off_v.size)
+
+    p_est = loco_med[pids, c_compact[:, np.newaxis]]
+    p_cnt = loco_cnt[pids, c_compact[:, np.newaxis]]
+    valid_w = (pw > 0.0) & np.isfinite(p_est) & (p_est > 0.0) & (p_cnt > 0)
+    eff_w = np.where(valid_w, pw, 0.0)
+    w_sum = np.sum(eff_w, axis=1)
+    has_est = w_sum > 0.0
+
+    baselines = np.where(
+        has_est,
+        np.sum(eff_w * np.where(valid_w, p_est, 0.0), axis=1)
+        / np.where(has_est, w_sum, 1.0),
+        np.nan,
+    )
+    support = np.sum(np.where(valid_w, p_cnt, 0), axis=1, dtype=np.int64)
+    return baselines, support
+
+
+def compute_prototype_null_models(
+    corrected: NDArray[np.floating],
+    contig_ids: NDArray[np.integer],
+    proto_ids: NDArray[np.uint16],
+    proto_weights: NDArray[np.floating],
+    *,
+    n_pca_components: int = 0,
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+    """Compute Empirical Bayes moderated null_mean and bio_dispersion (variance) via prototypes."""
+    mat = np.asarray(corrected, dtype=np.float64)
+    n_bins, n_samples = mat.shape
+    n_null = min(n_samples, _MAX_NULL_SAMPLES)
+    if n_bins == 0 or n_null == 0:
+        return np.zeros(n_bins, dtype=np.float32), np.zeros(n_bins, dtype=np.float32)
+
+    sub = mat[:, :n_null]
+    ratios = np.full((n_bins, n_null), np.nan, dtype=np.float64)
+    has_support = np.zeros(n_bins, dtype=np.bool_)
+    for s_idx in range(n_null):
+        col = sub[:, s_idx]
+        base, sup = evaluate_loco_prototype_baseline(
+            col, contig_ids, proto_ids, proto_weights
+        )
+        valid = (
+            np.isfinite(col)
+            & (col > 0.0)
+            & np.isfinite(base)
+            & (base > 0.0)
+            & (sup > 0)
+        )
+        has_support |= sup > 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratios[valid, s_idx] = np.log2(col[valid] / base[valid])
+
+    clean = np.nan_to_num(ratios, nan=0.0, posinf=0.0, neginf=0.0)
+    out_mean = np.where(has_support, np.mean(clean, axis=1), 0.0)
+
+    d = max(1, n_null - 1 - n_pca_components)
+    dof_scale = (n_null - 1) / d if n_null > 1 else 0.0
+    raw_vars = (
+        np.where(has_support, np.var(clean, axis=1, ddof=1) * dof_scale, 0.0)
+        if n_null > 1
+        else np.zeros(n_bins, dtype=np.float64)
+    )
+
+    valid_bins = has_support & (raw_vars > 1e-16)
+    if n_bins >= 10 and np.count_nonzero(valid_bins) >= 2:
+        mod_vars, _, _ = squeeze_var(raw_vars, df=float(d))
+        disp = np.where(valid_bins, np.maximum(mod_vars, 0.0), 0.0)
+    else:
+        disp = np.where(valid_bins, np.maximum(raw_vars, 0.0), 0.0)
+
+    disp[~np.isfinite(disp) | (disp <= 1e-16)] = 0.0
+    return out_mean.astype(np.float32), disp.astype(np.float32)
+
+
 def select_nearest_bins(
     profiles: NDArray[np.floating],
     contig_ids: NDArray[np.integer],
@@ -65,6 +290,7 @@ def select_nearest_bins(
     threads: int = 1,
 ) -> tuple[list[list[int]], list[list[float]]]:
     """Pick k nearest off-contig bins via per-contig leave-one-out KDTree query."""
+    del max_batch_memory_mb
     data = np.asarray(profiles, dtype=np.float64)
     contig_ids = np.asarray(contig_ids)
     n_bins = data.shape[0]
@@ -104,6 +330,7 @@ def squeeze_var(
     winsor_tail_p: tuple[float, float] = (0.0, 0.0),
 ) -> tuple[NDArray[np.float64], float, float]:
     """Empirical Bayes variance moderation matching Smyth (2004) / limma::squeezeVar."""
+    del winsor_tail_p
     var_arr = np.asarray(var, dtype=np.float64)
     valid = np.isfinite(var_arr) & (var_arr > 1e-16)
     if np.count_nonzero(valid) < 2:
@@ -122,7 +349,6 @@ def squeeze_var(
     else:
 
         def func(d0: float) -> float:
-            """Root objective for prior degrees of freedom d0."""
             return float(polygamma(1, d0 / 2.0)) - excess_var
 
         d0_hat = float(brentq(func, 1e-8, 1e8))
@@ -140,6 +366,7 @@ def compute_null_models(
     n_pca_components: int = 0,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute per-bin reference medians and DOF-corrected empirical Bayes null statistics."""
+    del threads
     n_bins, n_samples = corrected.shape
     n_null = min(n_samples, _MAX_NULL_SAMPLES)
     if n_null == 0 or n_bins == 0:

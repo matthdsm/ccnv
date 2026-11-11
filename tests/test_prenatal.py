@@ -24,7 +24,9 @@ from ccnv.features.prenatal import (
     fit_prenatal_models,
     predict_prenatal,
 )
+from ccnv.io.parquet import write_sample_parquet
 from ccnv.models import (
+    NUM_FRAG_BANDS,
     PredictConfig,
     ReadFilters,
     ReferenceConfig,
@@ -42,10 +44,10 @@ from ccnv.models.schemas import (
     BRANCH_MALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
-    REFERENCE_SCHEMA,
     SAMPLE_SCHEMA,
     ArtifactKind,
     PrenatalModelMetadata,
+    build_reference_schema,
     metadata_for,
 )
 from ccnv.predict import run as run_predict
@@ -92,6 +94,7 @@ def _build_synthetic_sample(
         contig_lengths=contig_lengths,
         values={
             "bin_size": bin_size,
+            "contig_order": list(contig_lengths.keys()),
             "source_identity": {"id": sample_id},
             "reference_identity": {"name": "test_ref"},
             "qc": {
@@ -107,17 +110,13 @@ def _build_synthetic_sample(
     n_rows = len(contig_list)
     return pa.table(
         {
-            "contig": pa.array(contig_list, type=pa.string()),
-            "start": pa.array(starts_list, type=pa.int64()),
-            "end": pa.array(ends_list, type=pa.int64()),
-            "count": pa.array(counts_list, type=pa.uint64()),
-            "fragment_lengths": pa.array([[]] * n_rows, type=pa.list_(pa.uint16())),
-            "endpoint_count": pa.array(
-                np.zeros(n_rows, dtype=np.uint32), type=pa.uint32()
-            ),
-            "frag_gc_sum": pa.array(
-                np.zeros(n_rows, dtype=np.float32), type=pa.float32()
-            ),
+            "count": pa.array(counts_list, type=pa.uint32()),
+            "paired_count": pa.array(np.zeros(n_rows, dtype=np.uint32)),
+            "frag_len_sum": pa.array(np.zeros(n_rows, dtype=np.uint64)),
+            "short_frag_count": pa.array(np.zeros(n_rows, dtype=np.uint32)),
+            "endpoint_count": pa.array(np.zeros(n_rows, dtype=np.uint32)),
+            "frag_gc_sum": pa.array(np.zeros(n_rows, dtype=np.float32)),
+            "frag_bands": pa.nulls(n_rows, type=pa.list_(pa.uint32(), NUM_FRAG_BANDS)),
         },
         schema=SAMPLE_SCHEMA.with_metadata(metadata),
     )
@@ -130,16 +129,8 @@ class TestClassifySCA(unittest.TestCase):
             yfrac_threshold=0.005,
             ffy_intercept=0.0,
             ffy_slope=1.0,
-            mlp_w1=[[0.1, -0.1]],
-            mlp_b1=[0.0, 0.0],
-            mlp_w2=[[0.5], [-0.5]],
-            mlp_b2=[0.0],
-            mlp_skew_intercept=0.0,
-            mlp_skew_slope=1.0,
             olm_weights=[0.1],
             olm_bias=0.0,
-            olm_skew_intercept=0.0,
-            olm_skew_slope=1.0,
             ffx_intercept=2.0,
             ffx_slope=-2.0,
             female_chrx_ratio_mean=1.0,
@@ -490,8 +481,9 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         )
 
         # Validate returned table schemas
-        self.assertEqual(auto_tbl.schema, REFERENCE_SCHEMA)
-        self.assertEqual(ffy_tbl.schema, REFERENCE_SCHEMA)
+        expected_schema = build_reference_schema(len(meta.olm_weights))
+        self.assertEqual(auto_tbl.schema, expected_schema)
+        self.assertEqual(ffy_tbl.schema, expected_schema)
 
         # Validate branches
         auto_branches = auto_tbl.column("branch").to_pylist()
@@ -506,9 +498,8 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         # Validate metadata fields
         self.assertEqual(meta.prenatal_bin_size, 100000)
         self.assertGreater(meta.yfrac_threshold, 0.0)
-        self.assertEqual(len(meta.mlp_b1), 2)
-        self.assertEqual(len(meta.mlp_b2), 1)
-        self.assertEqual(len(meta.mlp_w2), 2)
+        self.assertGreater(len(meta.olm_weights), 0)
+        self.assertTrue(meta.ffa_logit_mode)
 
     def test_predict_prenatal(self) -> None:
         auto_tbl, ffy_tbl, meta, _ = fit_prenatal_models(
@@ -550,10 +541,8 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         ref_table = pa.concat_tables([auto_tbl, ffy_tbl])
         fallback_meta = replace(
             meta,
-            mlp_b2=[-20.0],
+            olm_weights=[0.0] * len(meta.olm_weights),
             olm_bias=0.12,
-            olm_skew_intercept=0.0,
-            olm_skew_slope=1.0,
             ffa_logit_mode=False,
         )
         female_sample = self.sample_tables[1]
@@ -723,7 +712,7 @@ def _setup_synthetic_cohort_and_references(
             seed=200 + i,
         )
         s_path = sample_dir / f"cohort_{i}.ccnv"
-        pq.write_table(s_tbl, s_path)
+        write_sample_parquet(s_tbl, s_path)
         entries_data.append(
             {
                 "filepath": str(s_path),
@@ -786,7 +775,7 @@ def _setup_synthetic_cohort_and_references(
         cnv_region=("chr1", 100_000, 200_000, 2.5),
     )
     test_sample_path = root / "test_male_sample.ccnv"
-    pq.write_table(test_sample_tbl, test_sample_path)
+    write_sample_parquet(test_sample_tbl, test_sample_path)
 
     return (
         parquet_path(prenatal_prefix),

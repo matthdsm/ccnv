@@ -8,17 +8,13 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
-from helpers import make_sample_table
+from helpers import make_reference_table, make_sample_table
 
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
-    REFERENCE_SCHEMA,
-    ArtifactKind,
     FetalFractionResult,
     SCAResult,
     SegmentResult,
-    metadata_for,
 )
 from ccnv.qc.predict import (
     build_predict_qc_payload,
@@ -146,45 +142,23 @@ class TestQCReference(unittest.TestCase):
 
     def test_run_reference_qc_on_table(self) -> None:
         n_bins = 200
-        metadata = metadata_for(
-            ArtifactKind.REFERENCE,
+        table = make_reference_table(
+            branches=[BRANCH_AUTOSOMAL] * n_bins,
+            contigs=["chr1"] * n_bins,
+            starts=np.arange(n_bins) * 100,
+            ends=(np.arange(n_bins) + 1) * 100,
             contig_lengths={"chr1": 20000},
-            values={
-                "model": {
-                    "mode": "germline",
-                    "bin_size": 100,
-                    "nearest_bins": 300,
-                    "flat": False,
-                },
-                "sample_identities": [{"path": "s1"}],
+            pca_mean=np.zeros(n_bins, dtype=np.float32),
+            mean_distance=np.ones(n_bins, dtype=np.float32),
+            null_mean=np.zeros(n_bins, dtype=np.float32),
+            bio_dispersion=np.ones(n_bins, dtype=np.float32),
+            sample_identities=[{"path": "s1"}],
+            model={
+                "mode": "germline",
+                "bin_size": 100,
+                "nearest_bins": 300,
+                "flat": False,
             },
-        )
-        table = pa.table(
-            {
-                "branch": pa.array([BRANCH_AUTOSOMAL] * n_bins, type=pa.string()),
-                "contig": pa.array(["chr1"] * n_bins, type=pa.string()),
-                "start": pa.array(np.arange(n_bins) * 100, type=pa.int64()),
-                "end": pa.array((np.arange(n_bins) + 1) * 100, type=pa.int64()),
-                "masked": pa.array([False] * n_bins, type=pa.bool_()),
-                "gc": pa.array(np.zeros(n_bins, dtype=np.float32), type=pa.float32()),
-                "mappability": pa.array(
-                    np.zeros(n_bins, dtype=np.float32), type=pa.float32()
-                ),
-                "pca_mean": pa.array(np.zeros(n_bins), type=pa.float64()),
-                "pca_loadings": pa.array(
-                    [[] for _ in range(n_bins)], type=pa.list_(pa.float64())
-                ),
-                "nearest_ref_indices": pa.array(
-                    [[i for i in range(150)] for _ in range(n_bins)],
-                    type=pa.list_(pa.int32()),
-                ),
-                "mean_distance": pa.array(
-                    np.ones(n_bins, dtype=np.float32), type=pa.float32()
-                ),
-                "null_mean": pa.array(np.zeros(n_bins), type=pa.float64()),
-                "null_std": pa.array(np.ones(n_bins), type=pa.float64()),
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(metadata),
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:

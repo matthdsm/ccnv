@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "load_cytobands_track",
+    "load_fasta_gc_quantiles",
     "load_gc_track",
     "load_mappability_track",
     "read_fasta_contigs",
@@ -284,6 +285,31 @@ def _compute_fasta_gc(
     n_mask: NDArray[np.bool_] = (~np.isfinite(gc_raw)) | (n_frac > _MAX_N_FRACTION)
     gc_raw[n_mask] = np.nan
     return gc_raw, n_mask
+
+
+def load_fasta_gc_quantiles(
+    path: Path,
+    contigs: Sequence[str],
+    starts: NDArray[np.int64],
+    ends: NDArray[np.int64],
+) -> NDArray[np.float32] | None:
+    """Load 8-element sliding-window GC quantile vectors when path is a FASTA file."""
+    if _classify_gc_source(path) != "fasta":
+        return None
+    fasta = path.expanduser()
+    if not fasta.is_file():
+        raise CovariateError(f"FASTA not found: {fasta}")
+    specs, bin_size, placements = _extract_contig_grid(contigs, starts, ends)
+    _, _, gc_q_core = scan_fasta_gc_quantiles(str(fasta), specs, bin_size)
+    if starts.size == 0:
+        return np.empty((0, 8), dtype=np.float32)
+    if len(placements) == 1 and placements[0][2] is None:
+        return np.asarray(gc_q_core, dtype=np.float32)
+    out = np.empty((starts.size, gc_q_core.shape[1]), dtype=np.float32)
+    for dst_slice, src_slice, bin_idx in placements:
+        chunk = gc_q_core[src_slice]
+        out[dst_slice] = chunk if bin_idx is None else chunk[bin_idx]
+    return np.nan_to_num(out, nan=0.0).astype(np.float32)
 
 
 def _load_bed_gc(
