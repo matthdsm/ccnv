@@ -17,6 +17,7 @@ dist/
 docs/superpowers
 docs/designs
 RESEARCH.md
+.agents
 # zensical site
 site/
 target/
