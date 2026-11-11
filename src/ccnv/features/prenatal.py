@@ -41,6 +41,7 @@ from ccnv.models import (
     SamplesheetEntry,
     SCACall,
     SCAResult,
+    SchemaError,
     SegmentResult,
     build_reference_schema,
     decode_metadata,
@@ -766,7 +767,10 @@ def predict_prenatal(
     )
     ld_col = auto_ref.column("pca_loadings").combine_chunks()
     ld_type = ld_col.type
-    assert isinstance(ld_type, pa.FixedSizeListType)
+    if not isinstance(ld_type, pa.FixedSizeListType):
+        raise SchemaError(
+            f"expected FixedSizeListType for 'pca_loadings', found {ld_type}"
+        )
     n_olm = len(prenatal_meta.olm_weights)
     ref_pca_rotation = np.zeros((auto_ref.num_rows, n_olm), dtype=np.float64)
     if ld_type.list_size > 0 and auto_ref.num_rows > 0 and n_olm > 0:

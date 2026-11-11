@@ -140,6 +140,60 @@ def reconstruct_sample_grid(
     return codes, names, starts, ends
 
 
+def canonical_dictionary_array(
+    col: pa.Array | pa.ChunkedArray,
+    col_name: str,
+    *,
+    index_type: pa.DataType | None = None,
+) -> pa.DictionaryArray:
+    """Encode, unify, and deduplicate a string or dictionary column into one DictionaryArray."""
+    if col.null_count > 0:
+        raise SchemaError(f"column {col_name!r} contains null entries")
+    try:
+        encoded = pc.dictionary_encode(col)
+        if isinstance(encoded, pa.ChunkedArray):
+            encoded = encoded.unify_dictionaries().combine_chunks()
+    except (pa.ArrowInvalid, pa.ArrowTypeError) as err:
+        raise SchemaError(f"column {col_name!r} dictionary is invalid: {err}") from err
+    if not isinstance(encoded, pa.DictionaryArray):
+        raise SchemaError(
+            f"column {col_name!r} expected DictionaryArray, found {type(encoded).__name__}"
+        )
+    if encoded.dictionary.null_count > 0:
+        raise SchemaError(f"column {col_name!r} dictionary contains null entries")
+
+    vocab = [str(v) for v in encoded.dictionary.to_pylist()]
+    target_idx_type = index_type if index_type is not None else encoded.type.index_type
+    if len(set(vocab)) < len(vocab) or encoded.type.index_type != target_idx_type:
+        unique_vocab: list[str] = []
+        seen: dict[str, int] = {}
+        remap = np.empty(len(vocab), dtype=np.int64)
+        for idx, name in enumerate(vocab):
+            canon = seen.get(name)
+            if canon is None:
+                canon = len(unique_vocab)
+                seen[name] = canon
+                unique_vocab.append(name)
+            remap[idx] = canon
+        if target_idx_type == pa.int8() and len(unique_vocab) > np.iinfo(np.int8).max:
+            raise SchemaError(
+                f"column {col_name!r} cardinality {len(unique_vocab)} exceeds int8 dictionary bounds"
+            )
+        if target_idx_type == pa.int16() and len(unique_vocab) > np.iinfo(np.int16).max:
+            raise SchemaError(
+                f"column {col_name!r} cardinality {len(unique_vocab)} exceeds int16 dictionary bounds"
+            )
+        raw_codes = encoded.indices.to_numpy(zero_copy_only=False)
+        mapped_codes = (
+            remap[raw_codes] if raw_codes.size > 0 else np.empty(0, dtype=np.int64)
+        )
+        return pa.DictionaryArray.from_arrays(
+            pa.array(mapped_codes, type=target_idx_type),
+            pa.array(unique_vocab, type=pa.string()),
+        )
+    return encoded
+
+
 def bin_coordinates(table: pa.Table) -> tuple[tuple[str, int, int], ...]:
     """Return row identity as ``(contig, start, end)`` tuples."""
     if "contig" not in table.column_names:
@@ -150,13 +204,7 @@ def bin_coordinates(table: pa.Table) -> tuple[tuple[str, int, int], ...]:
             (names[int(c)], int(s), int(e))
             for c, s, e in zip(codes, starts, ends, strict=True)
         )
-    c_dict = (
-        pc.dictionary_encode(table.column("contig"))
-        .unify_dictionaries()
-        .combine_chunks()
-    )
-    if c_dict.dictionary.null_count > 0 or c_dict.null_count > 0:
-        raise SchemaError("column 'contig' contains null entries")
+    c_dict = canonical_dictionary_array(table.column("contig"), "contig")
     c_codes = c_dict.indices.to_numpy(zero_copy_only=False)
     c_names = tuple(
         str(c_dict.dictionary[i].as_py()) for i in range(len(c_dict.dictionary))
@@ -227,6 +275,15 @@ def fixed_size_list_to_numpy[ScalarT: np.generic](
     dtype: type[ScalarT],
 ) -> NDArray[ScalarT]:
     """Extract a FixedSizeListArray or ChunkedArray into a 2D (N, list_size) NumPy array."""
+    col_type = col.type
+    if not pa.types.is_fixed_size_list(col_type) or not isinstance(
+        col_type, pa.FixedSizeListType
+    ):
+        raise SchemaError(f"expected FixedSizeListType, found {col_type}")
+    if col_type.list_size != list_size:
+        raise SchemaError(
+            f"expected FixedSizeList[{list_size}], found FixedSizeList[{col_type.list_size}]"
+        )
     arr = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
     n = len(arr)
     np_dtype = np.dtype(dtype)
@@ -303,6 +360,7 @@ __all__ = [
     "SchemaVersionError",
     "bin_coordinates",
     "build_reference_schema",
+    "canonical_dictionary_array",
     "decode_metadata",
     "encode_metadata",
     "fixed_size_list_to_numpy",

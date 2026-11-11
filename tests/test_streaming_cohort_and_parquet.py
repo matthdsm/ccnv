@@ -463,3 +463,227 @@ def test_end_to_end_reference_and_parallel_bam_predict(tmp_path: Path) -> None:
     assert Path(f"{out_prefix}_segments.bed.gz").is_file()
     assert Path(f"{out_prefix}_qc.json").is_file()
     assert not list((tmp_path / "pred").glob("*.ccnv"))
+
+
+def test_extract_for_predict_contig_naming_resolution_and_default_mapq_1(
+    tmp_path: Path,
+) -> None:
+    from ccnv._core import scan_alignment_bins as scan_core
+    from ccnv.extract import _filters_from_ref_meta
+    from ccnv.models import PredictError, ReadFilters
+    from ccnv.predict import load_inputs
+
+    # Finding #4: partial/empty ref_meta.filters defaults min_mapping_quality to 1 (ReadFilters default)
+    ref_partial_filters = ReferenceMetadata(
+        bin_size=200,
+        contig_lengths={"1": 1200, "2": 1200, "X": 800, "Y": 800},
+        branches=(BRANCH_AUTOSOMAL,),
+        filters={"exclude_duplicates": True},
+    )
+    resolved_filters = _filters_from_ref_meta(ref_partial_filters)
+    assert (
+        resolved_filters.min_mapping_quality == ReadFilters().min_mapping_quality == 1
+    )
+
+    # Build BAM with UCSC ("chr1".."chrY") header and MAPQ=5 proper pairs (1 <= MAPQ < 20)
+    ucsc_bam = tmp_path / "ucsc_mapq5.bam"
+    header = {
+        "HD": {"VN": "1.6", "SO": "coordinate"},
+        "SQ": [
+            {"SN": "chr1", "LN": 1200},
+            {"SN": "chr2", "LN": 1200},
+            {"SN": "chrX", "LN": 800},
+            {"SN": "chrY", "LN": 800},
+        ],
+    }
+    with pysam.AlignmentFile(ucsc_bam, "wb", header=header) as outf:
+        for tid in (0, 1, 2):
+            a = pysam.AlignedSegment(outf.header)
+            a.query_name = f"mq5_{tid}"
+            a.query_sequence = "ACGT" * 12 + "AC"
+            a.flag = 99
+            a.reference_id = tid
+            a.reference_start = 50
+            a.mapping_quality = 5
+            a.cigar = ((0, 50),)
+            a.next_reference_id = tid
+            a.next_reference_start = 160
+            a.template_length = 160
+            a.query_qualities = pysam.qualitystring_to_array("I" * 50)
+            outf.write(a)
+    pysam.index(str(ucsc_bam))
+
+    # Core default signature also uses min_mapq=1
+    core_default = scan_core(str(ucsc_bam), [("1", 1200)], 200)
+    assert int(np.sum(np.asarray(core_default["count"]))) == 1
+
+    # Finding #1 & #4: Ensembl ("1", "2", "X", "Y") reference resolves UCSC BAM and keeps MAPQ=5 reads
+    extracted = extract_for_predict(ucsc_bam, ref_partial_filters, threads=1)
+    assert extracted["contig_order"] == ["1", "2", "X", "Y"]
+    assert int(np.sum(np.asarray(extracted["counts"]))) == 3
+
+    # Build Ensembl ("1", "2") reference Parquet and run load_inputs against UCSC BAM
+    cohort_paths: list[Path] = []
+    for idx in range(4):
+        p = tmp_path / f"ens_{idx}.ccnv"
+        write_synthetic_sample(
+            p,
+            [35 + idx] * 12,
+            contigs=["1"] * 6 + ["2"] * 6,
+            starts=[0, 200, 400, 600, 800, 1000] * 2,
+            ends=[200, 400, 600, 800, 1000, 1200] * 2,
+            contig_lengths={"1": 1200, "2": 1200},
+            bin_size=200,
+            fragment_lengths=[[160] * (35 + idx)] * 12,
+            endpoint_counts=[4] * 12,
+        )
+        cohort_paths.append(p)
+    ens_ref_path = build_reference(
+        ReferenceConfig(
+            samples=tuple(cohort_paths),
+            prefix=tmp_path / "ens_ref",
+            bin_size=200,
+            min_cohort_size=4,
+            sex_contigs=(),
+        )
+    )
+    inputs = load_inputs(ucsc_bam, ens_ref_path, mode="germline", threads=2)
+    assert inputs.contig_lengths == {"1": 1200, "2": 1200}
+
+    # Length mismatch across chr1 <-> 1 still raises BinCompatibilityError (subclass of PredictError)
+    bad_len_meta = ReferenceMetadata(
+        bin_size=200,
+        contig_lengths={"1": 1400},
+        branches=(BRANCH_AUTOSOMAL,),
+    )
+    with pytest.raises(BinCompatibilityError, match="contig length mismatch"):
+        extract_for_predict(ucsc_bam, bad_len_meta)
+    with pytest.raises(PredictError, match="contig length mismatch"):
+        extract_for_predict(ucsc_bam, bad_len_meta)
+
+
+def test_write_reference_parquet_handles_string_and_duplicate_vocab_branch_columns(
+    tmp_path: Path,
+) -> None:
+    schema_dict = build_reference_schema(1)
+    n_rows = 4
+    meta = ReferenceMetadata(
+        bin_size=100,
+        contig_lengths={"chr1": 200, "chrX": 200},
+        branches=(BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX),
+        pca_components=1,
+    )
+    base_cols: dict[str, object] = {
+        "branch": pa.DictionaryArray.from_arrays(
+            pa.array([0, 1, 2, 2], type=pa.int8()),
+            pa.array(
+                [BRANCH_AUTOSOMAL, BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX],
+                type=pa.string(),
+            ),
+        ),
+        "contig": pa.DictionaryArray.from_arrays(
+            pa.array([0, 0, 1, 1], type=pa.int16()),
+            pa.array(["chr1", "chrX"], type=pa.string()),
+        ),
+        "start": np.array([0, 100, 0, 100], dtype=np.uint32),
+        "end": np.array([100, 200, 100, 200], dtype=np.uint32),
+        "masked": np.zeros(n_rows, dtype=np.bool_),
+        "gc": np.full(n_rows, 0.42, dtype=np.float32),
+        "mappability": np.ones(n_rows, dtype=np.float32),
+        "gc_quantiles": pa.nulls(n_rows, type=pa.list_(pa.float32(), 8)),
+        "ref_frag_len": np.full(n_rows, 166.0, dtype=np.float32),
+        "ref_ep_rate": np.full(n_rows, 0.1, dtype=np.float32),
+        "pca_mean": np.full(n_rows, 0.25, dtype=np.float32),
+        "pca_loadings": pa.FixedSizeListArray.from_arrays(
+            pa.array([0.5, -0.5, 0.7, -0.7], type=pa.float32()), 1
+        ),
+        "proto_ids": pa.FixedSizeListArray.from_arrays(
+            pa.array(np.zeros(n_rows * 4, dtype=np.uint16)), 4
+        ),
+        "proto_weights": pa.FixedSizeListArray.from_arrays(
+            pa.array(
+                np.tile(
+                    np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float16), (n_rows, 1)
+                ).ravel()
+            ),
+            4,
+        ),
+        "mean_distance": np.full(n_rows, 0.1, dtype=np.float32),
+        "null_mean": np.zeros(n_rows, dtype=np.float32),
+        "bio_dispersion": np.full(n_rows, 0.01, dtype=np.float32),
+    }
+
+    # 1. Duplicate-vocabulary DictionaryArray on "branch" writes 2 row groups (not 3)
+    dup_vocab_table = pa.table(
+        base_cols, schema=schema_dict.with_metadata(meta.build_arrow_metadata())
+    )
+    dup_out = write_reference_parquet(dup_vocab_table, tmp_path / "dup_vocab.ccnv")
+    assert pq.ParquetFile(dup_out).num_row_groups == 2
+    reloaded_dup, _ = read_reference_parquet(
+        dup_out, branches=[BRANCH_AUTOSOMAL], check_rows=True
+    )
+    assert reloaded_dup.num_rows == 2
+
+    # 2. Plain pa.string() "branch" and "contig" columns write cleanly without AssertionError
+    str_schema = (
+        schema_dict.set(0, pa.field("branch", pa.string(), nullable=False))
+        .set(1, pa.field("contig", pa.string(), nullable=False))
+        .with_metadata(meta.build_arrow_metadata())
+    )
+    str_table = pa.table(
+        {
+            **base_cols,
+            "branch": pa.array(
+                [
+                    BRANCH_AUTOSOMAL,
+                    BRANCH_AUTOSOMAL,
+                    BRANCH_FEMALE_SEX,
+                    BRANCH_FEMALE_SEX,
+                ],
+                type=pa.string(),
+            ),
+            "contig": pa.array(["chr1", "chr1", "chrX", "chrX"], type=pa.string()),
+        },
+        schema=str_schema,
+    )
+    str_out = write_reference_parquet(str_table, tmp_path / "str_branch.ccnv")
+    assert pq.ParquetFile(str_out).num_row_groups == 2
+    reloaded_str, _ = read_reference_parquet(str_out, check_rows=True)
+    assert reloaded_str.num_rows == 4
+
+    # 3. Multi-chunk DictionaryArray with reversed dictionaries across chunks merges same branch into 1 row group
+    auto_only_meta = ReferenceMetadata(
+        bin_size=100,
+        contig_lengths={"chr1": 400},
+        branches=(BRANCH_AUTOSOMAL,),
+        pca_components=1,
+    )
+    b_c0 = pa.DictionaryArray.from_arrays(
+        pa.array([0, 0], type=pa.int8()),
+        pa.array([BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX], type=pa.string()),
+    )
+    b_c1 = pa.DictionaryArray.from_arrays(
+        pa.array([1, 1], type=pa.int8()),
+        pa.array([BRANCH_FEMALE_SEX, BRANCH_AUTOSOMAL], type=pa.string()),
+    )
+    multichunk_table = pa.table(
+        {
+            **base_cols,
+            "branch": pa.chunked_array([b_c0, b_c1]),
+            "contig": pa.DictionaryArray.from_arrays(
+                pa.array([0, 0, 0, 0], type=pa.int16()),
+                pa.array(["chr1"], type=pa.string()),
+            ),
+            "start": np.array([0, 100, 200, 300], dtype=np.uint32),
+            "end": np.array([100, 200, 300, 400], dtype=np.uint32),
+        },
+        schema=schema_dict.with_metadata(auto_only_meta.build_arrow_metadata()),
+    )
+    mc_out = write_reference_parquet(multichunk_table, tmp_path / "mc_branch.ccnv")
+    assert pq.ParquetFile(mc_out).num_row_groups == 1
+
+    # 4. Malformed extracted payloads raise ExtractError (never bare AssertionError)
+    from ccnv.extract import ExtractError, extracted_to_sample_buffers
+
+    with pytest.raises(ExtractError):
+        extracted_to_sample_buffers({"sample_metadata": "invalid"})

@@ -451,15 +451,17 @@ def fit_cohort_fragmentomics_model(
 ):
     """Deconvolve cohort fragment length densities and fit FF_size regularized ensemble."""
     n_samples = len(frag_metas)
-    if n_samples == 0 or not all(m is not None and m.paired_end for m in frag_metas):
+    if n_samples == 0:
+        return None
+    valid_metas = [m for m in frag_metas if m is not None and m.paired_end]
+    if len(valid_metas) != n_samples:
         return None
 
     auto_aligned = np.zeros((n_samples, FRAG_NUM_BINS), dtype=np.float64)
     chry_aligned = np.zeros((n_samples, FRAG_NUM_BINS), dtype=np.float64)
     x_frag = np.zeros((n_samples, 36), dtype=np.float64)
 
-    for i, meta in enumerate(frag_metas):
-        assert meta is not None
+    for i, meta in enumerate(valid_metas):
         auto_aligned[i] = align_histogram(
             np.asarray(meta.hist_autosomal, dtype=np.float64),
             meta.sizing_shift_bp,

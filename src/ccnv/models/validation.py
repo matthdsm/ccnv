@@ -23,6 +23,7 @@ from ccnv.models.schemas import (
     ReferenceMetadata,
     SampleMetadata,
     build_reference_schema,
+    canonical_dictionary_array,
     decode_metadata,
 )
 
@@ -273,20 +274,8 @@ def _validate_reference_rows(
 
     bin_size, prenatal_bin_size = _resolve_target_bin_sizes(metadata)
 
-    branch_dict = (
-        pc.dictionary_encode(table.column("branch"))
-        .unify_dictionaries()
-        .combine_chunks()
-    )
-    contig_dict = (
-        pc.dictionary_encode(table.column("contig"))
-        .unify_dictionaries()
-        .combine_chunks()
-    )
-    if branch_dict.dictionary.null_count > 0:
-        raise SchemaError("column 'branch' dictionary contains null entries")
-    if contig_dict.dictionary.null_count > 0:
-        raise SchemaError("column 'contig' dictionary contains null entries")
+    branch_dict = canonical_dictionary_array(table.column("branch"), "branch")
+    contig_dict = canonical_dictionary_array(table.column("contig"), "contig")
 
     b_codes = branch_dict.indices.to_numpy(zero_copy_only=False).astype(
         np.int32, copy=False

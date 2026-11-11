@@ -652,6 +652,155 @@ class TestRustCoreIO(unittest.TestCase):
                     np.array([5_000, 10_000, 10_000], dtype=np.int64),
                 )
 
+    def test_cram_header_skips_fasta_body_and_55mb_tile_boundary_crai_dedup(
+        self,
+    ) -> None:
+        import gzip
+
+        chr1_len = 55_000_000
+        chr2_len = 10_000
+        seq_chr1 = "ACGTGCAT" * (chr1_len // 8)
+        seq_chr2 = "GCTATAGC" * (chr2_len // 8)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fa_path = _make_fasta(
+                root / "large_ref.fa",
+                {"chr1": seq_chr1, "chr2": seq_chr2},
+            )
+            header = pysam.AlignmentHeader.from_dict(
+                {
+                    "HD": {"VN": "1.6", "SO": "coordinate"},
+                    "SQ": [
+                        {"SN": "chr1", "LN": chr1_len},
+                        {"SN": "chr2", "LN": chr2_len},
+                    ],
+                }
+            )
+
+            records: list[pysam.AlignedSegment] = []
+            # 1. Tile 0 interior pair: bin 2
+            records.extend(
+                _make_proper_pair(header, "p_t0", "chr1", 10_100, 166, seq_chr1)
+            )
+            # 2. Spans 50 Mb boundary with midpoint in tile 0 (49_999_990 -> bin 9999)
+            #    and downstream mate/endpoint in tile 1 (50_000_039 -> bin 10000)
+            records.extend(
+                _make_proper_pair(
+                    header,
+                    "p_span_mid_t0",
+                    "chr1",
+                    49_999_940,
+                    100,
+                    seq_chr1,
+                    read_len=40,
+                )
+            )
+            # 3. Spans 50 Mb boundary with upstream read in tile 0 (49_999_900)
+            #    and midpoint (50_000_025 -> bin 10000) + mate (50_000_100) in tile 1
+            records.extend(
+                _make_proper_pair(
+                    header, "p_span_mid_t1", "chr1", 49_999_900, 250, seq_chr1
+                )
+            )
+            # 4. Tile 1 interior pair: bin 10400
+            records.extend(
+                _make_proper_pair(header, "p_t1", "chr1", 52_000_100, 150, seq_chr1)
+            )
+            # 5. Second contig pair
+            records.extend(
+                _make_proper_pair(header, "p_chr2", "chr2", 1_000, 140, seq_chr2)
+            )
+            records.sort(key=lambda r: (r.reference_id, r.reference_start))
+
+            bam_path = root / "boundary.bam"
+            cram_path = root / "boundary.cram"
+            with pysam.AlignmentFile(str(bam_path), "wb", header=header) as out_bam:
+                for rec in records:
+                    out_bam.write(rec)
+            pysam.index(str(bam_path))
+
+            with (
+                pysam.AlignmentFile(str(bam_path), "rb") as in_bam,
+                pysam.AlignmentFile(
+                    str(cram_path), "wc", header=header, reference_filename=str(fa_path)
+                ) as out_cram,
+            ):
+                for rec in in_bam:
+                    out_cram.write(rec)
+            pysam.index(str(cram_path))
+
+            # Finding #2: read_alignment_header validates FASTA readability without parsing FASTA records
+            header_only_placeholder = root / "unindexed_placeholder.fa"
+            header_only_placeholder.write_bytes(b"")
+            self.assertEqual(
+                read_alignment_header(str(cram_path), str(header_only_placeholder)),
+                [("chr1", chr1_len), ("chr2", chr2_len)],
+            )
+            with self.assertRaises(AlignmentError):
+                read_alignment_header(str(cram_path), str(root / "missing.fa"))
+
+            # Finding #3: inject non-adjacent duplicate container offset entries into .crai
+            crai_path = Path(f"{cram_path}.crai")
+            with gzip.open(crai_path, "rt", encoding="ascii") as gz_in:
+                crai_lines = [ln for ln in gz_in.read().splitlines() if ln.strip()]
+            self.assertGreaterEqual(len(crai_lines), 1)
+            interleaved = [*crai_lines, crai_lines[0]]
+            if len(crai_lines) == 1:
+                fields = crai_lines[0].split("\t")
+                # Add a synthetic chr2 entry between duplicate chr1 container entries
+                synth_other = "\t".join(
+                    ["1", "1", "100", fields[3], fields[4], fields[5]]
+                )
+                interleaved = [crai_lines[0], synth_other, crai_lines[0]]
+            with gzip.open(crai_path, "wt", encoding="ascii") as gz_out:
+                gz_out.write("\n".join(interleaved) + "\n")
+
+            targets = [("chr1", chr1_len), ("chr2", chr2_len)]
+            bam_t1 = scan_alignment_bins(str(bam_path), targets, 5_000, 20, True, 1)
+            bam_t2 = scan_alignment_bins(str(bam_path), targets, 5_000, 20, True, 2)
+            cram_t1 = scan_alignment_bins(
+                str(cram_path), targets, 5_000, 20, True, 1, str(fa_path)
+            )
+            cram_t2 = scan_alignment_bins(
+                str(cram_path), targets, 5_000, 20, True, 2, str(fa_path)
+            )
+
+            for key in (
+                "count",
+                "paired_count",
+                "frag_len_sum",
+                "short_frag_count",
+                "endpoint_count",
+                "frag_bands",
+                "hist_autosomal",
+                "motif_counts",
+            ):
+                expected_arr = cast(NDArray[np.generic], bam_t1[key])
+                np.testing.assert_array_equal(
+                    cast(NDArray[np.generic], bam_t2[key]), expected_arr, err_msg=key
+                )
+                np.testing.assert_array_equal(
+                    cast(NDArray[np.generic], cram_t1[key]), expected_arr, err_msg=key
+                )
+                np.testing.assert_array_equal(
+                    cast(NDArray[np.generic], cram_t2[key]), expected_arr, err_msg=key
+                )
+
+            self.assertEqual(bam_t1["qc_counts"], bam_t2["qc_counts"])
+            self.assertEqual(bam_t1["qc_counts"], cram_t1["qc_counts"])
+            self.assertEqual(bam_t1["qc_counts"], cram_t2["qc_counts"])
+
+            counts = cast(NDArray[np.uint32], cram_t2["count"])
+            endpoints = cast(NDArray[np.uint32], cram_t2["endpoint_count"])
+            self.assertEqual(int(counts.sum()), 5)
+            self.assertEqual(int(counts[9_999]), 1)
+            self.assertEqual(int(counts[10_000]), 1)
+            # Bin 9999 has upstream endpoints of p_span_mid_t0 and p_span_mid_t1 (2);
+            # Bin 10000 has downstream endpoints of both boundary-spanning pairs (2).
+            self.assertEqual(int(endpoints[9_999]), 2)
+            self.assertEqual(int(endpoints[10_000]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

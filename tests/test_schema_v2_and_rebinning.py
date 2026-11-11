@@ -738,6 +738,102 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
             with self.assertRaises(SchemaError):
                 validate_reference_table(corrupt_table)
 
+    def test_fixed_size_list_size_validation_sliced_rebinning_and_multichunk_null_dict(
+        self,
+    ) -> None:
+        from ccnv.models import bin_coordinates, fixed_size_list_to_numpy
+
+        # Finding #6: fixed_size_list_to_numpy rejects list_size mismatch and non-FixedSizeList types
+        arr_12 = pa.FixedSizeListArray.from_arrays(
+            pa.array(np.arange(24, dtype=np.uint32)), 12
+        )
+        with self.assertRaisesRegex(SchemaError, r"FixedSizeList\[24\].*\[12\]"):
+            fixed_size_list_to_numpy(arr_12, 24, np.uint32)
+        with self.assertRaisesRegex(SchemaError, r"FixedSizeList\[24\].*\[12\]"):
+            fixed_size_list_to_numpy(pa.chunked_array([arr_12]), 24, np.uint32)
+
+        # Empty (n == 0) and all-null arrays/ChunkedArrays also validate list_size and FixedSizeListType
+        empty_12 = pa.array([], type=pa.list_(pa.uint32(), 12))
+        with self.assertRaisesRegex(SchemaError, r"FixedSizeList\[24\].*\[12\]"):
+            fixed_size_list_to_numpy(empty_12, 24, np.uint32)
+        with self.assertRaisesRegex(SchemaError, r"FixedSizeList\[24\].*\[12\]"):
+            fixed_size_list_to_numpy(
+                pa.chunked_array([], type=pa.list_(pa.uint32(), 12)), 24, np.uint32
+            )
+        with self.assertRaisesRegex(SchemaError, r"FixedSizeList\[24\].*\[12\]"):
+            fixed_size_list_to_numpy(
+                pa.nulls(3, type=pa.list_(pa.uint32(), 12)), 24, np.uint32
+            )
+        with self.assertRaisesRegex(SchemaError, "FixedSizeListType"):
+            fixed_size_list_to_numpy(pa.array([], type=pa.uint32()), 24, np.uint32)
+
+        # Finding #7: zero-copy table.slice(...) nested coarsening honors FixedSizeListArray offset
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bam_path = tmp / "slice_paired.bam"
+            _write_paired_bam(bam_path, [("chr1", 100_000), ("chr2", 80_000)])
+            full_5k = extract_sample_table(
+                ExtractConfig(alignment=bam_path, prefix=tmp / "s", bin_size=5_000)
+            )
+            # chr1 has 20 bins (0..20), chr2 has 16 bins (20..36); slice chr2 with non-zero offset=20
+            chr2_meta = metadata_for(
+                ArtifactKind.SAMPLE,
+                contig_lengths={"chr2": 80_000},
+                values={
+                    "bin_size": 5_000,
+                    "contig_order": ["chr2"],
+                    "source_identity": {"path": str(bam_path)},
+                    "reference_identity": {"n_contigs": 1, "contig_order": ["chr2"]},
+                    "qc": {},
+                    "filters": asdict(ReadFilters()),
+                },
+            )
+            sliced_chr2 = full_5k.slice(20, 16).replace_schema_metadata(chr2_meta)
+            assert sliced_chr2.column("frag_bands").chunk(0).offset == 20
+            coarsened_sliced = rebin_sample_sketch(sliced_chr2, 20_000)
+            assert coarsened_sliced.num_rows == 4
+            expected_bands = fixed_size_list_to_numpy(
+                sliced_chr2.column("frag_bands"), NUM_FRAG_BANDS, np.uint32
+            )
+            actual_bands = fixed_size_list_to_numpy(
+                coarsened_sliced.column("frag_bands"), NUM_FRAG_BANDS, np.uint32
+            )
+            np.testing.assert_array_equal(
+                actual_bands.sum(axis=0), expected_bands.sum(axis=0)
+            )
+
+        # Finding #8: multi-chunk DictionaryArray with null dictionary entries raises SchemaError (not ArrowInvalid)
+        base_ref = _make_valid_reference_table(2, 0, pca_rank=1)
+        b_chunk0 = pa.DictionaryArray.from_arrays(
+            pa.array([0], type=pa.int8()),
+            pa.array([BRANCH_AUTOSOMAL, None], type=pa.string()),
+        )
+        b_chunk1 = pa.DictionaryArray.from_arrays(
+            pa.array([0], type=pa.int8()),
+            pa.array([BRANCH_AUTOSOMAL], type=pa.string()),
+        )
+        multichunk_null_branch = base_ref.set_column(
+            0, "branch", pa.chunked_array([b_chunk0, b_chunk1])
+        )
+        with self.assertRaisesRegex(SchemaError, "dictionary"):
+            validate_reference_table(multichunk_null_branch, check_rows=True)
+
+        c_chunk0 = pa.DictionaryArray.from_arrays(
+            pa.array([0], type=pa.int16()),
+            pa.array(["chr1", None], type=pa.string()),
+        )
+        c_chunk1 = pa.DictionaryArray.from_arrays(
+            pa.array([0], type=pa.int16()),
+            pa.array(["chr1"], type=pa.string()),
+        )
+        multichunk_null_contig = base_ref.set_column(
+            1, "contig", pa.chunked_array([c_chunk0, c_chunk1])
+        )
+        with self.assertRaisesRegex(SchemaError, "dictionary"):
+            validate_reference_table(multichunk_null_contig, check_rows=True)
+        with self.assertRaisesRegex(SchemaError, "dictionary"):
+            bin_coordinates(multichunk_null_contig)
+
 
 if __name__ == "__main__":
     unittest.main()

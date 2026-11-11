@@ -22,6 +22,7 @@ from ccnv.models import (
     SampleBuffers,
     SampleMetadata,
     SchemaError,
+    canonical_dictionary_array,
     decode_metadata,
     fixed_size_list_to_numpy,
     validate_reference_table,
@@ -222,6 +223,27 @@ def write_reference_parquet(
     compression_level: int = 3,
 ) -> Path:
     """Validate reference table contract and write one ZSTD Parquet row group per branch."""
+    for col_name, idx_type in (("branch", pa.int8()), ("contig", pa.int16())):
+        if col_name in table.schema.names:
+            col_idx = table.schema.get_field_index(col_name)
+            col_field = table.schema.field(col_idx)
+            if (
+                pa.types.is_string(col_field.type)
+                or pa.types.is_large_string(col_field.type)
+            ) and table.column(col_idx).null_count == 0:
+                canon = canonical_dictionary_array(
+                    table.column(col_idx), col_name, index_type=idx_type
+                )
+                table = table.set_column(
+                    col_idx,
+                    pa.field(
+                        col_name,
+                        pa.dictionary(idx_type, pa.string()),
+                        nullable=False,
+                    ),
+                    canon,
+                )
+
     validate_reference_table(table, check_rows=True)
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,8 +261,11 @@ def write_reference_parquet(
         pq.write_table(table, out_path, **writer_kwargs)
         return out_path
 
-    branch_dict = table.column("branch").combine_chunks()
-    assert isinstance(branch_dict, pa.DictionaryArray)
+    branch_idx = table.schema.get_field_index("branch")
+    branch_dict = canonical_dictionary_array(
+        table.column(branch_idx), "branch", index_type=pa.int8()
+    )
+    table = table.set_column(branch_idx, table.schema.field(branch_idx), branch_dict)
     b_codes = branch_dict.indices.to_numpy(zero_copy_only=False)
     boundaries = (np.flatnonzero(b_codes[1:] != b_codes[:-1]) + 1).tolist()
     slice_starts = [0, *boundaries]
@@ -293,31 +318,18 @@ load_cohort = read_sample_tables
 
 def decode_dictionary_contigs(contig_col: pa.ChunkedArray) -> tuple[str, ...]:
     """Decode a dictionary-encoded or string contig column into a tuple of names."""
-    combined = contig_col.combine_chunks()
-    if isinstance(combined, pa.DictionaryArray):
-        vocab = tuple(
-            str(x) for x in combined.dictionary.to_numpy(zero_copy_only=False)
-        )
-        codes = combined.indices.to_numpy(zero_copy_only=False)
-        return tuple(vocab[int(c)] for c in codes)
-    return tuple(str(x) for x in combined.to_numpy(zero_copy_only=False))
+    c_dict = canonical_dictionary_array(contig_col, "contig")
+    vocab = tuple(str(x) for x in c_dict.dictionary.to_pylist())
+    codes = c_dict.indices.to_numpy(zero_copy_only=False)
+    return tuple(vocab[int(c)] for c in codes)
 
 
 def unique_dictionary_contigs(contig_col: pa.ChunkedArray) -> list[str]:
     """Return unique contig names present in a contig column in appearance/code order."""
-    combined = contig_col.combine_chunks()
-    if isinstance(combined, pa.DictionaryArray):
-        vocab = [str(x) for x in combined.dictionary.to_numpy(zero_copy_only=False)]
-        codes = combined.indices.to_numpy(zero_copy_only=False)
-        seen: list[str] = []
-        seen_set: set[str] = set()
-        for c in np.unique(codes):
-            name = vocab[int(c)]
-            if name not in seen_set:
-                seen_set.add(name)
-                seen.append(name)
-        return seen
-    return list(dict.fromkeys(str(x) for x in combined.to_numpy(zero_copy_only=False)))
+    c_dict = canonical_dictionary_array(contig_col, "contig")
+    vocab = [str(x) for x in c_dict.dictionary.to_pylist()]
+    codes = c_dict.indices.to_numpy(zero_copy_only=False)
+    return [vocab[int(c)] for c in np.unique(codes)]
 
 
 def extract_sample_meta_and_counts(
@@ -439,7 +451,10 @@ def extract_reference_branch_arrays(
 
     ld_col = ref_b.column("pca_loadings")
     ld_type = ld_col.type
-    assert isinstance(ld_type, pa.FixedSizeListType)
+    if not isinstance(ld_type, pa.FixedSizeListType):
+        raise SchemaError(
+            f"expected FixedSizeListType for 'pca_loadings', found {ld_type}"
+        )
     p_max = ld_type.list_size
     p_branch = (
         resolved_meta.branch_pca_ranks.get(branch, p_max)

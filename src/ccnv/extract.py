@@ -24,6 +24,7 @@ from ccnv.models import (
     SAMPLE_SCHEMA,
     AlignmentError,
     ArtifactKind,
+    BinCompatibilityError,
     ExtractConfig,
     ExtractError,
     FragmentomicsMetadata,
@@ -34,6 +35,7 @@ from ccnv.models import (
     SampleMetadata,
     metadata_for,
     parquet_path,
+    resolve_contig_name,
     select_layout,
 )
 from ccnv.qc.sample import build_sample_qc
@@ -146,7 +148,8 @@ def _scan_to_extracted(
 def extracted_to_sample_buffers(extracted: Mapping[str, object]) -> SampleBuffers:
     """Wrap extracted scan arrays and metadata directly without building a PyArrow Table."""
     meta = extracted["sample_metadata"]
-    assert isinstance(meta, SampleMetadata)
+    if not isinstance(meta, SampleMetadata):
+        raise ExtractError("extracted payload missing SampleMetadata")
     raw_bands = extracted.get("frag_bands")
     bands = (
         np.asarray(raw_bands, dtype=np.uint32)
@@ -180,20 +183,28 @@ def extracted_to_sample_table(extracted: Mapping[str, object]) -> pa.Table:
         frag_bands_col = pa.nulls(n_bins, type=pa.list_(pa.uint32(), NUM_FRAG_BANDS))
 
     contig_order_raw = extracted["contig_order"]
-    assert isinstance(contig_order_raw, list)
+    if not isinstance(contig_order_raw, Sequence) or isinstance(
+        contig_order_raw, (str, bytes)
+    ):
+        raise ExtractError("extracted 'contig_order' must be a sequence")
     contig_order = [str(x) for x in contig_order_raw]
     contig_lengths_raw = extracted["contig_lengths"]
-    assert isinstance(contig_lengths_raw, Mapping)
+    if not isinstance(contig_lengths_raw, Mapping):
+        raise ExtractError("extracted 'contig_lengths' must be a mapping")
     contig_lengths = {str(k): int(v) for k, v in contig_lengths_raw.items()}
     resolved_alignment = extracted["resolved_alignment"]
-    assert isinstance(resolved_alignment, Path)
+    if not isinstance(resolved_alignment, Path):
+        raise ExtractError("extracted 'resolved_alignment' must be a Path")
     resolved_fasta = extracted.get("resolved_fasta")
     filters = extracted["filters"]
-    assert isinstance(filters, ReadFilters)
+    if not isinstance(filters, ReadFilters):
+        raise ExtractError("extracted 'filters' must be ReadFilters")
     qc = extracted["qc"]
-    assert isinstance(qc, Mapping)
+    if not isinstance(qc, Mapping):
+        raise ExtractError("extracted 'qc' must be a mapping")
     meta_frag = extracted["fragmentomics"]
-    assert isinstance(meta_frag, FragmentomicsMetadata)
+    if not isinstance(meta_frag, FragmentomicsMetadata):
+        raise ExtractError("extracted 'fragmentomics' must be FragmentomicsMetadata")
 
     ref_id: dict[str, object] = {
         "n_contigs": len(contig_order),
@@ -240,23 +251,30 @@ def extracted_to_sample_table(extracted: Mapping[str, object]) -> pa.Table:
 
 
 def _filters_from_ref_meta(ref_meta: ReferenceMetadata) -> ReadFilters:
+    defaults = ReadFilters()
     raw = ref_meta.filters
     if not isinstance(raw, Mapping):
-        return ReadFilters()
+        return defaults
 
     def _bool(key: str, default: bool) -> bool:
         v = raw.get(key)
         return v if isinstance(v, bool) else default
 
     mq = raw.get("min_mapping_quality")
-    min_mq = int(mq) if isinstance(mq, int) and not isinstance(mq, bool) else 20
+    min_mq = (
+        int(mq)
+        if isinstance(mq, int) and not isinstance(mq, bool) and mq >= 0
+        else defaults.min_mapping_quality
+    )
     return ReadFilters(
         min_mapping_quality=min_mq,
-        exclude_duplicates=_bool("exclude_duplicates", True),
-        exclude_secondary=_bool("exclude_secondary", True),
-        exclude_supplementary=_bool("exclude_supplementary", True),
-        exclude_unmapped=_bool("exclude_unmapped", True),
-        require_proper_pair=_bool("require_proper_pair", True),
+        exclude_duplicates=_bool("exclude_duplicates", defaults.exclude_duplicates),
+        exclude_secondary=_bool("exclude_secondary", defaults.exclude_secondary),
+        exclude_supplementary=_bool(
+            "exclude_supplementary", defaults.exclude_supplementary
+        ),
+        exclude_unmapped=_bool("exclude_unmapped", defaults.exclude_unmapped),
+        require_proper_pair=_bool("require_proper_pair", defaults.require_proper_pair),
     )
 
 
@@ -285,11 +303,12 @@ def extract_for_predict(
 
     selected: list[tuple[str, int]] = []
     for name, expected_len in ref_meta.contig_lengths.items():
-        actual_len = header_map.get(name)
-        if actual_len is None:
+        resolved = resolve_contig_name(name, header_map)
+        if resolved is None:
             continue
+        actual_len = header_map[resolved]
         if actual_len != expected_len:
-            raise PredictError(f"contig length mismatch for {name!r}")
+            raise BinCompatibilityError(f"contig length mismatch for {name!r}")
         selected.append((name, expected_len))
     if not selected:
         raise PredictError(

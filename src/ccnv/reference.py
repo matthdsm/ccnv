@@ -51,6 +51,7 @@ from ccnv.models import (
     ReferenceConfig,
     ReferenceError,
     SamplesheetEntry,
+    SchemaError,
     build_reference_schema,
     fixed_size_list_to_numpy,
     metadata_for,
@@ -94,7 +95,8 @@ def run(config: ReferenceConfig) -> Path:
             config, entries=tuple(SamplesheetEntry(filepath=p) for p in config.samples)
         )
     if config.fasta is not None:
-        assert config.bin_size is not None
+        if config.bin_size is None:
+            raise ReferenceError("--fasta requires --binsize")
         contigs = read_fasta_contigs(config.fasta, all_contigs=config.all_contigs)
         cohort = cohort_from_fasta(
             contigs,
@@ -162,7 +164,10 @@ def _unify_branch_table(
 
     ld_col = table.column("pca_loadings").combine_chunks()
     ld_type = ld_col.type
-    assert isinstance(ld_type, pa.FixedSizeListType)
+    if not isinstance(ld_type, pa.FixedSizeListType):
+        raise SchemaError(
+            f"expected FixedSizeListType for 'pca_loadings', found {ld_type}"
+        )
     p_branch = ld_type.list_size
     if p_max == 0:
         padded_ld: pa.Array = pa.nulls(n_rows, type=pa.list_(pa.float32(), 0))
@@ -216,9 +221,8 @@ def build_reference_table(
     cohort_map: NDArray[np.float64] | None = None
     cohort_gc_q: NDArray[np.float32] | None = None
     try:
-        if config.gc is not None or config.fasta is not None:
-            gc_src = config.gc if config.gc is not None else config.fasta
-            assert gc_src is not None
+        gc_src = config.gc if config.gc is not None else config.fasta
+        if gc_src is not None:
             cohort_gc, cohort_n_mask = load_gc_track(
                 gc_src, cohort.contigs, cohort.starts, cohort.ends
             )
@@ -310,7 +314,8 @@ def build_reference_table(
         ).size >= config.min_sex_group_size:
             _add_branch(BRANCH_MALE_SEX, male_indices, sex_contigs)
     if config.mode == "prenatal":
-        assert prenatal_auto is not None and prenatal_ffy is not None
+        if prenatal_auto is None or prenatal_ffy is None:
+            raise ReferenceError("prenatal branch models were not initialized")
         for branch_name, branch_table in [
             (BRANCH_PRENATAL_AUTOSOMAL, prenatal_auto),
             (BRANCH_PRENATAL_FFY, prenatal_ffy),
@@ -322,7 +327,10 @@ def build_reference_table(
     p_max = 0
     for bt in branch_tables:
         lt = bt.schema.field("pca_loadings").type
-        assert isinstance(lt, pa.FixedSizeListType)
+        if not isinstance(lt, pa.FixedSizeListType):
+            raise SchemaError(
+                f"expected FixedSizeListType for 'pca_loadings', found {lt}"
+            )
         p_max = max(p_max, lt.list_size)
 
     all_contigs_vocab = list(cohort.contig_lengths.keys())

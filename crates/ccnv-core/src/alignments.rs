@@ -48,6 +48,23 @@ fn detect_alignment_kind(path: &Path) -> Result<AlignmentKind, String> {
     }
 }
 
+fn validate_cram_fasta_path<'a>(
+    cram_path: &Path,
+    fasta_path: Option<&'a Path>,
+) -> Result<&'a Path, String> {
+    let fa = fasta_path.ok_or_else(|| {
+        format!(
+            "{} is CRAM and requires a reference FASTA; pass --fasta /path/to/reference.fa",
+            cram_path.display()
+        )
+    })?;
+    if !fa.is_file() {
+        return Err(format!("CRAM reference FASTA not found: {}", fa.display()));
+    }
+    File::open(fa).map_err(|e| format!("failed to open FASTA {}: {e}", fa.display()))?;
+    Ok(fa)
+}
+
 fn build_fasta_repository(fasta_path: &Path) -> Result<fasta::Repository, String> {
     if !fasta_path.is_file() {
         return Err(format!(
@@ -78,7 +95,7 @@ fn read_sam_header(
     path: &Path,
     kind: AlignmentKind,
     fasta_path: Option<&Path>,
-) -> Result<(sam::Header, Option<fasta::Repository>), String> {
+) -> Result<sam::Header, String> {
     if !path.is_file() {
         return Err(format!("alignment not found: {}", path.display()));
     }
@@ -90,24 +107,17 @@ fn read_sam_header(
             let header = reader
                 .read_header()
                 .map_err(|e| format!("failed to read BAM header {}: {e}", path.display()))?;
-            Ok((header, None))
+            Ok(header)
         }
         AlignmentKind::Cram => {
-            let fa = fasta_path.ok_or_else(|| {
-                format!(
-                    "{} is CRAM and requires a reference FASTA; pass --fasta /path/to/reference.fa",
-                    path.display()
-                )
-            })?;
-            let repo = build_fasta_repository(fa)?;
+            let _fa = validate_cram_fasta_path(path, fasta_path)?;
             let mut reader = cram::io::reader::Builder::default()
-                .set_reference_sequence_repository(repo.clone())
                 .build_from_path(path)
                 .map_err(|e| format!("failed to open CRAM {}: {e}", path.display()))?;
             let header = reader
                 .read_header()
                 .map_err(|e| format!("failed to read CRAM header {}: {e}", path.display()))?;
-            Ok((header, Some(repo)))
+            Ok(header)
         }
     }
 }
@@ -415,6 +425,8 @@ fn scan_tiled_cram(
                             container_offsets.push(entry.offset());
                         }
                     }
+                    container_offsets.sort_unstable();
+                    container_offsets.dedup();
 
                     let mut acc = TileAccumulator::new(
                         tile.tile_idx,
@@ -493,7 +505,7 @@ pub(crate) fn read_alignment_header(
     let fa = fasta_path.map(PathBuf::from);
     let result = py.detach(|| -> Result<Vec<(String, usize)>, String> {
         let kind = detect_alignment_kind(&p)?;
-        let (header, _) = read_sam_header(&p, kind, fa.as_deref())?;
+        let header = read_sam_header(&p, kind, fa.as_deref())?;
         let mut contigs = Vec::with_capacity(header.reference_sequences().len());
         for (name, map) in header.reference_sequences() {
             contigs.push((name.to_string(), usize::from(map.length())));
@@ -508,9 +520,9 @@ pub(crate) fn read_alignment_header(
     path,
     contigs,
     bin_size,
-    min_mapq,
-    require_proper_pair,
-    threads,
+    min_mapq=1,
+    require_proper_pair=true,
+    threads=1,
     fasta_path=None,
     collect_bands=true,
     se_fragment_length=0,
@@ -561,7 +573,7 @@ pub(crate) fn scan_alignment_bins<'py>(
     let output = py
         .detach(|| -> Result<GlobalScanOutput, String> {
             let kind = detect_alignment_kind(&p)?;
-            let (header, repo_opt) = read_sam_header(&p, kind, fa.as_deref())?;
+            let header = read_sam_header(&p, kind, fa.as_deref())?;
             let header_names: Vec<String> = header
                 .reference_sequences()
                 .keys()
@@ -600,33 +612,41 @@ pub(crate) fn scan_alignment_bins<'py>(
                 total_bins += n_bins;
             }
 
-            match (kind, threads) {
-                (AlignmentKind::Bam, 1) => {
-                    scan_sequential_bam(&p, &ref_to_target, &targets, total_bins, bin_size, filters)
+            match kind {
+                AlignmentKind::Bam => {
+                    if threads == 1 {
+                        scan_sequential_bam(
+                            &p,
+                            &ref_to_target,
+                            &targets,
+                            total_bins,
+                            bin_size,
+                            filters,
+                        )
+                    } else {
+                        scan_tiled_bam(&p, &targets, total_bins, bin_size, threads, filters)
+                    }
                 }
-                (AlignmentKind::Bam, t) => {
-                    scan_tiled_bam(&p, &targets, total_bins, bin_size, t, filters)
+                AlignmentKind::Cram => {
+                    let fa_path = validate_cram_fasta_path(&p, fa.as_deref())?;
+                    let repo = build_fasta_repository(fa_path)?;
+                    if threads == 1 {
+                        scan_sequential_cram(
+                            &p,
+                            &header,
+                            repo,
+                            &ref_to_target,
+                            &targets,
+                            total_bins,
+                            bin_size,
+                            filters,
+                        )
+                    } else {
+                        scan_tiled_cram(
+                            &p, &header, repo, &targets, total_bins, bin_size, threads, filters,
+                        )
+                    }
                 }
-                (AlignmentKind::Cram, 1) => scan_sequential_cram(
-                    &p,
-                    &header,
-                    repo_opt.expect("CRAM repository initialized"),
-                    &ref_to_target,
-                    &targets,
-                    total_bins,
-                    bin_size,
-                    filters,
-                ),
-                (AlignmentKind::Cram, t) => scan_tiled_cram(
-                    &p,
-                    &header,
-                    repo_opt.expect("CRAM repository initialized"),
-                    &targets,
-                    total_bins,
-                    bin_size,
-                    t,
-                    filters,
-                ),
             }
         })
         .map_err(alignment_error)?;

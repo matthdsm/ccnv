@@ -78,7 +78,8 @@ def load_samplesheet(path: Path | str) -> tuple[SamplesheetEntry, ...]:
             f"{samplesheet_path}: schema violation at {loc}: {error.message}"
         ) from error
 
-    assert isinstance(raw_data, list)
+    if not isinstance(raw_data, list):
+        raise ReferenceError(f"{samplesheet_path}: samplesheet root must be a list")
 
     samplesheet_dir = samplesheet_path.parent.resolve()
     seen_paths: set[Path] = set()

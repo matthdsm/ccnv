@@ -19,6 +19,7 @@ from ccnv.models import (
     BinCompatibilityError,
     SampleBuffers,
     SampleMetadata,
+    fixed_size_list_to_numpy,
     validate_sample_table,
 )
 
@@ -81,21 +82,10 @@ def _coarsen_nested_sketch(
             n_dst, type=pa.list_(pa.uint32(), NUM_FRAG_BANDS)
         )
     else:
-        combined_bands = raw_bands_col.combine_chunks()
-        flat_vals = (
-            pc.fill_null(combined_bands.values, 0)
-            if combined_bands.values.null_count > 0
-            else combined_bands.values
-        )
-        bands_2d = flat_vals.to_numpy(zero_copy_only=False).reshape(
-            table.num_rows, NUM_FRAG_BANDS
-        )
-        if combined_bands.null_count > 0:
-            bands_2d = bands_2d.copy()
-            bands_2d[combined_bands.is_null().to_numpy(zero_copy_only=False)] = 0
-        dst_bands = np.add.reduceat(
-            bands_2d.astype(np.uint64, copy=False), reduce_idx, axis=0
-        ).astype(np.uint32)
+        bands_2d = fixed_size_list_to_numpy(
+            raw_bands_col, NUM_FRAG_BANDS, np.uint32
+        ).astype(np.uint64)
+        dst_bands = np.add.reduceat(bands_2d, reduce_idx, axis=0).astype(np.uint32)
         bands_col = pa.FixedSizeListArray.from_arrays(
             pa.array(dst_bands.ravel(), type=pa.uint32()),
             NUM_FRAG_BANDS,
