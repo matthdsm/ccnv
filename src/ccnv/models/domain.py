@@ -1,5 +1,7 @@
 """Core genomic and domain entities for ccnv."""
 
+from __future__ import annotations
+
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -28,51 +30,6 @@ class SamplesheetEntry:
 
 
 @dataclass(frozen=True, slots=True)
-class Contig:
-    """A contig exactly as declared by an alignment header."""
-
-    name: str
-    length: int
-    role: str | None = None
-
-    def __post_init__(self) -> None:
-        """Validate contig name and length invariants."""
-        if not self.name:
-            raise ValueError("contig name must not be empty")
-        if self.length <= 0:
-            raise ValueError("contig length must be positive")
-
-
-@dataclass(frozen=True, slots=True)
-class GenomeProfile:
-    """Ordered contigs and optional biological roles for one genome."""
-
-    contigs: tuple[Contig, ...]
-
-    def __post_init__(self) -> None:
-        """Validate non-empty and unique contigs."""
-        names = [contig.name for contig in self.contigs]
-        if not names:
-            raise ValueError("genome profile must contain at least one contig")
-        if len(names) != len(set(names)):
-            raise ValueError("contig names must be unique")
-
-    @property
-    def names(self) -> tuple[str, ...]:
-        """Ordered contig names."""
-        return tuple(contig.name for contig in self.contigs)
-
-    @property
-    def lengths(self) -> tuple[int, ...]:
-        """Ordered contig lengths in base pairs."""
-        return tuple(contig.length for contig in self.contigs)
-
-    def length_map(self) -> dict[str, int]:
-        """Mapping from contig name to length in base pairs."""
-        return {contig.name: contig.length for contig in self.contigs}
-
-
-@dataclass(frozen=True, slots=True)
 class Cytoband:
     """A cytogenetic band interval in 0-based half-open coordinates."""
 
@@ -91,26 +48,40 @@ def normalize_chr(name: str) -> str:
 
 
 def is_autosome_name(name: str) -> bool:
-    """Return True if contig is a canonical numbered autosome (1..22)."""
+    """Return True if contig is a canonical numbered autosome (>= 1)."""
 
     stripped = normalize_chr(name)
-    return stripped.isdigit() and 1 <= int(stripped) <= 22
+    return stripped.isascii() and stripped.isdigit() and int(stripped) >= 1
 
 
-def resolve_contig_name(contig: str, available: Iterable[str]) -> str | None:
-    """Resolve contig name against available keys with chr-prefix and case fallback."""
+@dataclass(frozen=True, slots=True)
+class ContigLookup:
+    """Pre-indexed contig resolver handling chr-prefix and case-insensitive matching."""
 
-    avail_set = set(available)
-    if contig in avail_set:
-        return contig
-    stripped = normalize_chr(contig)
-    if stripped in avail_set:
-        return stripped
-    prefixed = f"chr{stripped}"
-    if prefixed in avail_set:
-        return prefixed
-    lower_map = {normalize_chr(k).lower(): k for k in available}
-    return lower_map.get(stripped.lower())
+    exact: frozenset[str]
+    lower_normalized: dict[str, str]
+
+    @classmethod
+    def from_names(cls, available: Iterable[str]) -> ContigLookup:
+        """Build O(1) lookup tables from an iterable of available contig names."""
+        names = tuple(dict.fromkeys(available))
+        lower_map: dict[str, str] = {}
+        for name in names:
+            key = normalize_chr(name).lower()
+            lower_map.setdefault(key, name)
+        return cls(exact=frozenset(names), lower_normalized=lower_map)
+
+    def resolve(self, contig: str) -> str | None:
+        """Resolve a contig name against the indexed contig vocabulary."""
+        if contig in self.exact:
+            return contig
+        stripped = normalize_chr(contig)
+        if stripped in self.exact:
+            return stripped
+        prefixed = f"chr{stripped}"
+        if prefixed in self.exact:
+            return prefixed
+        return self.lower_normalized.get(stripped.lower())
 
 
 def is_canonical_contig(name: str) -> bool:
@@ -135,35 +106,37 @@ def natural_sort_key(name: str) -> tuple[tuple[int, int | str], ...]:
 
 
 def select_layout(
-    names: Sequence[str],
-    lengths: Sequence[int],
+    entries: Sequence[tuple[str, int]],
     *,
-    all_contigs: bool,
-) -> tuple[Contig, ...]:
-    """Keep canonical chromosomes unless ``all_contigs`` is set.
+    all_contigs: bool = False,
+) -> list[tuple[str, int]]:
+    """Keep canonical chromosomes from ordered ``(name, length)`` header pairs unless ``all_contigs`` is set."""
 
-    The result may be empty; callers decide how to report that. Header
-    names and lengths must already be aligned.
-    """
-
-    if len(names) != len(lengths):
-        raise ValueError("contig names and lengths must have equal length")
-    return tuple(
-        Contig(name, length)
-        for name, length in zip(names, lengths, strict=True)
-        if all_contigs or is_canonical_contig(name)
-    )
+    selected: list[tuple[str, int]] = []
+    for entry in entries:
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            raise TypeError("header entries must be (name, length) pairs")
+        contig_name, contig_len = entry
+        if not isinstance(contig_name, str) or not contig_name:
+            raise ValueError("contig name must not be empty")
+        if (
+            not isinstance(contig_len, int)
+            or isinstance(contig_len, bool)
+            or contig_len <= 0
+        ):
+            raise ValueError("contig length must be positive")
+        if all_contigs or is_canonical_contig(contig_name):
+            selected.append((contig_name, int(contig_len)))
+    return selected
 
 
 __all__ = [
-    "Contig",
+    "ContigLookup",
     "Cytoband",
-    "GenomeProfile",
     "SamplesheetEntry",
     "is_autosome_name",
     "is_canonical_contig",
     "natural_sort_key",
     "normalize_chr",
-    "resolve_contig_name",
     "select_layout",
 ]

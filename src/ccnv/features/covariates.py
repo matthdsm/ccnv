@@ -1,29 +1,23 @@
-"""Genomic covariate masking, feature assembly, and multiplicative bias correction."""
+"""Genomic covariate masking and standardized exogenous feature extraction."""
 
 from __future__ import annotations
 
 import math
-from typing import Final
 
 import numpy as np
-import scipy.stats
 from numpy.typing import NDArray
 
 from ccnv.models import (
     DEFAULT_MIN_MAPPABILITY,
     CovariateError,
 )
-from ccnv.stats.regression import apply_1d_correction, build_joint_covariate_basis
+from ccnv.stats import standardize_column
 
 __all__ = [
-    "DEFAULT_MIN_MAPPABILITY",
-    "correct_covariate_bias",
     "covariate_features",
     "mask_covariates",
     "validate_min_mappability",
 ]
-
-_MIN_VARIANCE_STD: Final[float] = 1e-6
 
 
 def validate_min_mappability(min_mappability: float) -> None:
@@ -61,86 +55,26 @@ def mask_covariates(
     return out
 
 
-def correct_covariate_bias(
-    normalized: NDArray[np.floating],
-    usable: NDArray[np.bool_],
-    gc: NDArray[np.floating] | None = None,
-    mappability: NDArray[np.floating] | None = None,
-    *,
-    mean_frag_len: NDArray[np.floating] | None = None,
-    endpoint_ratio: NDArray[np.floating] | None = None,
-) -> NDArray[np.float64]:
-    """Remove per-sample multiplicative GC, mappability, and fragmentomic trends on usable bins."""
-    data = np.asarray(normalized, dtype=np.float64)
-    mask = np.asarray(usable, dtype=np.bool_)
-    if data.ndim not in (1, 2):
-        raise CovariateError("normalized coverage array must be 1D or 2D")
-    n_usable = int(np.count_nonzero(mask))
-    if n_usable < 4 or (
-        gc is None
-        and mappability is None
-        and mean_frag_len is None
-        and endpoint_ratio is None
-    ):
-        return data.copy()
-
-    gc_sub = np.asarray(gc, dtype=np.float64)[mask] if gc is not None else None
-    map_sub = (
-        np.asarray(mappability, dtype=np.float64)[mask]
-        if mappability is not None
-        else None
-    )
-    len_sub = (
-        np.asarray(mean_frag_len, dtype=np.float64)[mask]
-        if mean_frag_len is not None
-        else None
-    )
-    ep_sub = (
-        np.asarray(endpoint_ratio, dtype=np.float64)[mask]
-        if endpoint_ratio is not None
-        else None
-    )
-    joint_design = build_joint_covariate_basis(
-        gc_sub,
-        map_sub,
-        mean_frag_len=len_sub,
-        endpoint_ratio=ep_sub,
-    )
-    if joint_design is None:
-        return data.copy()
-
-    out = data.copy()
-    sub = out[mask]
-    sub = apply_1d_correction(sub, joint_design)
-    out[mask] = sub
-    return out
-
-
 def covariate_features(
     usable: NDArray[np.bool_],
     gc: NDArray[np.floating] | None = None,
     mappability: NDArray[np.floating] | None = None,
-    mean_frag_len: NDArray[np.floating] | None = None,
-    endpoint_ratio: NDArray[np.floating] | None = None,
+    ref_frag_len: NDArray[np.floating] | None = None,
+    ref_ep_rate: NDArray[np.floating] | None = None,
 ) -> NDArray[np.float64] | None:
-    """Return standardized (GC, mappability, fragmentomics) feature matrix for unmasked bins."""
+    """Return standardized exogenous feature matrix for unmasked bins."""
     mask = np.asarray(usable, dtype=np.bool_)
-    n_usable = int(np.count_nonzero(mask))
-    if n_usable == 0:
+    if int(np.count_nonzero(mask)) == 0:
         return None
 
     features: list[NDArray[np.float64]] = []
-    for arr in (gc, mappability, mean_frag_len, endpoint_ratio):
+    for arr in (gc, mappability, ref_frag_len, ref_ep_rate):
         if arr is None:
             continue
         sub = np.asarray(arr, dtype=np.float64)[mask]
-        if not np.all(np.isfinite(sub)):
-            continue
-        std = float(np.std(sub))
-        if std > _MIN_VARIANCE_STD:
-            features.append(
-                np.asarray(scipy.stats.zscore(sub, ddof=0), dtype=np.float64)
-            )
+        z_col = standardize_column(sub)
+        if z_col is not None:
+            features.append(z_col)
 
     if not features:
         return None

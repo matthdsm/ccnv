@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=75"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "ccnv"
@@ -27,24 +27,26 @@ dependencies = [
     "polars>=2,<3",
     "polars-runtime-compat",
     "pyarrow",
-    "pybigwig",
-    "pysam",
     "pyyaml>=6.0",
-    "ruptures",
+    "ruptures>=1.1.10",
     "scikit-learn",
     "scipy",
     "typer",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pybigwig",
+    "pysam",
+]
+
 [project.scripts]
 ccnv = "ccnv.cli:app"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-"ccnv.io" = ["*.schema.json"]
-"ccnv.report.templates" = ["*.html.j2"]
+[tool.maturin]
+module-name = "ccnv._core"
+python-source = "src"
+features = ["pyo3/abi3-py314"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge", "bioconda"]
@@ -55,11 +57,7 @@ numpy = "*"
 polars = ">=2,<3"
 polars-runtime-compat = "*"
 pyarrow = "*"
-pybigwig = "*"
-pysam = "*"
 python = "3.14.*"
-ruptures = "*"
-samtools = "*"
 scikit-learn = "*"
 scipy = "*"
 typer = "*"
@@ -67,16 +65,24 @@ jinja2 = ">=3.1.6,<4"
 gcc = ">=16.2.0,<16.3"
 pyyaml = ">=6.0"
 jsonschema = ">=4.20.0"
+rust = "*"
+maturin = ">=1.8,<2.0"
 
 [tool.pixi.pypi-dependencies]
 ccnv = { path = ".", editable = true }
 
 [tool.pixi.feature.dev.dependencies]
 prek = "*"
+pybigwig = "*"
+pysam = "*"
 pytest = "*"
 ruff = "*"
+samtools = "*"
 pip = ">=26.2.1"
 python-build = ">=1.5.0,<2"
+
+[tool.pixi.feature.dev.pypi-dependencies]
+ccnv = { path = ".", editable = true, extras = ["dev"] }
 
 [tool.pixi.feature.docs.dependencies]
 zensical = "*"

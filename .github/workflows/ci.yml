@@ -35,6 +35,7 @@ jobs:
       - run: pixi run lint
       - run: pixi run test
       - run: pixi run hooks
+      - run: pixi run docs-build
 
   docker:
     needs: checks
@@ -82,7 +83,20 @@ jobs:
   wheel:
     needs: checks
     if: github.event_name == 'release'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            sdist: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            sdist: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            sdist: false
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     steps:
@@ -91,8 +105,12 @@ jobs:
         with:
           cache: true
           frozen: true
-      - run: pixi run python -m build --wheel
-      - name: Attach wheel to release
+      - name: Build wheel
+        run: pixi run maturin build --release --target ${{ matrix.target }} --out dist
+      - name: Build sdist
+        if: matrix.sdist
+        run: pixi run maturin sdist --out dist
+      - name: Attach artifacts to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/*.whl
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber

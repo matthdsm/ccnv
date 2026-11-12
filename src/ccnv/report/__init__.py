@@ -1,8 +1,12 @@
 """Downstream deliverables and visualization for ccnv."""
 
+from __future__ import annotations
+
 import logging
 from collections.abc import Sequence
 from pathlib import Path
+
+import polars as pl
 
 from ccnv.models import (
     AnalysisMode,
@@ -13,30 +17,36 @@ from ccnv.models import (
     SegmentResult,
     natural_sort_key,
 )
+from ccnv.report._common import (
+    bin_chunk_to_dataframe,
+    segments_to_dataframe,
+    sort_segments_dataframe,
+)
 from ccnv.report.bed import (
     BINS_BED_HEADER,
     CALLS_BED_HEADER,
     PRENATAL_CALLS_BED_HEADER,
     PRENATAL_SEGMENTS_BED_HEADER,
     SEGMENTS_BED_HEADER,
-    bin_bed_rows,
-    calls_bed_rows,
-    segment_bed_rows,
+    BinResults,
     sort_bin_result,
     sort_bin_results,
     sort_segments,
-    write_compressed_bed,
+    write_bins_bed_streaming,
+    write_segments_bed_streaming,
 )
 from ccnv.report.html import (
+    DEFAULT_MAX_PLOT_BINS,
     PLOTLY_CDN_URL,
+    decimate_bins_m4,
     encode_b64,
     render_genome_plot,
-    write_genome_plot,
 )
 from ccnv.report.vcf import (
     build_vcf_header,
     write_bins_vcf,
     write_segments_vcf,
+    write_vcf_streaming,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,23 +54,30 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "BINS_BED_HEADER",
     "CALLS_BED_HEADER",
+    "DEFAULT_MAX_PLOT_BINS",
     "PLOTLY_CDN_URL",
     "PRENATAL_CALLS_BED_HEADER",
     "PRENATAL_SEGMENTS_BED_HEADER",
     "SEGMENTS_BED_HEADER",
+    "BinResults",
     "PredictionOutputs",
+    "bin_chunk_to_dataframe",
     "build_vcf_header",
+    "decimate_bins_m4",
     "encode_b64",
     "natural_sort_key",
     "render_genome_plot",
+    "segments_to_dataframe",
     "sort_bin_result",
     "sort_bin_results",
     "sort_segments",
+    "sort_segments_dataframe",
+    "write_bins_bed_streaming",
     "write_bins_vcf",
-    "write_compressed_bed",
-    "write_genome_plot",
     "write_outputs",
+    "write_segments_bed_streaming",
     "write_segments_vcf",
+    "write_vcf_streaming",
 ]
 
 
@@ -72,6 +89,8 @@ def write_outputs(
     plot: bool,
     vcf: bool = True,
     *,
+    bins_vcf: bool = False,
+    threads: int = 1,
     cytobands: Sequence[Cytoband] | None = None,
     z_threshold: float = 3.0,
     ratio_threshold: float | None = None,
@@ -79,7 +98,7 @@ def write_outputs(
     mode: AnalysisMode = "germline",
     qc_json_path: Path | None = None,
 ) -> PredictionOutputs:
-    """Write compressed BED evidence, VCFs, and an interactive HTML plot."""
+    """Write compressed BED evidence, optional VCFs, and an interactive HTML plot."""
     prefix.parent.mkdir(parents=True, exist_ok=True)
     bins = sort_bin_results(bins)
     segments = sort_segments(segments)
@@ -88,48 +107,61 @@ def write_outputs(
     calls_bed = Path(f"{prefix}_calls.bed.gz")
     plot_path = Path(f"{prefix}_plot.html") if plot else None
     sample_name = prefix.name if prefix.name else "SAMPLE"
-    calls = [item for item in segments if item.call is not None]
     total_bins = sum(b.starts.size for b in bins)
     is_prenatal = mode == "prenatal"
-    seg_header = PRENATAL_SEGMENTS_BED_HEADER if is_prenatal else SEGMENTS_BED_HEADER
-    call_header = PRENATAL_CALLS_BED_HEADER if is_prenatal else CALLS_BED_HEADER
+
+    seg_df = segments_to_dataframe(segments, is_prenatal=is_prenatal)
+    calls_df = seg_df.filter(pl.col("call").is_not_null())
 
     logger.debug(
         "writing prediction outputs to prefix %s "
-        "(%d bins, %d segments, %d calls, mode=%s)",
+        "(%d bins, %d segments, %d calls, mode=%s, threads=%d)",
         prefix,
         total_bins,
         len(segments),
-        len(calls),
+        calls_df.height,
         mode,
+        threads,
     )
-    write_compressed_bed(bins_bed, BINS_BED_HEADER, bin_bed_rows(bins))
-    write_compressed_bed(
-        segments_bed, seg_header, segment_bed_rows(segments, is_prenatal=is_prenatal)
+    write_bins_bed_streaming(
+        bins_bed, bins, contig_lengths=contig_lengths, threads=threads
     )
-    write_compressed_bed(
+    write_segments_bed_streaming(
+        segments_bed,
+        calls_only=False,
+        is_prenatal=is_prenatal,
+        contig_lengths=contig_lengths,
+        threads=threads,
+        segments_df=seg_df,
+    )
+    write_segments_bed_streaming(
         calls_bed,
-        call_header,
-        calls_bed_rows(calls, is_prenatal=is_prenatal),
+        calls_only=True,
+        is_prenatal=is_prenatal,
+        contig_lengths=contig_lengths,
+        threads=threads,
+        segments_df=calls_df,
     )
-    bins_vcf: Path | None = None
-    segments_vcf: Path | None = None
-    calls_vcf: Path | None = None
+
+    bins_vcf_path: Path | None = None
+    segments_vcf_path: Path | None = None
+    calls_vcf_path: Path | None = None
     if vcf:
-        bins_vcf = Path(f"{prefix}_bins.vcf.gz")
-        segments_vcf = Path(f"{prefix}_segments.vcf.gz")
-        calls_vcf = Path(f"{prefix}_calls.vcf.gz")
-        write_bins_vcf(
-            bins_vcf,
-            build_vcf_header(
-                contig_lengths,
+        if bins_vcf:
+            bins_vcf_path = Path(f"{prefix}_bins.vcf.gz")
+            write_bins_vcf(
+                bins_vcf_path,
+                build_vcf_header(
+                    contig_lengths,
+                    sample_name,
+                    "bins",
+                    extra_contigs=(c for r in bins for c in dict.fromkeys(r.contigs)),
+                ),
+                bins,
                 sample_name,
-                "bins",
-                extra_contigs=(c for r in bins for c in r.contigs),
-            ),
-            bins,
-            sample_name,
-        )
+                contig_lengths=contig_lengths,
+                threads=threads,
+            )
         seg_header_vcf = build_vcf_header(
             contig_lengths,
             sample_name,
@@ -137,21 +169,30 @@ def write_outputs(
             extra_contigs=(s.contig for s in segments),
             prenatal_result=prenatal_result if is_prenatal else None,
         )
+        segments_vcf_path = Path(f"{prefix}_segments.vcf.gz")
+        calls_vcf_path = Path(f"{prefix}_calls.vcf.gz")
         write_segments_vcf(
-            segments_vcf,
+            segments_vcf_path,
             seg_header_vcf,
             segments,
             sample_name,
             is_prenatal=is_prenatal,
+            contig_lengths=contig_lengths,
+            threads=threads,
+            segments_df=seg_df,
         )
         write_segments_vcf(
-            calls_vcf,
+            calls_vcf_path,
             seg_header_vcf,
-            segments,
+            (),
             sample_name,
             calls_only=True,
             is_prenatal=is_prenatal,
+            contig_lengths=contig_lengths,
+            threads=threads,
+            segments_df=calls_df,
         )
+
     logger.debug(
         "wrote %s, %s, %s",
         bins_bed.name,
@@ -175,9 +216,9 @@ def write_outputs(
         segments_bed=segments_bed,
         calls_bed=calls_bed,
         plot_html=plot_path,
-        bins_vcf=bins_vcf,
-        segments_vcf=segments_vcf,
-        calls_vcf=calls_vcf,
+        bins_vcf=bins_vcf_path,
+        segments_vcf=segments_vcf_path,
+        calls_vcf=calls_vcf_path,
         bins=bins,
         segments=segments,
         qc_json_path=qc_json_path,

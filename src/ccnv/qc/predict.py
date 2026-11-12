@@ -2,23 +2,21 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pyarrow as pa
 
-from ccnv.features.fragmentomics import extract_sample_fragmentomics
 from ccnv.models import (
     SCHEMA_VERSION,
     AnalysisMode,
+    BinResult,
     FetalFractionResult,
+    SampleBuffers,
     SegmentResult,
-    decode_metadata,
 )
-from ccnv.qc.sample import sanitize_qc_payload
+from ccnv.qc.sample import write_qc_json
 
 __all__ = [
     "build_predict_qc_payload",
@@ -26,49 +24,77 @@ __all__ = [
 ]
 
 
+def _int_metric(
+    mapping: Mapping[str, object],
+    key: str,
+    *,
+    fallback_key: str | None = None,
+) -> int:
+    val = mapping.get(key) if key in mapping else None
+    if val is None and fallback_key is not None:
+        val = mapping.get(fallback_key)
+    if isinstance(val, (int, float, np.integer, np.floating)) and not isinstance(
+        val, bool
+    ):
+        return int(val)
+    return 0
+
+
 def build_predict_qc_payload(
     mode: AnalysisMode,
-    sample_table: pa.Table,
+    sample_table: SampleBuffers | pa.Table,
     segments: Sequence[SegmentResult],
     prenatal_result: FetalFractionResult | None = None,
+    bin_results: Sequence[BinResult] | None = None,
 ) -> dict[str, object]:
     """Construct structured QC metrics for a prediction invocation."""
-    sample_meta = decode_metadata(sample_table.schema.metadata)
-    qc_meta_raw = sample_meta.get("qc")
-    qc_meta: Mapping[str, Any] = qc_meta_raw if isinstance(qc_meta_raw, Mapping) else {}
+    bufs = SampleBuffers.coerce(sample_table)
+    qc_meta: Mapping[str, object] = bufs.meta.qc or {}
+    counts = np.asarray(bufs.count, dtype=np.float64)
+    source_identity: object = bufs.meta.source_identity
+    frag_meta = bufs.meta.fragmentomics
 
-    counts = (
-        sample_table.column("count").to_numpy(zero_copy_only=False).astype(np.float64)
-    )
-    total_bins = int(counts.size)
-    usable_bins = int(np.count_nonzero(counts > 0))
-    masked_bins = total_bins - usable_bins
-    mean_bin_count = float(np.mean(counts)) if total_bins > 0 else 0.0
-    median_bin_count = float(np.median(counts)) if total_bins > 0 else 0.0
+    if bin_results is not None and len(bin_results) > 0:
+        total_bins = sum(int(b.masked.size) for b in bin_results)
+        usable_bins = sum(int(np.count_nonzero(~b.masked)) for b in bin_results)
+        masked_bins = total_bins - usable_bins
+        usable_zs = [b.zscores[~b.masked] for b in bin_results if np.any(~b.masked)]
+        if usable_zs:
+            concat_z = np.concatenate(usable_zs)
+            finite_z = concat_z[np.isfinite(concat_z)]
+            lambda_gc: float | None = (
+                float(np.median(finite_z**2) / 0.4549364231195728)
+                if finite_z.size > 0
+                else 1.0
+            )
+        else:
+            lambda_gc = 1.0
+    else:
+        total_bins = int(counts.size)
+        usable_bins = int(np.count_nonzero(counts > 0))
+        masked_bins = total_bins - usable_bins
+        lambda_gc = None
 
-    effective_reads_examined = int(
-        qc_meta.get(
-            "effective_reads_examined",
-            qc_meta.get("reads_seen", 0),
-        )
+    mean_bin_count = float(np.mean(counts)) if counts.size > 0 else 0.0
+    median_bin_count = float(np.median(counts)) if counts.size > 0 else 0.0
+
+    effective_reads_examined = _int_metric(
+        qc_meta, "effective_reads_examined", fallback_key="reads_seen"
     )
-    effective_reads_kept = int(
-        qc_meta.get(
-            "effective_reads_kept",
-            qc_meta.get("reads_kept", 0),
-        )
+    effective_reads_kept = _int_metric(
+        qc_meta, "effective_reads_kept", fallback_key="reads_kept"
     )
-    autosomal_reads_kept = int(qc_meta.get("autosomal_reads_kept", 0))
-    sex_reads_kept = int(qc_meta.get("sex_reads_kept", 0))
+    autosomal_reads_kept = _int_metric(qc_meta, "autosomal_reads_kept")
+    sex_reads_kept = _int_metric(qc_meta, "sex_reads_kept")
 
     filter_drops = {
-        "unmapped": int(qc_meta.get("filter_unmapped", 0)),
-        "mapq": int(qc_meta.get("filter_mapq", 0)),
-        "duplicate": int(qc_meta.get("filter_duplicate", 0)),
-        "secondary": int(qc_meta.get("filter_secondary", 0)),
-        "supplementary": int(qc_meta.get("filter_supplementary", 0)),
-        "improper_pair": int(qc_meta.get("filter_improper_pair", 0)),
-        "no_start": int(qc_meta.get("filter_no_start", 0)),
+        "unmapped": _int_metric(qc_meta, "filter_unmapped"),
+        "mapq": _int_metric(qc_meta, "filter_mapq"),
+        "duplicate": _int_metric(qc_meta, "filter_duplicate"),
+        "secondary": _int_metric(qc_meta, "filter_secondary"),
+        "supplementary": _int_metric(qc_meta, "filter_supplementary"),
+        "improper_pair": _int_metric(qc_meta, "filter_improper_pair"),
+        "no_start": _int_metric(qc_meta, "filter_no_start"),
     }
 
     read_metrics: dict[str, object] = {
@@ -82,9 +108,9 @@ def build_predict_qc_payload(
         "masked_bins": masked_bins,
         "mean_bin_count": mean_bin_count,
         "median_bin_count": median_bin_count,
+        "lambda_gc": lambda_gc,
     }
 
-    source_identity = sample_meta.get("source_identity")
     sample_name = "SAMPLE"
     if isinstance(source_identity, Mapping):
         sample_path = source_identity.get("path")
@@ -107,9 +133,25 @@ def build_predict_qc_payload(
 
     prenatal_data: dict[str, object] | None = None
     if mode == "prenatal" and prenatal_result is not None:
+        origin_counts: dict[str, int] = {}
+        for s in segments:
+            if s.origin_call:
+                origin_counts[s.origin_call] = origin_counts.get(s.origin_call, 0) + 1
+
+        eff_ff = (
+            float(prenatal_result.effective_ff)
+            if prenatal_result.effective_ff is not None
+            else float(prenatal_result.active_ff)
+        )
         prenatal_data = {
             "fetal_sex": prenatal_result.fetal_sex,
             "active_ff": float(prenatal_result.active_ff),
+            "effective_ff": eff_ff,
+            "active_ff_se": (
+                float(prenatal_result.active_ff_se)
+                if prenatal_result.active_ff_se is not None
+                else None
+            ),
             "active_ff_source": prenatal_result.active_ff_source,
             "ffy": (
                 float(prenatal_result.ffy) if prenatal_result.ffy is not None else None
@@ -137,9 +179,19 @@ def build_predict_qc_payload(
             },
             "low_ff_warning": bool(prenatal_result.low_ff_warning),
             "warnings": list(prenatal_result.warnings),
+            "origin_summary": origin_counts,
+            "lod_ff_35mb": (
+                float(prenatal_result.lod_metrics.lod_ff_35mb)
+                if prenatal_result.lod_metrics is not None
+                else None
+            ),
+            "lod_ff_3mb": (
+                float(prenatal_result.lod_metrics.lod_ff_3mb)
+                if prenatal_result.lod_metrics is not None
+                else None
+            ),
         }
 
-    frag_meta = extract_sample_fragmentomics(sample_meta)
     frag_data: dict[str, object] | None = None
     if frag_meta is not None:
         frag_data = {
@@ -170,10 +222,5 @@ def build_predict_qc_payload(
 
 
 def write_predict_qc_json(path: Path | str, payload: Mapping[str, object]) -> Path:
-    """Write formatted predict QC metrics to a JSON file."""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    sanitized = sanitize_qc_payload(dict(payload))
-    with open(target, "w", encoding="utf-8") as handle:
-        json.dump(sanitized, handle, indent=2)
-    return target
+    """Atomically write formatted predict QC metrics to a JSON file."""
+    return write_qc_json(path, payload)

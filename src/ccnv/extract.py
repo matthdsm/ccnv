@@ -1,401 +1,265 @@
-"""Stream BAM/CRAM alignments into canonical sample Parquet bins."""
+"""Stream BAM/CRAM alignments into compact Schema v2.0.0 sample sketch Parquet."""
 
 from __future__ import annotations
 
-import json
 import logging
-from collections.abc import Iterator, Sequence
-from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
 import numpy as np
 import pyarrow as pa
-import pysam
 
-from ccnv.features.binning import bin_contig_fragments, bin_intervals
 from ccnv.io.alignments import (
-    alignment_format,
-    ensure_index,
-    open_alignment,
-    stream_contig_fragments,
+    ScanAlignmentResult,
+    read_alignment_header,
+    scan_alignment_bins,
+    validate_alignment_inputs,
 )
 from ccnv.io.parquet import write_sample_parquet
 from ccnv.models import (
-    FRAGMENTOMICS_METADATA_KEY,
-    SAMPLE_SCHEMA,
-    ArtifactKind,
+    BinCompatibilityError,
+    ContigLookup,
     ExtractConfig,
     ExtractError,
-    GenomeProfile,
+    FragmentomicsMetadata,
+    PredictError,
     ReadFilters,
-    metadata_for,
-    normalize_chr,
+    ReferenceMetadata,
+    SampleBuffers,
+    SampleMetadata,
+    SchemaError,
     parquet_path,
     select_layout,
 )
-from ccnv.qc.sample import build_sample_qc, empty_qc
-from ccnv.stats.fragmentomics import (
-    FRAG_MAX_LEN,
-    FRAG_MIN_LEN,
-    FRAG_NUM_BINS,
-    estimate_sample_landmarks,
-)
+from ccnv.qc.sample import build_sample_qc
+from ccnv.stats.fragmentomics import estimate_sample_landmarks
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "ExtractError",
-    "bin_contig_with_handle",
+    "extract_for_predict",
     "extract_sample_table",
     "run",
     "run_extract",
-    "split_thread_budget",
 ]
 
 
-@dataclass(frozen=True, slots=True)
-class _ContigTask:
-    path: Path
-    fmt: str
-    fasta: Path | None
-    name: str
-    length: int
-    bin_size: int
-    filters: ReadFilters
-    decode_threads: int = 1
-    min_frag_len: int = 30
-    max_frag_len: int = 600
-
-
-@dataclass(slots=True)
-class _ContigBinResult:
-    counts: np.ndarray
-    frag_arr: pa.Array
-    ep_counts: np.ndarray
-    gc_sums: np.ndarray
-    qc: dict[str, int]
-    hist: np.ndarray
-    motifs: np.ndarray
-    is_paired: bool
-
-
-_WORKER_HANDLES: dict[tuple[str, str, str | None, int], pysam.AlignmentFile] = {}
-
-
-def split_thread_budget(budget: int, n_tasks: int) -> tuple[int, int]:
-    """Split CPU budget into process workers and per-handle htslib threads."""
-    if budget <= 0 or n_tasks <= 0:
-        raise ValueError("thread budget and n_tasks must be positive integers")
-    if budget == 1 or n_tasks == 1:
-        return 1, budget
-    workers = min(n_tasks, max(1, budget // (2 if budget >= 4 else 1)))
-    return workers, max(1, budget // workers)
-
-
-def _worker_handle(task: _ContigTask) -> pysam.AlignmentFile:
-    """Retrieve or open a cached per-process AlignmentFile handle."""
-    key = (
-        str(task.path),
-        task.fmt,
-        str(task.fasta) if task.fasta else None,
-        task.decode_threads,
+def _scan_to_buffers(
+    scan: ScanAlignmentResult,
+    selected: Sequence[tuple[str, int]],
+    *,
+    bin_size: int,
+    fmt: str,
+    resolved_alignment: Path,
+    resolved_fasta: Path | None,
+    filters: ReadFilters,
+) -> SampleBuffers:
+    paired_end = bool(scan["paired_end"])
+    raw_bands = scan["frag_bands"]
+    bands_arr = (
+        np.asarray(raw_bands, dtype=np.uint32)
+        if paired_end and raw_bands is not None
+        else None
     )
-    if key not in _WORKER_HANDLES:
-        _WORKER_HANDLES[key] = open_alignment(
-            task.path, task.fmt, task.fasta, threads=task.decode_threads
-        )
-    return _WORKER_HANDLES[key]
-
-
-def _bin_contig(
-    task: _ContigTask,
-) -> _ContigBinResult:
-    """Bin reads for a contig task using a cached worker alignment handle."""
-    return bin_contig_with_handle(_worker_handle(task), task)
-
-
-def bin_contig_with_handle(
-    handle: pysam.AlignmentFile, task: _ContigTask
-) -> _ContigBinResult:
-    """Stream and bin reads for a contig using an open alignment handle."""
-    starts, _ = bin_intervals(task.length, task.bin_size)
-    qc = empty_qc()
-    m_list: list[int] = []
-    s_list: list[int] = []
-    e_list: list[int] = []
-    l_list: list[int] = []
-    gc_list: list[float] = []
-    contig_hist = np.zeros(FRAG_NUM_BINS, dtype=np.int64)
-    contig_motifs = np.zeros(256, dtype=np.int64)
-    paired_detected = False
-
-    for m, s, e, length, gc_frac, motif, is_paired in stream_contig_fragments(
-        handle,
-        task.name,
-        task.filters,
-        contig_length=task.length,
-        min_frag_len=task.min_frag_len,
-        max_frag_len=task.max_frag_len,
-        qc=qc,
-    ):
-        m_list.append(m)
-        s_list.append(s)
-        e_list.append(e)
-        l_list.append(length)
-        gc_list.append(gc_frac)
-        if is_paired:
-            paired_detected = True
-            if FRAG_MIN_LEN <= length <= FRAG_MAX_LEN:
-                contig_hist[length - FRAG_MIN_LEN] += 1
-        if motif >= 0:
-            contig_motifs[motif] += 1
-
-    counts, frag_arr, ep_counts, gc_sums = bin_contig_fragments(
-        np.array(m_list, dtype=np.int64),
-        np.array(s_list, dtype=np.int64),
-        np.array(e_list, dtype=np.int64),
-        np.array(l_list, dtype=np.uint16),
-        np.array(gc_list, dtype=np.float32),
-        is_paired=paired_detected,
-        n_bins=starts.size,
-        bin_size=task.bin_size,
+    qc = build_sample_qc(
+        {str(k): int(v) for k, v in scan["qc_counts"].items() if isinstance(v, int)}
     )
-    return _ContigBinResult(
-        counts=counts,
-        frag_arr=frag_arr,
-        ep_counts=ep_counts,
-        gc_sums=gc_sums,
-        qc=qc,
-        hist=contig_hist,
-        motifs=contig_motifs,
-        is_paired=paired_detected,
+    hist_auto = np.asarray(scan["hist_autosomal"], dtype=np.int64)
+    hist_chry = np.asarray(scan["hist_chry"], dtype=np.int64)
+    hist_chrx = np.asarray(scan["hist_chrx"], dtype=np.int64)
+    motifs = np.asarray(scan["motif_counts"], dtype=np.int64)
+    landmarks = estimate_sample_landmarks(
+        hist_autosomal=hist_auto,
+        end_motif_counts=motifs,
+        paired_end=paired_end,
+    )
+    meta_frag = FragmentomicsMetadata(
+        paired_end=landmarks.paired_end,
+        total_paired_fragments=landmarks.total_paired_fragments,
+        chromatosome_mode_bp=landmarks.chromatosome_mode_bp,
+        core_shoulder_bp=landmarks.core_shoulder_bp,
+        sizing_shift_bp=landmarks.sizing_shift_bp,
+        self_referenced_peak_ratio=landmarks.self_referenced_peak_ratio,
+        dinucleosome_fraction=landmarks.dinucleosome_fraction,
+        high_mw_fraction=landmarks.high_mw_fraction,
+        helical_10bp_amplitude=landmarks.helical_10bp_amplitude,
+        helical_10bp_phase=landmarks.helical_10bp_phase,
+        motif_diversity_score=landmarks.motif_diversity_score,
+        hist_autosomal=hist_auto.tolist(),
+        hist_chry=hist_chry.tolist(),
+        hist_chrx=hist_chrx.tolist(),
+        end_motif_counts=motifs.tolist(),
+    )
+    contig_order = [name for name, _ in selected]
+    contig_lengths = dict(selected)
+    source_id: dict[str, object] = {
+        "path": str(resolved_alignment.resolve()),
+        "format": fmt,
+    }
+    ref_id: dict[str, object] = {
+        "n_contigs": len(contig_order),
+        "contig_order": contig_order,
+        **(
+            {"fasta": str(resolved_fasta.resolve())}
+            if resolved_fasta is not None
+            else {}
+        ),
+    }
+    sample_meta = SampleMetadata(
+        bin_size=bin_size,
+        contig_order=tuple(contig_order),
+        contig_lengths=contig_lengths,
+        source_identity=source_id,
+        reference_identity=ref_id,
+        qc=dict(qc),
+        filters=filters.to_dict(),
+        fragmentomics=meta_frag,
+    )
+    return SampleBuffers(
+        meta=sample_meta,
+        count=np.asarray(scan["count"], dtype=np.uint32),
+        paired_count=np.asarray(scan["paired_count"], dtype=np.uint32),
+        frag_len_sum=np.asarray(scan["frag_len_sum"], dtype=np.uint64),
+        short_frag_count=np.asarray(scan["short_frag_count"], dtype=np.uint32),
+        endpoint_count=np.asarray(scan["endpoint_count"], dtype=np.uint32),
+        frag_gc_sum=np.asarray(scan["frag_gc_sum"], dtype=np.float32),
+        frag_bands=bands_arr,
     )
 
 
-@contextmanager
-def _binned_contigs(
-    tasks: Sequence[_ContigTask], workers: int, handle: pysam.AlignmentFile
-) -> Iterator[Iterator[_ContigBinResult]]:
-    """Yield an iterator of binned contig counts across single-process or worker pool."""
-    if workers <= 1 or len(tasks) < 2:
-        yield (bin_contig_with_handle(handle, task) for task in tasks)
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            yield pool.map(_bin_contig, tasks)
-
-
-def extract_sample_table(
-    config: ExtractConfig,
-) -> tuple[pa.Table, dict[str, object]]:
-    """Extract sample table and QC metadata in memory from one BAM/CRAM."""
-    alignment = config.alignment.expanduser()
-    if not alignment.is_file():
-        raise ExtractError(f"alignment not found: {alignment}")
-
-    fmt = alignment_format(alignment)
-    logger.debug("opening alignment %s as %s", alignment, fmt)
-    bam = open_alignment(alignment, fmt, config.fasta)
-
+def extract_for_predict(
+    alignment: Path,
+    ref_meta: ReferenceMetadata,
+    *,
+    threads: int = 1,
+    fasta: Path | None = None,
+    collect_bands: bool = False,
+) -> SampleBuffers:
+    """Stream BAM/CRAM directly into reference-aligned SampleBuffers via ccnv._core."""
     try:
-        if bam.has_index():
-            logger.debug("%s already has an index", alignment)
-        bam = ensure_index(alignment, fmt, bam, config.fasta, threads=1)
-        header_names = list(bam.references)
-        header_lengths = [int(length) for length in bam.lengths]
-        if not header_names or any(length <= 0 for length in header_lengths):
-            raise ExtractError(f"{alignment} header declares invalid contigs")
-        layout = select_layout(
-            header_names, header_lengths, all_contigs=config.all_contigs
+        fmt, resolved_alignment, resolved_fasta = validate_alignment_inputs(
+            alignment, fasta
         )
-        if not layout:
-            msg = (
-                f"{alignment} header declares no canonical chromosomes; "
-                "pass --all-contigs to bin every contig"
+        header = read_alignment_header(resolved_alignment, resolved_fasta)
+    except (ExtractError, ValueError, OSError) as err:
+        raise PredictError(f"failed to read sample {alignment}: {err}") from err
+
+    if not header or any(length <= 0 for _, length in header):
+        raise PredictError(f"{resolved_alignment} header declares invalid contigs")
+    if len(dict(header)) != len(header):
+        raise PredictError(f"{resolved_alignment} header declares duplicate contigs")
+
+    lookup = ContigLookup.from_names(ref_meta.contig_lengths.keys())
+    seen_ref_contigs: set[str] = set()
+    selected: list[tuple[str, int]] = []
+    for header_name, actual_len in header:
+        ref_name = lookup.resolve(header_name)
+        if ref_name is None:
+            continue
+        if ref_name in seen_ref_contigs:
+            raise PredictError(
+                f"{resolved_alignment} header maps multiple contigs to {ref_name!r}"
             )
-            raise ExtractError(msg)
-        profile = GenomeProfile(layout)
-        workers, decode_threads = split_thread_budget(config.threads, len(layout))
-        if workers <= 1 and decode_threads > 1:
-            bam.close()
-            bam = open_alignment(alignment, fmt, config.fasta, threads=decode_threads)
-
-        qc = empty_qc()
-        qc["header_mapped"], qc["header_unmapped"], qc["header_no_coordinate"] = (
-            int(bam.mapped),
-            int(bam.unmapped),
-            int(bam.nocoordinate),
+        seen_ref_contigs.add(ref_name)
+        expected_len = ref_meta.contig_lengths[ref_name]
+        if actual_len != expected_len:
+            raise BinCompatibilityError(f"contig length mismatch for {ref_name!r}")
+        selected.append((ref_name, expected_len))
+    if not selected:
+        raise PredictError(
+            f"{resolved_alignment} declares none of the reference contigs"
         )
-        logger.debug(
-            "read filters: min_mapping_quality=%d, exclude_duplicates=%s, "
-            "exclude_secondary=%s, exclude_supplementary=%s, require_proper_pair=%s",
-            config.filters.min_mapping_quality,
-            config.filters.exclude_duplicates,
-            config.filters.exclude_secondary,
-            config.filters.exclude_supplementary,
-            config.filters.require_proper_pair,
+
+    filters = ReadFilters.from_dict(ref_meta.filters or {}, strict=False)
+    try:
+        scan = scan_alignment_bins(
+            resolved_alignment,
+            selected,
+            ref_meta.bin_size,
+            filters,
+            threads=threads,
+            fasta=resolved_fasta,
+            collect_bands=collect_bands,
         )
-        tasks = [
-            _ContigTask(
-                alignment,
-                fmt,
-                config.fasta,
-                contig.name,
-                contig.length,
-                config.bin_size,
-                config.filters,
-                decode_threads,
-                config.min_frag_len,
-                config.max_frag_len,
-            )
-            for contig in layout
-        ]
-        contig_arrays = []
-        start_arrays = []
-        end_arrays = []
-        count_arrays = []
-        frag_arrays = []
-        ep_arrays = []
-        gc_arrays = []
+    except (ExtractError, ValueError, OSError) as err:
+        raise PredictError(f"failed to stream alignment {alignment}: {err}") from err
 
-        hist_autosomal = np.zeros(FRAG_NUM_BINS, dtype=np.int64)
-        hist_chry = np.zeros(FRAG_NUM_BINS, dtype=np.int64)
-        hist_chrx = np.zeros(FRAG_NUM_BINS, dtype=np.int64)
-        global_motifs = np.zeros(256, dtype=np.int64)
-        any_paired = False
+    return _scan_to_buffers(
+        scan,
+        selected,
+        bin_size=ref_meta.bin_size,
+        fmt=fmt,
+        resolved_alignment=resolved_alignment,
+        resolved_fasta=resolved_fasta,
+        filters=filters,
+    )
 
-        with _binned_contigs(tasks, workers, bam) as results:
-            for task, res in zip(tasks, results, strict=True):
-                for counter, value in res.qc.items():
-                    qc[counter] += value
-                norm_chr = normalize_chr(task.name)
-                key = (
-                    "sex_reads_kept"
-                    if norm_chr in {"X", "Y"}
-                    else "autosomal_reads_kept"
-                    if norm_chr.isdigit()
-                    else None
-                )
-                if key:
-                    qc[key] += res.qc["reads_kept"]
 
-                if norm_chr.isdigit():
-                    hist_autosomal += res.hist
-                elif norm_chr == "Y":
-                    hist_chry += res.hist
-                elif norm_chr == "X":
-                    hist_chrx += res.hist
-                global_motifs += res.motifs
-                if res.is_paired:
-                    any_paired = True
+def extract_sample_table(config: ExtractConfig) -> pa.Table:
+    """Extract a Schema v2.0.0 sample sketch table in memory from one BAM or CRAM."""
+    fmt, resolved_alignment, resolved_fasta = validate_alignment_inputs(
+        config.alignment, config.fasta
+    )
+    logger.debug("opening alignment %s as %s", resolved_alignment, fmt)
 
-                starts, ends = bin_intervals(task.length, config.bin_size)
-                logger.debug(
-                    "binned contig %s (%d bp): %d bins, %d reads kept",
-                    task.name,
-                    task.length,
-                    starts.size,
-                    res.qc["reads_kept"],
-                )
-                logger.debug(
-                    "contig %s filter drops: %d unmapped, %d low_mapq, "
-                    "%d duplicates, %d secondary, %d supplementary",
-                    task.name,
-                    res.qc["filter_unmapped"],
-                    res.qc["filter_mapq"],
-                    res.qc["filter_duplicate"],
-                    res.qc["filter_secondary"],
-                    res.qc["filter_supplementary"],
-                )
-                contig_arrays.append(np.full(starts.size, task.name, dtype=object))
-                start_arrays.append(starts)
-                end_arrays.append(ends)
-                count_arrays.append(res.counts)
-                frag_arrays.append(res.frag_arr)
-                ep_arrays.append(res.ep_counts)
-                gc_arrays.append(res.gc_sums)
-    finally:
-        bam.close()
+    header = read_alignment_header(resolved_alignment, resolved_fasta)
+    if not header or any(length <= 0 for _, length in header):
+        raise ExtractError(f"{resolved_alignment} header declares invalid contigs")
 
-    qc = build_sample_qc(qc)
+    selected = select_layout(header, all_contigs=config.all_contigs)
+    if not selected:
+        raise ExtractError(
+            f"{resolved_alignment} header declares no canonical chromosomes; "
+            "pass --all-contigs to bin every contig"
+        )
+    if len(dict(selected)) != len(selected):
+        raise ExtractError(f"{resolved_alignment} header declares duplicate contigs")
+
+    scan = scan_alignment_bins(
+        resolved_alignment,
+        selected,
+        config.bin_size,
+        config.filters,
+        threads=config.threads,
+        fasta=resolved_fasta,
+        collect_bands=True,
+    )
+    buffers = _scan_to_buffers(
+        scan,
+        selected,
+        bin_size=config.bin_size,
+        fmt=fmt,
+        resolved_alignment=resolved_alignment,
+        resolved_fasta=resolved_fasta,
+        filters=config.filters,
+    )
+    qc = buffers.meta.qc
     logger.debug(
-        "extract QC summary: %d reads examined, %d kept (%.1f%%), %d duplicate, "
-        "%d low_mapq, %d unmapped",
-        qc["reads_seen"],
-        qc["reads_kept"],
-        (qc["reads_kept"] / qc["reads_seen"] * 100) if qc["reads_seen"] else 0.0,
-        qc["filter_duplicate"],
-        qc["filter_mapq"],
-        qc["filter_unmapped"],
+        "extract QC summary: %s reads seen, %s kept, %s mate_dedup_skipped, %s filtered",
+        qc.get("reads_seen"),
+        qc.get("reads_kept"),
+        qc.get("mate_dedup_skipped"),
+        qc.get("reads_filtered"),
     )
-    ref_id = {
-        "n_contigs": len(profile.names),
-        "contig_order": list(profile.names),
-        **({"fasta": str(config.fasta.expanduser().resolve())} if config.fasta else {}),
-    }
-
-    meta_frag = estimate_sample_landmarks(
-        hist_autosomal=hist_autosomal,
-        hist_chry=hist_chry,
-        hist_chrx=hist_chrx,
-        end_motif_counts=global_motifs,
-        paired_end=any_paired,
-    )
-
-    metadata = metadata_for(
-        ArtifactKind.SAMPLE,
-        contig_lengths=profile.length_map(),
-        values={
-            "bin_size": config.bin_size,
-            "source_identity": {"path": str(alignment.resolve()), "format": fmt},
-            "reference_identity": ref_id,
-            "qc": dict(qc),
-            "filters": dict(asdict(config.filters)),
-        },
-    )
-    metadata[FRAGMENTOMICS_METADATA_KEY] = json.dumps(asdict(meta_frag)).encode("utf-8")
-
-    columns = {
-        "contig": pa.array(
-            np.concatenate(contig_arrays) if contig_arrays else [], type=pa.string()
-        ),
-        "start": pa.array(
-            np.concatenate(start_arrays) if start_arrays else [], type=pa.int64()
-        ),
-        "end": pa.array(
-            np.concatenate(end_arrays) if end_arrays else [], type=pa.int64()
-        ),
-        "count": pa.array(
-            np.concatenate(count_arrays) if count_arrays else [], type=pa.uint64()
-        ),
-        "fragment_lengths": (
-            pa.concat_arrays(frag_arrays)
-            if frag_arrays
-            else pa.array([], type=pa.list_(pa.uint16()))
-        ),
-        "endpoint_count": pa.array(
-            np.concatenate(ep_arrays) if ep_arrays else [], type=pa.uint32()
-        ),
-        "frag_gc_sum": pa.array(
-            np.concatenate(gc_arrays) if gc_arrays else [], type=pa.float32()
-        ),
-    }
-    table = pa.table(columns, schema=SAMPLE_SCHEMA.with_metadata(metadata))
-    return table, qc
+    return buffers.to_table()
 
 
 def run(config: ExtractConfig) -> None:
     """Extract binned counts from one BAM/CRAM into canonical sample Parquet."""
-    table, _ = extract_sample_table(config)
+    table = extract_sample_table(config)
     output = parquet_path(config.prefix)
     logger.debug("writing sample parquet %s (%d bins)", output, table.num_rows)
-    write_sample_parquet(table, output)
+    try:
+        write_sample_parquet(table, output)
+        size_kb = output.stat().st_size / 1024
+    except (SchemaError, OSError, pa.ArrowException) as err:
+        raise ExtractError(f"failed to write sample parquet {output}: {err}") from err
     logger.debug(
         "wrote sample parquet %s (%.1f KB)",
         output,
-        output.stat().st_size / 1024,
+        size_kb,
     )
 
 
