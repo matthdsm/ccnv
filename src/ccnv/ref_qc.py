@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-
 import pyarrow as pa
 
 from ccnv.io.parquet import read_reference_parquet
@@ -14,8 +12,6 @@ from ccnv.models import (
     SchemaError,
 )
 from ccnv.qc.reference import run_reference_qc_on_table
-
-logger = logging.getLogger(__name__)
 
 __all__ = ["ReferenceQCError", "run_reference_qc"]
 
@@ -31,14 +27,19 @@ def run_reference_qc(config: ReferenceQCConfig) -> ReferenceQCOutputs:
         raise ReferenceQCError(f"reference file not found: {ref_path}")
 
     try:
-        table = read_reference_parquet(ref_path)
-    except (OSError, pa.ArrowInvalid, SchemaError) as error:
+        table, _ = read_reference_parquet(ref_path, check_rows=True)
+    except (OSError, pa.ArrowInvalid, pa.ArrowException, SchemaError) as error:
         raise ReferenceQCError(f"failed to read {ref_path}: {error}") from error
 
-    return run_reference_qc_on_table(
-        table,
-        prefix=out_prefix,
-        reference_path=ref_path,
-        write_json=True,
-        emit_stderr=True,
-    )
+    try:
+        return run_reference_qc_on_table(
+            table,
+            prefix=out_prefix,
+            reference_path=ref_path,
+            write_json=True,
+            emit_stderr=True,
+        )
+    except OSError as error:
+        raise ReferenceQCError(
+            f"failed to write QC report for {out_prefix}: {error}"
+        ) from error

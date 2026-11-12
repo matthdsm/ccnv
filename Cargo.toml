@@ -1,0 +1,18 @@
+[package]
+name = "ccnv-core"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "_core"
+path = "crates/ccnv-core/src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+bigtools = { version = "0.5", default-features = false, features = ["read"] }
+noodles = { version = "0.119", features = ["bam", "bgzf", "core", "cram", "csi", "fasta", "sam", "tabix"] }
+numpy = "0.30"
+pyo3 = { version = "0.30", features = ["extension-module"] }
+rayon = "1.12"

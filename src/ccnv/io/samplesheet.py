@@ -1,75 +1,37 @@
 """Cohort samplesheet validation and parsing."""
 
+from __future__ import annotations
+
 import functools
 import importlib.resources
 import json
+import math
 from pathlib import Path
-from typing import Any
 
 import jsonschema
-import pyarrow as pa
-import pyarrow.parquet as pq
 import yaml
 
-from ccnv.models import (
-    ArtifactKind,
-    ReferenceError,
-    SamplesheetEntry,
-    SchemaError,
-    validate_schema,
-)
+from ccnv.models import ReferenceError, SamplesheetEntry
 
-__all__ = [
-    "_get_samplesheet_schema",
-    "_validate_sample_file",
-    "load_samplesheet",
-]
+__all__ = ["load_samplesheet"]
 
 
 @functools.cache
-def _get_samplesheet_schema() -> dict[str, Any]:
+def _get_samplesheet_schema() -> dict[str, object]:
     """Load and cache the JSON schema for samplesheet validation."""
     schema_ref = importlib.resources.files("ccnv.io").joinpath(
         "samplesheet.schema.json"
     )
     with schema_ref.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _validate_sample_file(path: Path) -> None:
-    """Validate that sample path exists and conforms to sample Parquet schema."""
-    if not path.is_file():
-        raise ReferenceError(f"{path}: sample file not found")
-    try:
-        schema = pq.read_schema(path)
-        validate_schema(schema, ArtifactKind.SAMPLE)
-    except (FileNotFoundError, OSError, pa.ArrowInvalid, pa.ArrowException) as error:
-        raise ReferenceError(f"{path}: cannot read sample Parquet ({error})") from error
-    except SchemaError as error:
-        raise ReferenceError(f"{path}: invalid sample Parquet ({error})") from error
+        loaded = json.load(f)
+    if not isinstance(loaded, dict):
+        raise ReferenceError("samplesheet JSON schema root must be an object")
+    return loaded
 
 
 def load_samplesheet(path: Path | str) -> tuple[SamplesheetEntry, ...]:
-    """Load, validate, and parse a cohort samplesheet from YAML or JSON.
-
-    Parameters
-    ----------
-    path:
-        Path to the YAML or JSON samplesheet file.
-
-    Returns
-    -------
-    tuple[SamplesheetEntry, ...]
-        Validated samplesheet entries with resolved filepaths in declared order.
-
-    Raises
-    ------
-    ReferenceError
-        If the samplesheet cannot be found, contains invalid YAML/JSON,
-        violates the JSON schema, references missing or invalid sample
-        Parquet files, or contains duplicate resolved sample paths.
-    """
-    samplesheet_path = Path(path)
+    """Load, validate, and parse a cohort samplesheet from YAML or JSON."""
+    samplesheet_path = Path(path).expanduser()
     if not samplesheet_path.is_file():
         raise ReferenceError(f"samplesheet not found: {samplesheet_path}")
 
@@ -81,8 +43,12 @@ def load_samplesheet(path: Path | str) -> tuple[SamplesheetEntry, ...]:
         ) from error
 
     try:
-        raw_data = yaml.safe_load(content)
-    except yaml.YAMLError as error:
+        if samplesheet_path.suffix.lower() == ".json":
+            raw_data = json.loads(content)
+        else:
+            loader_cls = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+            raw_data = yaml.load(content, Loader=loader_cls)
+    except (json.JSONDecodeError, yaml.YAMLError) as error:
         raise ReferenceError(
             f"{samplesheet_path}: failed to parse YAML/JSON ({error})"
         ) from error
@@ -103,15 +69,15 @@ def load_samplesheet(path: Path | str) -> tuple[SamplesheetEntry, ...]:
             f"{samplesheet_path}: schema violation at {loc}: {error.message}"
         ) from error
 
-    assert isinstance(raw_data, list)
+    if not isinstance(raw_data, list):
+        raise ReferenceError(f"{samplesheet_path}: samplesheet root must be a list")
 
     samplesheet_dir = samplesheet_path.parent.resolve()
     seen_paths: set[Path] = set()
     entries: list[SamplesheetEntry] = []
 
     for idx, item in enumerate(raw_data):
-        raw_filepath = item["filepath"]
-        entry_path = Path(raw_filepath)
+        entry_path = Path(item["filepath"]).expanduser()
         resolved_path = (
             entry_path.resolve()
             if entry_path.is_absolute()
@@ -125,18 +91,25 @@ def load_samplesheet(path: Path | str) -> tuple[SamplesheetEntry, ...]:
             )
         seen_paths.add(resolved_path)
 
-        _validate_sample_file(resolved_path)
+        if not resolved_path.is_file():
+            raise ReferenceError(f"{resolved_path}: sample file not found")
 
         raw_sex = item.get("sex")
         raw_ff = item.get("ff")
         ff_val = float(raw_ff) if raw_ff is not None else None
+        if ff_val is not None and not math.isfinite(ff_val):
+            raise ReferenceError(
+                f"{samplesheet_path}: entry {idx} fetal fraction ff must be finite, got {raw_ff!r}"
+            )
 
-        entries.append(
-            SamplesheetEntry(
+        try:
+            entry = SamplesheetEntry(
                 filepath=resolved_path,
                 sex=raw_sex,
                 ff=ff_val,
             )
-        )
+        except ValueError as error:
+            raise ReferenceError(f"{samplesheet_path}: entry {idx}: {error}") from error
+        entries.append(entry)
 
     return tuple(entries)

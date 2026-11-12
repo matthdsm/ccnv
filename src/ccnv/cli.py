@@ -1,45 +1,32 @@
 """Thin command-line interface for ccnv pipeline stages."""
 
 import logging
+import math
 import os
 import sys
-from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
 from time import perf_counter
-from typing import Annotated, NoReturn, cast
+from typing import Annotated, NoReturn
 
 import typer
 
-from ccnv.extract import ExtractError
 from ccnv.extract import run as run_extract
-from ccnv.io.parquet import is_sample_parquet
 from ccnv.models import (
     DEFAULT_BIN_SIZE,
     DEFAULT_MIN_MAPPABILITY,
+    AnalysisMode,
+    CcnvError,
     ExtractConfig,
     PredictConfig,
     ReadFilters,
     ReferenceConfig,
     ReferenceQCConfig,
+    SexBranch,
 )
-from ccnv.models import (
-    AnalysisMode as AnalysisModeLiteral,
-)
-from ccnv.predict import PredictError
 from ccnv.predict import run as run_predict
-from ccnv.ref_qc import (
-    ReferenceQCError,
-    run_reference_qc,
-)
-from ccnv.reference import (
-    DEFAULT_SEX_CONTIGS,
-    DEFAULT_SEX_SIGNAL_CONTIGS,
-    ReferenceError,
-)
-from ccnv.reference import (
-    run as run_reference,
-)
+from ccnv.ref_qc import run_reference_qc
+from ccnv.reference import run as run_reference
 
 app = typer.Typer(
     name="ccnv",
@@ -59,21 +46,6 @@ class LogLevel(StrEnum):
     warning = "WARNING"
     error = "ERROR"
     critical = "CRITICAL"
-
-
-class SexBranch(StrEnum):
-    """Allowed predict sex-branch values."""
-
-    autosomal = "autosomal"
-    female = "female"
-    male = "male"
-
-
-class AnalysisMode(StrEnum):
-    """Allowed pipeline analysis modes."""
-
-    germline = "germline"
-    prenatal = "prenatal"
 
 
 def configure_logging(level: LogLevel) -> None:
@@ -141,12 +113,26 @@ GcOption = Annotated[
     ),
 ]
 
+
+def _require_positive_float(value: float | None) -> float | None:
+    if value is not None and (not math.isfinite(value) or value <= 0.0):
+        raise typer.BadParameter("must be a finite positive number (> 0)")
+    return value
+
+
+def _require_finite_unit_float(value: float | None) -> float | None:
+    if value is not None and (not math.isfinite(value) or value < 0.0 or value > 1.0):
+        raise typer.BadParameter("must be a finite number in [0, 1]")
+    return value
+
+
 MinMappabilityOption = Annotated[
     float,
     typer.Option(
         "--min-mappability",
         min=0.0,
         max=1.0,
+        callback=_require_finite_unit_float,
         help="Minimum bin mappability in [0, 1] required to stay unmasked",
     ),
 ]
@@ -163,36 +149,6 @@ FastaOption = Annotated[
 ]
 
 
-class SampleInputError(ValueError):
-    """Raised when reference sample arguments cannot be expanded."""
-
-
-def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
-    """Expand files and directories into unique sample Parquet paths."""
-
-    samples: list[Path] = []
-    seen: set[Path] = set()
-    for path in paths:
-        resolved = path.expanduser().resolve()
-        if resolved.is_dir():
-            matches = [
-                candidate.resolve()
-                for candidate in sorted(resolved.rglob("*.ccnv"))
-                if is_sample_parquet(candidate)
-            ]
-            if not matches:
-                raise SampleInputError(f"{path} contains no sample CCNV files")
-            for match in matches:
-                if match not in seen:
-                    seen.add(match)
-                    samples.append(match)
-            continue
-        if resolved not in seen:
-            seen.add(resolved)
-            samples.append(resolved)
-    return tuple(samples)
-
-
 @app.command()
 def extract(
     alignment: Annotated[
@@ -202,7 +158,10 @@ def extract(
             file_okay=True,
             dir_okay=False,
             readable=True,
-            help="BAM or CRAM input; a missing index is created automatically",
+            help=(
+                "BAM or CRAM input; single-threaded extraction streams without an "
+                "index, while --threads > 1 requires a .bai, .csi, or .crai index"
+            ),
         ),
     ],
     prefix: Annotated[
@@ -248,8 +207,8 @@ def extract(
             "--threads",
             min=1,
             help=(
-                "CPU budget split between contig worker processes and "
-                "per-handle BAM/CRAM decode threads"
+                "CPU budget for parallel 50 Mb tile streaming and BAM/CRAM "
+                "decompression (requires alignment index when > 1)"
             ),
         ),
     ] = DEFAULT_THREADS,
@@ -265,25 +224,25 @@ def extract(
         threads,
     )
     started = perf_counter()
-    config = ExtractConfig(
-        alignment,
-        prefix if prefix is not None else alignment.with_suffix(""),
-        bin_size,
-        fasta=fasta,
-        filters=ReadFilters(
-            min_mapping_quality=min_mapq,
-            exclude_duplicates=not keep_duplicates,
-            exclude_secondary=not keep_secondary,
-            exclude_supplementary=not keep_supplementary,
-            require_proper_pair=not allow_improper_pairs,
-        ),
-        threads=threads,
-        all_contigs=all_contigs,
-    )
     try:
+        config = ExtractConfig(
+            alignment,
+            prefix if prefix is not None else alignment.with_suffix(""),
+            bin_size,
+            fasta=fasta,
+            filters=ReadFilters(
+                min_mapping_quality=min_mapq,
+                exclude_duplicates=not keep_duplicates,
+                exclude_secondary=not keep_secondary,
+                exclude_supplementary=not keep_supplementary,
+                require_proper_pair=not allow_improper_pairs,
+            ),
+            threads=threads,
+            all_contigs=all_contigs,
+        )
         run_extract(config)
         cli_logger.debug("extract completed in %.3f s", perf_counter() - started)
-    except ExtractError as error:
+    except (CcnvError, ValueError, OSError) as error:
         _fail(error, 1)
 
 
@@ -293,13 +252,6 @@ def reference(
         Path,
         typer.Option(help="Output path prefix; writes PREFIX.ccnv"),
     ],
-    samples: Annotated[
-        list[Path] | None,
-        typer.Argument(
-            hidden=True,
-            help="Deprecated: provide --samplesheet or --fasta instead",
-        ),
-    ] = None,
     samplesheet: Annotated[
         Path | None,
         typer.Option(
@@ -354,28 +306,26 @@ def reference(
         typer.Option("--sex-contig", help="Sex contig name; repeat as needed"),
     ] = None,
     sex_signal_contig: Annotated[
-        str,
+        str | None,
         typer.Option(help="Contig used for inferred sex; higher fraction is male"),
-    ] = DEFAULT_SEX_SIGNAL_CONTIGS[0],
+    ] = None,
     sex_cutoff: Annotated[
         float | None,
         typer.Option(
             "--sex-cutoff",
             min=0.0,
             max=1.0,
+            callback=_require_finite_unit_float,
             help="Signal-contig coverage fraction cutoff; samples above it are male",
         ),
     ] = None,
     pca_components: Annotated[
-        int, typer.Option(min=1, help="PCA components per branch")
-    ] = 5,
-    nearest_bins: Annotated[
-        int,
+        int | None,
         typer.Option(
             min=1,
-            help="Nearest off-contig reference bins per target",
+            help="Maximum PCA components per branch (defaults to dynamic SVHT rank)",
         ),
-    ] = 300,
+    ] = None,
     max_batch_memory_mb: Annotated[
         int,
         typer.Option(min=1, help="Maximum memory in MiB for distance batches"),
@@ -422,38 +372,10 @@ def reference(
         threads,
     )
     started = perf_counter()
-    sample_paths: tuple[Path, ...] = ()
-    if samples and (samplesheet is not None or fasta is not None):
-        _fail(
-            ValueError(
-                "cannot combine positional sample arguments with "
-                "--samplesheet or --fasta"
-            ),
-            2,
-        )
     if samplesheet is None and fasta is None:
-        if samples:
-            if len(samples) == 1 and samples[0].suffix.lower() in (
-                ".fasta",
-                ".fa",
-                ".fna",
-            ):
-                fasta = samples[0]
-            else:
-                try:
-                    sample_paths = expand_sample_inputs(samples)
-                except SampleInputError as error:
-                    _fail(error, 2)
-        else:
-            _fail(
-                ValueError("provide exactly one of --samplesheet or --fasta"),
-                2,
-            )
-    elif samplesheet is not None and fasta is not None:
-        _fail(
-            ValueError("provide either --samplesheet or --fasta, not both"),
-            2,
-        )
+        _fail(ValueError("provide exactly one of --samplesheet or --fasta"), 2)
+    if samplesheet is not None and fasta is not None:
+        _fail(ValueError("provide either --samplesheet or --fasta, not both"), 2)
     try:
         run_reference(
             ReferenceConfig(
@@ -469,24 +391,20 @@ def reference(
                 min_cohort_size=min_cohort_size,
                 min_mappability=min_mappability,
                 min_sex_group_size=min_sex_group_size,
-                mode=cast(AnalysisModeLiteral, mode.value),
-                nearest_bins=nearest_bins,
+                mode=mode,
                 pca_components=pca_components,
                 prefix=prefix,
                 prenatal_bin_size=prenatal_binsize,
                 qc_report=qc_report,
-                samples=sample_paths,
                 samplesheet_path=samplesheet,
-                sex_contigs=(
-                    tuple(sex_contig) if sex_contig is not None else DEFAULT_SEX_CONTIGS
-                ),
+                sex_contigs=(tuple(sex_contig) if sex_contig is not None else None),
                 sex_cutoff=sex_cutoff,
                 sex_signal_contig=sex_signal_contig,
                 threads=threads,
             )
         )
         cli_logger.debug("reference completed in %.3f s", perf_counter() - started)
-    except ReferenceError as error:
+    except (CcnvError, ValueError, OSError) as error:
         _fail(error, 1)
 
 
@@ -522,7 +440,7 @@ def ref_qc(
     try:
         run_reference_qc(ReferenceQCConfig(reference=reference, prefix=prefix))
         cli_logger.debug("ref-qc completed in %.3f s", perf_counter() - started)
-    except ReferenceQCError as error:
+    except (CcnvError, ValueError, OSError) as error:
         _fail(error, 1)
 
 
@@ -551,6 +469,8 @@ def predict(
     prefix: Annotated[
         Path | None,
         typer.Option(
+            "--prefix",
+            "-o",
             help="Output path prefix for BED, VCF, and HTML deliverables",
         ),
     ] = None,
@@ -560,17 +480,24 @@ def predict(
     ] = SexBranch.autosomal,
     penalty: Annotated[
         float,
-        typer.Option(min=0.0, help="Weighted-SSE segmentation penalty"),
+        typer.Option(
+            callback=_require_positive_float,
+            help="Breakpoint penalty multiplier (gamma) for calibrated mBIC segmentation",
+        ),
     ] = 1.0,
     z_threshold: Annotated[
         float,
-        typer.Option("--z-threshold", min=0.0, help="Absolute segment z call cutoff"),
+        typer.Option(
+            "--z-threshold",
+            callback=_require_positive_float,
+            help="Absolute segment z call cutoff",
+        ),
     ] = 3.0,
     ratio_threshold: Annotated[
         float | None,
         typer.Option(
             "--ratio-threshold",
-            min=0.0,
+            callback=_require_positive_float,
             help="Absolute log2-ratio call cutoff; overrides z-score calling",
         ),
     ] = None,
@@ -616,9 +543,26 @@ def predict(
     vcf: Annotated[
         bool,
         typer.Option(
-            "--vcf/--no-vcf", help="Write VCFv4.2 outputs for bins and segments"
+            "--vcf/--no-vcf",
+            help="Write VCFv4.2 outputs for segments and calls (use --bins-vcf for per-bin VCF)",
         ),
     ] = True,
+    bins_vcf: Annotated[
+        bool,
+        typer.Option(
+            "--bins-vcf/--no-bins-vcf",
+            help="Write bin-level VCFv4.2 output when --vcf is enabled",
+        ),
+    ] = False,
+    threads: Annotated[
+        int,
+        typer.Option(
+            "--threads",
+            "-t",
+            min=1,
+            help="Worker threads for direct BAM/CRAM streaming and deliverable generation",
+        ),
+    ] = DEFAULT_THREADS,
     fasta: FastaOption = None,
     mappability: MappabilityOption = None,
     gc: GcOption = None,
@@ -630,11 +574,12 @@ def predict(
 
     configure_logging(loglevel)
     cli_logger.debug(
-        "starting predict: sample=%s, reference=%s, sex=%s, mode=%s",
+        "starting predict: sample=%s, reference=%s, sex=%s, mode=%s, threads=%d",
         sample,
         reference,
         sex.value,
         mode.value,
+        threads,
     )
     started = perf_counter()
     try:
@@ -643,7 +588,7 @@ def predict(
                 sample=sample,
                 reference=reference,
                 prefix=prefix if prefix is not None else sample.with_suffix(""),
-                sex=sex.value,
+                sex=sex,
                 penalty=penalty,
                 z_threshold=z_threshold,
                 ratio_threshold=ratio_threshold,
@@ -652,17 +597,19 @@ def predict(
                 max_blacklist_gap=max_blacklist_gap,
                 plot=plot,
                 vcf=vcf,
+                bins_vcf=bins_vcf,
                 cytobands=cytobands,
                 mappability=mappability,
                 gc=gc,
                 fasta=fasta,
                 min_mappability=min_mappability,
-                mode=cast(AnalysisModeLiteral, mode.value),
+                mode=mode,
+                threads=threads,
             )
         )
 
         cli_logger.debug("predict completed in %.3f s", perf_counter() - started)
-    except PredictError as error:
+    except (CcnvError, ValueError, OSError) as error:
         _fail(error, 1)
 
 

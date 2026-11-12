@@ -1,523 +1,412 @@
-"""Prenatal model training, inference, SCA calling, and segment annotation."""
+"""Prenatal model training, inference, and 4D ray SCA classification."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import replace
 from typing import Final
 
 import numpy as np
-import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 import scipy.special
-import scipy.stats
 from numpy.typing import NDArray
 
-from ccnv.features.cohort import (
-    Cohort,
-    rebin_cohort,
-    rebin_sample_table,
-    validate_cohort,
+from ccnv.features.binning import (
+    align_grid_indices,
+    align_sample_to_grid_indices,
+    compute_bin_exposure,
 )
+from ccnv.features.cohort import Cohort, rebin_cohort, validate_cohort
 from ccnv.features.fragmentomics import (
     extract_sample_fragmentomics,
-    extract_segment_fragment_lengths,
     fit_cohort_fragmentomics_model,
-    fuse_active_fetal_fraction,
-    score_segment_origin,
+    resolve_fisher_moment_weights,
 )
+from ccnv.features.prenatal_grid import (
+    col_f64,
+    col_i64,
+    compute_100k_profiles,
+    extract_ref_contig_roles,
+    prepare_covariate_multipliers,
+    resolve_5k_covariates,
+    resolve_contig_masks,
+    sample_grid,
+)
+from ccnv.features.rebinning import rebin_sample_buffers
+from ccnv.features.sex import SexLabel
 from ccnv.models import (
+    BRANCH_AUTOSOMAL,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
-    REFERENCE_SCHEMA,
+    DEFAULT_MIN_MAPPABILITY,
+    ActiveFFSource,
+    BranchFitArrays,
     FetalFractionResult,
     FetalSex,
+    InvalidInputError,
+    PredictError,
     PrenatalModelMetadata,
+    SampleBuffers,
     SamplesheetEntry,
-    SCACall,
     SCAResult,
-    SegmentResult,
+    SchemaError,
+    decode_dictionary_contigs,
     decode_metadata,
-    is_autosome_name,
+    fixed_size_list_to_numpy,
     normalize_chr,
 )
-from ccnv.stats.fragmentomics import predict_ff_fragmentomics
-from ccnv.stats.pca import pca_irlba_numpy
-from ccnv.stats.prenatal_math import (
-    fit_elasticnet_ffy,
-    fit_ffa_logit_ensemble,
-    infer_sex_gmm_1d,
-    rlm_huber,
+from ccnv.stats.fragmentomics import (
+    compute_band_fisher_weights,
+    compute_fragment_length_llr,
+    predict_ff_fragmentomics,
 )
+from ccnv.stats.pca import pca_irlba_numpy, project_huber_pca_wave
+from ccnv.stats.prenatal_math import (
+    PoissonFFYModel,
+    classify_sca_ray_4d,
+    compute_autosomal_density,
+    evaluate_poisson_msy_ffy,
+    fit_forward_ffx_model,
+    fit_msy_sex_mixture,
+    fit_poisson_msy_ffy,
+)
+from ccnv.stats.regression import fit_logit_linear_ensemble
 
-_PAR1_START: Final[int] = 2_781_479
-_YQ12_END: Final[int] = 28_800_000
-_EXCLUDED_PRENATAL_AUTOSOMES: Final[frozenset[int]] = frozenset({13, 18, 21})
-
-__all__ = [
-    "annotate_prenatal_segments",
-    "classify_sca",
-    "fit_prenatal_models",
-    "predict_prenatal",
-]
-
-
-def _is_ffa_autosome(norm_contig: str) -> bool:
-    """Return True if contig is a canonical autosome excluding 13, 18, 21."""
-    return (
-        is_autosome_name(norm_contig)
-        and int(norm_contig) not in _EXCLUDED_PRENATAL_AUTOSOMES
+_REQUIRED_REF_COLUMNS: Final[frozenset[str]] = frozenset(
+    (
+        "branch",
+        "contig",
+        "start",
+        "end",
+        "masked",
+        "gc",
+        "mappability",
+        "pca_mean",
+        "pca_loadings",
+        "null_mean",
     )
+)
+_BASE_SCA_PRIORS: Final[dict[str, float]] = dict.fromkeys(
+    ("XX", "XY", "XO", "XXX", "XXY", "XYY"), 1e-6
+)
+_FEMALE_SCA_PRIORS: Final[dict[str, float]] = _BASE_SCA_PRIORS | {
+    "XX": 0.90,
+    "XO": 0.05,
+    "XXX": 0.05,
+}
+_MALE_SCA_PRIORS: Final[dict[str, float]] = _BASE_SCA_PRIORS | {
+    "XY": 0.90,
+    "XXY": 0.05,
+    "XYY": 0.05,
+}
+
+__all__ = ["fit_prenatal_models", "predict_prenatal"]
 
 
-_is_preface_autosome = _is_ffa_autosome
-
-
-def _resolve_autosome_mask(norm_contigs: Sequence[str]) -> NDArray[np.bool_]:
-    """Resolve boolean autosome mask for FFA, falling back to all autosomes."""
-    mask = np.array([_is_ffa_autosome(c) for c in norm_contigs], dtype=np.bool_)
-    if not np.any(mask):
-        mask = np.array([is_autosome_name(c) for c in norm_contigs], dtype=np.bool_)
-    return mask
-
-
-def _build_prenatal_branch_table(
-    *,
-    branch: str,
-    contigs: Sequence[str],
-    starts: NDArray[np.int64],
-    ends: NDArray[np.int64],
-    masked: NDArray[np.bool_],
-    pca_mean: NDArray[np.float64],
-    pca_loadings: list[list[float]] | None = None,
-    null_mean: NDArray[np.float64] | None = None,
-) -> pa.Table:
-    """Build a prenatal branch table containing coordinates and null models."""
-    n_bins = len(contigs)
-    return pa.table(
-        {
-            "branch": pa.array([branch] * n_bins, type=pa.string()),
-            "contig": pa.array(contigs, type=pa.string()),
-            "start": pa.array(starts, type=pa.int64()),
-            "end": pa.array(ends, type=pa.int64()),
-            "masked": pa.array(masked, type=pa.bool_()),
-            "gc": pa.array(np.zeros(n_bins, dtype=np.float32), type=pa.float32()),
-            "mappability": pa.array(
-                np.zeros(n_bins, dtype=np.float32), type=pa.float32()
-            ),
-            "pca_mean": pa.array(pca_mean, type=pa.float64()),
-            "pca_loadings": pa.array(
-                pca_loadings
-                if pca_loadings is not None
-                else [[] for _ in range(n_bins)],
-                type=pa.list_(pa.float64()),
-            ),
-            "nearest_ref_indices": pa.array(
-                [[] for _ in range(n_bins)], type=pa.list_(pa.int32())
-            ),
-            "mean_distance": pa.array(
-                np.zeros(n_bins, dtype=np.float32), type=pa.float32()
-            ),
-            "null_mean": pa.array(
-                null_mean
-                if null_mean is not None
-                else np.zeros(n_bins, dtype=np.float64),
-                type=pa.float64(),
-            ),
-            "null_std": pa.array(np.zeros(n_bins, dtype=np.float64), type=pa.float64()),
-        },
-        schema=REFERENCE_SCHEMA,
-    )
-
-
-def _align_sample_to_ref(
-    sample_contigs: Sequence[str],
-    sample_starts: NDArray[np.int64],
-    sample_ends: NDArray[np.int64],
-    ref_table: pa.Table,
-) -> NDArray[np.int32]:
-    """Map reference rows to matching sample bin indices, or -1 if missing."""
-    ref_n = ref_table.num_rows
-    if ref_n == 0:
-        return np.empty(0, dtype=np.int32)
-    if len(sample_contigs) == 0:
-        return np.full(ref_n, -1, dtype=np.int32)
-
-    ref_c = [normalize_chr(str(c)) for c in ref_table.column("contig").to_pylist()]
-    ref_s = np.asarray(
-        ref_table.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    ref_e = np.asarray(
-        ref_table.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    sample_norm_c = [normalize_chr(str(c)) for c in sample_contigs]
-
-    ref_df = pl.DataFrame(
-        {
-            "contig_norm": ref_c,
-            "start": ref_s,
-            "end": ref_e,
-            "ref_idx": np.arange(ref_n, dtype=np.int32),
-        }
-    )
-    sample_df = pl.DataFrame(
-        {
-            "contig_norm": sample_norm_c,
-            "start": np.asarray(sample_starts, dtype=np.int64),
-            "end": np.asarray(sample_ends, dtype=np.int64),
-            "sample_idx": np.arange(len(sample_contigs), dtype=np.int32),
-        }
-    )
-
-    joined = ref_df.join(
-        sample_df, on=["contig_norm", "start", "end"], how="left"
-    ).sort("ref_idx")
-    return joined["sample_idx"].fill_null(-1).to_numpy().astype(np.int32)
-
-
-def _autosomal_density(
-    counts: np.ndarray,
-    widths: np.ndarray,
-    auto_mask: np.ndarray,
-    fallback_bin_size: int,
-) -> float:
-    """Calculate mean mappable autosomal read density (reads per bp)."""
-    sub_counts = counts[auto_mask]
-    sub_widths = widths[auto_mask]
-    mappable = sub_counts > 0
-    if np.any(mappable):
-        return float(np.mean(sub_counts[mappable] / sub_widths[mappable]))
-    return 1.0 / float(max(fallback_bin_size, 1))
-
-
-def classify_sca(
+def _evaluate_sca_and_active_ff(
     fetal_sex: FetalSex,
     ffy: float | None,
+    ffy_se: float | None,
     ffx: float,
-    ffa: float = 0.0,
-    chrx_ratio: float = 1.0,
-    prenatal_meta: PrenatalModelMetadata | None = None,
+    ffa: float,
+    chrx_ratio: float,
+    meta: PrenatalModelMetadata,
     *,
-    preface: float | None = None,
-) -> SCAResult:
-    """Classify Sex Chromosome Aneuploidy (SCA) via 2D Stoichiometric Gaussian Bayes."""
-    if preface is not None:
-        ffa = preface
-    if prenatal_meta is None:
-        raise ValueError("prenatal_meta is required for classify_sca")
-    mu_f = float(prenatal_meta.female_chrx_ratio_mean)
-    std_f = max(float(prenatal_meta.female_chrx_ratio_std), 1e-4)
-    chrx_zscore = float((chrx_ratio - mu_f) / std_f)
-
-    rx = float(chrx_ratio)
-    delta_x = rx - 1.0
+    ff_size: float | None = None,
+    chrx_llr_fetal: float | None = None,
+) -> tuple[SCAResult, float, float, ActiveFFSource]:
+    """Evaluate 4D ray SCA classification and Student-t4 fused active FF."""
+    mu_xf = float(meta.female_chrx_ratio_mean)
+    std_xf = max(float(meta.female_chrx_ratio_std), 1e-4)
+    abs_a1 = max(abs(float(meta.alpha_1)), 1e-6)
     f_y = float(ffy) if (fetal_sex == "M" and ffy is not None) else 0.0
-    ff_delta = float(ffx - f_y) if fetal_sex == "M" else None
-
-    # Reference fetal fraction f_0
-    cands: list[float] = []
-    if fetal_sex == "M" and ffy is not None and ffy > 0.001:
-        cands.append(float(ffy))
-    if ffa > 0.001:
-        cands.append(float(ffa))
-    if abs(ffx) > 0.001:
-        cands.append(abs(float(ffx)))
-    if not cands:
-        cands = [max(float(ffa), 0.05)]
-    f0 = max(float(np.median(cands)), 0.01)
-
-    means: dict[SCACall, tuple[float, float]] = {
-        "XX": (0.0, 0.0),
-        "XY": (-0.5 * f0, f0),
-        "XO": (-0.5 * f0, 0.0),
-        "XXX": (0.5 * f0, 0.0),
-        "XXY": (0.0, f0),
-        "XYY": (-0.5 * f0, 2.0 * f0),
-    }
-
-    sigma_x = max(float(prenatal_meta.female_chrx_ratio_std), 0.005)
-    sigma_y = max(float(prenatal_meta.ffy_std), 0.005)
-
-    if fetal_sex == "F":
-        priors: dict[SCACall, float] = {
-            "XX": 0.90,
-            "XO": 0.05,
-            "XXX": 0.05,
-            "XY": 1e-6,
-            "XXY": 1e-6,
-            "XYY": 1e-6,
-        }
-    else:
-        priors = {
-            "XY": 0.90,
-            "XXY": 0.05,
-            "XYY": 0.05,
-            "XX": 1e-6,
-            "XO": 1e-6,
-            "XXX": 1e-6,
-        }
-
-    karyotypes = list(means.keys())
-    d2_list: list[float] = []
-    log_joints: list[float] = []
-    for k in karyotypes:
-        mx, my = means[k]
-        d2 = ((delta_x - mx) / sigma_x) ** 2 + ((f_y - my) / sigma_y) ** 2
-        d2_list.append(float(d2))
-        log_lik = -0.5 * d2
-        log_joints.append(float(log_lik + np.log(priors[k])))
-
-    best_idx = int(np.argmax(log_joints))
-    best_k = karyotypes[best_idx]
-    best_d2 = d2_list[best_idx]
-
-    log_norm = float(scipy.special.logsumexp(log_joints))
-    best_post = float(np.exp(log_joints[best_idx] - log_norm))
-
-    is_mixed = best_d2 > 13.8155 or (
-        fetal_sex == "F"
-        and abs(delta_x) > 0.02
-        and abs(ffx) > 0.02
-        and (delta_x * ffx > 0)
+    se_y = float(ffy_se) if (fetal_sex == "M" and ffy_se is not None) else 0.0
+    priors = _FEMALE_SCA_PRIORS if fetal_sex == "F" else _MALE_SCA_PRIORS
+    cls_res = classify_sca_ray_4d(
+        delta_x=float(0.5 * (float(chrx_ratio) - mu_xf) / abs_a1),
+        sigma_x=max(0.5 * std_xf / abs_a1, 0.005),
+        ffy=f_y,
+        sigma_ffy=max(math.hypot(se_y, float(meta.ffy_std)), 0.005),
+        ffa=ffa,
+        sigma_ffa=max(float(meta.ffa_std), 0.005),
+        ff_size=ff_size,
+        sigma_size=max(float(meta.ff_size_std), 0.005),
+        chrx_llr_fetal=chrx_llr_fetal,
+        clinical_priors=priors,
     )
-
-    if is_mixed:
-        call: SCACall = "DISCORDANT_MIXED"
-        is_aneuploid = True
-        confidence = float(np.clip(scipy.stats.chi2.cdf(best_d2, df=2), 0.5, 1.0))
-    else:
-        call = best_k
-        is_aneuploid = call not in ("XX", "XY")
-        confidence = float(np.clip(best_post, 0.5, 1.0))
-
-    return SCAResult(
-        call=call,
-        is_aneuploid=is_aneuploid,
-        confidence=confidence,
-        chrx_zscore=chrx_zscore,
-        ff_delta=ff_delta,
+    sca = SCAResult(
+        call=cls_res.call,
+        is_aneuploid=cls_res.call not in ("XX", "XY"),
+        confidence=float(np.clip(cls_res.posterior, 0.5, 1.0)),
+        chrx_zscore=float((chrx_ratio - mu_xf) / std_xf),
+        ff_delta=float(ffx - f_y) if fetal_sex == "M" else None,
     )
+    return sca, cls_res.active_ff, cls_res.active_ff_se, cls_res.active_ff_source
+
+
+def _compute_effective_ff(
+    active_ff: float, bufs: SampleBuffers, meta: PrenatalModelMetadata
+) -> float:
+    """Compute Fisher-weighted effective fetal fraction when paired-end band weights apply."""
+    mu_f, mu_m = resolve_fisher_moment_weights(bufs, meta)
+    if mu_f == 1.0 and mu_m == 1.0:
+        return float(active_ff)
+    f_val = float(np.clip(active_ff, 0.0, 1.0))
+    denom = f_val * mu_f + (1.0 - f_val) * mu_m
+    return float(f_val * mu_f / denom) if denom > 0.0 else float(active_ff)
 
 
 def fit_prenatal_models(
-    sample_tables: Sequence[pa.Table] | Cohort,
+    sample_tables: Cohort | Sequence[SampleBuffers | pa.Table],
     entries: Sequence[SamplesheetEntry],
-    bin_size: int,
-    prenatal_bin_size: int,
+    *,
+    prenatal_bin_size: int = 100_000,
+    cohort_gc: NDArray[np.floating] | None = None,
+    cohort_mappability: NDArray[np.floating] | None = None,
+    cohort_n_mask: NDArray[np.bool_] | None = None,
+    min_mappability: float = DEFAULT_MIN_MAPPABILITY,
+    autosomes: Sequence[str] | None = None,
+    sex_contigs: Sequence[str] | None = None,
+    sex_signal_contig: str | None = None,
     seed: int = 42,
-) -> tuple[pa.Table, pa.Table, PrenatalModelMetadata, tuple[bool, ...]]:
-    """Fit FFY, FFA, and FFX models on cohort samples."""
-    # 1. Extract 5 kb coordinates, chrY fractions, and sex classification
-    if not isinstance(sample_tables, Sequence):
+) -> tuple[PrenatalModelMetadata, tuple[BranchFitArrays, ...], tuple[SexLabel, ...]]:
+    """Fit FFY, FFA, FFX, and fragmentomic models across a prenatal cohort."""
+    if isinstance(sample_tables, Cohort):
         cohort_5k = sample_tables
+    elif len(sample_tables) == 0:
+        raise InvalidInputError("sample_tables must contain at least one sample table")
     else:
-        if len(sample_tables) == 0:
-            raise ValueError("sample_tables must contain at least one sample table")
-        cohort_5k = validate_cohort(sample_tables, target_bin_size=bin_size)
+        cohort_5k = validate_cohort(sample_tables)
 
-    n_samples = cohort_5k.counts.shape[1]
+    n_samples = int(cohort_5k.counts.shape[1])
     if n_samples == 0:
-        raise ValueError("sample_tables must contain at least one sample table")
+        raise InvalidInputError("sample_tables must contain at least one sample table")
     if len(entries) != n_samples:
-        raise ValueError(
-            f"sample_tables ({n_samples}) and entries ({len(entries)}) "
-            f"must have the same length"
+        raise InvalidInputError(
+            f"sample_tables ({n_samples}) != entries ({len(entries)})"
         )
+    if prenatal_bin_size <= 0:
+        raise InvalidInputError("prenatal_bin_size must be a positive integer")
 
     c_5k = list(cohort_5k.contigs)
-    s_5k = cohort_5k.starts
-    e_5k = cohort_5k.ends
-    w_5k = e_5k - s_5k
-    counts_5k_matrix = cohort_5k.counts
-
-    norm_c_5k = np.array([normalize_chr(c) for c in c_5k], dtype=object)
-    chry_mask_5k = norm_c_5k == "Y"
-    auto_mask_5k = _resolve_autosome_mask(norm_c_5k)
-
-    n_chry_bins = int(np.sum(chry_mask_5k))
-    total_reads = np.sum(counts_5k_matrix, axis=0)
-    chry_reads = (
-        np.sum(counts_5k_matrix[chry_mask_5k, :], axis=0)
-        if n_chry_bins > 0
-        else np.zeros(n_samples, dtype=np.float64)
+    s_5k, e_5k, counts_5k = cohort_5k.starts, cohort_5k.ends, cohort_5k.counts
+    auto_mask_5k, _, chry_mask_5k = resolve_contig_masks(
+        c_5k,
+        autosomes=autosomes,
+        sex_contigs=sex_contigs,
+        sex_signal_contig=sex_signal_contig,
     )
-    yfracs = chry_reads / np.maximum(total_reads, 1.0)
+    n_chry_bins = int(np.count_nonzero(chry_mask_5k))
+    _, c_ids_5k = np.unique([normalize_chr(c) for c in c_5k], return_inverse=True)
+    c_ids_i16 = c_ids_5k.astype(np.int16)
+    exp_5k = compute_bin_exposure(s_5k, e_5k, cohort_5k.bin_size)
+    eff_n_mask = cohort_n_mask
+    if eff_n_mask is None and cohort_gc is not None:
+        raw_gc_arr = np.asarray(cohort_gc, dtype=np.float64)
+        if np.any(np.isfinite(raw_gc_arr) & (raw_gc_arr >= 0.0) & (raw_gc_arr <= 1.0)):
+            eff_n_mask = ~np.isfinite(raw_gc_arr)
+    gc_5k, map_5k = prepare_covariate_multipliers(
+        cohort_gc, cohort_mappability, eff_n_mask, min_mappability, len(c_5k)
+    )
+    r_auto_5k = np.zeros(n_samples, dtype=np.float64)
+    for i in range(n_samples):
+        col_i = counts_5k[:, i].astype(np.float64)
+        r_auto_5k[i] = compute_autosomal_density(
+            col_i, c_ids_i16, exp_5k, map_5k, gc_5k, auto_mask_5k
+        )
+    labeled_ff = np.array(
+        [
+            float(e.ff) if (e.ff is not None and math.isfinite(e.ff)) else np.nan
+            for e in entries
+        ],
+        dtype=np.float64,
+    )
 
-    y_norm_all = np.zeros((n_samples, n_chry_bins), dtype=np.float64)
     if n_chry_bins > 0:
-        for i in range(n_samples):
-            r_auto = _autosomal_density(
-                counts_5k_matrix[:, i], w_5k, auto_mask_5k, bin_size
+        msy_counts = counts_5k[chry_mask_5k, :].astype(np.float64)
+        map_y = map_5k[chry_mask_5k]
+        chry_unit = (exp_5k[chry_mask_5k] * map_y * gc_5k[chry_mask_5k]).astype(
+            np.float64
+        )
+        msy_exposure = chry_unit[:, np.newaxis] * r_auto_5k[np.newaxis, :]
+        q25_rate = np.quantile(
+            msy_counts / np.maximum(msy_exposure, 1e-6), 0.25, axis=1
+        )
+        mix_bins = (map_y >= 0.80) & (q25_rate <= 0.15)
+        if not np.any(mix_bins):
+            mix_bins = (
+                (map_y >= 0.50)
+                if np.any(map_y >= 0.50)
+                else np.ones(n_chry_bins, np.bool_)
             )
-            y_norm_all[i, :] = counts_5k_matrix[chry_mask_5k, i] / (
-                r_auto * w_5k[chry_mask_5k]
+        sex_mix = fit_msy_sex_mixture(
+            np.sum(msy_counts[mix_bins], axis=0),
+            np.sum(msy_exposure[mix_bins], axis=0),
+            bic_delta_min=6.0,
+        )
+        sex_codes = np.array(
+            [1 if e.sex == "M" else (0 if e.sex == "F" else -1) for e in entries]
+        )
+        is_male_arr = np.where(
+            sex_codes >= 0, sex_codes == 1, sex_mix.bimodal & (sex_mix.p_male > 0.5)
+        )
+        quarantined = (
+            (sex_mix.p_male > 0.02) & (sex_mix.p_male < 0.98)
+            if sex_mix.bimodal
+            else np.zeros(n_samples, dtype=np.bool_)
+        )
+        clean_f = (~is_male_arr) & (~quarantined)
+        clean_m = is_male_arr & (~quarantined)
+        clean_f = clean_f if np.any(clean_f) else ~is_male_arr
+        clean_m = clean_m if np.any(clean_m) else is_male_arr
+
+        poisson_model = fit_poisson_msy_ffy(
+            msy_counts, msy_exposure, map_5k[chry_mask_5k], clean_f, clean_m, labeled_ff
+        )
+        final_ffy = np.zeros(n_samples, dtype=np.float64)
+        male_ffy_se = np.zeros(n_samples, dtype=np.float64)
+        for idx in np.flatnonzero(is_male_arr):
+            final_ffy[idx], male_ffy_se[idx] = evaluate_poisson_msy_ffy(
+                msy_counts[:, int(idx)], msy_exposure[:, int(idx)], poisson_model
             )
 
-    is_male_gmm, yfrac_threshold = infer_sex_gmm_1d(yfracs, seed=seed)
-    is_male_resolved: list[bool] = []
-    for i, entry in enumerate(entries):
-        if entry.sex == "M":
-            is_male_resolved.append(True)
-        elif entry.sex == "F":
-            is_male_resolved.append(False)
+        cal_m = clean_m & np.isfinite(labeled_ff)
+        if int(np.count_nonzero(cal_m)) >= 2:
+            resid = final_ffy[cal_m] - labeled_ff[cal_m]
+            ffy_std = max(float(np.sqrt(np.mean(resid * resid))), 0.005)
         else:
-            is_male_resolved.append(bool(is_male_gmm[i]))
-
-    is_male_arr = np.array(is_male_resolved, dtype=np.bool_)
-
-    # 2. Informative chrY mask and FFY fitting
-    if n_chry_bins > 0:
-        chry_starts = s_5k[chry_mask_5k]
-        chry_ends = e_5k[chry_mask_5k]
-        coord_mask = (chry_starts >= _PAR1_START) & (chry_ends <= _YQ12_END)
-        if not np.any(coord_mask):
-            coord_mask = np.ones(n_chry_bins, dtype=np.bool_)
-
-        has_males = bool(np.any(is_male_arr))
-        has_females = bool(np.any(~is_male_arr))
-
-        if has_males and has_females:
-            mean_male = np.mean(y_norm_all[is_male_arr, :], axis=0)
-            med_female = np.median(y_norm_all[~is_male_arr, :], axis=0)
-            info_mask = (
-                coord_mask & (mean_male > med_female + 1e-4) & (med_female < 0.15)
+            ffy_std = (
+                max(float(np.median(male_ffy_se[clean_m])), 0.005)
+                if np.any(clean_m)
+                else 0.01
             )
-            if not np.any(info_mask):
-                info_mask = coord_mask
-        else:
-            info_mask = coord_mask
 
-        y_scores = np.mean(y_norm_all[:, info_mask], axis=1)
-        if has_females:
-            female_baseline = float(np.median(y_scores[~is_male_arr]))
-        else:
-            female_baseline = 0.0
-        male_100_baseline = female_baseline + 0.5
-
-        denom = max(male_100_baseline - female_baseline, 1e-6)
-        prior_ffy = np.clip((y_scores - female_baseline) / denom, 0.0, 1.0)
-        prior_ffy[~is_male_arr] = 0.0
-
-        target_ffy = prior_ffy.copy()
-        for i, entry in enumerate(entries):
-            if entry.ff is not None:
-                target_ffy[i] = entry.ff
-
-        X_info = y_norm_all[:, info_mask]
-        w_info, ffy_intercept = fit_elasticnet_ffy(X_info, target_ffy, seed=seed)
+        clean_idx = poisson_model.clean_bin_indices
+        informative_mask = np.zeros(n_chry_bins, dtype=np.bool_)
+        informative_mask[clean_idx] = True
         ffy_weights = np.zeros(n_chry_bins, dtype=np.float64)
-        ffy_weights[info_mask] = w_info
-        ffy_slope = 1.0
+        ffy_weights[clean_idx] = poisson_model.lambda_bg
+        ffy_slope = float(poisson_model.kappa_cal)
 
-        final_ffy = ffy_intercept + X_info @ w_info
-        informative_mask = info_mask
+        msy_sums = np.sum(
+            msy_counts[clean_idx] if clean_idx.size else msy_counts, axis=0
+        )
+        yfracs = msy_sums / np.maximum(np.sum(counts_5k, axis=0, dtype=np.float64), 1.0)
+        y_f, y_m = yfracs[clean_f], yfracs[clean_m]
+        if y_f.size > 0 and y_m.size > 0:
+            max_f, min_m = float(np.max(y_f)), float(np.min(y_m))
+            mid = (
+                max_f + min_m
+                if max_f < min_m
+                else float(np.median(y_f) + np.median(y_m))
+            )
+            yfrac_threshold = 0.5 * mid
+        elif y_f.size > 0:
+            yfrac_threshold = max(float(np.max(y_f)) * 2.0 + 1e-4, 0.002)
+        else:
+            yfrac_threshold = 0.5 * float(np.min(y_m)) if y_m.size > 0 else 0.005
     else:
         informative_mask = np.zeros(0, dtype=np.bool_)
         ffy_weights = np.zeros(0, dtype=np.float64)
-        ffy_intercept, ffy_slope = 0.0, 1.0
+        ffy_slope, ffy_std, yfrac_threshold = 1.0, 0.01, 0.005
         final_ffy = np.zeros(n_samples, dtype=np.float64)
+        is_male_arr = np.array([e.sex == "M" for e in entries], dtype=np.bool_)
+        quarantined = np.zeros(n_samples, dtype=np.bool_)
+        poisson_model = PoissonFFYModel(
+            np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64), 1.0, 0.0
+        )
 
-    # 3. Rebin to prenatal_bin_size (100 kb) for FFA and FFX
+    unlabeled_m = np.where(is_male_arr, np.maximum(0.0, final_ffy), np.nan)
+    ff_targets = np.where(
+        quarantined, np.nan, np.where(np.isfinite(labeled_ff), labeled_ff, unlabeled_m)
+    )
+
     cohort_100k = rebin_cohort(cohort_5k, prenatal_bin_size)
     c_100k = list(cohort_100k.contigs)
-    s_100k = cohort_100k.starts
-    e_100k = cohort_100k.ends
-    counts_100k_matrix = cohort_100k.counts
+    s_100k, e_100k = cohort_100k.starts, cohort_100k.ends
+    auto_mask_100k, chrx_mask_100k, _ = resolve_contig_masks(
+        c_100k,
+        autosomes=autosomes,
+        sex_contigs=sex_contigs,
+        sex_signal_contig=sex_signal_contig,
+    )
+    p_bin = prenatal_bin_size
+    full_log2_100k, chrx_ratios = compute_100k_profiles(
+        cohort_100k.counts,
+        c_100k,
+        s_100k,
+        e_100k,
+        p_bin,
+        auto_mask_100k,
+        chrx_mask_100k,
+    )
+    log2_ratios_100k = full_log2_100k[:, auto_mask_100k]
 
-    w_100k = e_100k - s_100k
-    norm_c_100k = np.array([normalize_chr(c) for c in c_100k], dtype=object)
-    auto_mask_100k = _resolve_autosome_mask(norm_c_100k)
-    chrx_mask_100k = norm_c_100k == "X"
-
-    n_auto_100k = int(np.sum(auto_mask_100k))
-    log2_ratios_100k = np.zeros((n_samples, n_auto_100k), dtype=np.float64)
-    chrx_ratios = np.ones(n_samples, dtype=np.float64)
-
-    for i in range(n_samples):
-        counts_100k = counts_100k_matrix[:, i]
-        r_auto_100k = _autosomal_density(
-            counts_100k, w_100k, auto_mask_100k, prenatal_bin_size
-        )
-        exp_auto = r_auto_100k * w_100k[auto_mask_100k]
-        ratio_auto = counts_100k[auto_mask_100k] / exp_auto
-        log2_ratios_100k[i, :] = np.log2(np.where(ratio_auto > 0, ratio_auto, np.nan))
-
-        if np.any(chrx_mask_100k):
-            exp_chrx = r_auto_100k * w_100k[chrx_mask_100k]
-            ratio_chrx = counts_100k[chrx_mask_100k] / exp_chrx
-            log2_chrx = np.log2(np.where(ratio_chrx > 0, ratio_chrx, np.nan))
-            if np.any(np.isfinite(log2_chrx)):
-                chrx_ratios[i] = float(2.0 ** np.nanmean(log2_chrx))
-
-    # Mask low-coverage/variable 100 kb autosomal bins
-    valid_bins = np.isfinite(log2_ratios_100k)
-    frac_valid = np.mean(valid_bins, axis=0)
-    auto_masked = frac_valid < 0.99
+    n_auto_100k = int(np.count_nonzero(auto_mask_100k))
+    clean_rows = (
+        ~quarantined if np.any(~quarantined) else np.ones(n_samples, dtype=np.bool_)
+    )
+    auto_masked = np.mean(np.isfinite(log2_ratios_100k[clean_rows]), axis=0) < 0.99
     if np.all(auto_masked):
         auto_masked[:] = False
 
-    raw_ratios = np.where(valid_bins, log2_ratios_100k, np.nan)
+    raw_ratios = np.where(np.isfinite(log2_ratios_100k), log2_ratios_100k, np.nan)
     with np.errstate(all="ignore"):
-        mean_features = np.nanmean(raw_ratios, axis=0)
-    mean_features = np.nan_to_num(mean_features, nan=0.0)
+        mean_features = np.nan_to_num(
+            np.nanmean(raw_ratios[clean_rows], axis=0), nan=0.0
+        )
+    x_autosomal = np.where(
+        np.isnan(raw_ratios), mean_features[np.newaxis, :], raw_ratios
+    )
 
-    nan_r, nan_c = np.where(np.isnan(raw_ratios))
-    X_autosomal = raw_ratios.copy()
-    X_autosomal[nan_r, nan_c] = np.take(mean_features, nan_c)
-    X_autosomal = np.nan_to_num(X_autosomal, nan=0.0)
-
-    # Truncated PCA
-    n_feat = min(50, max(1, n_samples - 1))
-    if float(np.var(X_autosomal)) < 1e-12:
-        pca_center = np.mean(X_autosomal, axis=0)
+    unmasked_cols = ~auto_masked
+    n_unmasked = int(np.count_nonzero(unmasked_cols))
+    n_feat = min(50, max(1, n_samples - 1), max(1, n_unmasked))
+    x_sub = x_autosomal[:, unmasked_cols]
+    pca_center = np.zeros(n_auto_100k, dtype=np.float64)
+    if n_unmasked == 0 or float(np.var(x_sub)) < 1e-12:
+        if n_unmasked > 0:
+            pca_center[unmasked_cols] = np.mean(x_sub, axis=0)
         scores = np.zeros((n_samples, n_feat), dtype=np.float64)
         pca_rotation = np.zeros((n_auto_100k, n_feat), dtype=np.float64)
     else:
-        scores, pca_center, pca_rotation = pca_irlba_numpy(
-            X_autosomal, n_components=n_feat, seed=seed
+        scores, sub_center, sub_rot = pca_irlba_numpy(
+            x_sub, n_components=n_feat, seed=seed
+        )
+        pca_center[unmasked_cols] = sub_center
+        pca_rotation = np.zeros((n_auto_100k, sub_rot.shape[1]), dtype=np.float64)
+        pca_rotation[unmasked_cols, :] = sub_rot
+
+    ffa_valid = (~quarantined) & np.isfinite(ff_targets)
+    if int(np.count_nonzero(ffa_valid)) >= 3:
+        ens_fit = fit_logit_linear_ensemble(
+            scores[ffa_valid],
+            ff_targets[ffa_valid],
+            standardize=False,
+            l1_ratios=(0.1, 0.5),
+            seed=seed,
+        )
+        w_ens, b_ens, sigma_ffa = ens_fit.weights, ens_fit.intercept, ens_fit.oof_rmse
+    else:
+        w_ens = np.zeros(scores.shape[1], dtype=np.float64)
+        mean_ff = float(np.mean(ff_targets[ffa_valid])) if np.any(ffa_valid) else 0.05
+        b_ens, sigma_ffa = (
+            float(scipy.special.logit(float(np.clip(mean_ff, 0.005, 0.5)))),
+            0.25,
         )
 
-    # 4. FFA Training targets (entry.ff if given, else FFY on male fetuses)
-    target_ffa = np.full(n_samples, np.nan, dtype=np.float64)
-    for i, entry in enumerate(entries):
-        if entry.ff is not None:
-            target_ffa[i] = entry.ff
-        elif is_male_arr[i]:
-            target_ffa[i] = max(0.0, float(final_ffy[i]))
-
-    labeled_mask = np.isfinite(target_ffa)
-    if not np.any(labeled_mask):
-        labeled_mask[:] = True
-        target_ffa[:] = 0.05
-
-    labeled_idx = np.flatnonzero(labeled_mask)
-    X_labeled = scores[labeled_idx, :]
-    y_labeled = target_ffa[labeled_idx]
-
-    # Fit convex logit-link RidgeCV and ElasticNetCV ensemble
-    w_ens, b_ens, sigma_ffa = fit_ffa_logit_ensemble(X_labeled, y_labeled, seed=seed)
-
-    # 5. chrX Diploid Female Baseline and FFX Huber Regression
-    has_females = bool(np.any(~is_male_arr))
-    if has_females:
-        fem_ratios = chrx_ratios[~is_male_arr]
-        fem_chrx_mean = float(np.mean(fem_ratios))
-        fem_chrx_std = max(float(np.std(fem_ratios)), 0.005)
-    else:
-        fem_chrx_mean = 1.0
-        fem_chrx_std = 0.01
-
-    male_mask = is_male_arr
-    if np.sum(male_mask) >= 2:
-        ffx_int, ffx_slope = rlm_huber(chrx_ratios[male_mask], final_ffy[male_mask])
-    else:
-        ffx_int, ffx_slope = 2.0, -2.0
+    f_rx = np.where(is_male_arr, ff_targets, 0.0)
+    alpha_0, raw_alpha_1, sigma_x_sys = fit_forward_ffx_model(
+        chrx_ratios, f_rx, (~quarantined) & np.isfinite(chrx_ratios) & np.isfinite(f_rx)
+    )
+    alpha_1 = float(raw_alpha_1) if raw_alpha_1 < -1e-6 else -0.5
 
     if isinstance(sample_tables, Sequence):
         frag_metas = [
-            extract_sample_fragmentomics(decode_metadata(t.schema.metadata))
+            t.meta.fragmentomics
+            if isinstance(t, SampleBuffers)
+            else extract_sample_fragmentomics(decode_metadata(t.schema.metadata))
             for t in sample_tables
         ]
     else:
@@ -525,49 +414,36 @@ def fit_prenatal_models(
             extract_sample_fragmentomics(m) for m in cohort_5k.sample_metadata
         ]
 
-    labeled_ff = np.array(
-        [entry.ff if entry.ff is not None else np.nan for entry in entries],
-        dtype=np.float64,
-    )
     frag_fit = fit_cohort_fragmentomics_model(
-        frag_metas, is_male_arr, final_ffy, labeled_ff
+        frag_metas, is_male_arr, ff_targets, quarantined=quarantined, seed=seed
     )
+    p_fet = p_mat = w_frag = b_frag = m_frag = s_frag = band_w_list = mu_f_val = (
+        mu_m_val
+    ) = None
+    std_size = 0.018
     if frag_fit is not None:
-        p_fet, p_mat, w_frag, b_frag, m_frag, s_frag, std_size = frag_fit
-    else:
-        p_fet, p_mat, w_frag, b_frag, m_frag, s_frag = (
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        std_size = 0.018
+        p_fet, p_mat = frag_fit.p_fetal_density, frag_fit.p_maternal_density
+        w_frag, b_frag = frag_fit.ff_frag_weights, frag_fit.ff_frag_bias
+        m_frag, s_frag = frag_fit.ff_frag_feature_mean, frag_fit.ff_frag_feature_scale
+        std_size = float(frag_fit.ff_size_std)
+        bw, mf, mm = compute_band_fisher_weights(p_fet, p_mat, f0=0.08)
+        band_w_list = [float(x) for x in bw]
+        mu_f_val, mu_m_val = float(mf), float(mm)
 
-    # 6. Build PrenatalModelMetadata
+    q_list = (
+        [int(x) for x in np.flatnonzero(quarantined)] if np.any(quarantined) else None
+    )
     prenatal_meta = PrenatalModelMetadata(
         prenatal_bin_size=prenatal_bin_size,
         yfrac_threshold=float(yfrac_threshold),
-        ffy_intercept=float(ffy_intercept),
         ffy_slope=float(ffy_slope),
-        mlp_w1=[[0.0, 0.0] for _ in range(n_feat)],
-        mlp_b1=[0.0, 0.0],
-        mlp_w2=[[0.0], [0.0]],
-        mlp_b2=[0.0],
-        mlp_skew_intercept=0.0,
-        mlp_skew_slope=1.0,
         olm_weights=[float(x) for x in w_ens],
         olm_bias=float(b_ens),
-        olm_skew_intercept=0.0,
-        olm_skew_slope=1.0,
-        ffx_intercept=float(ffx_int),
-        ffx_slope=float(ffx_slope),
-        female_chrx_ratio_mean=float(fem_chrx_mean),
-        female_chrx_ratio_std=float(fem_chrx_std),
-        ffy_std=0.01,
+        female_chrx_ratio_mean=float(alpha_0),
+        female_chrx_ratio_std=float(sigma_x_sys),
+        alpha_1=alpha_1,
+        ffy_std=float(ffy_std),
         ffa_std=float(sigma_ffa),
-        ffx_std=0.025,
         ffa_logit_mode=True,
         p_fetal_density=p_fet,
         p_maternal_density=p_mat,
@@ -575,274 +451,283 @@ def fit_prenatal_models(
         ff_frag_bias=b_frag,
         ff_frag_feature_mean=m_frag,
         ff_frag_feature_scale=s_frag,
-        ff_size_std=float(std_size),
+        ff_size_std=std_size,
+        msy_bg_rate=float(poisson_model.pooled_bg_rate),
+        clean_msy_bins=[int(x) for x in poisson_model.clean_bin_indices],
+        quarantined_samples=q_list,
+        band_fisher_weights=band_w_list,
+        mu_fetal_w=mu_f_val,
+        mu_maternal_w=mu_m_val,
     )
 
-    # 7. Construct Arrow Reference Tables
-    auto_indices = np.flatnonzero(auto_mask_100k)
-    prenatal_auto_table = _build_prenatal_branch_table(
+    auto_idx = np.flatnonzero(auto_mask_100k)
+    prenatal_auto_fit = BranchFitArrays(
         branch=BRANCH_PRENATAL_AUTOSOMAL,
-        contigs=[c_100k[i] for i in auto_indices],
-        starts=s_100k[auto_indices],
-        ends=e_100k[auto_indices],
+        contigs=tuple(c_100k[int(i)] for i in auto_idx),
+        starts=s_100k[auto_idx],
+        ends=e_100k[auto_idx],
         masked=auto_masked,
         pca_mean=pca_center,
-        pca_loadings=[[float(v) for v in row] for row in pca_rotation],
+        pca_loadings=np.asarray(pca_rotation, dtype=np.float32),
         null_mean=mean_features,
     )
-
-    chry_indices = np.flatnonzero(chry_mask_5k)
-    prenatal_ffy_table = _build_prenatal_branch_table(
+    chry_idx = np.flatnonzero(chry_mask_5k)
+    prenatal_ffy_fit = BranchFitArrays(
         branch=BRANCH_PRENATAL_FFY,
-        contigs=[c_5k[i] for i in chry_indices],
-        starts=s_5k[chry_indices],
-        ends=e_5k[chry_indices],
+        contigs=tuple(c_5k[int(i)] for i in chry_idx),
+        starts=s_5k[chry_idx],
+        ends=e_5k[chry_idx],
         masked=~informative_mask,
         pca_mean=ffy_weights,
+        gc=cohort_gc[chry_idx] if cohort_gc is not None else None,
+        mappability=cohort_mappability[chry_idx]
+        if cohort_mappability is not None
+        else None,
     )
-
-    return (
-        prenatal_auto_table,
-        prenatal_ffy_table,
-        prenatal_meta,
-        tuple(is_male_resolved),
+    sex_labels: tuple[SexLabel, ...] = tuple(
+        "male" if m else "female" for m in is_male_arr.tolist()
     )
+    return prenatal_meta, (prenatal_auto_fit, prenatal_ffy_fit), sex_labels
 
 
 def predict_prenatal(
-    sample_table: pa.Table,
+    sample: SampleBuffers,
     reference_table: pa.Table,
     prenatal_meta: PrenatalModelMetadata,
+    *,
     min_ff_warning: float = 0.04,
+    sample_gc_override: NDArray[np.floating] | None = None,
+    sample_mappability_override: NDArray[np.floating] | None = None,
+    sample_n_mask_override: NDArray[np.bool_] | None = None,
+    min_mappability: float = DEFAULT_MIN_MAPPABILITY,
 ) -> FetalFractionResult:
     """Predict fetal sex, FFY, FFA, FFX, SCA status, and active fetal fraction."""
-    # 1. Extract reference branches
-    ref_branches = reference_table.column("branch").to_pylist()
-    if BRANCH_PRENATAL_FFY not in ref_branches:
-        raise ValueError(f"reference table is missing '{BRANCH_PRENATAL_FFY}' branch")
-    if BRANCH_PRENATAL_AUTOSOMAL not in ref_branches:
-        raise ValueError(
-            f"reference table is missing '{BRANCH_PRENATAL_AUTOSOMAL}' branch"
+    pm = prenatal_meta
+    missing_cols = sorted(_REQUIRED_REF_COLUMNS - set(reference_table.column_names))
+    if missing_cols:
+        raise PredictError(
+            f"reference table is missing required columns: {', '.join(missing_cols)}"
         )
 
-    ffy_ref = reference_table.filter(
-        pc.equal(reference_table.column("branch"), BRANCH_PRENATAL_FFY)
+    branch_col = reference_table.column("branch")
+    ref_branches = {str(v) for v in pc.unique(branch_col).to_pylist() if v is not None}
+    for req in (BRANCH_PRENATAL_AUTOSOMAL, BRANCH_PRENATAL_FFY):
+        if req not in ref_branches:
+            raise PredictError(f"reference table is missing '{req}' branch")
+
+    ffy_ref = reference_table.filter(pc.equal(branch_col, BRANCH_PRENATAL_FFY))
+    auto_ref = reference_table.filter(pc.equal(branch_col, BRANCH_PRENATAL_AUTOSOMAL))
+    roles = extract_ref_contig_roles(reference_table, ffy_ref)
+
+    bufs = SampleBuffers.coerce(sample, validate=True)
+    ffy_ref_c = decode_dictionary_contigs(ffy_ref.column("contig"))
+    ffy_ref_s, ffy_ref_e = col_i64(ffy_ref, "start"), col_i64(ffy_ref, "end")
+    ffy_bin = (
+        max(1, int(np.max(ffy_ref_e - ffy_ref_s)))
+        if ffy_ref.num_rows > 0
+        else bufs.meta.bin_size
     )
-    auto_ref = reference_table.filter(
-        pc.equal(reference_table.column("branch"), BRANCH_PRENATAL_AUTOSOMAL)
+    bufs_5k = (
+        bufs if bufs.meta.bin_size == ffy_bin else rebin_sample_buffers(bufs, ffy_bin)
+    )
+    counts_5k = np.asarray(bufs_5k.count, dtype=np.float64)
+    sample_c, sample_s, sample_e = sample_grid(bufs_5k.meta)
+    auto_mask_5k, _, _ = resolve_contig_masks(
+        sample_c, autosomes=roles[0], sex_contigs=roles[1], sex_signal_contig=roles[2]
     )
 
-    # 2. Evaluate chry_score and fetal sex from 5 kb sample table
-    sample_c = [str(x) for x in sample_table.column("contig").to_pylist()]
-    sample_s = np.asarray(
-        sample_table.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
+    ffy_align = align_sample_to_grid_indices(
+        bufs_5k.meta, ffy_ref_c, ffy_ref_s, ffy_ref_e, allow_alias=True
     )
-    sample_e = np.asarray(
-        sample_table.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
+    sample_chry_c = np.zeros(ffy_ref.num_rows, dtype=np.float64)
+    hit_y = ffy_align >= 0
+    sample_chry_c[hit_y] = counts_5k[ffy_align[hit_y]]
+
+    ref_ffy_masked = np.asarray(
+        ffy_ref.column("masked").to_numpy(zero_copy_only=False), np.bool_
     )
-    sample_w = sample_e - sample_s
-    sample_counts = np.asarray(
-        sample_table.column("count").to_numpy(zero_copy_only=False),
-        dtype=np.float64,
+    raw_clean = (
+        np.asarray(pm.clean_msy_bins, dtype=np.int64)
+        if pm.clean_msy_bins is not None
+        else np.flatnonzero(~ref_ffy_masked).astype(np.int64)
     )
-    norm_sample_c = np.array([normalize_chr(c) for c in sample_c], dtype=object)
+    clean_idx = raw_clean[(raw_clean >= 0) & (raw_clean < ffy_ref.num_rows)]
+    chry_reads = float(
+        np.sum(sample_chry_c[clean_idx] if clean_idx.size else sample_chry_c)
+    )
+    chry_score = chry_reads / max(float(np.sum(counts_5k)), 1.0)
+    fetal_sex: FetalSex = "M" if chry_score >= pm.yfrac_threshold else "F"
 
-    chry_mask = norm_sample_c == "Y"
-    total_reads = float(np.sum(sample_counts))
-    chry_reads = float(np.sum(sample_counts[chry_mask])) if np.any(chry_mask) else 0.0
-    chry_score = chry_reads / max(total_reads, 1.0)
-    fetal_sex: FetalSex = "M" if chry_score >= prenatal_meta.yfrac_threshold else "F"
+    ffy: float | None = None
+    ffy_se: float | None = None
+    if fetal_sex == "M" and np.any(hit_y):
+        auto_5k = (
+            reference_table.filter(pc.equal(branch_col, BRANCH_AUTOSOMAL))
+            if BRANCH_AUTOSOMAL in ref_branches
+            else None
+        )
+        gc_5k, map_5k, ffy_gc, ffy_map = resolve_5k_covariates(
+            bufs,
+            bufs_5k,
+            auto_5k,
+            ffy_ref,
+            ffy_align,
+            sample_gc_override,
+            sample_mappability_override,
+            sample_n_mask_override,
+            min_mappability,
+        )
+        _, c_ids_5k = np.unique(
+            [normalize_chr(c) for c in sample_c], return_inverse=True
+        )
+        exp_5k = compute_bin_exposure(sample_s, sample_e, ffy_bin)
+        r_auto_5k = compute_autosomal_density(
+            counts_5k, c_ids_5k.astype(np.int16), exp_5k, map_5k, gc_5k, auto_mask_5k
+        )
+        ffy_exp_unit = (ffy_ref_e - ffy_ref_s).astype(np.float64) / max(
+            float(ffy_bin), 1.0
+        )
+        sample_chry_exp = r_auto_5k * ffy_exp_unit * ffy_map * ffy_gc
+        ref_w = col_f64(ffy_ref, "pca_mean")
+        lam_bg = ref_w[clean_idx] if clean_idx.size else np.empty(0, dtype=np.float64)
+        p_model = PoissonFFYModel(
+            clean_idx, lam_bg, pm.ffy_slope, float(pm.msy_bg_rate or 0.0)
+        )
+        ffy_raw, ffy_se_val = evaluate_poisson_msy_ffy(
+            sample_chry_c, sample_chry_exp, p_model
+        )
+        ffy, ffy_se = max(0.0, float(ffy_raw)), float(ffy_se_val)
 
-    # 3. Compute FFY if male
-    if fetal_sex == "M" and np.any(chry_mask) and ffy_ref.num_rows > 0:
-        auto_mask_5k = _resolve_autosome_mask(norm_sample_c)
-        r_auto_5k = _autosomal_density(sample_counts, sample_w, auto_mask_5k, 5000)
-        y_norm = sample_counts[chry_mask] / (r_auto_5k * sample_w[chry_mask])
+    p_bin = pm.prenatal_bin_size
+    bufs_100k = (
+        bufs if bufs.meta.bin_size == p_bin else rebin_sample_buffers(bufs, p_bin)
+    )
+    counts_100k = np.asarray(bufs_100k.count, dtype=np.float64)
+    c_100k, s_100k, e_100k = sample_grid(bufs_100k.meta)
+    auto_mask_100k, chrx_mask_100k, _ = resolve_contig_masks(
+        c_100k, autosomes=roles[0], sex_contigs=roles[1], sex_signal_contig=roles[2]
+    )
+    full_log2, chrx_arr = compute_100k_profiles(
+        counts_100k[:, np.newaxis],
+        c_100k,
+        s_100k,
+        e_100k,
+        p_bin,
+        auto_mask_100k,
+        chrx_mask_100k,
+    )
+    chrx_ratio = float(chrx_arr[0])
 
-        ref_ffy_weights = np.asarray(
-            ffy_ref.column("pca_mean").to_numpy(zero_copy_only=False),
-            dtype=np.float64,
+    ref_null_mean = col_f64(auto_ref, "null_mean")
+    ref_pca_center = col_f64(auto_ref, "pca_mean")
+    ld_col = auto_ref.column("pca_loadings").combine_chunks()
+    if not isinstance(ld_col.type, pa.FixedSizeListType):
+        raise SchemaError(
+            f"expected FixedSizeListType for 'pca_loadings', found {ld_col.type}"
         )
-        ref_ffy_masked = np.asarray(
-            ffy_ref.column("masked").to_numpy(zero_copy_only=False), dtype=np.bool_
+    n_olm = len(pm.olm_weights)
+    ref_rot = np.zeros((auto_ref.num_rows, n_olm), dtype=np.float64)
+    if ld_col.type.list_size > 0 and auto_ref.num_rows > 0 and n_olm > 0:
+        full_ld = fixed_size_list_to_numpy(ld_col, ld_col.type.list_size, np.float32)
+        k_copy = min(n_olm, ld_col.type.list_size)
+        ref_rot[:, :k_copy] = np.nan_to_num(
+            full_ld[:, :k_copy].astype(np.float64), nan=0.0
         )
-        weights = np.where(~ref_ffy_masked, ref_ffy_weights, 0.0)
 
-        # Coordinate matching
-        ref_ffy_s = np.asarray(
-            ffy_ref.column("start").to_numpy(zero_copy_only=False),
-            dtype=np.int64,
-        )
-        matched_coords = y_norm.size == weights.size and np.array_equal(
-            sample_s[chry_mask], ref_ffy_s
-        )
-        if matched_coords:
-            raw_ffy = float(np.sum(y_norm * weights))
-        else:
-            aligned = _align_sample_to_ref(sample_c, sample_s, sample_e, ffy_ref)
-            raw_ffy = 0.0
-            for j, s_idx in enumerate(aligned):
-                if s_idx >= 0 and weights[j] != 0.0:
-                    s_w = sample_w[s_idx]
-                    raw_ffy += float(
-                        (sample_counts[s_idx] / (r_auto_5k * s_w)) * weights[j]
-                    )
-
-        ffy_computed = float(
-            prenatal_meta.ffy_intercept + prenatal_meta.ffy_slope * raw_ffy
-        )
-        ffy: float | None = max(0.0, ffy_computed)
+    ref_auto_c = decode_dictionary_contigs(auto_ref.column("contig"))
+    ref_auto_s, ref_auto_e = col_i64(auto_ref, "start"), col_i64(auto_ref, "end")
+    auto_c_100k = tuple(c_100k[int(i)] for i in np.flatnonzero(auto_mask_100k))
+    if (
+        auto_c_100k == ref_auto_c
+        and np.array_equal(s_100k[auto_mask_100k], ref_auto_s)
+        and np.array_equal(e_100k[auto_mask_100k], ref_auto_e)
+    ):
+        log2_ratios = full_log2[0, auto_mask_100k]
     else:
-        ffy = None
-
-    # 4. Rebin sample to 100 kb for FFA and FFX
-    sample_100k = rebin_sample_table(sample_table, prenatal_meta.prenatal_bin_size)
-    c_100k = [str(x) for x in sample_100k.column("contig").to_pylist()]
-    s_100k = np.asarray(
-        sample_100k.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    e_100k = np.asarray(
-        sample_100k.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    w_100k = e_100k - s_100k
-    counts_100k = np.asarray(
-        sample_100k.column("count").to_numpy(zero_copy_only=False),
-        dtype=np.float64,
-    )
-    norm_c_100k = np.array([normalize_chr(c) for c in c_100k], dtype=object)
-    auto_mask_100k = _resolve_autosome_mask(norm_c_100k)
-    chrx_mask_100k = norm_c_100k == "X"
-
-    r_auto_100k = _autosomal_density(
-        counts_100k, w_100k, auto_mask_100k, prenatal_meta.prenatal_bin_size
-    )
-
-    # Autosomal log2 ratios on auto_ref bins
-    exp_counts = r_auto_100k * w_100k[auto_mask_100k]
-    ratio_auto = counts_100k[auto_mask_100k] / exp_counts
-    log2_ratios = np.log2(np.where(ratio_auto > 0, ratio_auto, np.nan))
-
-    ref_null_mean = np.asarray(
-        auto_ref.column("null_mean").to_numpy(zero_copy_only=False),
-        dtype=np.float64,
-    )
-    ref_pca_center = np.asarray(
-        auto_ref.column("pca_mean").to_numpy(zero_copy_only=False),
-        dtype=np.float64,
-    )
-    ref_pca_rotation = np.array(
-        auto_ref.column("pca_loadings").to_pylist(), dtype=np.float64
-    )
-
-    ref_auto_s = np.asarray(
-        auto_ref.column("start").to_numpy(zero_copy_only=False),
-        dtype=np.int64,
-    )
-    auto_s_100k = s_100k[auto_mask_100k]
-    matched_auto = log2_ratios.size == ref_null_mean.size and np.array_equal(
-        auto_s_100k, ref_auto_s
-    )
-    if not matched_auto:
-        aligned = _align_sample_to_ref(c_100k, s_100k, e_100k, auto_ref)
-        aligned_ratios = np.full(ref_null_mean.size, np.nan, dtype=np.float64)
-        for j, s_idx in enumerate(aligned):
-            if s_idx >= 0:
-                exp_count = r_auto_100k * w_100k[s_idx]
-                if exp_count > 0 and counts_100k[s_idx] > 0:
-                    aligned_ratios[j] = math.log2(counts_100k[s_idx] / exp_count)
-        log2_ratios = aligned_ratios
-
-    imputed = np.where(np.isnan(log2_ratios), ref_null_mean, log2_ratios)
-    centered = imputed - ref_pca_center
-    features = centered @ ref_pca_rotation
-
-    # Evaluate FFA via convex logit ensemble or legacy MLP/OLM fallback
-    if prenatal_meta.ffa_logit_mode:
-        features_flat = features.ravel() if features.ndim > 1 else features
-        raw_logit = float(
-            np.dot(
-                features_flat, np.asarray(prenatal_meta.olm_weights, dtype=np.float64)
-            )
-            + prenatal_meta.olm_bias
+        aligned = align_grid_indices(
+            c_100k, s_100k, e_100k, ref_auto_c, ref_auto_s, ref_auto_e, allow_alias=True
         )
-        ffa = float(scipy.special.expit(raw_logit))
-    else:
-        # Legacy MLP or fallback to OLM
-        w1 = np.asarray(prenatal_meta.mlp_w1, dtype=np.float64)
-        b1 = np.asarray(prenatal_meta.mlp_b1, dtype=np.float64)
-        w2 = np.asarray(prenatal_meta.mlp_w2, dtype=np.float64)
-        b2 = np.asarray(prenatal_meta.mlp_b2, dtype=np.float64)
+        log2_ratios = np.full(ref_null_mean.size, np.nan, dtype=np.float64)
+        hit_a = aligned >= 0
+        log2_ratios[hit_a] = full_log2[0, aligned[hit_a]]
 
-        h = scipy.special.expit(features @ w1 + b1)
-        raw_mlp = float(scipy.special.expit(h @ w2 + b2)[0])
-
-        if 0.01 <= raw_mlp <= 0.50:
-            ffa = float(
-                prenatal_meta.mlp_skew_intercept
-                + prenatal_meta.mlp_skew_slope * raw_mlp
-            )
-        else:
-            olm_w = np.asarray(prenatal_meta.olm_weights, dtype=np.float64)
-            olm_bias = float(prenatal_meta.olm_bias)
-            raw_olm = float(features @ olm_w + olm_bias)
-            ffa = float(
-                prenatal_meta.olm_skew_intercept
-                + prenatal_meta.olm_skew_slope * raw_olm
-            )
-
-    # 5. Evaluate chrX ratio and FFX
-    if np.any(chrx_mask_100k):
-        exp_chrx = r_auto_100k * w_100k[chrx_mask_100k]
-        ratio_chrx = counts_100k[chrx_mask_100k] / exp_chrx
-        log2_chrx = np.log2(np.where(ratio_chrx > 0, ratio_chrx, np.nan))
-        chrx_ratio = (
-            float(2.0 ** np.nanmean(log2_chrx))
-            if np.any(np.isfinite(log2_chrx))
-            else 1.0
+    centered = (
+        np.where(np.isnan(log2_ratios), ref_null_mean, log2_ratios) - ref_pca_center
+    )
+    ref_masked = np.asarray(
+        auto_ref.column("masked").to_numpy(zero_copy_only=False), np.bool_
+    )
+    usable_pca = (~ref_masked) & np.isfinite(centered)
+    if n_olm > 0 and int(np.count_nonzero(usable_pca)) > n_olm:
+        feat, _ = project_huber_pca_wave(
+            centered[usable_pca], ref_rot[usable_pca].T, alpha=1e-4, clip=None
         )
+    elif n_olm > 0 and np.any(usable_pca):
+        feat = centered[usable_pca] @ ref_rot[usable_pca]
     else:
-        chrx_ratio = 1.0
+        feat = np.zeros(n_olm, dtype=np.float64)
 
-    ffx = float(prenatal_meta.ffx_intercept + prenatal_meta.ffx_slope * chrx_ratio)
-
-    # 6. Classify SCA
-    sca_result = classify_sca(
-        fetal_sex=fetal_sex,
-        ffy=ffy,
-        ffx=ffx,
-        ffa=ffa,
-        chrx_ratio=chrx_ratio,
-        prenatal_meta=prenatal_meta,
+    raw_ffa = float(np.dot(feat, np.asarray(pm.olm_weights))) + pm.olm_bias
+    ffa = (
+        float(scipy.special.expit(raw_ffa))
+        if pm.ffa_logit_mode
+        else float(np.clip(raw_ffa, 0.0, 1.0))
     )
+    ffx = float((chrx_ratio - pm.female_chrx_ratio_mean) / pm.alpha_1)
 
-    # 7. Active Fetal Fraction selection
-    sample_frag_meta = extract_sample_fragmentomics(
-        decode_metadata(sample_table.schema.metadata)
-    )
-    ff_size = (
-        predict_ff_fragmentomics(sample_frag_meta, prenatal_meta)
-        if sample_frag_meta is not None
-        else None
-    )
+    frag_meta = bufs.meta.fragmentomics
+    ff_size: float | None = None
+    chrx_llr_fetal: float | None = None
+    if frag_meta is not None:
+        ff_size = predict_ff_fragmentomics(
+            frag_meta.hist_autosomal,
+            frag_meta.end_motif_counts,
+            paired_end=frag_meta.paired_end,
+            chromatosome_mode_bp=frag_meta.chromatosome_mode_bp,
+            sizing_shift_bp=frag_meta.sizing_shift_bp,
+            helical_10bp_amp=frag_meta.helical_10bp_amplitude,
+            motif_mds=frag_meta.motif_diversity_score,
+            p_fetal_density=pm.p_fetal_density,
+            p_maternal_density=pm.p_maternal_density,
+            ff_frag_weights=pm.ff_frag_weights,
+            ff_frag_bias=pm.ff_frag_bias or 0.0,
+            ff_frag_feature_mean=pm.ff_frag_feature_mean,
+            ff_frag_feature_scale=pm.ff_frag_feature_scale,
+        )
+        if (
+            frag_meta.paired_end
+            and int(np.sum(frag_meta.hist_chrx)) >= 50
+            and pm.p_fetal_density is not None
+            and pm.p_maternal_density is not None
+        ):
+            chrx_llr_fetal = compute_fragment_length_llr(
+                frag_meta.hist_chrx,
+                pm.p_fetal_density,
+                pm.p_maternal_density,
+                sizing_shift_bp=frag_meta.sizing_shift_bp,
+                baseline_ff=ffa,
+            )
 
-    active_ff, active_ff_source = fuse_active_fetal_fraction(
-        fetal_sex=fetal_sex,
-        sca_call=sca_result.call,
-        ffy=ffy,
-        ffa=ffa,
-        ffx=ffx,
+    sca_res, active_ff, active_ff_se, active_ff_source = _evaluate_sca_and_active_ff(
+        fetal_sex,
+        ffy,
+        ffy_se,
+        ffx,
+        ffa,
+        chrx_ratio,
+        pm,
         ff_size=ff_size,
-        prenatal_meta=prenatal_meta,
+        chrx_llr_fetal=chrx_llr_fetal,
     )
-
+    effective_ff = _compute_effective_ff(active_ff, bufs, pm)
     low_ff_warning = bool(active_ff < min_ff_warning)
-    warnings: list[str] = []
+    warnings_list: list[str] = []
     if low_ff_warning:
-        warnings.append(
+        warnings_list.append(
             f"fetal fraction below warning threshold ({min_ff_warning:.2f})"
         )
-    if sca_result.is_aneuploid:
-        warnings.append(f"sex chromosome aneuploidy detected: {sca_result.call}")
+    if sca_res.is_aneuploid:
+        warnings_list.append(f"sex chromosome aneuploidy detected: {sca_res.call}")
 
     return FetalFractionResult(
         fetal_sex=fetal_sex,
@@ -854,96 +739,10 @@ def predict_prenatal(
         ff_size=ff_size,
         chrx_ratio=chrx_ratio,
         chry_score=chry_score,
-        yfrac_threshold=prenatal_meta.yfrac_threshold,
-        sca=sca_result,
+        yfrac_threshold=pm.yfrac_threshold,
+        sca=sca_res,
         low_ff_warning=low_ff_warning,
-        warnings=tuple(warnings),
+        warnings=tuple(warnings_list),
+        active_ff_se=active_ff_se,
+        effective_ff=effective_ff,
     )
-
-
-def annotate_prenatal_segments(
-    segments: Sequence[SegmentResult],
-    prenatal_result: FetalFractionResult,
-    z_threshold: float = 3.0,
-    sample_table: pa.Table | None = None,
-    prenatal_meta: PrenatalModelMetadata | None = None,
-) -> list[SegmentResult]:
-    """Annotate segments with expected ratio, implied FF, discordance status, and origin."""
-    active_ff = max(0.0, float(prenatal_result.active_ff))
-    annotated: list[SegmentResult] = []
-
-    shift_bp = 0.0
-    p_fetal = None
-    p_maternal = None
-    if sample_table is not None:
-        frag_meta = extract_sample_fragmentomics(
-            decode_metadata(sample_table.schema.metadata)
-        )
-        if frag_meta is not None:
-            shift_bp = frag_meta.sizing_shift_bp
-    if prenatal_meta is not None:
-        p_fetal = prenatal_meta.p_fetal_density
-        p_maternal = prenatal_meta.p_maternal_density
-
-    for seg in segments:
-        if active_ff <= 0.0:
-            expected_ratio = 0.0
-        elif seg.ratio >= 0.0:
-            expected_ratio = math.log2(1.0 + 0.5 * active_ff)
-        else:
-            arg = max(1e-6, 1.0 - 0.5 * active_ff)
-            expected_ratio = math.log2(arg)
-
-        implied_ff = 2.0 * abs(2.0**seg.ratio - 1.0)
-
-        norm_contig = normalize_chr(seg.contig)
-        is_gonosome = norm_contig in {"X", "Y"}
-        has_call = (seg.call is not None) or (abs(seg.zscore) >= z_threshold)
-
-        discordant = False
-        reason: str | None = None
-
-        if is_gonosome and (prenatal_result.sca.is_aneuploid or has_call):
-            discordant = True
-            reason = "SCA_DISCORDANT"
-        elif has_call and abs(seg.ratio) < 0.5 * abs(expected_ratio):
-            discordant = True
-            reason = "SUB_FETAL_RATIO"
-        elif has_call and implied_ff > max(2.5 * active_ff, active_ff + 0.15):
-            discordant = True
-            reason = "SUPER_FETAL_RATIO"
-
-        frag_short_ratio = None
-        frag_llr_size = None
-        origin_call = None
-        if sample_table is not None and p_fetal is not None and p_maternal is not None:
-            lengths = extract_segment_fragment_lengths(
-                sample_table, seg.contig, seg.start, seg.end
-            )
-            is_gain = (
-                seg.call.lower() == "gain" if seg.call is not None else (seg.ratio >= 0)
-            )
-            frag_short_ratio, frag_llr_size, origin_call = score_segment_origin(
-                lengths,
-                shift_bp,
-                p_fetal,
-                p_maternal,
-                active_ff=active_ff,
-                is_gain=is_gain,
-                has_call=has_call,
-            )
-
-        annotated.append(
-            replace(
-                seg,
-                expected_ratio=float(expected_ratio),
-                implied_ff=float(implied_ff),
-                discordant=discordant,
-                discordance_reason=reason,
-                frag_short_ratio=frag_short_ratio,
-                frag_llr_size=frag_llr_size,
-                origin_call=origin_call,
-            )
-        )
-
-    return annotated

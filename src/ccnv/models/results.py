@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 import numpy as np
 from numpy.typing import NDArray
@@ -10,7 +10,43 @@ from numpy.typing import NDArray
 CallType = Literal["gain", "loss"]
 SCACall = Literal["XX", "XY", "XO", "XXX", "XXY", "XYY", "DISCORDANT_MIXED"]
 FetalSex = Literal["M", "F"]
-ActiveFFSource = Literal["FFY", "FFA", "FF_SIZE", "FUSED"]
+ActiveFFSource = Literal["FFY", "FFA", "FFX", "FF_SIZE", "FUSED"]
+
+
+class ScanQcCounts(TypedDict):
+    """Effective read filter counters returned by the Rust alignment scanner."""
+
+    reads_seen: int
+    reads_kept: int
+    mate_dedup_skipped: int
+    reads_filtered: int
+    autosomal_reads_kept: int
+    sex_reads_kept: int
+    filter_unmapped: int
+    filter_no_start: int
+    filter_secondary: int
+    filter_supplementary: int
+    filter_duplicate: int
+    filter_improper_pair: int
+    filter_mapq: int
+
+
+class ScanAlignmentResult(TypedDict):
+    """Per-bin channels, histograms, and QC counters returned by scan_alignment_bins."""
+
+    count: NDArray[np.uint32]
+    paired_count: NDArray[np.uint32]
+    frag_len_sum: NDArray[np.uint64]
+    short_frag_count: NDArray[np.uint32]
+    endpoint_count: NDArray[np.uint32]
+    frag_gc_sum: NDArray[np.float32]
+    frag_bands: NDArray[np.uint32] | None
+    hist_autosomal: NDArray[np.uint64]
+    hist_chrx: NDArray[np.uint64]
+    hist_chry: NDArray[np.uint64]
+    motif_counts: NDArray[np.uint64]
+    paired_end: bool
+    qc_counts: ScanQcCounts
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +62,8 @@ class BinResult:
     weights: NDArray[np.float64]
     reference_sizes: NDArray[np.int64]
     masked: NDArray[np.bool_]
+    counts: NDArray[np.float64] | None = None
+    expected_counts: NDArray[np.float64] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +85,19 @@ class SegmentResult:
     frag_short_ratio: float | None = None
     frag_llr_size: float | None = None
     origin_call: str | None = None
+    copy_number: int | None = None
+    log_bf: float | None = None
+    q_value: float = 1.0
+    mosaic_fraction: float | None = None
+    mosaic_ci: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PrenatalLoDMetrics:
+    """Analytical Limit of Detection (LoD) minimum fetal fraction thresholds."""
+
+    lod_ff_35mb: float
+    lod_ff_3mb: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,19 +133,17 @@ class FetalFractionResult:
     ff_size: float | None = None
     low_ff_warning: bool = False
     warnings: tuple[str, ...] = ()
-
-    @property
-    def preface(self) -> float:
-        """Alias for ffa (fetal fraction autosomal)."""
-        return self.ffa
+    active_ff_se: float | None = None
+    effective_ff: float | None = None
+    lod_metrics: PrenatalLoDMetrics | None = None
 
     def __post_init__(self) -> None:
         """Validate fetal sex and active FF source invariants."""
         if self.fetal_sex not in ("M", "F"):
             raise ValueError(f"fetal_sex must be 'M' or 'F', got {self.fetal_sex!r}")
-        if self.active_ff_source not in ("FFY", "FFA", "FF_SIZE", "FUSED"):
+        if self.active_ff_source not in ("FFY", "FFA", "FFX", "FF_SIZE", "FUSED"):
             raise ValueError(
-                f"active_ff_source must be 'FFY', 'FFA', 'FF_SIZE', or 'FUSED', "
+                "active_ff_source must be 'FFY', 'FFA', 'FFX', 'FF_SIZE', or 'FUSED', "
                 f"got {self.active_ff_source!r}"
             )
         if not isinstance(self.warnings, tuple):
@@ -119,24 +168,59 @@ class PredictionOutputs:
 
 
 @dataclass(frozen=True, slots=True)
+class BranchQCStatus:
+    """Wrapper around branch QC metrics dictionary providing status attribute."""
+
+    data: dict[str, object]
+
+    @property
+    def status(self) -> str:
+        """Branch quality verdict string (PASS, WARN, or FAIL)."""
+        return str(self.data.get("verdict", ""))
+
+    def __getitem__(self, key: str) -> object:
+        return self.data[key]
+
+    def get(self, key: str, default: object = None) -> object:
+        return self.data.get(key, default)
+
+
+@dataclass(frozen=True, slots=True)
 class ReferenceQCOutputs:
     """Artifacts and verdict produced by reference QC."""
 
-    json_path: Path
+    json_path: Path | None
     overall_verdict: str
     worst_severity: int
     data: dict[str, object]
+
+    @property
+    def branches(self) -> dict[str, BranchQCStatus]:
+        """Typed map of branch QC results by branch name."""
+        raw = self.data.get("branches")
+        if isinstance(raw, dict):
+            return {
+                str(k): (
+                    BranchQCStatus(v) if isinstance(v, dict) else BranchQCStatus({})
+                )
+                for k, v in raw.items()
+            }
+        return {}
 
 
 __all__ = [
     "ActiveFFSource",
     "BinResult",
+    "BranchQCStatus",
     "CallType",
     "FetalFractionResult",
     "FetalSex",
     "PredictionOutputs",
+    "PrenatalLoDMetrics",
     "ReferenceQCOutputs",
     "SCACall",
     "SCAResult",
+    "ScanAlignmentResult",
+    "ScanQcCounts",
     "SegmentResult",
 ]

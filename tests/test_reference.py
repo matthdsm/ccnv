@@ -1,61 +1,49 @@
+from __future__ import annotations
+
 import tempfile
 import unittest
-from dataclasses import asdict, replace
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pysam
-from published_fixtures import (
-    CHR21_LENGTH,
-    PUBLISHED_BIN_SIZE,
-    PUBLISHED_CRAM,
-    PUBLISHED_CRAM2,
-    PUBLISHED_CRAM2_URL,
-    PUBLISHED_CRAM_URL,
-    ensure_published_fasta,
-    ensure_published_file,
-)
+from helpers import make_reference_table, make_sample_table
+from numpy.typing import NDArray
 from typer.testing import CliRunner
 
 from ccnv.cli import app
 from ccnv.features.cohort import (
     cohort_from_fasta,
-    infer_sample_sexes,
-    mask_low_coverage,
-    normalize_depth,
+    load_and_assemble_cohort,
+    mask_low_coverage_per_contig,
     validate_cohort,
 )
-from ccnv.io.parquet import read_sample_parquet
-from ccnv.io.parquet import read_sample_tables as load_cohort
+from ccnv.features.sex import infer_sample_sexes
+from ccnv.io.parquet import write_sample_parquet
 from ccnv.io.tracks import read_fasta_contigs
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
+    COORDINATE_SYSTEM,
+    SCHEMA_VERSION,
     PredictConfig,
-    ReadFilters,
     ReferenceConfig,
     ReferenceError,
-    parquet_path,
-)
-from ccnv.models.schemas import (
-    REFERENCE_SCHEMA,
-    SAMPLE_SCHEMA,
-    ArtifactKind,
+    ReferenceMetadata,
+    SampleBuffers,
+    SampleMetadata,
+    SamplesheetEntry,
     SchemaError,
     decode_metadata,
-    metadata_for,
-    validate_table,
+    parquet_path,
+    validate_reference_table,
 )
 from ccnv.predict import run as predict
-from ccnv.reference import (
-    DEFAULT_SEX_CONTIGS,
-    build_reference_table,
-    run,
-)
-from ccnv.stats.pca import fit_pca
+from ccnv.reference import build_reference_table, run
+from ccnv.stats.pca import fit_whitened_pca
 
 
 def _sample_table(
@@ -68,54 +56,65 @@ def _sample_table(
     bin_size: int = 100,
     identity: object | None = None,
 ) -> pa.Table:
-    n_bins = len(counts)
-    if starts is None:
-        starts = [i * bin_size for i in range(n_bins)]
-    if ends is None:
-        ends = [start + bin_size for start in starts]
-    if contigs is None:
-        contigs = ["chr1"] * n_bins
-        if contig_lengths is None:
-            contig_lengths = {"chr1": ends[-1]}
-    elif contig_lengths is None:
-        contig_lengths = {}
-        for name in dict.fromkeys(contigs):
-            contig_lengths[name] = max(
-                end for contig, end in zip(contigs, ends, strict=True) if contig == name
-            )
-    metadata = metadata_for(
-        ArtifactKind.SAMPLE,
+    return make_sample_table(
+        counts,
+        contigs=contigs,
+        starts=starts,
+        ends=ends,
         contig_lengths=contig_lengths,
-        values={
-            "bin_size": bin_size,
-            "source_identity": identity if identity is not None else {"id": "sample"},
-            "reference_identity": {"name": "test"},
-            "qc": {},
-            "filters": asdict(ReadFilters()),
-        },
-    )
-    n_rows = len(contigs)
-    return pa.table(
-        {
-            "contig": contigs,
-            "start": pa.array(starts, type=pa.int64()),
-            "end": pa.array(ends, type=pa.int64()),
-            "count": pa.array(counts, type=pa.uint64()),
-            "fragment_lengths": pa.array([[]] * n_rows, type=pa.list_(pa.uint16())),
-            "endpoint_count": pa.array(
-                np.zeros(n_rows, dtype=np.uint32), type=pa.uint32()
-            ),
-            "frag_gc_sum": pa.array(
-                np.zeros(n_rows, dtype=np.float32), type=pa.float32()
-            ),
-        },
-        schema=SAMPLE_SCHEMA.with_metadata(metadata),
+        bin_size=bin_size,
+        identity=identity,
     )
 
 
 def _write_sample(directory: Path, name: str, table: pa.Table) -> Path:
     path = directory / name
     pq.write_table(table, path)
+    return path
+
+
+def _make_sample_buffers(
+    contig_lengths: dict[str, int],
+    bin_size: int,
+    counts: NDArray[np.uint32],
+    *,
+    sample_id: str = "S1",
+) -> SampleBuffers:
+    n = int(counts.size)
+    z_u32 = np.zeros(n, dtype=np.uint32)
+    total = int(np.sum(counts))
+    meta = SampleMetadata(
+        schema_version=SCHEMA_VERSION,
+        coordinate_system=COORDINATE_SYSTEM,
+        bin_size=bin_size,
+        contig_order=tuple(contig_lengths.keys()),
+        contig_lengths=contig_lengths,
+        source_identity={"id": sample_id},
+        reference_identity={"name": "ref"},
+        filters={"min_mapping_quality": 1},
+        qc={
+            "effective_reads_examined": total,
+            "effective_reads_kept": total,
+        },
+        fragmentomics=None,
+    )
+    return SampleBuffers(
+        meta=meta,
+        count=counts,
+        paired_count=z_u32,
+        frag_len_sum=np.zeros(n, dtype=np.uint64),
+        short_frag_count=z_u32,
+        endpoint_count=z_u32,
+        frag_gc_sum=np.zeros(n, dtype=np.float32),
+        frag_bands=None,
+    )
+
+
+def _write_tiny_fasta(path: Path, records: tuple[tuple[str, int], ...]) -> Path:
+    with path.open("w", encoding="ascii") as handle:
+        for name, length in records:
+            handle.write(f">{name}\n{'A' * length}\n")
+    pysam.faidx(str(path))
     return path
 
 
@@ -131,35 +130,25 @@ class TestReferenceSchemaRejection(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             path = _write_sample(Path(tmpdir), "bad.ccnv", table)
-            with self.assertRaisesRegex(ReferenceError, "fields do not match"):
-                load_cohort((path,))
+            with self.assertRaisesRegex(
+                ReferenceError, "artifact_kind|fields do not match"
+            ):
+                load_and_assemble_cohort((SamplesheetEntry(filepath=path),))
 
     def test_validate_table_rejects_duplicate_branch_bins(self) -> None:
-        metadata = metadata_for(
-            ArtifactKind.REFERENCE,
+        table = make_reference_table(
+            branches=[BRANCH_AUTOSOMAL, BRANCH_AUTOSOMAL],
+            contigs=["chr1", "chr1"],
+            starts=[0, 0],
+            ends=[10, 10],
             contig_lengths={"chr1": 10},
-            values={"model": {}, "sample_identities": []},
+            pca_loadings=[[0.1], [0.1]],
         )
-        table = pa.table(
-            {
-                "branch": [BRANCH_AUTOSOMAL, BRANCH_AUTOSOMAL],
-                "contig": ["chr1", "chr1"],
-                "start": pa.array([0, 0], type=pa.int64()),
-                "end": pa.array([10, 10], type=pa.int64()),
-                "masked": [False, False],
-                "gc": pa.array([-1.0, -1.0], type=pa.float32()),
-                "mappability": pa.array([-1.0, -1.0], type=pa.float32()),
-                "pca_mean": pa.array([0.0, 0.0], type=pa.float64()),
-                "pca_loadings": pa.array([[0.1], [0.1]], type=pa.list_(pa.float64())),
-                "nearest_ref_indices": pa.array([[], []], type=pa.list_(pa.int32())),
-                "mean_distance": pa.array([0.0, 0.0], type=pa.float32()),
-                "null_mean": pa.array([0.0, 0.0], type=pa.float64()),
-                "null_std": pa.array([0.0, 0.0], type=pa.float64()),
-            },
-            schema=REFERENCE_SCHEMA.with_metadata(metadata),
-        )
-        with self.assertRaisesRegex(SchemaError, "duplicates bin identity"):
-            validate_table(table, ArtifactKind.REFERENCE)
+        with self.assertRaisesRegex(
+            SchemaError,
+            "does not match previous bin end|duplicates|strictly monotonic|non-overlapping|contiguous",
+        ):
+            validate_reference_table(table)
 
 
 class TestMaskingAndPca(unittest.TestCase):
@@ -169,24 +158,103 @@ class TestMaskingAndPca(unittest.TestCase):
                 [100.0, 100.0, 100.0],
                 [0.0, 0.0, 0.0],
                 [1.0, 1.0, 1.0],
-            ]
+            ],
+            dtype=np.float32,
         )
-        normalized = normalize_depth(counts)
-        mask = mask_low_coverage(normalized)
+        mask = mask_low_coverage_per_contig(
+            counts,
+            np.zeros(3, dtype=np.int16),
+            np.ones(3, dtype=np.float32),
+        )
         np.testing.assert_array_equal(mask, [True, False, False])
 
     def test_pca_is_deterministic_and_matches_unmasked_bins(self) -> None:
         rng = np.random.default_rng(0)
-        data = rng.random((12, 6)) + 0.2
-        first = fit_pca(data, n_components=3)
-        second = fit_pca(data, n_components=3)
-        np.testing.assert_allclose(first[0], second[0])
-        np.testing.assert_allclose(first[1], second[1])
-        np.testing.assert_allclose(first[2], second[2])
-        self.assertEqual(first[1].shape, (12,))
-        self.assertGreaterEqual(first[2].shape[0], 1)
-        self.assertLessEqual(first[2].shape[0], 3)
-        self.assertEqual(first[2].shape[1], 12)
+        expected = np.full((12, 6), 100.0, dtype=np.float32)
+        u = rng.normal(0.0, 0.25, size=(12, 2))
+        v = rng.normal(0.0, 1.0, size=(2, 6))
+        counts = rng.poisson(expected.astype(np.float64) * np.exp(u @ v)).astype(
+            np.float32
+        )
+        usable = np.ones(12, dtype=bool)
+        first = fit_whitened_pca(counts, expected, usable, max_components=3)
+        second = fit_whitened_pca(counts, expected, usable, max_components=3)
+        np.testing.assert_allclose(first.mean_rate, second.mean_rate)
+        np.testing.assert_allclose(first.loadings, second.loadings)
+        np.testing.assert_allclose(first.singular_values, second.singular_values)
+        self.assertEqual(first.mean_rate.shape, (12,))
+        self.assertGreaterEqual(first.loadings.shape[0], 1)
+        self.assertLessEqual(first.loadings.shape[0], 3)
+        self.assertEqual(first.loadings.shape[1], 12)
+
+    def test_defect6_pca_components_none_dynamic_svht_vs_explicit_five_cap(
+        self,
+    ) -> None:
+        contig_lengths = {"chr1": 500_000, "chr2": 500_000}
+        bin_size = 5000
+        n_bins = 200
+        n_samples = 30
+        rng = np.random.default_rng(606)
+
+        u_raw, _ = np.linalg.qr(rng.standard_normal((n_bins, 7)))
+        v_raw, _ = np.linalg.qr(rng.standard_normal((n_samples, 7)))
+        log_waves = u_raw @ np.diag([14.0, 13.0, 12.0, 11.0, 10.0, 9.0, 8.5]) @ v_raw.T
+        rates = 600.0 * np.exp(0.15 * log_waves)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            entries: list[SamplesheetEntry] = []
+            for j in range(n_samples):
+                c_arr = rng.poisson(rates[:, j]).astype(np.uint32)
+                meta = SampleMetadata(
+                    bin_size=bin_size,
+                    contig_lengths=contig_lengths,
+                    contig_order=("chr1", "chr2"),
+                    source_identity={},
+                    reference_identity={},
+                    qc={"effective_reads_kept": 80_000},
+                    filters={"min_mapping_quality": 1},
+                )
+                z_u32 = np.zeros(n_bins, dtype=np.uint32)
+                bufs = SampleBuffers(
+                    meta=meta,
+                    count=c_arr,
+                    paired_count=z_u32,
+                    frag_len_sum=np.zeros(n_bins, dtype=np.uint64),
+                    short_frag_count=z_u32,
+                    endpoint_count=z_u32,
+                    frag_gc_sum=np.zeros(n_bins, dtype=np.float32),
+                    frag_bands=None,
+                )
+                sp = root / f"rk_{j}.ccnv"
+                write_sample_parquet(bufs.to_table(), sp)
+                entries.append(SamplesheetEntry(filepath=sp))
+
+            dyn_prefix = root / "ref_dyn"
+            run(
+                ReferenceConfig(
+                    entries=tuple(entries),
+                    prefix=dyn_prefix,
+                    bin_size=bin_size,
+                    pca_components=None,
+                    qc_report=False,
+                )
+            )
+            dyn_schema = pq.read_schema(parquet_path(dyn_prefix))
+            self.assertGreaterEqual(dyn_schema.field("pca_loadings").type.list_size, 6)
+
+            cap_prefix = root / "ref_cap5"
+            run(
+                ReferenceConfig(
+                    entries=tuple(entries),
+                    prefix=cap_prefix,
+                    bin_size=bin_size,
+                    pca_components=5,
+                    qc_report=False,
+                )
+            )
+            cap_schema = pq.read_schema(parquet_path(cap_prefix))
+            self.assertEqual(cap_schema.field("pca_loadings").type.list_size, 5)
 
 
 class TestSexInference(unittest.TestCase):
@@ -238,22 +306,25 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             cohort,
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.ccnv") for index in range(6)),
+                entries=tuple(
+                    SamplesheetEntry(filepath=Path(f"{index}.ccnv"))
+                    for index in range(6)
+                ),
                 prefix=Path("unused"),
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
                 min_sex_group_size=3,
             ),
         )
-        validate_table(table, ArtifactKind.REFERENCE)
+        validate_reference_table(table)
         branches = set(table.column("branch").to_pylist())
         self.assertEqual(
             branches,
             {BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX},
         )
         model = decode_metadata(table.schema.metadata)["model"]
-        assert isinstance(model, dict)
+        if not isinstance(model, dict):
+            self.fail("expected model metadata dict")
         self.assertEqual(model["sex_source"], "inferred")
         self.assertEqual(model["autosomal_contigs"], ["chr1"])
         self.assertEqual(model["sex_contigs"], ["chrY"])
@@ -276,47 +347,53 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.ccnv") for index in range(6)),
+                entries=tuple(
+                    SamplesheetEntry(filepath=Path(f"{index}.ccnv"))
+                    for index in range(6)
+                ),
                 prefix=Path("unused"),
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
                 min_sex_group_size=3,
             ),
         )
         model = decode_metadata(table.schema.metadata)["model"]
-        assert isinstance(model, dict)
+        if not isinstance(model, dict):
+            self.fail("expected model metadata dict")
         self.assertEqual(model["autosomal_contigs"], ["chr1"])
         self.assertEqual(model["sex_contigs"], ["chrX", "chrY"])
         self.assertEqual(model["sex_signal_contig"], "chrY")
 
     def test_defaults_select_unprefixed_x_and_y(self) -> None:
+        females = [[40, 20, 1], [38, 21, 2]]
+        males = [[40, 10, 18], [42, 11, 19]]
         tables = [
             _sample_table(
-                [40, 2, 1],
+                counts,
                 contigs=["1", "X", "Y"],
                 starts=[0, 0, 0],
                 ends=[100, 100, 100],
                 contig_lengths={"1": 100, "X": 100, "Y": 100},
                 identity={"id": f"s{index}"},
             )
-            for index in range(4)
+            for index, counts in enumerate(females + males)
         ]
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
+                entries=tuple(
+                    SamplesheetEntry(filepath=Path(f"{index}.ccnv"))
+                    for index in range(4)
+                ),
                 prefix=Path("unused"),
-                sex_contigs=DEFAULT_SEX_CONTIGS,
-                sex_signal_contig="chrY",
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
                 min_sex_group_size=2,
             ),
         )
         model = decode_metadata(table.schema.metadata)["model"]
-        assert isinstance(model, dict)
+        if not isinstance(model, dict):
+            self.fail("expected model metadata dict")
         self.assertEqual(model["autosomal_contigs"], ["1"])
         self.assertEqual(model["sex_contigs"], ["X", "Y"])
         self.assertEqual(model["sex_signal_contig"], "Y")
@@ -336,17 +413,18 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
+                entries=tuple(
+                    SamplesheetEntry(filepath=Path(f"{index}.ccnv"))
+                    for index in range(4)
+                ),
                 prefix=Path("unused"),
-                sex_contigs=DEFAULT_SEX_CONTIGS,
-                sex_signal_contig="chrY",
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
             ),
         )
         model = decode_metadata(table.schema.metadata)["model"]
-        assert isinstance(model, dict)
+        if not isinstance(model, dict):
+            self.fail("expected model metadata dict")
         self.assertEqual(model["autosomal_contigs"], ["chr1", "scaffold"])
         self.assertEqual(model["sex_contigs"], [])
         self.assertIsNone(model["sex_signal_contig"])
@@ -366,11 +444,12 @@ class TestSexInference(unittest.TestCase):
         ]
         cohort = validate_cohort(tuple(tables))
         config = ReferenceConfig(
-            samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
+            entries=tuple(
+                SamplesheetEntry(filepath=Path(f"{index}.ccnv")) for index in range(4)
+            ),
             prefix=Path("unused"),
             sex_contigs=("chrZ",),
             pca_components=2,
-            nearest_bins=1,
             min_cohort_size=4,
         )
         with self.assertRaisesRegex(ReferenceError, "unknown sex contig"):
@@ -389,11 +468,12 @@ class TestSexInference(unittest.TestCase):
             for index in range(4)
         ]
         config = ReferenceConfig(
-            samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
+            entries=tuple(
+                SamplesheetEntry(filepath=Path(f"{index}.ccnv")) for index in range(4)
+            ),
             prefix=Path("unused"),
             sex_signal_contig="chrZ",
             pca_components=2,
-            nearest_bins=1,
             min_cohort_size=4,
         )
         with self.assertRaisesRegex(ReferenceError, "unknown sex-signal contig"):
@@ -422,17 +502,20 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.ccnv") for index in range(6)),
+                entries=tuple(
+                    SamplesheetEntry(filepath=Path(f"{index}.ccnv"))
+                    for index in range(6)
+                ),
                 prefix=Path("unused"),
                 sex_cutoff=0.1,
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
                 min_sex_group_size=3,
             ),
         )
         model = decode_metadata(table.schema.metadata)["model"]
-        assert isinstance(model, dict)
+        if not isinstance(model, dict):
+            self.fail("expected model metadata dict")
         self.assertEqual(model["sex_cutoff"], 0.1)
         self.assertEqual(
             model["sample_sexes"],
@@ -468,12 +551,11 @@ class TestSexInference(unittest.TestCase):
                 for index, counts in enumerate(female_counts + male_counts)
             ]
             config = ReferenceConfig(
-                samples=tuple(paths),
+                entries=tuple(SamplesheetEntry(filepath=p) for p in paths),
                 prefix=root / "ref",
                 sex_contigs=("chrY",),
                 sex_signal_contig="chrY",
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
                 min_sex_group_size=3,
             )
@@ -481,14 +563,15 @@ class TestSexInference(unittest.TestCase):
             run(replace(config, prefix=root / "ref2"))
             first = pq.read_table(root / "ref.ccnv")
             second = pq.read_table(root / "ref2.ccnv")
-            validate_table(first, ArtifactKind.REFERENCE)
+            validate_reference_table(first)
             self.assertEqual(
                 decode_metadata(first.schema.metadata)["model"],
                 decode_metadata(second.schema.metadata)["model"],
             )
             self.assertEqual(first.to_pydict(), second.to_pydict())
             model = decode_metadata(first.schema.metadata)["model"]
-            assert isinstance(model, dict)
+            if not isinstance(model, dict):
+                self.fail("expected model metadata dict")
             self.assertEqual(model["sex_source"], "inferred")
             self.assertEqual(
                 model["sample_sexes"],
@@ -519,99 +602,81 @@ class TestSexInference(unittest.TestCase):
 
                 ref_prefix = root / f"ref_{cohort_size}"
                 config = ReferenceConfig(
-                    samples=tuple(paths),
+                    entries=tuple(SamplesheetEntry(filepath=p) for p in paths),
                     prefix=ref_prefix,
                     pca_components=2,
-                    nearest_bins=1,
                     min_cohort_size=4,
                 )
                 run(config)
                 ref_path = root / f"ref_{cohort_size}.ccnv"
                 table = pq.read_table(ref_path)
-                validate_table(table, ArtifactKind.REFERENCE)
+                validate_reference_table(table)
+                self.assertIn("proto_ids", table.column_names)
+                self.assertIn("proto_weights", table.column_names)
                 self.assertIn("mean_distance", table.column_names)
                 self.assertIn("null_mean", table.column_names)
-                self.assertIn("null_std", table.column_names)
-                self.assertNotIn("nearest_ref_distances", table.column_names)
-                self.assertNotIn("null_ratios", table.column_names)
+                self.assertIn("bio_dispersion", table.column_names)
+                self.assertNotIn("nearest_ref_indices", table.column_names)
+                self.assertNotIn("null_std", table.column_names)
                 self.assertEqual(len(table.column("null_mean")), 4)
-                self.assertEqual(len(table.column("null_std")), 4)
+                self.assertEqual(len(table.column("bio_dispersion")), 4)
 
-
-class TestReferencePublishedCrams(unittest.TestCase):
-    def test_cli_builds_reference_from_two_published_crams(self) -> None:
-        fasta = ensure_published_fasta()
-        crams = (
-            ensure_published_file(PUBLISHED_CRAM, PUBLISHED_CRAM_URL),
-            ensure_published_file(PUBLISHED_CRAM2, PUBLISHED_CRAM2_URL),
-        )
-        runner = CliRunner()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            sample_paths: list[Path] = []
-            for index, cram in enumerate(crams, start=1):
-                prefix = root / f"sample{index}"
-                result = runner.invoke(
-                    app,
-                    [
-                        "extract",
-                        str(cram),
-                        "--fasta",
-                        str(fasta),
-                        "--prefix",
-                        str(prefix),
-                        "--bin-size",
-                        str(PUBLISHED_BIN_SIZE),
-                    ],
-                )
-                self.assertEqual(result.exit_code, 0, result.output)
-                sample_paths.append(parquet_path(prefix))
-
-            samples = [read_sample_parquet(path) for path in sample_paths]
-            self.assertEqual(samples[0].num_rows, samples[1].num_rows)
-            self.assertEqual(
-                set(samples[0].column("contig").to_pylist()),
-                {"chr21"},
-            )
-
-            reference_prefix = root / "reference"
-            result = runner.invoke(
-                app,
+    def test_explicit_samplesheet_sexes_without_chry_and_zero_row_prenatal_ffy_rejected(
+        self,
+    ) -> None:
+        rng = np.random.default_rng(7)
+        lengths = {"chr1": 100_000, "chr2": 100_000, "chrX": 100_000}
+        tables: list[pa.Table] = []
+        entries: list[SamplesheetEntry] = []
+        for idx in range(8):
+            is_male = idx >= 4
+            counts = np.concatenate(
                 [
-                    "reference",
-                    *(str(path) for path in sample_paths),
-                    "--prefix",
-                    str(reference_prefix),
-                    "--bin-size",
-                    str(PUBLISHED_BIN_SIZE),
-                    "--min-cohort-size",
-                    "2",
-                    "--pca-components",
-                    "1",
-                    "--nearest-bins",
-                    "16",
-                ],
+                    rng.poisson(100, size=20).astype(np.uint32),
+                    rng.poisson(100, size=20).astype(np.uint32),
+                    rng.poisson(50 if is_male else 100, size=20).astype(np.uint32),
+                ]
             )
-            self.assertEqual(result.exit_code, 0, result.output)
+            tables.append(
+                _make_sample_buffers(
+                    lengths, 5000, counts, sample_id=f"NX{idx}"
+                ).to_table()
+            )
+            entries.append(
+                SamplesheetEntry(
+                    filepath=Path(f"nx_{idx}.ccnv"), sex="M" if is_male else "F"
+                )
+            )
 
-            table = pq.read_table(parquet_path(reference_prefix))
-            validate_table(table, ArtifactKind.REFERENCE)
-            metadata = decode_metadata(table.schema.metadata)
-            model = metadata["model"]
-            assert isinstance(model, dict)
-            self.assertEqual(table.num_rows, samples[0].num_rows)
-            self.assertEqual(set(table.column("contig").to_pylist()), {"chr21"})
-            self.assertEqual(
-                set(table.column("branch").to_pylist()), {BRANCH_AUTOSOMAL}
+        cohort = validate_cohort(tuple(tables))
+        ref_tbl = build_reference_table(
+            cohort,
+            ReferenceConfig(
+                entries=tuple(entries),
+                prefix=Path("unused"),
+                min_cohort_size=4,
+                min_sex_group_size=3,
+            ),
+        )
+        branches = set(ref_tbl.column("branch").to_pylist())
+        self.assertEqual(
+            branches, {BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX}
+        )
+        meta = ReferenceMetadata.from_table(ref_tbl)
+        self.assertEqual(meta.sex_source, "samplesheet")
+
+        with self.assertRaisesRegex(ReferenceError, "prenatal_ffy"):
+            build_reference_table(
+                cohort,
+                ReferenceConfig(
+                    entries=tuple(entries),
+                    prefix=Path("unused_prenatal"),
+                    mode="prenatal",
+                    prenatal_bin_size=50_000,
+                    min_cohort_size=4,
+                    min_sex_group_size=3,
+                ),
             )
-            self.assertEqual(table.column("end").to_pylist()[-1], CHR21_LENGTH)
-            self.assertEqual(metadata["contig_lengths"], {"chr21": CHR21_LENGTH})
-            self.assertEqual(model["bin_size"], PUBLISHED_BIN_SIZE)
-            self.assertEqual(model["branches"], [BRANCH_AUTOSOMAL])
-            self.assertEqual(model["autosomal_contigs"], ["chr21"])
-            self.assertEqual(len(metadata["sample_identities"]), 2)
-            unmasked = sum(1 for masked in table.column("masked") if not masked)
-            self.assertGreater(unmasked, 0)
 
 
 class TestFlatFastaReference(unittest.TestCase):
@@ -622,7 +687,7 @@ class TestFlatFastaReference(unittest.TestCase):
                 (("chr1", 250), ("chr2", 150), ("chrX", 100)),
             )
             contigs_dict = read_fasta_contigs(fasta)
-            cohort = cohort_from_fasta(contigs_dict, 100, n_samples=2, fasta_path=fasta)
+            cohort = cohort_from_fasta(contigs_dict, 100, fasta_path=fasta)
 
             self.assertEqual(cohort.bin_size, 100)
             self.assertEqual(
@@ -630,27 +695,23 @@ class TestFlatFastaReference(unittest.TestCase):
             )
             np.testing.assert_array_equal(cohort.starts, [0, 100, 200, 0, 100, 0])
             np.testing.assert_array_equal(cohort.ends, [100, 200, 250, 100, 150, 100])
-            np.testing.assert_array_equal(
-                cohort.counts[:, 0], [100, 100, 50, 100, 50, 100]
-            )
-            np.testing.assert_array_equal(cohort.counts[:, 0], cohort.counts[:, 1])
+            self.assertEqual(cohort.counts.shape, (6, 0))
 
             prefix = Path(tmpdir) / "ref"
             run(
                 ReferenceConfig(
-                    samples=(),
                     prefix=prefix,
                     fasta=fasta,
                     bin_size=100,
                     pca_components=1,
-                    nearest_bins=2,
                     min_cohort_size=2,
                 )
             )
             table = pq.read_table(parquet_path(prefix))
-            validate_table(table, ArtifactKind.REFERENCE)
+            validate_reference_table(table)
             model = decode_metadata(table.schema.metadata)["model"]
-            assert isinstance(model, dict)
+            if not isinstance(model, dict):
+                self.fail("expected model metadata dict")
             self.assertTrue(model["flat"])
             self.assertEqual(model["branches"], [BRANCH_AUTOSOMAL])
             self.assertEqual(model["autosomal_contigs"], ["chr1", "chr2", "chrX"])
@@ -671,12 +732,10 @@ class TestFlatFastaReference(unittest.TestCase):
             reference_prefix = root / "ref"
             run(
                 ReferenceConfig(
-                    samples=(),
                     prefix=reference_prefix,
                     fasta=fasta,
                     bin_size=100,
                     pca_components=1,
-                    nearest_bins=2,
                     min_cohort_size=2,
                     qc_report=False,
                 )
@@ -716,6 +775,7 @@ class TestFlatFastaReference(unittest.TestCase):
                 app,
                 [
                     "reference",
+                    "--fasta",
                     str(fasta),
                     "--prefix",
                     str(prefix),
@@ -725,14 +785,13 @@ class TestFlatFastaReference(unittest.TestCase):
                     "2",
                     "--pca-components",
                     "1",
-                    "--nearest-bins",
-                    "2",
                 ],
             )
             self.assertEqual(result.exit_code, 0, result.output)
             table = pq.read_table(parquet_path(prefix))
             model = decode_metadata(table.schema.metadata)["model"]
-            assert isinstance(model, dict)
+            if not isinstance(model, dict):
+                self.fail("expected model metadata dict")
             self.assertTrue(model["flat"])
             self.assertEqual(table.num_rows, 4)
 
@@ -742,7 +801,7 @@ class TestFlatFastaReference(unittest.TestCase):
             with self.assertRaisesRegex(ReferenceError, "not both"):
                 run(
                     ReferenceConfig(
-                        samples=(Path("sample.ccnv"),),
+                        entries=(SamplesheetEntry(filepath=Path("sample.ccnv")),),
                         prefix=Path(tmpdir) / "ref",
                         fasta=fasta,
                         bin_size=100,
@@ -750,8 +809,10 @@ class TestFlatFastaReference(unittest.TestCase):
                 )
 
     def test_neither_samples_nor_fasta_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ReferenceError, "sample Parquet paths or a FASTA"):
-            run(ReferenceConfig(samples=(), prefix=Path("ref")))
+        with self.assertRaisesRegex(
+            ReferenceError, "sample Parquet entries or a FASTA"
+        ):
+            run(ReferenceConfig(prefix=Path("ref")))
 
     def test_prenatal_mode_rejects_fasta(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -769,14 +830,6 @@ class TestFlatFastaReference(unittest.TestCase):
                         mode="prenatal",
                     )
                 )
-
-
-def _write_tiny_fasta(path: Path, records: tuple[tuple[str, int], ...]) -> Path:
-    with path.open("w", encoding="ascii") as handle:
-        for name, length in records:
-            handle.write(f">{name}\n{'A' * length}\n")
-    pysam.faidx(str(path))
-    return path
 
 
 if __name__ == "__main__":

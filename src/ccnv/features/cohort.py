@@ -1,57 +1,72 @@
-"""Cohort sample aggregation, rebinning, depth normalization, and sex inference."""
+"""Cohort sample aggregation, streaming assembly, and super-block depth scaling."""
 
 from __future__ import annotations
 
 import logging
 import math
+import os
+import tempfile
+import weakref
+from collections import deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Final, Literal
+from typing import Final
 
 import numpy as np
-import polars as pl
 import pyarrow as pa
+import pyarrow.parquet as pq
 from numpy.typing import NDArray
 
-from ccnv.features.binning import bin_intervals, rebin_counts
-from ccnv.features.fragmentomics import (
-    extract_bin_fragmentomic_covariates,
-    is_paired_sample_metadata,
+from ccnv._core import FRAG_BAND_EDGES
+from ccnv.features.binning import (
+    build_coordinate_grid,
+    rebin_counts_matrix,
 )
+from ccnv.features.fragmentomics import has_paired_fragmentomics
+from ccnv.features.rebinning import rebin_sample_buffers
 from ccnv.models import (
-    FRAGMENTOMICS_METADATA_KEY,
-    ArtifactKind,
+    NUM_FRAG_BANDS,
+    BinCompatibilityError,
+    InvalidInputError,
     ReferenceError,
+    SampleBuffers,
+    SampleMetadata,
+    SamplesheetEntry,
     SchemaError,
     decode_metadata,
-    metadata_for,
-    validate_table,
+    reconstruct_sample_grid,
 )
+from ccnv.stats import estimate_superblock_scales
 
 logger = logging.getLogger(__name__)
-
-SexLabel = Literal["female", "male"]
 _MASK_FRACTION: Final[float] = 0.05
-_SEPARATION_MAD_MULTIPLIER: Final[float] = 4.0
+_DEFAULT_FRAG_LEN_BP: Final[float] = 167.0
+_FRAG_BAND_MIDPOINTS: Final[NDArray[np.float64]] = 0.5 * (
+    np.asarray(FRAG_BAND_EDGES[:-1], dtype=np.float64)
+    + np.asarray(FRAG_BAND_EDGES[1:], dtype=np.float64)
+    - 1.0
+)
 
-_ParsedSample = tuple[
-    dict[str, object],
-    dict[str, int],
-    tuple[str, ...],
-    NDArray[np.int64],
-    NDArray[np.int64],
-    NDArray[np.float64],
-    NDArray[np.float64] | None,
-    NDArray[np.float64] | None,
+__all__ = [
+    "Cohort",
+    "alloc_cohort_counts",
+    "build_fisher_weighted_cohort",
+    "cohort_from_fasta",
+    "estimate_size_factors",
+    "load_and_assemble_cohort",
+    "mask_low_coverage_per_contig",
+    "rebin_cohort",
+    "validate_cohort",
 ]
 
 
 @dataclass(frozen=True, slots=True)
 class Cohort:
-    """Aligned binned counts from compatible sample Parquet files."""
+    """Aligned binned counts and fragmentomic summaries across cohort samples."""
 
-    counts: NDArray[np.float64]
+    counts: NDArray[np.float32] | NDArray[np.float64]
     contigs: tuple[str, ...]
     starts: NDArray[np.int64]
     ends: NDArray[np.int64]
@@ -60,913 +75,643 @@ class Cohort:
     identities: tuple[object, ...]
     paths: tuple[Path, ...]
     sample_metadata: tuple[dict[str, object], ...] = ()
-    mean_frag_len: NDArray[np.float64] | None = None
-    endpoint_ratio: NDArray[np.float64] | None = None
+    ref_frag_len: NDArray[np.float32] | None = None
+    ref_ep_rate: NDArray[np.float32] | None = None
+    in_memory_tables: tuple[SampleBuffers, ...] = ()
+    ref_kappa_frag: NDArray[np.float32] | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class SexInference:
-    """Deterministic sex assignments, or a rejected inference."""
+class _StreamedSample:
+    index: int
+    path: Path
+    raw_meta: dict[str, object]
+    sample_meta: SampleMetadata
+    is_paired: bool
+    count: NDArray[np.uint32]
+    paired_count: NDArray[np.uint32]
+    frag_len_sum: NDArray[np.uint64]
+    endpoint_count: NDArray[np.uint32]
+    bufs: SampleBuffers | None = None
 
-    labels: tuple[SexLabel, ...] | None
-    cutoff: float | None
-    fractions: tuple[float, ...]
-    passed: bool
-    reason: str
 
-
-class InvalidInputError(ReferenceError, ValueError):
-    """Raised when count matrix input validation fails."""
+def _encode_contig_ids(
+    contigs: NDArray[np.integer]
+    | Sequence[str]
+    | NDArray[np.str_]
+    | NDArray[np.object_],
+    expected_len: int,
+) -> NDArray[np.int64]:
+    if isinstance(contigs, np.ndarray) and np.issubdtype(contigs.dtype, np.integer):
+        c_ids = np.asarray(contigs, dtype=np.int64)
+    else:
+        c_arr = np.asarray(contigs, dtype=str)
+        if c_arr.shape != (expected_len,):
+            raise InvalidInputError("contigs length must match counts row count")
+        _, c_ids = np.unique(c_arr, return_inverse=True)
+        c_ids = c_ids.astype(np.int64, copy=False)
+    if c_ids.shape != (expected_len,):
+        raise InvalidInputError("contigs length must match counts row count")
+    return c_ids
 
 
 def estimate_size_factors(
-    counts: NDArray[np.floating],
+    counts: NDArray[np.floating] | NDArray[np.integer],
     mask: NDArray[np.bool_] | None = None,
+    *,
+    contigs: NDArray[np.integer]
+    | Sequence[str]
+    | NDArray[np.str_]
+    | NDArray[np.object_]
+    | None = None,
+    starts: NDArray[np.integer] | None = None,
+    ends: NDArray[np.integer] | None = None,
+    block_bp: int = 1_000_000,
 ) -> NDArray[np.float64]:
-    """Estimate DESeq2 median-of-ratios size factors for each sample."""
-    matrix = np.asarray(counts, dtype=np.float64)
-    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] == 0:
+    """Estimate DESeq2 median-of-ratios size factors over per-contig 1 Mb super-blocks."""
+    arr = counts if isinstance(counts, np.ndarray) else np.asarray(counts)
+    if arr.ndim != 2 or 0 in arr.shape:
         raise InvalidInputError("Counts matrix must be a non-empty 2D array.")
-    if np.any(matrix < 0):
-        raise InvalidInputError("Counts matrix cannot contain negative values.")
-
-    if mask is not None:
-        mask_arr = np.asarray(mask, dtype=np.bool_)
-        if mask_arr.ndim != 1 or mask_arr.shape[0] != matrix.shape[0]:
-            raise InvalidInputError("mask length must match counts row count")
-        sub = matrix[mask_arr]
-        if sub.shape[0] == 0:
-            raise InvalidInputError("No usable bins remaining after mask.")
-    else:
-        sub = matrix
-
-    totals = sub.sum(axis=0)
-    if np.any(totals <= 0):
-        suffix = " on usable bins" if mask is not None else ""
+    if contigs is None or starts is None or ends is None:
         raise InvalidInputError(
-            f"Total read count is zero for at least one sample{suffix}."
+            "contigs, starts, and ends coordinates are required for super-block size factors"
         )
+    n_bins = arr.shape[0]
+    c_ids = _encode_contig_ids(contigs, n_bins)
+    s_arr = np.asarray(starts, dtype=np.int64)
+    e_arr = np.asarray(ends, dtype=np.int64)
+    if s_arr.shape != (n_bins,) or e_arr.shape != (n_bins,):
+        raise InvalidInputError("starts and ends must match counts row count")
+    widths = e_arr - s_arr
+    if np.any(widths < 0):
+        raise InvalidInputError("bin widths cannot be negative")
+    bin_size = max(1, int(np.max(widths)))
+    return estimate_superblock_scales(
+        arr,
+        c_ids,
+        usable=mask,
+        bin_size=bin_size,
+        block_bp=block_bp,
+    )
 
-    pos_rows = np.all(sub > 0, axis=1)
-    if np.count_nonzero(pos_rows) >= 1:
-        log_geomean = np.mean(np.log(sub[pos_rows]), axis=1, keepdims=True)
-        raw_sf = np.exp(np.median(np.log(sub[pos_rows]) - log_geomean, axis=0))
+
+def mask_low_coverage_per_contig(
+    counts: NDArray[np.floating] | NDArray[np.integer],
+    contigs: NDArray[np.integer]
+    | Sequence[str]
+    | NDArray[np.str_]
+    | NDArray[np.object_],
+    exposure: NDArray[np.floating],
+    *,
+    min_fraction: float = _MASK_FRACTION,
+) -> NDArray[np.bool_]:
+    """Mask bins per contig where exposure-adjusted depth falls below min_fraction of positive median."""
+    if not math.isfinite(min_fraction) or not (0.0 <= min_fraction < 1.0):
+        raise InvalidInputError("min_fraction must be a finite number in [0, 1)")
+    arr = np.asarray(counts)
+    if arr.ndim == 1:
+        totals = np.asarray(arr, dtype=np.float64)
+    elif arr.ndim == 2:
+        totals = np.sum(arr, axis=1, dtype=np.float64)
     else:
-        pos_medians = [
-            float(np.median(col[col > 0])) if np.any(col > 0) else 0.0 for col in sub.T
-        ]
-        if all(m > 0 for m in pos_medians):
-            raw_sf = np.asarray(pos_medians, dtype=np.float64)
-        else:
-            raw_sf = totals.astype(np.float64)
+        raise InvalidInputError("counts must be a 1D or 2D array")
 
-    sf = raw_sf / np.exp(np.mean(np.log(raw_sf)))
-    return sf
+    n_bins = totals.shape[0]
+    exp_arr = np.asarray(exposure, dtype=np.float64)
+    if exp_arr.shape != (n_bins,):
+        raise InvalidInputError("exposure length must match counts row count")
+    c_ids = _encode_contig_ids(contigs, n_bins)
+    if n_bins == 0:
+        return np.empty(0, dtype=np.bool_)
 
-
-def normalize_depth(
-    counts: NDArray[np.floating],
-    mask: NDArray[np.bool_] | None = None,
-) -> NDArray[np.float64]:
-    """Normalize sample count matrix using DESeq2 median-of-ratios depth scaling."""
-    matrix = np.asarray(counts, dtype=np.float64)
-    sf = estimate_size_factors(matrix, mask=mask)
-    sub = matrix[mask] if mask is not None else matrix
-    col_sums = sub.sum(axis=0)
-    median_scale = float(np.median(col_sums / sf))
-    s = sf * median_scale
-    return matrix / s[np.newaxis, :]
-
-
-def mask_low_coverage(normalized: NDArray[np.floating]) -> NDArray[np.bool_]:
-    """Mask bins with no coverage or coverage below 5% of the positive median."""
-    per_bin = np.asarray(normalized, dtype=np.float64).sum(axis=1)
-    positive = per_bin[per_bin > 0]
-    if positive.size == 0:
-        return np.zeros(per_bin.shape, dtype=np.bool_)
-    threshold = _MASK_FRACTION * float(np.median(positive))
-    return per_bin > threshold
-
-
-def _median_abs_deviation(values: NDArray[np.floating]) -> float:
-    """Compute the unscaled Median Absolute Deviation (MAD) of an array."""
-    arr = np.asarray(values, dtype=np.float64)
-    if arr.size == 0:
-        return 0.0
-    med = float(np.median(arr))
-    return float(np.median(np.abs(arr - med)))
-
-
-def _validate_sex_cutoff(cutoff: float | None) -> None:
-    """Validate that sex separation cutoff is in range [0, 1]."""
-    if cutoff is None:
-        return
-    if not math.isfinite(cutoff) or cutoff < 0.0 or cutoff > 1.0:
-        raise ReferenceError("sex_cutoff must be a finite number in [0, 1]")
-
-
-def _labels_from_cutoff(
-    values: NDArray[np.float64],
-    recorded: tuple[float, ...],
-    cutoff: float,
-) -> SexInference:
-    """Assign sex labels by thresholding contig fractions against an explicit cutoff."""
-    _validate_sex_cutoff(cutoff)
-    labels = tuple("male" if float(value) > cutoff else "female" for value in values)
-    return SexInference(
-        labels=labels,
-        cutoff=float(cutoff),
-        fractions=recorded,
-        passed=True,
-        reason="cutoff",
-    )
-
-
-def infer_sample_sexes(
-    fractions: NDArray[np.floating],
-    min_group_size: int,
-    min_separation: float = 0.0,
-    cutoff: float | None = None,
-) -> SexInference:
-    """Split Y-like fractions into female/male groups when separation is clear."""
-    values = np.asarray(fractions, dtype=np.float64)
-    recorded = tuple(float(value) for value in values)
-    if min_group_size < 1:
-        raise ReferenceError("min_sex_group_size must be a positive integer")
-    if cutoff is not None:
-        return _labels_from_cutoff(values, recorded, cutoff)
-    if values.size < 2 * min_group_size:
-        return SexInference(
-            labels=None,
-            cutoff=None,
-            fractions=recorded,
-            passed=False,
-            reason="cohort is too small for sex inference",
-        )
-
-    order = np.argsort(values, kind="mergesort")
-    sorted_values = values[order]
-    best_gap = -np.inf
-    best_split = -1
-    for split in range(min_group_size, values.size - min_group_size + 1):
-        gap = float(sorted_values[split] - sorted_values[split - 1])
-        if gap > best_gap:
-            best_gap = gap
-            best_split = split
-
-    if best_split < 0 or best_gap <= 0:
-        return SexInference(
-            labels=None,
-            cutoff=None,
-            fractions=recorded,
-            passed=False,
-            reason="sex-signal fractions are not separable",
-        )
-
-    low = sorted_values[:best_split]
-    high = sorted_values[best_split:]
-    spread = max(
-        _median_abs_deviation(low),
-        _median_abs_deviation(high),
-        1e-12,
-    )
-    cutoff_val = float((low[-1] + high[0]) / 2.0)
-    if best_gap < max(min_separation, _SEPARATION_MAD_MULTIPLIER * spread):
-        return SexInference(
-            labels=None,
-            cutoff=cutoff_val,
-            fractions=recorded,
-            passed=False,
-            reason="sex-signal groups are not sufficiently separated",
-        )
-
-    labels = ["female"] * values.size
-    for index in order[best_split:]:
-        labels[int(index)] = "male"
-    return SexInference(
-        labels=tuple(labels),
-        cutoff=cutoff_val,
-        fractions=recorded,
-        passed=True,
-        reason="separated",
-    )
-
-
-def _build_target_grid(
-    contig_lengths: Mapping[str, int], target_bin_size: int
-) -> pl.DataFrame:
-    """Construct a canonical DataFrame grid of genomic bin intervals for given contigs."""
-    grid_contigs: list[str] = []
-    grid_starts: list[np.ndarray] = []
-    grid_ends: list[np.ndarray] = []
-    for c_name, c_len in contig_lengths.items():
-        s, e = bin_intervals(int(c_len), target_bin_size)
-        grid_contigs.extend([str(c_name)] * s.size)
-        grid_starts.append(s)
-        grid_ends.append(e)
-
-    return pl.DataFrame(
-        {
-            "contig": grid_contigs,
-            "start": (
-                np.concatenate(grid_starts)
-                if grid_starts
-                else np.empty(0, dtype=np.int64)
-            ),
-            "end": (
-                np.concatenate(grid_ends) if grid_ends else np.empty(0, dtype=np.int64)
-            ),
-        },
-        schema={"contig": pl.String, "start": pl.Int64, "end": pl.Int64},
-    )
-
-
-def _redistribute_by_overlap(
-    src_starts: NDArray[np.int64],
-    src_ends: NDArray[np.int64],
-    src_counts: NDArray[np.floating],
-    tgt_starts: NDArray[np.int64],
-    tgt_ends: NDArray[np.int64],
-) -> NDArray[np.float64]:
-    """Redistribute count mass from arbitrary source intervals to target bins by overlap."""
-    n_targets = tgt_starts.size
-    if n_targets == 0:
-        return (
-            np.empty((0, src_counts.shape[1]), dtype=np.float64)
-            if src_counts.ndim == 2
-            else np.empty(0, dtype=np.float64)
-        )
-    if src_starts.size == 0:
-        return (
-            np.zeros((n_targets, src_counts.shape[1]), dtype=np.float64)
-            if src_counts.ndim == 2
-            else np.zeros(n_targets, dtype=np.float64)
-        )
-
-    is_2d = src_counts.ndim == 2
-    out = (
-        np.zeros((n_targets, src_counts.shape[1]), dtype=np.float64)
-        if is_2d
-        else np.zeros(n_targets, dtype=np.float64)
-    )
-
-    t_bin_size = max(int(tgt_ends[0] - tgt_starts[0]), 1)
-    lens = src_ends - src_starts
-    valid = lens > 0
-    if not np.any(valid):
-        return out
-
-    s_s = src_starts[valid]
-    s_e = src_ends[valid]
-    s_c = src_counts[valid]
-    s_len = lens[valid].astype(np.float64)
-
-    first_k = np.clip(s_s // t_bin_size, 0, n_targets - 1)
-    last_k = np.clip((s_e - 1) // t_bin_size, 0, n_targets - 1)
-
-    for i in range(len(s_s)):
-        for k in range(int(first_k[i]), int(last_k[i]) + 1):
-            ov = max(
-                0,
-                min(int(s_e[i]), int(tgt_ends[k]))
-                - max(int(s_s[i]), int(tgt_starts[k])),
+    pos = np.isfinite(exp_arr) & (exp_arr > 0.0) & np.isfinite(totals) & (totals > 0.0)
+    rate = np.where(pos, totals / np.maximum(exp_arr, 1e-6), 0.0)
+    keep = np.zeros(n_bins, dtype=np.bool_)
+    for c_val in np.unique(c_ids):
+        on_c = c_ids == c_val
+        pos_rates = rate[on_c & pos]
+        if pos_rates.size > 0:
+            keep[on_c] = pos[on_c] & (
+                rate[on_c] > min_fraction * float(np.median(pos_rates))
             )
-            if ov > 0:
-                frac = ov / s_len[i]
-                if is_2d:
-                    out[k] += frac * s_c[i]
-                else:
-                    out[k] += frac * s_c[i]
-    return out
+    return keep
 
 
-def rebin_sample_table(table: pa.Table, target_bin_size: int) -> pa.Table:
-    """Rescale sample Parquet counts to target_bin_size without changing length."""
-    if target_bin_size <= 0:
-        raise ValueError("target_bin_size must be a positive integer")
-    metadata = decode_metadata(table.schema.metadata)
-    current_bin_size = metadata.get("bin_size")
-    if current_bin_size == target_bin_size:
-        return table
-
-    contig_lengths = metadata.get("contig_lengths")
-    if not isinstance(contig_lengths, dict) or not contig_lengths:
-        raise ValueError("table metadata lacks contig_lengths")
-
-    meta_values = {
-        key: val
-        for key, val in metadata.items()
-        if key
-        not in (
-            "artifact_kind",
-            "schema_version",
-            "coordinate_system",
-            "contig_lengths",
-        )
-    }
-    meta_values["bin_size"] = target_bin_size
-    new_metadata = metadata_for(
-        ArtifactKind.SAMPLE,
-        contig_lengths={str(k): int(v) for k, v in contig_lengths.items()},
-        values=meta_values,
+def _finalize_frag_covariates(
+    sum_count: NDArray[np.float64],
+    sum_paired: NDArray[np.float64],
+    sum_flen: NDArray[np.float64],
+    sum_ep: NDArray[np.float64],
+    *,
+    is_paired: bool,
+) -> tuple[NDArray[np.float32] | None, NDArray[np.float32] | None]:
+    if not is_paired:
+        return None, None
+    pos = sum_paired > 0.0
+    fb = (
+        float(np.median(sum_flen[pos] / sum_paired[pos]))
+        if np.any(pos)
+        else _DEFAULT_FRAG_LEN_BP
     )
-    has_frag = "fragment_lengths" in table.column_names
-    has_ep = "endpoint_count" in table.column_names
-    has_gc = "frag_gc_sum" in table.column_names
-
-    schema_fields = [
-        pa.field("contig", pa.string(), nullable=False),
-        pa.field("start", pa.int64(), nullable=False),
-        pa.field("end", pa.int64(), nullable=False),
-        pa.field("count", pa.float64(), nullable=False),
-    ]
-    if has_frag:
-        schema_fields.append(
-            pa.field("fragment_lengths", pa.list_(pa.uint16()), nullable=False)
-        )
-    if has_ep:
-        schema_fields.append(pa.field("endpoint_count", pa.uint32(), nullable=False))
-    if has_gc:
-        schema_fields.append(pa.field("frag_gc_sum", pa.float32(), nullable=False))
-
-    new_schema = pa.schema(schema_fields).with_metadata(new_metadata)
-
-    intervals_contained = False
-    if (
-        isinstance(current_bin_size, int)
-        and current_bin_size > 0
-        and target_bin_size % current_bin_size == 0
-        and target_bin_size > current_bin_size
-    ):
-        df = pl.from_arrow(table)
-        assert isinstance(df, pl.DataFrame)
-        intervals_contained = (
-            df.height == 0
-            or df.select(
-                (
-                    (pl.col("start") // target_bin_size)
-                    == ((pl.col("end") - 1) // target_bin_size)
-                ).all()
-            ).item()
-        )
-
-    if intervals_contained:
-        target_grid = _build_target_grid(contig_lengths, target_bin_size)
-        df = pl.from_arrow(table)
-        assert isinstance(df, pl.DataFrame)
-        if df.height > 0:
-            agg_exprs = [pl.col("count").sum().alias("count")]
-            select_cols = [
-                pl.col("contig").cast(pl.String),
-                ((pl.col("start") // target_bin_size) * target_bin_size)
-                .cast(pl.Int64)
-                .alias("start"),
-                pl.col("count").cast(pl.Float64),
-            ]
-            if has_frag:
-                agg_exprs.append(
-                    pl.col("fragment_lengths")
-                    .drop_nulls()
-                    .list.drop_nulls()
-                    .list.explode()
-                    .cast(pl.UInt16)
-                    .alias("fragment_lengths")
-                )
-                select_cols.append(pl.col("fragment_lengths"))
-            if has_ep:
-                agg_exprs.append(
-                    pl.col("endpoint_count")
-                    .sum()
-                    .cast(pl.UInt32)
-                    .alias("endpoint_count")
-                )
-                select_cols.append(pl.col("endpoint_count"))
-            if has_gc:
-                agg_exprs.append(
-                    pl.col("frag_gc_sum").sum().cast(pl.Float32).alias("frag_gc_sum")
-                )
-                select_cols.append(pl.col("frag_gc_sum"))
-
-            agg_df = (
-                df.select(select_cols)
-                .group_by(["contig", "start"], maintain_order=True)
-                .agg(agg_exprs)
-            )
-
-            with_cols = [pl.col("count").fill_null(0.0).cast(pl.Float64)]
-            if has_frag:
-                with_cols.append(
-                    pl.col("fragment_lengths")
-                    .fill_null(pl.lit([], dtype=pl.List(pl.UInt16)))
-                    .list.drop_nulls()
-                )
-            if has_ep:
-                with_cols.append(pl.col("endpoint_count").fill_null(0).cast(pl.UInt32))
-            if has_gc:
-                with_cols.append(pl.col("frag_gc_sum").fill_null(0.0).cast(pl.Float32))
-
-            result_df = target_grid.join(
-                agg_df, on=["contig", "start"], how="left", maintain_order="left"
-            ).with_columns(with_cols)
-        else:
-            with_cols = [pl.lit(0.0, dtype=pl.Float64).alias("count")]
-            if has_frag:
-                with_cols.append(
-                    pl.lit([], dtype=pl.List(pl.UInt16)).alias("fragment_lengths")
-                )
-            if has_ep:
-                with_cols.append(pl.lit(0, dtype=pl.UInt32).alias("endpoint_count"))
-            if has_gc:
-                with_cols.append(pl.lit(0.0, dtype=pl.Float32).alias("frag_gc_sum"))
-            result_df = target_grid.with_columns(with_cols)
-
-        arrow_table = result_df.to_arrow()
-        table_cols = {
-            "contig": pa.array(
-                arrow_table.column("contig").to_pylist(), type=pa.string()
-            ),
-            "start": pa.array(arrow_table.column("start").to_numpy(), type=pa.int64()),
-            "end": pa.array(arrow_table.column("end").to_numpy(), type=pa.int64()),
-            "count": pa.array(
-                arrow_table.column("count").to_numpy(), type=pa.float64()
-            ),
-        }
-        if has_frag:
-            table_cols["fragment_lengths"] = pa.array(
-                arrow_table.column("fragment_lengths").to_pylist(),
-                type=pa.list_(pa.uint16()),
-            )
-        if has_ep:
-            table_cols["endpoint_count"] = pa.array(
-                arrow_table.column("endpoint_count").to_numpy(),
-                type=pa.uint32(),
-            )
-        if has_gc:
-            table_cols["frag_gc_sum"] = pa.array(
-                arrow_table.column("frag_gc_sum").to_numpy(),
-                type=pa.float32(),
-            )
-
-        return pa.table(table_cols, schema=new_schema)
-
-    contig_arr = np.asarray(table.column("contig"))
-    start_col = np.asarray(
-        table.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
+    ref_frag_len = np.where(pos, sum_flen / np.maximum(sum_paired, 1e-12), fb).astype(
+        np.float32
     )
-    end_col = np.asarray(
-        table.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    count_col = np.asarray(
-        table.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
+    ref_ep_rate = (sum_ep / np.maximum(sum_count, 1e-12)).astype(np.float32)
+    return ref_frag_len, ref_ep_rate
+
+
+def _extract_streamed_sample(
+    index: int,
+    bufs: SampleBuffers,
+    raw_meta: dict[str, object],
+    path: Path,
+    target_bin_size: int | None,
+    *,
+    retain_buffers: bool = False,
+) -> _StreamedSample:
+    if target_bin_size is not None and bufs.meta.bin_size != target_bin_size:
+        bufs = rebin_sample_buffers(bufs, target_bin_size)
+        if bufs.meta.fragmentomics is None:
+            raw_meta.pop("fragmentomics", None)
+
+    is_paired = has_paired_fragmentomics(bufs)
+    return _StreamedSample(
+        index=index,
+        path=path,
+        raw_meta=raw_meta,
+        sample_meta=bufs.meta,
+        is_paired=is_paired,
+        count=np.asarray(bufs.count, dtype=np.uint32),
+        paired_count=bufs.paired_count,
+        frag_len_sum=bufs.frag_len_sum,
+        endpoint_count=bufs.endpoint_count,
+        bufs=bufs if retain_buffers else None,
     )
 
-    new_contigs: list[np.ndarray] = []
-    new_starts: list[np.ndarray] = []
-    new_ends: list[np.ndarray] = []
-    new_counts: list[np.ndarray] = []
 
-    if len(contig_arr) == 0:
-        contig_slices: dict[str, tuple[int, int]] = {}
-    else:
-        changes = np.flatnonzero(contig_arr[1:] != contig_arr[:-1]) + 1
-        starts = np.concatenate(([0], changes))
-        ends = np.concatenate((changes, [len(contig_arr)]))
-        contig_slices = {
-            str(contig_arr[s]): (int(s), int(e))
-            for s, e in zip(starts, ends, strict=True)
-        }
-
-    for contig_name, length in contig_lengths.items():
-        target_starts, target_ends = bin_intervals(int(length), target_bin_size)
-        span = contig_slices.get(contig_name)
-        if span is None:
-            target_counts = np.zeros(target_starts.size, dtype=np.float64)
-        else:
-            s, e = span
-            s_starts = start_col[s:e]
-            s_ends = end_col[s:e]
-            s_counts = count_col[s:e]
-            is_part = (
-                s_starts.size > 0
-                and s_starts[0] == 0
-                and s_ends[-1] == target_ends[-1]
-                and np.array_equal(s_starts[1:], s_ends[:-1])
-            )
-            if is_part:
-                target_counts = rebin_counts(
-                    s_starts, s_ends, s_counts, target_starts, target_ends
-                )
-            else:
-                target_counts = _redistribute_by_overlap(
-                    s_starts, s_ends, s_counts, target_starts, target_ends
-                )
-        new_contigs.append(np.full(target_starts.size, contig_name, dtype=object))
-        new_starts.append(target_starts)
-        new_ends.append(target_ends)
-        new_counts.append(target_counts)
-
-    empty_str = np.array([], dtype=object)
-    empty_i64 = np.empty(0, dtype=np.int64)
-    empty_f64 = np.empty(0, dtype=np.float64)
-
-    out_cols = {
-        "contig": pa.array(
-            np.concatenate(new_contigs) if new_contigs else empty_str,
-            type=pa.string(),
-        ),
-        "start": pa.array(
-            np.concatenate(new_starts) if new_starts else empty_i64,
-            type=pa.int64(),
-        ),
-        "end": pa.array(
-            np.concatenate(new_ends) if new_ends else empty_i64,
-            type=pa.int64(),
-        ),
-        "count": pa.array(
-            np.concatenate(new_counts) if new_counts else empty_f64,
-            type=pa.float64(),
-        ),
-    }
-    n_rows = len(out_cols["contig"])
-    if has_frag or has_ep or has_gc:
-        logger.warning(
-            "dropping fragmentomic metadata during non-nested interval rebinning"
-        )
-        if new_schema.metadata:
-            meta_dict = dict(new_schema.metadata)
-            meta_dict.pop(FRAGMENTOMICS_METADATA_KEY, None)
-            meta_dict.pop(b"ccnv.fragmentomics", None)
-            meta_dict.pop(b"fragmentomics", None)
-            new_schema = new_schema.with_metadata(meta_dict)
-
-    if has_frag:
-        out_cols["fragment_lengths"] = pa.ListArray.from_arrays(
-            np.zeros(n_rows + 1, dtype=np.int32),
-            np.empty(0, dtype=np.uint16),
-        )
-    if has_ep:
-        out_cols["endpoint_count"] = pa.array(
-            np.zeros(n_rows, dtype=np.uint32), type=pa.uint32()
-        )
-    if has_gc:
-        out_cols["frag_gc_sum"] = pa.array(
-            np.zeros(n_rows, dtype=np.float32), type=pa.float32()
-        )
-
-    return pa.table(out_cols, schema=new_schema)
-
-
-def _parse_sample_table(
-    table: pa.Table,
-    label: str,
-    target_bin_size: int | None = None,
-) -> _ParsedSample:
-    """Validate and unpack a sample table, rebinning if needed."""
+def _read_cohort_sample(path: Path) -> tuple[SampleBuffers, pa.Table]:
     try:
-        validate_table(table, ArtifactKind.SAMPLE)
-    except SchemaError as error:
-        raise ReferenceError(f"{label}: {error}") from error
+        table = pq.read_table(path)
+        bufs = SampleBuffers.from_table(table, validate=True)
+    except (FileNotFoundError, OSError, pa.ArrowInvalid, pa.ArrowException) as err:
+        raise ReferenceError(f"{path}: cannot read sample Parquet ({err})") from err
+    except SchemaError as err:
+        raise ReferenceError(f"{path}: {err}") from err
+    return bufs, table
 
-    metadata = decode_metadata(table.schema.metadata)
-    contig_lengths = metadata.get("contig_lengths")
-    orig_bin_size = metadata.get("bin_size")
-    if not isinstance(contig_lengths, dict) or not isinstance(orig_bin_size, int):
-        raise ReferenceError(f"{label}: sample metadata is incomplete")
 
-    effective_bin_size = (
-        target_bin_size if target_bin_size is not None else orig_bin_size
-    )
-    if orig_bin_size != effective_bin_size:
-        logger.debug(
-            "rebinning cohort sample %s from %s bp to %s bp",
-            Path(label).name,
-            orig_bin_size,
-            effective_bin_size,
-        )
-        table = rebin_sample_table(table, effective_bin_size)
-        metadata = decode_metadata(table.schema.metadata)
+def _read_and_extract_sample(
+    index: int, path: Path, target_bin_size: int | None
+) -> _StreamedSample:
+    bufs, table = _read_cohort_sample(path)
+    raw_meta = decode_metadata(table.schema.metadata)
+    return _extract_streamed_sample(index, bufs, raw_meta, path, target_bin_size)
 
-    contigs = tuple(str(c) for c in table.column("contig").to_pylist())
-    starts = np.asarray(
-        table.column("start").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    ends = np.asarray(
-        table.column("end").to_numpy(zero_copy_only=False), dtype=np.int64
-    )
-    counts = np.asarray(
-        table.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
-    )
-    frag_len: NDArray[np.float64] | None = None
-    ep_ratio: NDArray[np.float64] | None = None
+
+def alloc_cohort_counts(
+    n_bins: int, n_samples: int, max_batch_memory_mb: int
+) -> NDArray[np.float32]:
+    """Allocate a Fortran-contiguous float32 cohort matrix, spilling to memmap above budget."""
     if (
-        "fragment_lengths" in table.column_names
-        or "endpoint_count" in table.column_names
+        n_bins > 0
+        and n_samples > 0
+        and n_bins * n_samples * 4 > max_batch_memory_mb * 1024 * 1024
     ):
-        frag_len, ep_ratio = extract_bin_fragmentomic_covariates(table)
-    lengths = {str(k): int(v) for k, v in contig_lengths.items()}
-    return metadata, lengths, contigs, starts, ends, counts, frag_len, ep_ratio
+        with tempfile.NamedTemporaryFile(
+            prefix="ccnv_cohort_", suffix=".mmap", delete=False
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            mmap_arr = np.memmap(
+                tmp_path,
+                dtype=np.float32,
+                mode="w+",
+                shape=(n_bins, n_samples),
+                order="F",
+            )
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            weakref.finalize(mmap_arr, lambda p=tmp_path: p.unlink(missing_ok=True))
+        return mmap_arr
+    return np.empty((n_bins, n_samples), dtype=np.float32, order="F")
 
 
-def _assemble_cohort(
-    parsed: Sequence[_ParsedSample],
-    paths: Sequence[Path],
-    target_bin_size: int | None = None,
-) -> Cohort:
-    """Combine parsed sample tables into an aligned Cohort structure."""
-    (
-        first_meta,
-        expected_lengths,
-        expected_contigs,
-        expected_starts,
-        expected_ends,
-        _,
-        _,
-        _,
-    ) = parsed[0]
-    expected_bin_size = int(first_meta["bin_size"])
-    counts_list: list[NDArray[np.float64]] = []
-    identities: list[object] = []
-    frag_lens: list[NDArray[np.float64]] = []
-    ep_ratios: list[NDArray[np.float64]] = []
+class _CohortAccumulator:
+    def __init__(
+        self,
+        first: _StreamedSample,
+        n_samples: int,
+        *,
+        require_same_native_bin: bool,
+        max_batch_memory_mb: int,
+    ) -> None:
+        n_bins = first.count.size
+        self.first, self.require_same_native_bin = first, require_same_native_bin
+        self.counts = alloc_cohort_counts(n_bins, n_samples, max_batch_memory_mb)
+        self.sum_count = np.zeros(n_bins, dtype=np.float64)
+        self.sum_paired = np.zeros(n_bins, dtype=np.float64)
+        self.sum_flen = np.zeros(n_bins, dtype=np.float64)
+        self.sum_ep = np.zeros(n_bins, dtype=np.float64)
+        self.raw_metas: list[dict[str, object]] = [{} for _ in range(n_samples)]
+        self.identities: list[object] = [None for _ in range(n_samples)]
+        self.record(first)
 
-    first_paired = is_paired_sample_metadata(first_meta)
-
-    for path, sample_data in zip(paths, parsed, strict=True):
-        metadata, lengths, contigs, starts, ends, counts, frag_len, ep_ratio = (
-            sample_data
-        )
-        if is_paired_sample_metadata(metadata) != first_paired:
+    def record(self, sample: _StreamedSample) -> None:
+        first, sm, fm = self.first, sample.sample_meta, self.first.sample_meta
+        if sample.is_paired != first.is_paired:
             raise ReferenceError(
                 "mixed single-end and paired-end cohort controls are not supported"
             )
-        bin_size = int(metadata["bin_size"])
-        if lengths != expected_lengths:
-            raise ReferenceError(f"{path}: contig_lengths do not match the cohort")
-        if target_bin_size is None and bin_size != expected_bin_size:
+        if sm.contig_lengths != fm.contig_lengths:
             raise ReferenceError(
-                f"{path}: bin_size {bin_size} does not match cohort {expected_bin_size}"
+                f"{sample.path}: contig_lengths do not match the cohort"
             )
-        if (
-            contigs != expected_contigs
-            or not np.array_equal(starts, expected_starts)
-            or not np.array_equal(ends, expected_ends)
-        ):
-            raise ReferenceError(f"{path}: bin coordinates do not match the cohort")
+        if self.require_same_native_bin and sm.bin_size != fm.bin_size:
+            raise ReferenceError(
+                f"{sample.path}: bin_size {sm.bin_size} does not match cohort {fm.bin_size}"
+            )
+        if sm.contig_order != fm.contig_order or sample.count.size != first.count.size:
+            raise ReferenceError(
+                f"{sample.path}: bin coordinates do not match the cohort"
+            )
 
+        idx = sample.index
         logger.debug(
             "loaded cohort sample %s: %d bins, %d total depth",
-            path.name,
-            counts.size,
-            int(np.sum(counts)),
+            sample.path.name,
+            sample.count.size,
+            int(np.sum(sample.count)),
         )
-        counts_list.append(counts)
-        identities.append(metadata.get("source_identity", {"path": str(path)}))
-        if frag_len is not None:
-            frag_lens.append(frag_len)
-        if ep_ratio is not None:
-            ep_ratios.append(ep_ratio)
+        self.counts[:, idx] = sample.count
+        self.sum_count += sample.count
+        self.sum_paired += sample.paired_count
+        self.sum_flen += sample.frag_len_sum
+        self.sum_ep += sample.endpoint_count
+        self.raw_metas[idx] = sample.raw_meta
+        self.identities[idx] = sample.raw_meta.get(
+            "source_identity", {"path": str(sample.path)}
+        )
 
-    cohort_frag_len = (
-        np.mean(np.column_stack(frag_lens), axis=1)
-        if first_paired and frag_lens
-        else None
+    def finalize(
+        self,
+        paths: Sequence[Path],
+        *,
+        in_memory_tables: Sequence[SampleBuffers] = (),
+    ) -> Cohort:
+        codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(
+            self.first.sample_meta
+        )
+        ref_frag_len, ref_ep_rate = _finalize_frag_covariates(
+            self.sum_count,
+            self.sum_paired,
+            self.sum_flen,
+            self.sum_ep,
+            is_paired=self.first.is_paired,
+        )
+        return Cohort(
+            counts=self.counts,
+            contigs=tuple(names[int(c)] for c in codes),
+            starts=starts_u32.astype(np.int64),
+            ends=ends_u32.astype(np.int64),
+            contig_lengths=dict(self.first.sample_meta.contig_lengths),
+            bin_size=self.first.sample_meta.bin_size,
+            identities=tuple(self.identities),
+            paths=tuple(paths),
+            sample_metadata=tuple(self.raw_metas),
+            ref_frag_len=ref_frag_len,
+            ref_ep_rate=ref_ep_rate,
+            in_memory_tables=tuple(in_memory_tables),
+        )
+
+
+def load_and_assemble_cohort(
+    entries: Sequence[SamplesheetEntry],
+    target_bin_size: int | None = None,
+    *,
+    threads: int = 1,
+    max_batch_memory_mb: int = 512,
+) -> Cohort:
+    """Stream sample sketches into a Fortran-contiguous float32 cohort matrix."""
+    if len(entries) < 1:
+        raise ReferenceError("cohort must contain at least one sample")
+    if target_bin_size is not None and target_bin_size <= 0:
+        raise BinCompatibilityError("target_bin_size must be a positive integer")
+
+    paths = [entry.filepath for entry in entries]
+    n_samples = len(paths)
+    first = _read_and_extract_sample(0, paths[0], target_bin_size)
+    acc = _CohortAccumulator(
+        first,
+        n_samples,
+        require_same_native_bin=target_bin_size is None,
+        max_batch_memory_mb=max_batch_memory_mb,
     )
-    cohort_ep_ratio = (
-        np.mean(np.column_stack(ep_ratios), axis=1)
-        if first_paired and ep_ratios
-        else None
+    if n_samples > 1:
+        workers = max(1, min(threads, n_samples - 1))
+        pending: deque[Future[_StreamedSample]] = deque()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for idx in range(1, min(n_samples, 1 + 2 * workers)):
+                pending.append(
+                    pool.submit(
+                        _read_and_extract_sample, idx, paths[idx], target_bin_size
+                    )
+                )
+            next_idx = 1 + len(pending)
+            while pending:
+                acc.record(pending.popleft().result())
+                if next_idx < n_samples:
+                    pending.append(
+                        pool.submit(
+                            _read_and_extract_sample,
+                            next_idx,
+                            paths[next_idx],
+                            target_bin_size,
+                        )
+                    )
+                    next_idx += 1
+    return acc.finalize(paths)
+
+
+def _weighted_sample_summary(
+    bufs: SampleBuffers,
+    target_bin_size: int,
+    w_24: NDArray[np.float64],
+    w_sq_24: NDArray[np.float64],
+    w_mid_24: NDArray[np.float64],
+) -> tuple[
+    NDArray[np.float32],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    if bufs.meta.bin_size != target_bin_size:
+        bufs = rebin_sample_buffers(bufs, target_bin_size)
+    zeros = np.zeros(bufs.num_rows, dtype=np.float64)
+    if (
+        bufs.num_rows == 0
+        or bufs.frag_bands is None
+        or not np.any(bufs.paired_count > 0)
+    ):
+        w_counts = np.asarray(bufs.count, dtype=np.float64)
+        return (
+            w_counts.astype(np.float32),
+            np.asarray(bufs.paired_count, dtype=np.float64),
+            np.asarray(bufs.frag_len_sum, dtype=np.float64),
+            np.asarray(bufs.endpoint_count, dtype=np.float64),
+            zeros,
+            zeros,
+            zeros,
+        )
+    bands_f64 = np.asarray(bufs.frag_bands, dtype=np.float64)
+    raw_cnt = np.asarray(bufs.count, dtype=np.float64)
+    paired_f64 = np.asarray(bufs.paired_count, dtype=np.float64)
+    raw_unpaired = np.maximum(raw_cnt - paired_f64, 0.0)
+    w_paired = bands_f64 @ w_24
+    w_counts = raw_unpaired + w_paired
+    w_flen = bands_f64 @ w_mid_24
+    ep_scale = np.where(raw_cnt > 0.0, w_counts / np.maximum(raw_cnt, 1.0), 1.0)
+    w_ep = np.asarray(bufs.endpoint_count, dtype=np.float64) * ep_scale
+
+    has_p = paired_f64 > 0.0
+    n_tot_bin = np.where(has_p, raw_unpaired + paired_f64, 0.0)
+    w_tot_bin = np.where(has_p, w_counts, 0.0)
+    w_sq_bin = np.where(has_p, raw_unpaired + (bands_f64 @ w_sq_24), 0.0)
+    return (
+        w_counts.astype(np.float32),
+        w_paired,
+        w_flen,
+        w_ep,
+        n_tot_bin,
+        w_tot_bin,
+        w_sq_bin,
     )
 
-    return Cohort(
-        counts=np.column_stack(counts_list),
-        contigs=expected_contigs,
-        starts=expected_starts,
-        ends=expected_ends,
-        contig_lengths=expected_lengths,
-        bin_size=expected_bin_size,
-        identities=tuple(identities),
-        paths=tuple(paths),
-        sample_metadata=tuple(p[0] for p in parsed),
-        mean_frag_len=cohort_frag_len,
-        endpoint_ratio=cohort_ep_ratio,
+
+def build_fisher_weighted_cohort(
+    cohort: Cohort,
+    band_weights_24: Sequence[float] | NDArray[np.floating] | None,
+    *,
+    max_batch_memory_mb: int = 256,
+    threads: int = 1,
+) -> Cohort:
+    """Return a Cohort whose counts and fragmentomic covariates apply 24-band Fisher read weighting."""
+    if band_weights_24 is None:
+        return cohort
+    w_24 = np.asarray(band_weights_24, dtype=np.float64)
+    if (
+        w_24.ndim != 1
+        or w_24.size != NUM_FRAG_BANDS
+        or not np.all(np.isfinite(w_24) & (w_24 >= 0.0))
+    ):
+        raise ReferenceError(
+            f"band_weights_24 must contain {NUM_FRAG_BANDS} finite non-negative weights"
+        )
+
+    n_bins, n_samples = cohort.counts.shape
+    if n_bins == 0 or n_samples == 0:
+        return cohort
+
+    has_inmem = len(cohort.in_memory_tables) == n_samples
+    has_paths = len(cohort.paths) == n_samples and all(
+        p.is_file() for p in cohort.paths
     )
+    if not has_inmem and not has_paths:
+        raise ReferenceError(
+            "cannot apply Fisher fragment weighting: cohort lacks in-memory sample buffers and readable sample paths"
+        )
+
+    w_sq_24 = np.square(w_24)
+    w_mid_24 = w_24 * _FRAG_BAND_MIDPOINTS
+    weighted = alloc_cohort_counts(n_bins, n_samples, max_batch_memory_mb)
+    sum_count = np.zeros(n_bins, dtype=np.float64)
+    sum_paired = np.zeros(n_bins, dtype=np.float64)
+    sum_flen = np.zeros(n_bins, dtype=np.float64)
+    sum_ep = np.zeros(n_bins, dtype=np.float64)
+    sum_n_tot = np.zeros(n_bins, dtype=np.float64)
+    sum_w_tot = np.zeros(n_bins, dtype=np.float64)
+    sum_w_sq = np.zeros(n_bins, dtype=np.float64)
+
+    def _accumulate(
+        idx: int,
+        col: NDArray[np.float32],
+        w_p: NDArray[np.float64],
+        w_fl: NDArray[np.float64],
+        w_e: NDArray[np.float64],
+        n_tot_b: NDArray[np.float64],
+        w_tot_b: NDArray[np.float64],
+        w_sq_b: NDArray[np.float64],
+    ) -> None:
+        nonlocal sum_count, sum_paired, sum_flen, sum_ep
+        nonlocal sum_n_tot, sum_w_tot, sum_w_sq
+        weighted[:, idx] = col
+        sum_count += col
+        sum_paired += w_p
+        sum_flen += w_fl
+        sum_ep += w_e
+        sum_n_tot += n_tot_b
+        sum_w_tot += w_tot_b
+        sum_w_sq += w_sq_b
+
+    if has_inmem:
+        for idx, bufs in enumerate(cohort.in_memory_tables):
+            summary = _weighted_sample_summary(
+                bufs, cohort.bin_size, w_24, w_sq_24, w_mid_24
+            )
+            _accumulate(idx, *summary)
+    else:
+
+        def _load_col(
+            idx: int,
+        ) -> tuple[
+            int,
+            NDArray[np.float32],
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+        ]:
+            bufs, _ = _read_cohort_sample(cohort.paths[idx])
+            summary = _weighted_sample_summary(
+                bufs, cohort.bin_size, w_24, w_sq_24, w_mid_24
+            )
+            return idx, *summary
+
+        workers = max(1, min(threads, n_samples))
+        if workers == 1:
+            for idx in range(n_samples):
+                _accumulate(*_load_col(idx))
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for loaded in pool.map(_load_col, range(n_samples)):
+                    _accumulate(*loaded)
+
+    has_frag_covs = (cohort.ref_frag_len is not None) or (
+        cohort.ref_ep_rate is not None
+    )
+    ref_frag_len, ref_ep_rate = _finalize_frag_covariates(
+        sum_count, sum_paired, sum_flen, sum_ep, is_paired=has_frag_covs
+    )
+    has_paired = sum_n_tot > 0.0
+    ref_kappa = np.ones(n_bins, dtype=np.float32)
+    ref_kappa[has_paired] = np.maximum(
+        sum_n_tot[has_paired]
+        * sum_w_sq[has_paired]
+        / np.maximum(np.square(sum_w_tot[has_paired]), 1e-12),
+        1.0,
+    ).astype(np.float32)
+    return replace(
+        cohort,
+        counts=weighted,
+        ref_frag_len=ref_frag_len,
+        ref_ep_rate=ref_ep_rate,
+        ref_kappa_frag=ref_kappa,
+    )
+
+
+def validate_cohort(
+    tables: Sequence[pa.Table | SampleBuffers],
+    paths: Sequence[Path] | None = None,
+    target_bin_size: int | None = None,
+) -> Cohort:
+    """Validate in-memory sample sketch tables or buffers into an aligned Cohort."""
+    if len(tables) < 1:
+        raise ReferenceError("cohort must contain at least one sample")
+    resolved = (
+        list(paths)
+        if paths is not None
+        else [Path(f"sample_{i}") for i in range(len(tables))]
+    )
+    if len(resolved) != len(tables):
+        raise ReferenceError("paths must align with sample tables")
+
+    def _coerce_one(idx: int) -> _StreamedSample:
+        item = tables[idx]
+        path = resolved[idx]
+        try:
+            bufs = SampleBuffers.coerce(item, validate=True)
+        except SchemaError as err:
+            raise ReferenceError(f"{path}: {err}") from err
+        raw_meta = (
+            bufs.meta.to_metadata()
+            if isinstance(item, SampleBuffers)
+            else decode_metadata(item.schema.metadata)
+        )
+        return _extract_streamed_sample(
+            idx, bufs, raw_meta, path, target_bin_size, retain_buffers=True
+        )
+
+    first = _coerce_one(0)
+    acc = _CohortAccumulator(
+        first,
+        len(tables),
+        require_same_native_bin=target_bin_size is None,
+        max_batch_memory_mb=65_536,
+    )
+    retained: list[SampleBuffers] = [first.bufs] if first.bufs is not None else []
+    for idx in range(1, len(tables)):
+        sample = _coerce_one(idx)
+        acc.record(sample)
+        if sample.bufs is not None:
+            retained.append(sample.bufs)
+    return acc.finalize(resolved, in_memory_tables=retained)
 
 
 def rebin_cohort(cohort: Cohort, target_bin_size: int) -> Cohort:
     """Rescale 2D cohort count matrix to target_bin_size."""
     if target_bin_size <= 0:
-        raise ValueError("target_bin_size must be a positive integer")
+        raise InvalidInputError("target_bin_size must be a positive integer")
     if cohort.bin_size == target_bin_size:
         return cohort
-
-    current_bin_size = cohort.bin_size
-    n_samples = cohort.counts.shape[1]
-
-    intervals_contained = cohort.starts.size == 0 or bool(
-        np.all(
-            (cohort.starts // target_bin_size) == ((cohort.ends - 1) // target_bin_size)
-        )
+    rebinned = rebin_counts_matrix(
+        cohort.counts,
+        cohort.contigs,
+        cohort.starts,
+        cohort.ends,
+        cohort.contig_lengths,
+        cohort.bin_size,
+        target_bin_size,
     )
-
-    if (
-        current_bin_size > 0
-        and target_bin_size % current_bin_size == 0
-        and target_bin_size > current_bin_size
-        and intervals_contained
-    ):
-        target_grid = _build_target_grid(cohort.contig_lengths, target_bin_size)
-        if cohort.counts.shape[0] > 0 and n_samples > 0:
-            sample_col_names = [f"c_{j}" for j in range(n_samples)]
-            df_dict: dict[str, object] = {
-                "contig": [str(c) for c in cohort.contigs],
-                "start": cohort.starts,
-            }
-            for j, name in enumerate(sample_col_names):
-                df_dict[name] = cohort.counts[:, j]
-            df = pl.DataFrame(df_dict)
-
-            agg_df = (
-                df.select(
-                    [
-                        pl.col("contig"),
-                        ((pl.col("start") // target_bin_size) * target_bin_size)
-                        .cast(pl.Int64)
-                        .alias("start"),
-                        pl.col("^c_.*$"),
-                    ]
-                )
-                .group_by(["contig", "start"], maintain_order=True)
-                .agg(pl.col("^c_.*$").sum())
-            )
-            result_df = target_grid.join(
-                agg_df, on=["contig", "start"], how="left", maintain_order="left"
-            ).with_columns(pl.col("^c_.*$").fill_null(0.0).cast(pl.Float64))
-            new_counts = (
-                result_df.select(sample_col_names).to_numpy()
-                if target_grid.height > 0
-                else np.empty((0, n_samples), dtype=np.float64)
-            )
-        else:
-            result_df = target_grid
-            new_counts = (
-                np.zeros((target_grid.height, n_samples), dtype=np.float64)
-                if n_samples > 0
-                else np.empty((target_grid.height, 0), dtype=np.float64)
-            )
-
-        return Cohort(
-            contigs=tuple(result_df["contig"].to_list()),
-            starts=result_df["start"].to_numpy(),
-            ends=result_df["end"].to_numpy(),
-            counts=new_counts,
-            contig_lengths=cohort.contig_lengths,
-            identities=cohort.identities,
-            bin_size=target_bin_size,
-            paths=cohort.paths,
-            sample_metadata=cohort.sample_metadata,
-        )
-
-    contig_arr = np.asarray(cohort.contigs)
-    n_samples = cohort.counts.shape[1]
-    if len(contig_arr) == 0:
-        contig_slices: dict[str, tuple[int, int]] = {}
-    else:
-        changes = np.flatnonzero(contig_arr[1:] != contig_arr[:-1]) + 1
-        starts_idx = np.concatenate(([0], changes))
-        ends_idx = np.concatenate((changes, [len(contig_arr)]))
-        contig_slices = {
-            str(contig_arr[s]): (int(s), int(e))
-            for s, e in zip(starts_idx, ends_idx, strict=True)
-        }
-
-    new_c: list[str] = []
-    new_s: list[np.ndarray] = []
-    new_e: list[np.ndarray] = []
-    new_counts: list[np.ndarray] = []
-
-    for c_name, c_len in cohort.contig_lengths.items():
-        t_starts, t_ends = bin_intervals(int(c_len), target_bin_size)
-        span = contig_slices.get(c_name)
-        if span is None:
-            t_counts = np.zeros((t_starts.size, n_samples), dtype=np.float64)
-        else:
-            s_i, e_i = span
-            src_s = cohort.starts[s_i:e_i]
-            src_e = cohort.ends[s_i:e_i]
-            is_part = (
-                src_s.size > 0
-                and src_s[0] == 0
-                and src_e[-1] == t_ends[-1]
-                and np.array_equal(src_s[1:], src_e[:-1])
-            )
-            if is_part:
-                t_counts = np.column_stack(
-                    [
-                        rebin_counts(
-                            src_s,
-                            src_e,
-                            cohort.counts[s_i:e_i, j],
-                            t_starts,
-                            t_ends,
-                        )
-                        for j in range(n_samples)
-                    ]
-                )
-            else:
-                t_counts = _redistribute_by_overlap(
-                    src_s,
-                    src_e,
-                    cohort.counts[s_i:e_i, :],
-                    t_starts,
-                    t_ends,
-                )
-        new_c.extend([c_name] * t_starts.size)
-        new_s.append(t_starts)
-        new_e.append(t_ends)
-        new_counts.append(t_counts)
-
     return Cohort(
-        contigs=tuple(new_c),
-        starts=np.concatenate(new_s) if new_s else np.empty(0, dtype=np.int64),
-        ends=np.concatenate(new_e) if new_e else np.empty(0, dtype=np.int64),
-        counts=(
-            np.vstack(new_counts)
-            if new_counts
-            else np.empty((0, n_samples), dtype=np.float64)
-        ),
-        contig_lengths=cohort.contig_lengths,
-        identities=cohort.identities,
-        bin_size=target_bin_size,
-        paths=cohort.paths,
-        sample_metadata=cohort.sample_metadata,
+        *rebinned,
+        cohort.contig_lengths,
+        target_bin_size,
+        cohort.identities,
+        cohort.paths,
+        cohort.sample_metadata,
     )
-
-
-def validate_cohort(
-    tables: Sequence[pa.Table],
-    paths: Sequence[Path] | None = None,
-    target_bin_size: int | None = None,
-) -> Cohort:
-    """Require matching contig lengths across samples, rebinning counts if set."""
-    if len(tables) < 1:
-        raise ReferenceError("cohort must contain at least one sample")
-    resolved_paths = (
-        tuple(paths)
-        if paths is not None
-        else tuple(Path(f"sample_{index}") for index in range(len(tables)))
-    )
-    if len(resolved_paths) != len(tables):
-        raise ReferenceError("paths must align with sample tables")
-
-    parsed = [
-        _parse_sample_table(table, str(path), target_bin_size)
-        for path, table in zip(resolved_paths, tables, strict=True)
-    ]
-    return _assemble_cohort(parsed, resolved_paths, target_bin_size)
 
 
 def cohort_from_fasta(
     contigs_dict: Mapping[str, int],
     bin_size: int,
     *,
-    n_samples: int,
     fasta_path: Path | None = None,
 ) -> Cohort:
-    """Build identical uniform-depth samples from FASTA contig lengths."""
-    if n_samples < 1:
-        raise ReferenceError("n_samples must be a positive integer")
-    names = list(contigs_dict.keys())
-    lengths = [int(v) for v in contigs_dict.values()]
-    source_path = fasta_path or Path("flat_fasta")
-
-    contigs: list[str] = []
-    starts: list[int] = []
-    ends: list[int] = []
-    for name, length in zip(names, lengths, strict=True):
-        contig_starts, contig_ends = bin_intervals(length, bin_size)
-        contigs.extend([name] * contig_starts.size)
-        starts.extend(int(value) for value in contig_starts)
-        ends.extend(int(value) for value in contig_ends)
-    start_array = np.asarray(starts, dtype=np.int64)
-    end_array = np.asarray(ends, dtype=np.int64)
-    expected = np.maximum(end_array - start_array, 1).astype(np.float64)
-    counts = np.broadcast_to(expected[:, np.newaxis], (expected.size, n_samples)).copy()
-    resolved = source_path.expanduser().resolve()
-    identities = tuple(
-        {
-            "path": str(resolved),
-            "format": "flat-fasta",
-            "replica": index,
-        }
-        for index in range(n_samples)
+    """Build a 0-sample coordinate grid from FASTA contig lengths for flat reference models."""
+    if bin_size <= 0:
+        raise ReferenceError("bin_size must be a positive integer")
+    resolved = (fasta_path or Path("flat_fasta")).expanduser().resolve()
+    contigs, starts, ends, contig_lengths = build_coordinate_grid(
+        contigs_dict, bin_size
     )
+    counts = np.empty((starts.size, 0), dtype=np.float32, order="F")
+    identities: tuple[object, ...] = ({"path": str(resolved), "format": "flat-fasta"},)
     return Cohort(
         counts=counts,
-        contigs=tuple(contigs),
-        starts=start_array,
-        ends=end_array,
-        contig_lengths=dict(zip(names, lengths, strict=True)),
+        contigs=contigs,
+        starts=starts,
+        ends=ends,
+        contig_lengths=contig_lengths,
         bin_size=bin_size,
         identities=identities,
-        paths=tuple(Path(f"{resolved}#flat-{index}") for index in range(n_samples)),
+        paths=(),
     )

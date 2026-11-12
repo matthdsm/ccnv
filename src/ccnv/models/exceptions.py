@@ -9,6 +9,10 @@ class ReferenceError(CcnvError):
     """Raised when reference construction, validation, or cohort aggregation fails."""
 
 
+class InvalidInputError(ReferenceError, ValueError):
+    """Raised when count matrix or bin coordinate input validation fails."""
+
+
 class CovariateError(CcnvError):
     """Raised when GC or mappability covariate calculation or loading fails."""
 
@@ -17,12 +21,24 @@ class PredictError(CcnvError):
     """Raised when prediction or segmentation fails."""
 
 
+class BinCompatibilityError(ReferenceError, PredictError):
+    """Raised when sample and target bin grids cannot be reconciled without upsampling."""
+
+
 class SchemaError(CcnvError):
     """Raised when an artifact violates a storage contract."""
 
 
+class SchemaVersionError(SchemaError):
+    """Raised when an artifact uses an unsupported or legacy schema version."""
+
+
 class ExtractError(CcnvError):
     """Raised when extraction cannot proceed with the given inputs."""
+
+
+class AlignmentError(ExtractError):
+    """Raised when BAM or CRAM header, index, or record reading fails."""
 
 
 class ReferenceQCError(CcnvError):
@@ -30,11 +46,15 @@ class ReferenceQCError(CcnvError):
 
 
 __all__ = [
+    "AlignmentError",
+    "BinCompatibilityError",
     "CcnvError",
     "CovariateError",
     "ExtractError",
+    "InvalidInputError",
     "PredictError",
     "ReferenceError",
     "ReferenceQCError",
     "SchemaError",
+    "SchemaVersionError",
 ]

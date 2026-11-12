@@ -26,6 +26,7 @@ from ccnv.qc.sample import (
     build_sample_qc,
     empty_qc,
     sanitize_qc_payload,
+    write_qc_json,
 )
 
 __all__ = [
@@ -49,5 +50,6 @@ __all__ = [
     "run_reference_qc_on_table",
     "sanitize_qc_payload",
     "write_predict_qc_json",
+    "write_qc_json",
     "write_reference_qc_json",
 ]

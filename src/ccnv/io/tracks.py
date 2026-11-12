@@ -2,23 +2,29 @@
 
 from __future__ import annotations
 
+import functools
 import gzip
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Final
 
 import numpy as np
-import pyBigWig
-import pysam
+import polars as pl
 from numpy.typing import NDArray
 
+from ccnv._core import (
+    read_fasta_contigs_core,
+    scan_bigwig_means,
+    scan_fasta_gc_quantiles,
+)
 from ccnv.models import (
+    ContigLookup,
     CovariateError,
     Cytoband,
     ReferenceError,
     natural_sort_key,
-    resolve_contig_name,
     select_layout,
 )
 
@@ -38,12 +44,6 @@ _BIGWIG_SUFFIXES: Final[frozenset[str]] = frozenset({".bw", ".bigwig"})
 _BED_SUFFIXES: Final[frozenset[str]] = frozenset(
     {".bed", ".bedgraph", ".tsv", ".txt", ".wig"}
 )
-
-_ASCII_BASE_LUT: Final[NDArray[np.uint8]] = np.zeros(256, dtype=np.uint8)
-for _ch in b"GgCc":
-    _ASCII_BASE_LUT[_ch] = 1
-for _ch in b"AaTtUu":
-    _ASCII_BASE_LUT[_ch] = 2
 
 
 def _bin_weighted_mean(
@@ -123,6 +123,106 @@ def _bin_weighted_mean(
     return result
 
 
+def _extract_contig_grid(
+    contigs: Sequence[str],
+    starts: NDArray[np.int64],
+    ends: NDArray[np.int64],
+) -> tuple[
+    list[tuple[str, int]], int, list[tuple[slice, slice, NDArray[np.intp] | None]]
+]:
+    """Map caller bin arrays to `(contig, length)` specs and output slices."""
+    n = starts.size
+    if len(contigs) != n or ends.size != n:
+        raise CovariateError("contig, start, and end arrays must have equal length")
+    if n == 0:
+        return [], 1, []
+
+    runs: list[tuple[str, int, int]] = []
+    seen_contigs: set[str] = set()
+    run_start = 0
+    prev = str(contigs[0])
+    for idx in range(1, n):
+        cur = str(contigs[idx])
+        if cur != prev:
+            if prev in seen_contigs:
+                raise CovariateError(f"non-contiguous contig run on contig {prev}")
+            seen_contigs.add(prev)
+            runs.append((prev, run_start, idx))
+            prev = cur
+            run_start = idx
+    if prev in seen_contigs:
+        raise CovariateError(f"non-contiguous contig run on contig {prev}")
+    runs.append((prev, run_start, n))
+
+    for cname, s_idx, e_idx in runs:
+        c_starts = starts[s_idx:e_idx]
+        c_ends = ends[s_idx:e_idx]
+        if bool(np.any(c_starts < 0)) or bool(np.any(c_ends <= c_starts)):
+            raise CovariateError(
+                f"non-positive or inverted bin coordinates on contig {cname}"
+            )
+        if c_starts.size >= 2 and bool(np.any(c_starts[1:] < c_ends[:-1])):
+            raise CovariateError(
+                f"unsorted or overlapping bin coordinates on contig {cname}"
+            )
+
+    bin_size = 0
+    for _, s_idx, e_idx in runs:
+        if e_idx - s_idx >= 2:
+            bin_size = int(ends[s_idx] - starts[s_idx])
+            break
+
+    if bin_size <= 0:
+        max_width = max(int(np.max(ends - starts)), 1)
+        pos_starts = [int(s) for s in starts if int(s) > 0]
+        if pos_starts:
+            step = functools.reduce(math.gcd, pos_starts)
+            if step < max_width:
+                raise CovariateError(
+                    f"non-uniform bin coordinates on contig {runs[0][0]} are unsupported"
+                )
+            bin_size = step
+        else:
+            bin_size = max_width
+
+    specs: list[tuple[str, int]] = []
+    placements: list[tuple[slice, slice, NDArray[np.intp] | None]] = []
+    core_offset = 0
+    for cname, s_idx, e_idx in runs:
+        c_starts = starts[s_idx:e_idx]
+        c_ends = ends[s_idx:e_idx]
+        contig_len = int(c_ends[-1])
+        n_core = (contig_len + bin_size - 1) // bin_size
+        is_full_grid = (
+            c_starts.size == n_core
+            and int(c_starts[0]) == 0
+            and (
+                n_core == 1
+                or (
+                    bool(np.all(c_starts[1:] == c_ends[:-1]))
+                    and bool(np.all(c_ends[:-1] - c_starts[:-1] == bin_size))
+                )
+            )
+        )
+        if is_full_grid:
+            bin_idx = None
+        elif bool(np.all(c_starts % bin_size == 0)) and bool(
+            np.all(c_ends == np.minimum(c_starts + bin_size, contig_len))
+        ):
+            bin_idx = (c_starts // bin_size).astype(np.intp)
+        else:
+            raise CovariateError(
+                f"non-uniform bin coordinates on contig {cname} are unsupported"
+            )
+        specs.append((cname, contig_len))
+        placements.append(
+            (slice(s_idx, e_idx), slice(core_offset, core_offset + n_core), bin_idx)
+        )
+        core_offset += n_core
+
+    return specs, bin_size, placements
+
+
 def _load_bigwig_intervals(
     path: Path,
     contigs: Sequence[str],
@@ -132,59 +232,23 @@ def _load_bigwig_intervals(
     label: str,
     full_bin_denominator: bool = False,
 ) -> NDArray[np.float64]:
-    """Read per-bin overlap-weighted means from a BigWig file via pyBigWig."""
+    """Read per-bin overlap-weighted means from a BigWig file via `ccnv._core`."""
     resolved = path.expanduser()
     if not resolved.is_file():
         raise CovariateError(f"{label} file not found: {resolved}")
-    try:
-        bw = pyBigWig.open(str(resolved))
-    except Exception as error:
-        raise CovariateError(
-            f"failed to open {label} BigWig {resolved}: {error}"
-        ) from error
-    if bw is None or not bw.isBigWig():
-        if bw is not None:
-            bw.close()
-        raise CovariateError(f"{resolved} is not a valid BigWig file")
 
-    try:
-        bw_chroms = bw.chroms() or {}
-        avail = set(bw_chroms.keys())
-        contig_arr = np.asarray(contigs, dtype=object)
-        out = np.full(
-            starts.size,
-            0.0 if full_bin_denominator else np.nan,
-            dtype=np.float64,
-        )
-        matched_any = False
+    specs, bin_size, placements = _extract_contig_grid(contigs, starts, ends)
+    core_vals = scan_bigwig_means(str(resolved), specs, bin_size, full_bin_denominator)
+    if starts.size == 0:
+        return np.empty(0, dtype=np.float64)
 
-        for contig in dict.fromkeys(contigs):
-            bw_contig = resolve_contig_name(str(contig), avail)
-            if bw_contig is None:
-                continue
-            matched_any = True
-            mask = contig_arr == contig
-            c_starts = starts[mask]
-            c_ends = ends[mask]
-            chrom_len = int(bw_chroms[bw_contig])
-            raw_intervals = bw.intervals(bw_contig, 0, chrom_len)
-            if raw_intervals:
-                iv_arr = np.array(raw_intervals, dtype=np.float64)
-                out[mask] = _bin_weighted_mean(
-                    c_starts,
-                    c_ends,
-                    iv_arr[:, 0].astype(np.int64),
-                    iv_arr[:, 1].astype(np.int64),
-                    iv_arr[:, 2],
-                    full_bin_denominator=full_bin_denominator,
-                )
-    finally:
-        bw.close()
+    if len(placements) == 1 and placements[0][2] is None:
+        return core_vals.astype(np.float64)
 
-    if not matched_any and starts.size > 0:
-        raise CovariateError(
-            f"{label} BigWig {resolved} contains none of the target contigs"
-        )
+    out = np.empty(starts.size, dtype=np.float64)
+    for dst_slice, src_slice, bin_idx in placements:
+        chunk = core_vals[src_slice]
+        out[dst_slice] = chunk if bin_idx is None else chunk[bin_idx]
     return out
 
 
@@ -203,6 +267,16 @@ def load_mappability_track(
         label="mappability",
         full_bin_denominator=True,
     )
+    if np.any(np.isinf(values)):
+        raise CovariateError(f"mappability track {path} contains infinite values")
+    finite_vals = values[np.isfinite(values)]
+    if finite_vals.size > 0 and (
+        bool(np.any(finite_vals < -1e-5)) or bool(np.any(finite_vals > 1.0 + 1e-5))
+    ):
+        raise CovariateError(
+            f"mappability track {path} contains values outside [0.0, 1.0]: "
+            f"min={float(np.min(finite_vals)):.6g}, max={float(np.max(finite_vals)):.6g}"
+        )
     values = np.nan_to_num(values, nan=0.0)
     values = np.clip(values, 0.0, 1.0)
     logger.debug(
@@ -219,75 +293,43 @@ def _compute_fasta_gc(
     contigs: Sequence[str],
     starts: NDArray[np.int64],
     ends: NDArray[np.int64],
-) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
-    """Compute per-bin GC fraction and >50% N-base mask from an indexed FASTA."""
+) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.float32]]:
+    """Compute per-bin GC fraction, >50% N-base mask, and 8-bin GC quantiles in one FASTA pass."""
     fasta = path.expanduser()
     if not fasta.is_file():
         raise CovariateError(f"FASTA not found: {fasta}")
-    if not Path(f"{fasta}.fai").is_file():
-        try:
-            pysam.faidx(str(fasta))
-        except Exception as error:
-            raise CovariateError(f"failed to index FASTA {fasta}: {error}") from error
 
-    try:
-        handle = pysam.FastaFile(str(fasta))
-    except Exception as error:
-        raise CovariateError(f"failed to open FASTA {fasta}: {error}") from error
+    specs, bin_size, placements = _extract_contig_grid(contigs, starts, ends)
+    gc_core, n_frac_core, gc_q_core = scan_fasta_gc_quantiles(
+        str(fasta), specs, bin_size
+    )
+    if starts.size == 0:
+        return (
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.bool_),
+            np.empty((0, 8), dtype=np.float32),
+        )
 
-    try:
-        avail = set(handle.references)
-        contig_arr = np.asarray(contigs, dtype=object)
-        gc_out = np.full(starts.size, np.nan, dtype=np.float64)
-        n_mask = np.ones(starts.size, dtype=np.bool_)
-        matched_any = False
+    if len(placements) == 1 and placements[0][2] is None:
+        gc_raw = gc_core.astype(np.float64)
+        n_frac = n_frac_core
+        gc_q_out = np.nan_to_num(gc_q_core, nan=0.0).astype(np.float32, copy=False)
+    else:
+        gc_raw = np.empty(starts.size, dtype=np.float64)
+        n_frac = np.empty(starts.size, dtype=np.float32)
+        gc_q_out = np.empty((starts.size, gc_q_core.shape[1]), dtype=np.float32)
+        for dst_slice, src_slice, bin_idx in placements:
+            c_gc = gc_core[src_slice]
+            c_nf = n_frac_core[src_slice]
+            c_gq = gc_q_core[src_slice]
+            gc_raw[dst_slice] = c_gc if bin_idx is None else c_gc[bin_idx]
+            n_frac[dst_slice] = c_nf if bin_idx is None else c_nf[bin_idx]
+            gc_q_out[dst_slice] = c_gq if bin_idx is None else c_gq[bin_idx]
+        gc_q_out = np.nan_to_num(gc_q_out, nan=0.0).astype(np.float32, copy=False)
 
-        for contig in dict.fromkeys(contigs):
-            fa_contig = resolve_contig_name(str(contig), avail)
-            if fa_contig is None:
-                continue
-            matched_any = True
-            mask = contig_arr == contig
-            c_starts = starts[mask]
-            c_ends = ends[mask]
-            seq_bytes = np.frombuffer(
-                handle.fetch(fa_contig).encode("ascii"), dtype=np.uint8
-            )
-            seq_len = seq_bytes.size
-            if seq_len == 0:
-                continue
-            codes = _ASCII_BASE_LUT[seq_bytes]
-            del seq_bytes
-            gc_prefix = np.empty(seq_len + 1, dtype=np.int32)
-            at_prefix = np.empty(seq_len + 1, dtype=np.int32)
-            gc_prefix[0] = 0
-            at_prefix[0] = 0
-            np.cumsum(codes == 1, dtype=np.int32, out=gc_prefix[1:])
-            np.cumsum(codes == 2, dtype=np.int32, out=at_prefix[1:])
-            del codes
-
-            clamped_s = np.clip(c_starts, 0, seq_len)
-            clamped_e = np.clip(c_ends, clamped_s, seq_len)
-            gc_counts = gc_prefix[clamped_e] - gc_prefix[clamped_s]
-            at_counts = at_prefix[clamped_e] - at_prefix[clamped_s]
-            valid_bases = gc_counts + at_counts
-            bin_lengths = np.maximum(c_ends - c_starts, 1)
-            n_counts = np.maximum(bin_lengths - valid_bases, 0)
-            n_fraction = n_counts / bin_lengths
-
-            bad = (valid_bases <= 0) | (n_fraction > _MAX_N_FRACTION)
-            c_gc = np.full(c_starts.size, np.nan, dtype=np.float64)
-            good = ~bad
-            c_gc[good] = gc_counts[good] / valid_bases[good]
-
-            gc_out[mask] = c_gc
-            n_mask[mask] = bad
-    finally:
-        handle.close()
-
-    if not matched_any and starts.size > 0:
-        raise CovariateError(f"FASTA {fasta} contains none of the target contigs")
-    return gc_out, n_mask
+    n_mask: NDArray[np.bool_] = (~np.isfinite(gc_raw)) | (n_frac > _MAX_N_FRACTION)
+    gc_raw[n_mask] = np.nan
+    return gc_raw, n_mask, gc_q_out
 
 
 def _load_bed_gc(
@@ -301,57 +343,99 @@ def _load_bed_gc(
     if not resolved.is_file():
         raise CovariateError(f"GC track file not found: {resolved}")
 
-    by_contig: dict[str, tuple[list[int], list[int], list[float]]] = {}
-    opener = gzip.open if resolved.suffix.lower() == ".gz" else open
+    _extract_contig_grid(contigs, starts, ends)
+    if starts.size == 0:
+        return np.empty(0, dtype=np.float64)
+
     try:
-        with opener(resolved, "rt", encoding="utf-8") as handle:
-            for line_num, raw in enumerate(handle, start=1):
-                line = raw.strip()
-                if not line or line.startswith(("#", "track", "browser")):
-                    continue
-                parts = line.split()
-                if len(parts) < 4:
-                    raise CovariateError(
-                        f"{resolved}:{line_num}: expected at least 4 columns"
-                    )
-                if line_num == 1 and not parts[1].lstrip("-").isdigit():
-                    continue
-                try:
-                    s = int(parts[1])
-                    e = int(parts[2])
-                    val = float(parts[3])
-                except ValueError as error:
-                    raise CovariateError(
-                        f"{resolved}:{line_num}: invalid numeric coordinate or GC value"
-                    ) from error
-                bucket = by_contig.setdefault(parts[0], ([], [], []))
-                bucket[0].append(s)
-                bucket[1].append(e)
-                bucket[2].append(val)
-    except OSError as error:
+        df = pl.read_csv(
+            resolved,
+            has_header=False,
+            separator="\x00",
+            quote_char=None,
+            comment_prefix="#",
+            infer_schema=False,
+        )
+    except pl.exceptions.NoDataError:
+        df = pl.DataFrame()
+    except (OSError, pl.exceptions.PolarsError) as error:
         raise CovariateError(f"failed to read GC track {resolved}: {error}") from error
 
-    avail = set(by_contig.keys())
+    if df.height > 0:
+        col0 = df.columns[0]
+        df = df.select(pl.col(col0).str.strip_chars().alias("line")).filter(
+            pl.col("line").is_not_null()
+            & (pl.col("line").str.len_bytes() > 0)
+            & ~pl.col("line").str.starts_with("#")
+            & ~pl.col("line").str.starts_with("track")
+            & ~pl.col("line").str.starts_with("browser")
+        )
+        if df.height > 0:
+            df = df.select(
+                pl.col("line")
+                .str.replace_all(r"\s+", "\t")
+                .str.split_exact("\t", 3)
+                .struct.rename_fields(["contig", "start_s", "end_s", "val_s"])
+                .alias("_parts")
+            ).unnest("_parts")
+
+            first_s = df.item(0, "start_s")
+            first_v = df.item(0, "val_s")
+            if (
+                isinstance(first_s, str)
+                and isinstance(first_v, str)
+                and not first_s.lstrip("-").isdigit()
+            ):
+                df = df.slice(1)
+
+        if df.height > 0:
+            if (
+                df.select(
+                    pl.any_horizontal(pl.col("start_s", "end_s", "val_s").is_null())
+                )
+                .to_series()
+                .any()
+            ):
+                raise CovariateError(f"{resolved}: expected at least 4 columns")
+            try:
+                df = df.select(
+                    pl.col("contig"),
+                    pl.col("start_s").cast(pl.Int64, strict=True).alias("start"),
+                    pl.col("end_s").cast(pl.Int64, strict=True).alias("end"),
+                    pl.col("val_s").cast(pl.Float64, strict=True).alias("val"),
+                )
+            except pl.exceptions.PolarsError as error:
+                raise CovariateError(
+                    f"{resolved}: invalid numeric coordinate or GC value"
+                ) from error
+
+    by_contig: dict[str, pl.DataFrame] = {}
+    if df.height > 0 and "start" in df.columns:
+        for key, part in df.partition_by("contig", as_dict=True).items():
+            contig_key = str(key[0]) if isinstance(key, tuple) else str(key)
+            by_contig[contig_key] = part
+
+    lookup = ContigLookup.from_names(by_contig.keys())
     contig_arr = np.asarray(contigs, dtype=object)
     out = np.full(starts.size, np.nan, dtype=np.float64)
     matched_any = False
 
     for contig in dict.fromkeys(contigs):
-        bed_contig = resolve_contig_name(str(contig), avail)
+        bed_contig = lookup.resolve(str(contig))
         if bed_contig is None:
             continue
         matched_any = True
         mask = contig_arr == contig
-        iv_s, iv_e, iv_v = by_contig[bed_contig]
+        part = by_contig[bed_contig]
         out[mask] = _bin_weighted_mean(
             starts[mask],
             ends[mask],
-            np.asarray(iv_s, dtype=np.int64),
-            np.asarray(iv_e, dtype=np.int64),
-            np.asarray(iv_v, dtype=np.float64),
+            part["start"].to_numpy(),
+            part["end"].to_numpy(),
+            part["val"].to_numpy(),
         )
 
-    if not matched_any and starts.size > 0:
+    if not matched_any:
         raise CovariateError(f"GC track {resolved} contains none of the target contigs")
     return out
 
@@ -381,11 +465,12 @@ def load_gc_track(
     contigs: Sequence[str],
     starts: NDArray[np.int64],
     ends: NDArray[np.int64],
-) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
-    """Load per-bin GC content in [0, 1] and N-base mask from FASTA, BigWig, or BED."""
+) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.float32] | None]:
+    """Load per-bin GC content in [0, 1], N-base mask, and optional FASTA GC quantiles."""
     kind = _classify_gc_source(path)
+    gc_quantiles: NDArray[np.float32] | None = None
     if kind == "fasta":
-        gc, n_mask = _compute_fasta_gc(path, contigs, starts, ends)
+        gc, n_mask, gc_quantiles = _compute_fasta_gc(path, contigs, starts, ends)
     elif kind == "bigwig":
         gc = _load_bigwig_intervals(path, contigs, starts, ends, label="GC")
         n_mask = ~np.isfinite(gc)
@@ -395,10 +480,12 @@ def load_gc_track(
 
     finite = np.isfinite(gc)
     if np.any(finite):
-        max_val = float(np.nanmax(gc[finite]))
-        if 1.0001 < max_val <= 100.0:
-            gc[finite] /= 100.0
-        invalid_range = (gc < 0.0) | (gc > 1.0)
+        finite_vals = gc[finite]
+        if 1.0 < float(np.median(finite_vals)) and float(np.max(finite_vals)) <= 100.0:
+            gc[finite] = finite_vals / 100.0
+            finite_vals = gc[finite]
+        invalid_range = np.zeros(gc.shape, dtype=np.bool_)
+        invalid_range[finite] = (finite_vals < 0.0) | (finite_vals > 1.0)
         gc[invalid_range] = np.nan
         n_mask |= invalid_range
 
@@ -409,59 +496,56 @@ def load_gc_track(
         int(np.count_nonzero(np.isfinite(gc) & ~n_mask)),
         gc.size,
     )
-    return gc, n_mask
+    return gc, n_mask, gc_quantiles
 
 
 def load_cytobands_track(
     path: Path, contig_lengths: Mapping[str, int]
 ) -> tuple[Cytoband, ...]:
     """Parse a UCSC cytoband BED/TSV file (.txt, .bed, or .gz) aligned to contigs."""
-    contig_lookup: dict[str, str] = {}
-    for c in contig_lengths:
-        contig_lookup[c.casefold()] = c
-        stripped = c[3:] if c.lower().startswith("chr") else c
-        contig_lookup[stripped.casefold()] = c
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        raise CovariateError(f"cytobands file not found: {resolved}")
 
-    open_fn = gzip.open if path.suffix.lower() == ".gz" else open
+    lookup = ContigLookup.from_names(contig_lengths.keys())
+    open_fn = gzip.open if resolved.suffix.lower() == ".gz" else open
     bands: list[Cytoband] = []
-    with open_fn(path, "rt", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith(("#", "track")):
-                continue
-            fields = line.split("\t") if "\t" in line else line.split()
-            if len(fields) < 4:
-                continue
-            raw_contig = fields[0]
-            stripped_raw = (
-                raw_contig[3:] if raw_contig.lower().startswith("chr") else raw_contig
-            )
-            canonical = contig_lookup.get(raw_contig.casefold()) or contig_lookup.get(
-                stripped_raw.casefold()
-            )
-            if canonical is None:
-                continue
-            try:
-                start = int(fields[1])
-                end = int(fields[2])
-            except ValueError:
-                continue
-            max_len = contig_lengths[canonical]
-            start = max(0, min(start, max_len))
-            end = max(0, min(end, max_len))
-            if end <= start:
-                continue
-            name = fields[3]
-            stain = fields[4] if len(fields) >= 5 else "gneg"
-            bands.append(
-                Cytoband(
-                    contig=canonical,
-                    start=start,
-                    end=end,
-                    name=name,
-                    stain=stain,
+    try:
+        with open_fn(resolved, "rt", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith(("#", "track", "browser")):
+                    continue
+                fields = line.split("\t") if "\t" in line else line.split()
+                if len(fields) < 4:
+                    continue
+                canonical = lookup.resolve(fields[0])
+                if canonical is None:
+                    continue
+                try:
+                    start = int(fields[1])
+                    end = int(fields[2])
+                except ValueError:
+                    continue
+                max_len = contig_lengths[canonical]
+                start = max(0, min(start, max_len))
+                end = max(0, min(end, max_len))
+                if end <= start:
+                    continue
+                name = fields[3]
+                stain = fields[4] if len(fields) >= 5 else "gneg"
+                bands.append(
+                    Cytoband(
+                        contig=canonical,
+                        start=start,
+                        end=end,
+                        name=name,
+                        stain=stain,
+                    )
                 )
-            )
+    except (OSError, EOFError, UnicodeDecodeError) as error:
+        raise CovariateError(f"failed to read cytobands {resolved}: {error}") from error
+
     return tuple(
         sorted(bands, key=lambda b: (natural_sort_key(b.contig), b.start, b.end))
     )
@@ -476,27 +560,20 @@ def read_fasta_contigs(
     fasta = Path(fasta_path).expanduser().resolve()
     if not fasta.is_file():
         raise ReferenceError(f"FASTA not found: {fasta}")
-    if not Path(f"{fasta}.fai").is_file():
-        logger.debug("creating FASTA index for %s", fasta)
-        try:
-            pysam.faidx(str(fasta))
-        except Exception as error:
-            raise ReferenceError(f"failed to index FASTA {fasta}: {error}") from error
     try:
-        handle = pysam.FastaFile(str(fasta))
-    except Exception as error:
-        raise ReferenceError(f"failed to open FASTA {fasta}: {error}") from error
-    try:
-        header_names = list(handle.references)
-        header_lengths = [int(length) for length in handle.lengths]
-    finally:
-        handle.close()
-    if any(length <= 0 for length in header_lengths):
+        pairs = read_fasta_contigs_core(str(fasta))
+    except (CovariateError, OSError) as error:
+        raise ReferenceError(f"failed to read FASTA {fasta}: {error}") from error
+    if not pairs:
+        raise ReferenceError(f"{fasta} declares no contigs")
+    if any(length <= 0 for _, length in pairs):
         raise ReferenceError(f"{fasta} contains non-positive contig lengths")
-    layout = select_layout(header_names, header_lengths, all_contigs=all_contigs)
-    if not layout:
+    if len({name for name, _ in pairs}) != len(pairs):
+        raise ReferenceError(f"{fasta} declares duplicate contig names")
+    selected = select_layout(pairs, all_contigs=all_contigs)
+    if not selected:
         raise ReferenceError(
             f"{fasta} declares no canonical chromosomes; "
             "pass --all-contigs to include every contig"
         )
-    return {contig.name: contig.length for contig in layout}
+    return dict(selected)

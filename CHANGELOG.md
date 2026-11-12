@@ -11,24 +11,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Cell-free DNA (cffDNA vs maternal cfDNA) fragmentomic feature extraction and size distribution modeling across `extract`, `reference`, and `predict`:
-  - `ccnv extract`: Single-pass alignment streaming with paired-end dyad midpoint binning (`TLEN > 0`), extracting clamped insert lengths (``$`30\text{–}600\text{ bp}`$``), unclipped ``$`5'`$`` 4-mer motif codes, fragment GC content, and cleavage endpoint counts alongside `ccnv.fragmentomics` Parquet metadata.
-  - Parabolic chromatosome landmarking and sub-bin linear histogram alignment (``$`\Delta_{\text{bp}} = M_{\text{chrom}} - 166.0 \in [-11.0, +14.0]\text{ bp}`$``) standardizing platform sizing offsets across cohorts.
-  - 36-feature convex logit-link `FF_size` ensemble (`RidgeCV` + `ElasticNetCV`) incorporating 28 mode-aligned `5 bp` log-density bands, core-to-chromatosome and sub-nucleosomal peak ratios, ``$`10.4\text{ bp}`$`` helical DFT cleavage amplitude, Motif Diversity Score (MDS), and top nuclease 4-mer frequencies (`CCCA`, `CCAG`, `CCTG`).
-  - Cohort fragment length deconvolution estimating pure fetal ``$`\hat{p}_F(L)`$`` (pooled male `chrY` minus female-scaled misalignment background) and maternal ``$`\hat{p}_M(L)`$`` (autosomal zero-fetal-fraction OLS intercept) probability densities.
-  - Depth-conserving Fisher-optimal read weighting ``$`w^{\ast}(L) \in [0.25, 3.0]`$`` solved via 25-step bisection under ``$`\mathbb{E}_{L \sim p_{\text{mix}}}[w^{\ast}(L)] = 1.0`$``, paired with weighted-reference baseline alignment during `ccnv predict --mode prenatal`.
-  - Contained-interval 4-channel Polars coarsening (`count`, `fragment_lengths`, `endpoint_count`, `frag_gc_sum`) with mass-conserving 1D count interpolation fallback on non-nested bin grids.
-  - Augmented Huber B-spline covariate regression and ``$`\mathbb{R}^{P+C}`$`` (`C` up to 4) `KDTree` off-contig neighbor matching incorporating per-bin mean fragment length ``$`\bar{L}_i`$`` and cleavage endpoint ratio ``$`E_i / \max(C_i, 1.0)`$``.
-  - Multi-modal Bates-Granger inverse-variance precision fusion combining concordant `FFY`, `FFA`, `FFX`, and `FF_size` estimates into `active_ff`.
-  - Segment-level fragmentomic log-likelihood ratio scoring (``$`\mathrm{LLR}_{\text{size}}`$``) and biological origin classification (`FETAL_CONFIRMED`, `MATERNAL_CONFIRMED`, `INDETERMINATE`).
-  - Polymorphic alignment ingestion in `ccnv predict`: directly accepts `.bam`, `.cram` (with `--fasta`), and `.parquet`/`.ccnv` sample files.
-  - Deliverables: annotated `frag_short_ratio`, `frag_llr_size`, and `origin_call` in BED tables, prenatal VCF header/INFO/FORMAT fields (`EXP_LOG2R`, `IMPLIED_FF`, `DISCORDANT`, `DISC_REASON`, `FRAG_SHORT_R`, `FRAG_LLR`, `ORIGIN`, `FF`), `<prefix>_qc.json` fragmentomics metrics with high leukocyte DNA warnings, and interactive HTML viewer tooltips and `FF (Y/A/X/Size)` badge.
-- Standardized Parquet Arrow schema version to `1.0.0` (`SCHEMA_VERSION = "1.0.0"`). Legacy sample Parquet files generated without fragmentomic fields (`fragment_lengths`, `endpoint_count`, `frag_gc_sum`) and pre-1.0.0 reference files are intentionally unsupported, requiring re-extraction via `ccnv extract` and reference rebuilding via `ccnv reference`.
-- Zensical documentation site hosted on GitHub Pages (`https://matthdsm.github.io/copynumber-cnv/`), with automated deployment in `.github/workflows/docs.yml`, MathJax 3 LaTeX math support, guarded instant-navigation re-typesetting (`docs/javascripts/mathjax.js`), and pixi tasks (`pixi run docs-build`, `pixi run docs-serve`).
-- Dual-target Markdown and LaTeX rendering rules in `AGENTS.md` and automated contract checks in `tests/test_docs_markdown.py`, enforcing Zensical `pymdownx.arithmatex` + admonition compatibility across `docs/**/*.md` and GitHub `cmark-gfm` compatibility across repository `README.md`, `CHANGELOG.md`, and package documentation.
-- Core pipeline subcommands: `ccnv extract` (stream BAM/CRAM into sample Parquet with deterministic read QC and canonical contig filtering), `ccnv reference` (build cohort or flat uniform-depth FASTA models with Gavish-Donoho SVHT PCA and signal-subspace `KDTree` neighbor search), `ccnv ref-qc` (audit reference usability with `PASS`/`WARN`/`FAIL` heuristics), and `ccnv predict` (robust Huber PCA projection, weighted `Binseg`/`Pelt` and unweighted `KernelCPD` segmentation, autocorrelation-corrected Stouffer Z-score calling).
-- Cell-free DNA (cfDNA) prenatal analysis mode (`--mode prenatal`): non-negative Elastic Net 5 kb `chrY` `FFY`, convex logit-link `RidgeCV`/`ElasticNetCV` 100 kb `FFA`, Huber `FFX`, 2D stoichiometric Gaussian Bayes sex chromosome aneuploidy classifier with Mahalanobis ``$`\chi^2`$`` outlier gate, precision-fused `active_ff`, and stoichiometric ratio/implied-FF segment discordance annotation (`SCA_DISCORDANT`, `SUB_FETAL_RATIO`, `SUPER_FETAL_RATIO`).
-- Covariate normalization and robust depth scaling: joint quantile B-spline regression with interaction terms (`SplineTransformer` + `HuberRegressor`) for GC content, mappability, and fragmentomic bias correction (`--gc`, `--mappability`, `--min-mappability`), Smyth Empirical Bayes moderated variance shrinkage (`squeeze_var`), and DESeq2 median-of-ratios library size factor normalization.
-- Deliverables and interactive reporting: bgzipped and tabix-indexed BED (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`) and standard VCFv4.2 outputs (`_bins.vcf.gz`, `_segments.vcf.gz`, `_calls.vcf.gz`), structured QC payloads (`<prefix>_qc.json`), and standalone interactive Plotly WebGL HTML viewer (`_plot.html`) with pan/zoom, cytoband search, and prenatal discordance overlays.
-- Native performance and storage architecture: versioned Parquet storage schema (`1.0.0`) with Zstandard compression and Delta Binary Packing, Polars DataFrame expressions with zero-copy Arrow interop, mass-conserving count rebinning, multi-threaded C-compiled `scipy.spatial.KDTree` neighbor search, and organism-agnostic contig handling.
-- Documentation and CI automation: mathematical methodology specification with 42 peer-reviewed citations (`docs/methodology.md`), pipeline flowcharts (`docs/pipeline.md`), and GitHub Actions workflow building multi-arch container images (`ghcr.io/matthdsm/copynumber-cnv`).
+- Compiled Rust I/O kernel (`crates/ccnv-core`, `ccnv._core`) wrapping `noodles` (`bam`, `cram`, `fasta`, `bgzf`, `tabix`, `csi`) and `bigtools` (BigWig) for high-performance multi-threaded tile streaming and single-pass BGZF/tabix/CSI writing without runtime dependencies on `pysam` or `pybigwig`.
+- Apache Arrow Schema `2.0.0` (`SCHEMA_VERSION = "2.0.0"`) storing 7 coordinate-free per-bin sample columns (`count`, `paired_count`, `frag_len_sum`, `short_frag_count`, `endpoint_count`, `frag_gc_sum`, and 24 fixed fragment-length bands `frag_bands: list<uint32>[24]`) for compact $`O(B)`$ memory footprint.
+- Compact Prototype Graph ($`M \le 2{,}048`$) constructed via `MiniBatchKMeans` with $`k=4`$ soft-weighted nearest off-contig prototypes, eliminating $`O(U^2)`$ pairwise distance calculations.
+- Depth-decomposed biological overdispersion (`bio_dispersion`) separating Poisson shot noise from technical dispersion using Smyth Empirical Bayes shrinkage (`squeeze_var`).
+- Calibrated `ruptures.Pelt` change-point segmentation with modified BIC (mBIC) penalty $`\beta_c = \gamma \cdot 2 \hat{\kappa}_c \ln(\max(U_{\text{block}}, 3))`$.
+- Multi-scale dyadic BLUE segment Z-scores ($`Z_{\text{BLUE}}`$) with spatial variance inflation $`\hat{\kappa}_c(L)`$ across dyadic block scales $`L \in \lbrace 1, 4, 16, 64, 256, 1024 \rbrace`$.
+- Discrete integer copy-number Bayes factors ($`\ln \mathrm{BF}_{CN \ne CN_0} \gt 2.0`$) over diploid ($`CN \in \lbrace 0, 1, 2, 3, 4+\rbrace`$) and haploid sex-chromosome ($`CN \in \lbrace 0, 1, 2, 3+\rbrace`$) states using segment Negative-Binomial/Poisson count log-likelihood ratios (with Gaussian log-ratio fallback when counts are absent), detecting homozygous deletions ($`CN=0`$) down to $`0.1\times`$ sequencing depth.
+- Closed-form Poisson MLE for MSY fetal fraction (`FFY`) with analytical standard error propagation.
+- Forward-calibrated $`R_X`$ baseline regression across euploid `XX` ($`f=0`$) and `XY` ($`f=\hat{f}_{\text{FFY}}`$) control cohorts.
+- Reference-side 24-band Fisher read weighting ($`w^{\ast}_{0.08}`$) pre-applied during reference construction, eliminating test-time baseline distortions.
+- 4D closed-form erfc Gaussian mixture ray-marginalized sex chromosome aneuploidy (SCA) classifier with `chrX` fragment-origin likelihood gating.
+- Precision-weighted Student-$`t_4`$ IRLS multi-modal active fetal fraction fusion (`active_ff`).
+- 5-state self-referenced coupled depth + Dirichlet-Multinomial origin engine (`FETAL_CONSTITUTIONAL`, `PLACENTAL_MOSAIC`, `MATERNAL_UNINHERITED`, `MATERNAL_AND_FETAL_INHERITED`, `MATERNAL_MOSAIC`, with `INDETERMINATE` when max posterior $`\lt 0.80`$).
+- Multi-architecture `abi3` release wheel matrix in GitHub Actions across `ubuntu-latest` (`x86_64`), `ubuntu-24.04-arm` (`aarch64`), and `macos-latest` (`arm64`), plus `sdist`.
+- Slim production Dockerfile copying compiled Rust crates and stripping build artifacts (`rustlib`, `rustc`, `cargo`) before production image packaging.
+
+### Changed
+
+- Replaced Python/pysam alignment streaming with compiled Rust multi-threaded tile scanner.
+- Replaced $`k=300`$ `KDTree` all-bin nearest neighbor search with compact Prototype Graph ($`M \le 2{,}048`$, $`k=4`$).
+- Replaced greedy `Binseg` default with calibrated `ruptures.Pelt` + mBIC.
+- Replaced single-sample runtime Fisher weight scaling with reference-side 24-band weighting ($`w^{\ast}_{0.08}`$) applied consistently across prenatal cohort CNV reference branches and sample prediction.
+- Updated `--pca-components` (`ReferenceConfig.pca_components`) to default to `None` (dynamic Gavish-Donoho SVHT rank selection up to `60`) while treating explicit integer values as hard upper caps.
+- Canonicalized in-memory sample representation on `SampleBuffers`, unified 17-column reference branch assembly on `BranchFitArrays` and `assemble_reference_table`, and consolidated single-pass FASTA GC and 200 bp GC quantile scanning in `load_gc_track`.
+- Updated prenatal sex chromosome aneuploidy classification from 2D Mahalanobis $`\chi^2`$ gate to 4D erfc ray marginalization.
+- Upgraded sample and reference storage contract from `1.0.0` to `2.0.0`.
+
+### Removed
+
+- Removed runtime dependencies on `pysam`, `pybigwig`, and `samtools` from production environment.
+- Removed deprecated `--nearest-bins` CLI flag and positional `ccnv reference` sample arguments in favor of `--samplesheet` and `--fasta`.
+- Removed legacy `align_reference_to_weighted_sample` function and unused v1 kNN, `Binseg`, Stouffer, and B-spline helpers.
+- Removed legacy `fragment_lengths: list<uint16>` and `nearest_ref_indices: list<int32>` schema columns.
