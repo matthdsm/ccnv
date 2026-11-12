@@ -6,9 +6,10 @@ from pathlib import Path
 import numpy as np
 
 from ccnv.stats.segmentation import (
+    ContigSegmentationInput,
     WeightedL2Cost,
+    segment_and_score_genome,
     segment_contig,
-    segment_genome,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "benchmark"
@@ -78,7 +79,6 @@ class TestSegmentContig(unittest.TestCase):
             weights=weights,
             contig_length=3_200_000,
             penalty=0.5,
-            algorithm="pelt",
             min_size=2,
             max_blacklist_gap=2_000_000,
         )
@@ -107,7 +107,6 @@ class TestSegmentContig(unittest.TestCase):
             weights=weights,
             contig_length=1_000_000,
             penalty=0.5,
-            algorithm="binseg",
             min_size=2,
         )
         self.assertEqual(
@@ -137,7 +136,6 @@ class TestSegmentContig(unittest.TestCase):
                 weights=weights,
                 contig_length=1000,
                 penalty=4.0,
-                algorithm="pelt",
             )
             mock_cls.assert_called_once_with(kernel="linear", min_size=2, jump=1)
             mock_detector.fit.return_value.predict.assert_called_once_with(pen=2.0)
@@ -195,11 +193,23 @@ class TestSegmentContig(unittest.TestCase):
 
     def test_preserves_arbitrary_x_and_y_contig_names(self) -> None:
         inputs = {
-            "X": ([0], [80], [0.1], [1.0], 80),
-            "chrY": ([0], [50], [-0.1], [1.0], 50),
+            "X": ContigSegmentationInput(
+                starts=np.array([0], dtype=np.int64),
+                ends=np.array([80], dtype=np.int64),
+                ratios=np.array([0.1], dtype=np.float64),
+                weights=np.array([1.0], dtype=np.float64),
+                contig_length=80,
+            ),
+            "chrY": ContigSegmentationInput(
+                starts=np.array([0], dtype=np.int64),
+                ends=np.array([50], dtype=np.int64),
+                ratios=np.array([-0.1], dtype=np.float64),
+                weights=np.array([1.0], dtype=np.float64),
+                contig_length=50,
+            ),
         }
 
-        segments = segment_genome(inputs, penalty=1.0)
+        segments = segment_and_score_genome(inputs, penalty=1.0)
 
         self.assertEqual([item.contig for item in segments], ["X", "chrY"])
         self.assertEqual(
@@ -275,26 +285,24 @@ class TestBenchmarkConcordance(unittest.TestCase):
                     "gain" if float(row["ratio"]) > 0.2 else None,
                 )
 
-        for algorithm in ("pelt", "binseg"):
-            observed_calls: list[str] = []
-            for contig, bins in bins_by_contig.items():
-                ratios = [item[1] for item in bins]
-                weights = [item[2] for item in bins]
-                result = segment_contig(
-                    contig=contig,
-                    starts=np.arange(len(bins)) * 100_000,
-                    ends=np.arange(1, len(bins) + 1) * 100_000,
-                    ratios=ratios,
-                    weights=weights,
-                    contig_length=len(bins) * 100_000,
-                    penalty=0.01,
-                    algorithm=algorithm,
-                )
-                self.assertEqual(len(result), 1)
-                self.assertEqual(result[0].end // 100_000, expected[contig][1])
-                if result[0].mean > 0.2:
-                    observed_calls.append("gain")
-            self.assertEqual(observed_calls, ["gain"])
+        observed_calls: list[str] = []
+        for contig, bins in bins_by_contig.items():
+            ratios = [item[1] for item in bins]
+            weights = [item[2] for item in bins]
+            result = segment_contig(
+                contig=contig,
+                starts=np.arange(len(bins)) * 100_000,
+                ends=np.arange(1, len(bins) + 1) * 100_000,
+                ratios=ratios,
+                weights=weights,
+                contig_length=len(bins) * 100_000,
+                penalty=0.01,
+            )
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0].end // 100_000, expected[contig][1])
+            if result[0].mean > 0.2:
+                observed_calls.append("gain")
+        self.assertEqual(observed_calls, ["gain"])
 
     def test_selected_algorithm_matches_real_fixture_segments_and_call(self) -> None:
         bins: dict[str, list[list[float | int]]] = {}

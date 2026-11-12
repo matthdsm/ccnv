@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 import unittest
 from dataclasses import asdict
@@ -25,23 +26,20 @@ from typer.testing import CliRunner
 from ccnv.cli import app
 from ccnv.extract import extract_sample_table, run
 from ccnv.features.binning import (
-    bin_counts,
     bin_intervals,
+    compute_bin_exposure,
     rebin_counts,
 )
 from ccnv.features.rebinning import rebin_sample_sketch
-from ccnv.io.alignments import rejection_reason
 from ccnv.io.parquet import read_sample_parquet
 from ccnv.models import (
     FRAGMENTOMICS_METADATA_KEY,
     NUM_FRAG_BANDS,
     AlignmentError,
     BinCompatibilityError,
-    Contig,
     ExtractConfig,
     ExtractError,
     FragmentomicsMetadata,
-    GenomeProfile,
     ReadFilters,
     SampleMetadata,
     is_canonical_contig,
@@ -61,29 +59,6 @@ from ccnv.models.schemas import (
 from ccnv.qc.sample import QC_COUNTERS, empty_qc
 
 
-class FakeRead:
-    def __init__(
-        self,
-        reference_start: int | None = 0,
-        mapping_quality: int = 60,
-        *,
-        is_unmapped: bool = False,
-        is_secondary: bool = False,
-        is_supplementary: bool = False,
-        is_duplicate: bool = False,
-        is_paired: bool = False,
-        is_proper_pair: bool = True,
-    ) -> None:
-        self.reference_start = reference_start
-        self.mapping_quality = mapping_quality
-        self.is_unmapped = is_unmapped
-        self.is_secondary = is_secondary
-        self.is_supplementary = is_supplementary
-        self.is_duplicate = is_duplicate
-        self.is_paired = is_paired
-        self.is_proper_pair = is_proper_pair
-
-
 class TestBinEdges(unittest.TestCase):
     def test_full_bins_when_length_divides_evenly(self) -> None:
         starts, ends = bin_intervals(300, 100)
@@ -100,13 +75,10 @@ class TestBinEdges(unittest.TestCase):
         np.testing.assert_array_equal(starts, [0])
         np.testing.assert_array_equal(ends, [99])
 
-    def test_boundary_starts_land_in_expected_bins(self) -> None:
-        counts = bin_counts(
-            np.array([0, 99, 100, 199, 200, 249], dtype=np.int64),
-            bin_size=100,
-            n_bins=3,
-        )
-        np.testing.assert_array_equal(counts, [2, 2, 2])
+    def test_bin_exposure_reflects_partial_last_bin_width(self) -> None:
+        starts, ends = bin_intervals(250, 100)
+        exp = compute_bin_exposure(starts, ends, 100)
+        np.testing.assert_allclose(exp, [1.0, 1.0, 0.5])
 
 
 class TestRebin(unittest.TestCase):
@@ -196,48 +168,10 @@ class TestRebin(unittest.TestCase):
             rebin_sample_sketch(rebinned, target_bin_size=50)
 
 
-class TestReadFilters(unittest.TestCase):
-    def test_default_filters_keep_primary_mapped_read(self) -> None:
-        self.assertIsNone(rejection_reason(FakeRead(), ReadFilters()))
-
-    def test_mapq_duplicate_secondary_and_improper_pair(self) -> None:
-        filters = ReadFilters()
-        self.assertEqual(
-            rejection_reason(FakeRead(mapping_quality=0), filters), "filter_mapq"
-        )
-        self.assertEqual(
-            rejection_reason(FakeRead(is_duplicate=True), filters),
-            "filter_duplicate",
-        )
-        self.assertEqual(
-            rejection_reason(FakeRead(is_secondary=True), filters),
-            "filter_secondary",
-        )
-        self.assertEqual(
-            rejection_reason(FakeRead(is_supplementary=True), filters),
-            "filter_supplementary",
-        )
-        self.assertEqual(
-            rejection_reason(FakeRead(is_paired=True, is_proper_pair=False), filters),
-            "filter_improper_pair",
-        )
-
-    def test_unpaired_reads_are_not_subject_to_proper_pair_rule(self) -> None:
-        self.assertIsNone(
-            rejection_reason(
-                FakeRead(is_paired=False, is_proper_pair=False), ReadFilters()
-            )
-        )
-
-    def test_custom_min_mapping_quality_is_inclusive(self) -> None:
-        filters = ReadFilters(min_mapping_quality=20)
-        self.assertEqual(
-            rejection_reason(FakeRead(mapping_quality=19), filters), "filter_mapq"
-        )
-        self.assertIsNone(rejection_reason(FakeRead(mapping_quality=20), filters))
-
-
 class TestExtractAlignment(unittest.TestCase):
+    def tearDown(self) -> None:
+        logging.getLogger("ccnv").handlers.clear()
+
     def test_invalid_header_raises_extract_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             bam_path = Path(tmpdir) / "sample.bam"
@@ -560,22 +494,17 @@ class TestParallelBinning(unittest.TestCase):
 class TestCanonicalContigs(unittest.TestCase):
     def test_select_layout_drops_non_canonical_names(self) -> None:
         layout = select_layout(
-            ["chr1", "chrM", "chrX", "scaffold"],
-            [100, 50, 80, 40],
+            [("chr1", 100), ("chrM", 50), ("chrX", 80), ("scaffold", 40)],
             all_contigs=False,
         )
-        self.assertEqual(layout, (Contig("chr1", 100), Contig("chrX", 80)))
-        profile = GenomeProfile(layout)
-        self.assertEqual(profile.names, ("chr1", "chrX"))
-        self.assertEqual(profile.length_map(), {"chr1": 100, "chrX": 80})
+        self.assertEqual(layout, [("chr1", 100), ("chrX", 80)])
 
     def test_select_layout_keeps_every_contig_when_requested(self) -> None:
         layout = select_layout(
-            ["chr1", "chrM"],
-            [100, 50],
+            [("chr1", 100), ("chrM", 50)],
             all_contigs=True,
         )
-        self.assertEqual(tuple(contig.name for contig in layout), ("chr1", "chrM"))
+        self.assertEqual(tuple(name for name, _ in layout), ("chr1", "chrM"))
 
     def test_canonical_spellings_including_non_human_autosomes_are_kept(self) -> None:
         for name in (

@@ -9,187 +9,205 @@ import numpy as np
 from ccnv import stats
 from ccnv.models.exceptions import ReferenceError
 from ccnv.stats.neighbors import (
-    compute_null_models,
-    distance_cutoff,
-    select_nearest_bins,
+    build_whitened_subspace_features,
+    calibrate_prototype_dispersion,
+    evaluate_loco_prototype_baseline,
+    fit_prototype_graph,
+    squeeze_var,
 )
 from ccnv.stats.pca import (
-    fit_pca,
+    fit_whitened_pca,
     pca_irlba_numpy,
+    project_huber_pca_wave,
+    reconstruct_whitened_pca_expected,
 )
 from ccnv.stats.prenatal_math import (
-    infer_sex_gmm_1d,
+    classify_sca_ray_4d,
+    fit_msy_sex_mixture,
+    fuse_active_fetal_fraction_student_t4,
     ols_fit,
-    rlm_huber,
 )
 from ccnv.stats.regression import (
-    apply_1d_correction,
-    build_1d_basis,
-    build_joint_covariate_basis,
-    fit_sample_trend,
+    build_exogenous_covariate_basis,
+    fit_poisson_covariate_trends,
+    half_sample_mode,
+    standardize_column,
 )
 from ccnv.stats.segmentation import (
+    ContigSegmentationInput,
     Segment,
     WeightedL2Cost,
+    segment_and_score_genome,
     segment_contig,
-    segment_genome,
 )
 
 
 class TestStatsPackageExports(unittest.TestCase):
     def test_all_symbols_exported(self) -> None:
         expected_symbols = [
+            "CANONICAL_CHROMATOSOME_BP",
             "DEFAULT_MAX_BLACKLIST_GAP",
-            "Algorithm",
-            "Segment",
-            "WeightedL2Cost",
-            "apply_1d_correction",
-            "build_1d_basis",
-            "build_joint_covariate_basis",
-            "build_signal_space_features",
-            "compute_null_models",
+            "FRAG_MAX_LEN",
+            "FRAG_MIN_LEN",
+            "FRAG_NUM_BINS",
+            "LN2_SQ",
+            "LOG_WAVE_CLIP",
+            "ContigSegmentationInput",
             "MSYSexModel",
             "PoissonFFYModel",
+            "PreparedContigData",
+            "Segment",
+            "WeightedL2Cost",
+            "WhitenedPCAResult",
+            "align_histogram",
+            "build_exogenous_covariate_basis",
+            "build_fragmentomic_feature_vector",
+            "build_whitened_subspace_features",
+            "calibrate_prototype_dispersion",
+            "classify_sca_ray_4d",
             "compute_autosomal_density",
-            "distance_cutoff",
+            "compute_band_fisher_weights",
+            "compute_helical_periodicity",
+            "compute_kish_loco_inflation",
+            "compute_loco_prototype_support",
+            "compute_motif_diversity_score",
+            "deconvolve_fetal_maternal_densities",
+            "deconvolve_fetal_maternal_em",
+            "encode_kmer_4",
+            "estimate_dyadic_inflation",
+            "estimate_sample_landmarks",
+            "evaluate_band_weighted_counts",
+            "evaluate_blue_scores_and_bayes_factors",
+            "evaluate_loco_prototype_baseline",
             "evaluate_poisson_msy_ffy",
-            "fit_elasticnet_ffy",
+            "exact_poisson_log2_jensen_bias",
+            "exact_poisson_log_variance",
+            "fit_ff_fragmentomics_ensemble",
             "fit_ffa_logit_ensemble",
             "fit_forward_ffx_model",
+            "fit_logit_linear_ensemble",
             "fit_msy_sex_mixture",
-            "fit_pca",
+            "fit_poisson_covariate_trends",
             "fit_poisson_msy_ffy",
-            "fit_preface_logit_ensemble",
-            "fit_sample_trend",
-            "infer_sex_gmm_1d",
+            "fit_prototype_graph",
+            "fit_whitened_pca",
+            "fuse_active_fetal_fraction_student_t4",
+            "half_sample_mode",
+            "hsm_biweight_mode",
+            "interpolate_dyadic_inflation",
             "ols_fit",
-            "optimal_svht_rank",
             "pca_irlba_numpy",
-            "rlm_huber",
+            "predict_ff_fragmentomics",
+            "predict_ff_kl_deconvolution",
+            "project_huber_pca_wave",
+            "reconstruct_whitened_pca_expected",
+            "segment_and_score_genome",
             "segment_contig",
-            "segment_genome",
-            "select_nearest_bins",
             "squeeze_var",
+            "standardize_column",
         ]
         for symbol in expected_symbols:
             self.assertTrue(hasattr(stats, symbol), f"Symbol {symbol} missing in stats")
             self.assertIn(symbol, stats.__all__)
 
 
-class TestPCA(unittest.TestCase):
-    def test_fit_pca_reconstruction_and_correction(self) -> None:
+class TestWhitenedPCA(unittest.TestCase):
+    def test_fit_whitened_pca_and_huber_projection(self) -> None:
         rng = np.random.default_rng(42)
-        n_bins, n_samples = 50, 10
-        # Rank-2 signal + small noise
-        u = rng.normal(size=(n_bins, 2))
-        v = rng.normal(size=(2, n_samples))
-        raw = np.abs(u @ v) + 1.0
+        n_bins, n_samples = 60, 12
+        mu_base = np.full(n_bins, 120.0, dtype=np.float64)
+        size_factors = rng.uniform(0.8, 1.2, size=n_samples)
+        expected_in = (mu_base[:, None] * size_factors[None, :]).astype(np.float32)
+        u = rng.normal(0.0, 0.25, size=(n_bins, 2))
+        v = rng.normal(0.0, 1.0, size=(2, n_samples))
+        counts = rng.poisson(expected_in.astype(np.float64) * np.exp(u @ v)).astype(
+            np.float32
+        )
+        usable = np.ones(n_bins, dtype=bool)
 
-        corrected, mean, loadings = fit_pca(raw, n_components=2)
-        self.assertEqual(corrected.shape, (n_bins, n_samples))
-        self.assertEqual(mean.shape, (n_bins,))
-        self.assertEqual(loadings.shape, (2, n_bins))
-        self.assertTrue(np.all(np.isfinite(corrected)))
+        res = fit_whitened_pca(
+            counts,
+            expected_in,
+            usable,
+            max_components=5,
+        )
+        self.assertEqual(res.mean_rate.shape, (n_bins,))
+        self.assertGreaterEqual(res.loadings.shape[0], 1)
+        self.assertEqual(res.loadings.shape[1], n_bins)
 
-    def test_fit_pca_constant_data(self) -> None:
-        data = np.ones((10, 5), dtype=np.float64) * 2.0
-        corrected, mean, loadings = fit_pca(data, n_components=2)
-        np.testing.assert_allclose(corrected, 1.0)
-        np.testing.assert_allclose(mean, 2.0)
-        np.testing.assert_allclose(loadings, 0.0)
+        recon = reconstruct_whitened_pca_expected(expected_in, usable, res)
+        self.assertEqual(recon.shape, (n_bins, n_samples))
+        self.assertTrue(np.all(recon > 0.0))
 
-    def test_fit_pca_invalid_shapes(self) -> None:
-        with self.assertRaises(ReferenceError):
-            fit_pca(np.empty((0, 0)), n_components=1)
-        with self.assertRaises(ReferenceError):
-            fit_pca(np.ones(10), n_components=1)
-        with self.assertRaises(ReferenceError):
-            fit_pca(np.ones((10, 5)), n_components=0)
+        log_sig = np.log(
+            (counts[:, 0] + 0.5) / (expected_in[:, 0] * res.mean_rate + 0.5)
+        )
+        coef, wave = project_huber_pca_wave(log_sig.astype(np.float64), res.loadings)
+        self.assertEqual(coef.shape, (res.loadings.shape[0],))
+        self.assertEqual(wave.shape, (n_bins,))
+        self.assertTrue(np.all(np.isfinite(wave)))
+
+    def test_fit_whitened_pca_invalid_shapes(self) -> None:
+        with self.assertRaises((ReferenceError, ValueError)):
+            fit_whitened_pca(
+                np.empty((0, 0), dtype=np.float32),
+                np.empty((0, 0), dtype=np.float32),
+                np.empty(0, dtype=bool),
+            )
 
     def test_pca_irlba_numpy_matches_expected_shapes(self) -> None:
         rng = np.random.default_rng(123)
-        X = rng.normal(size=(20, 15))
-        scores, center, rotation = pca_irlba_numpy(X, n_components=3, seed=42)
+        mat = rng.normal(size=(20, 15))
+        scores, center, rotation = pca_irlba_numpy(mat, n_components=3, seed=42)
         self.assertEqual(scores.shape, (20, 3))
         self.assertEqual(center.shape, (15,))
         self.assertEqual(rotation.shape, (15, 3))
 
-    def test_pca_irlba_numpy_empty_and_zero(self) -> None:
-        empty = np.empty((0, 0), dtype=np.float64)
-        scores, _center, _rotation = pca_irlba_numpy(empty, n_components=2)
-        self.assertEqual(scores.shape, (0, 2))
 
-        zeros = np.zeros((10, 5), dtype=np.float64)
-        scores, _center, _rotation = pca_irlba_numpy(zeros, n_components=2)
-        self.assertEqual(scores.shape, (10, 2))
-        np.testing.assert_allclose(scores, 0.0)
-
-    def test_optimal_svht_rank_recovers_true_low_rank_signal(self) -> None:
-        from ccnv.stats.pca import optimal_svht_rank
-
+class TestPrototypeNeighbors(unittest.TestCase):
+    def test_fit_prototype_graph_and_loco_dispersion(self) -> None:
         rng = np.random.default_rng(42)
-        u = rng.normal(size=(300, 3)) * 8.0
-        v = rng.normal(size=(3, 40))
-        noisy = u @ v + rng.normal(0.0, 1.0, size=(300, 40))
-        rank = optimal_svht_rank(noisy, max_components=10)
-        self.assertEqual(rank, 3)
-
-
-class TestNeighbors(unittest.TestCase):
-    def test_select_nearest_bins_basic(self) -> None:
-        profiles = np.array(
-            [
-                [1.0, 0.0],
-                [0.0, 1.0],
-                [1.0, 0.1],
-                [0.1, 1.0],
-            ]
+        n_bins, n_samples = 40, 10
+        contig_ids = np.repeat(np.arange(4, dtype=np.int16), 10)
+        usable = np.ones(n_bins, dtype=bool)
+        features = rng.normal(size=(n_bins, 3)).astype(np.float32)
+        centers, proto_ids, proto_weights, mean_dist = fit_prototype_graph(
+            features,
+            max_prototypes=12,
+            top_r=4,
         )
-        contig_ids = np.array([0, 0, 1, 1])
-        indices, _distances = select_nearest_bins(
-            profiles, contig_ids, k=1, max_batch_memory_mb=1
+        self.assertEqual(centers.shape[1], 3)
+        self.assertEqual(proto_ids.shape, (n_bins, 4))
+        self.assertEqual(proto_weights.shape, (n_bins, 4))
+        self.assertEqual(mean_dist.shape, (n_bins,))
+
+        mu_hat = np.full((n_bins, n_samples), 150.0, dtype=np.float32)
+        counts = rng.poisson(mu_hat).astype(np.float32)
+        null_mean, bio_disp = calibrate_prototype_dispersion(
+            counts,
+            mu_hat,
+            contig_ids,
+            usable,
+            proto_ids,
+            proto_weights,
+            pca_rank=1,
+            n_prototypes=int(centers.shape[0]),
         )
-        self.assertEqual(indices[0], [2])
-        self.assertEqual(indices[1], [3])
-        self.assertEqual(indices[2], [0])
-        self.assertEqual(indices[3], [1])
+        self.assertEqual(null_mean.shape, (n_bins,))
+        self.assertEqual(bio_disp.shape, (n_bins,))
+        self.assertTrue(np.all(bio_disp >= 0.0))
 
-    def test_select_nearest_bins_empty_and_errors(self) -> None:
-        indices, distances = select_nearest_bins(
-            np.empty((0, 2)), np.array([], dtype=int), k=1, max_batch_memory_mb=1
+        baseline, support = evaluate_loco_prototype_baseline(
+            (counts[:, 0] / 150.0).astype(np.float64),
+            contig_ids,
+            proto_ids,
+            proto_weights,
         )
-        self.assertEqual(indices, [])
-        self.assertEqual(distances, [])
-
-        with self.assertRaisesRegex(ValueError, "positive integer"):
-            select_nearest_bins(
-                np.ones((4, 2)), np.array([0, 0, 1, 1]), k=0, max_batch_memory_mb=1
-            )
-
-    def test_compute_null_models_basic(self) -> None:
-        corrected = np.ones((5, 10), dtype=np.float64)
-        nearest_indices = [[1, 2], [0, 2], [0, 1], [0, 1], [0, 1]]
-        null_mean, null_std = compute_null_models(corrected, nearest_indices)
-        self.assertEqual(null_mean.shape, (5,))
-        self.assertEqual(null_std.shape, (5,))
-        np.testing.assert_allclose(null_mean, 0.0)
-        np.testing.assert_allclose(null_std, 0.0)
-
-    def test_distance_cutoff(self) -> None:
-        distances = [[1.0, 2.0], [2.0, 3.0], [1.5, 2.5]]
-        cutoff = distance_cutoff(distances, repeats=3)
-        self.assertTrue(np.isfinite(cutoff))
-        self.assertGreater(cutoff, 3.0)
-
-        # Empty / non-finite
-        self.assertEqual(distance_cutoff([]), float("inf"))
-        self.assertEqual(distance_cutoff([[float("nan")]]), float("inf"))
+        self.assertEqual(baseline.shape, (n_bins,))
+        self.assertEqual(support.shape, (n_bins,))
 
     def test_squeeze_var_matches_smyth_2004_closed_form(self) -> None:
-        from ccnv.stats.neighbors import squeeze_var
-
         rng = np.random.default_rng(42)
-        # Simulate 2,000 bins with true inverse-chi-square prior d0=8, s0_sq=0.04, df=10
         d0_true, s0_sq_true, df = 8.0, 0.04, 10.0
         true_sigma2 = (d0_true * s0_sq_true) / rng.chisquare(df=d0_true, size=2000)
         sample_var = true_sigma2 * (rng.chisquare(df=df, size=2000) / df)
@@ -202,168 +220,121 @@ class TestNeighbors(unittest.TestCase):
         expected_post = (d0_hat * s0_sq_hat + df * sample_var) / (d0_hat + df)
         np.testing.assert_allclose(var_post, expected_post, rtol=1e-12)
 
-    def test_compute_null_models_applies_pca_dof_correction_and_eb_moderation(
-        self,
-    ) -> None:
-        from ccnv.stats.neighbors import compute_null_models
-
-        rng = np.random.default_rng(7)
-        corrected = 1.0 + rng.normal(0.0, 0.05, size=(30, 10))
-        nbrs = [[(i + 1) % 30, (i + 2) % 30] for i in range(30)]
-        _, std_no_pca = compute_null_models(corrected, nbrs, n_pca_components=0)
-        _, std_pca4 = compute_null_models(corrected, nbrs, n_pca_components=4)
-        # With P=4 removed from S=10 samples, DOF shrinks from 9 to 5 -> std scales by sqrt(9/5)
-        self.assertGreater(
-            float(np.median(std_pca4)), float(np.median(std_no_pca)) * 1.2
+    def test_build_whitened_subspace_features(self) -> None:
+        loadings = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float32)
+        s_vals = np.array([2.0, 1.0], dtype=np.float64)
+        cov = np.array([[0.1], [0.2], [0.3]], dtype=np.float64)
+        feats = build_whitened_subspace_features(
+            loadings, s_vals, 0.5, covariate_mat=cov
         )
-
-    def test_select_nearest_bins_kdtree_off_contig_exact(self) -> None:
-        from ccnv.stats.neighbors import select_nearest_bins
-
-        profiles = np.array([[0.0, 0.0], [0.1, 0.0], [5.0, 5.0], [5.1, 5.0]])
-        cids = np.array([0, 1, 0, 1])
-        idx, dist = select_nearest_bins(profiles, cids, k=2, max_batch_memory_mb=16)
-        self.assertEqual(idx[0], [1, 3])
-        self.assertEqual(idx[1], [0, 2])
-        self.assertAlmostEqual(dist[0][0], 0.01, places=6)
-
-    def test_build_signal_space_features(self) -> None:
-        from ccnv.stats.neighbors import build_signal_space_features
-
-        loadings = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])  # 2 components, 3 bins
-        feats = build_signal_space_features(loadings)
-        self.assertEqual(feats.shape, (3, 2))
-        np.testing.assert_allclose(feats, loadings.T)
-
-        s_vals = np.array([2.0, 0.5])
-        feats_scaled = build_signal_space_features(loadings, singular_values=s_vals)
-        expected_scaled = loadings.T * s_vals
-        np.testing.assert_allclose(feats_scaled, expected_scaled)
-
-        cov = np.array([[0.1], [0.2], [0.3]])
-        feats_cov = build_signal_space_features(loadings, covariate_mat=cov)
-        self.assertEqual(feats_cov.shape, (3, 3))
-        np.testing.assert_allclose(feats_cov[:, :2], loadings.T)
-        np.testing.assert_allclose(feats_cov[:, 2:], cov)
-
-        # Flat FASTA fallback: zero loadings with cov
-        zero_loadings = np.zeros((2, 3))
-        feats_flat = build_signal_space_features(zero_loadings, covariate_mat=cov)
-        np.testing.assert_allclose(feats_flat, cov)
+        self.assertEqual(feats.shape, (3, 3))
+        self.assertTrue(np.all(np.isfinite(feats)))
 
 
-class TestSegmentation(unittest.TestCase):
-    def test_weighted_l2_cost(self) -> None:
+class TestSegmentationAndRegression(unittest.TestCase):
+    def test_weighted_l2_cost_and_segment_genome(self) -> None:
         values = np.array([1.0, 2.0, 10.0])
         weights = np.array([1.0, 3.0, 0.0])
         cost = WeightedL2Cost().fit(values, weights)
         expected = np.sum(weights[:2] * np.square(values[:2] - 1.75))
         self.assertAlmostEqual(cost.error(0, 3), float(expected))
 
-    def test_segment_contig_and_genome(self) -> None:
-        starts = [0, 100, 200, 300, 400]
-        ends = [100, 200, 300, 400, 500]
-        ratios = [1.0, 1.0, 2.0, 2.0, 2.0]
-        weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+        starts = np.array([0, 100, 200, 300, 400], dtype=np.int64)
+        ends = np.array([100, 200, 300, 400, 500], dtype=np.int64)
+        ratios = np.array([0.0, 0.0, 0.8, 0.8, 0.8], dtype=np.float64)
+        prec = np.full(5, 100.0, dtype=np.float64)
 
-        segments = segment_contig(
+        segs = segment_contig(
             contig="chr1",
             starts=starts,
             ends=ends,
             ratios=ratios,
-            weights=weights,
+            weights=prec,
             contig_length=500,
             penalty=0.5,
             min_size=2,
         )
-        self.assertGreaterEqual(len(segments), 1)
-        self.assertIsInstance(segments[0], Segment)
+        self.assertGreaterEqual(len(segs), 1)
+        self.assertIsInstance(segs[0], Segment)
 
-        genome_segments = segment_genome(
-            {"chr1": (starts, ends, ratios, weights, 500)},
+        scored = segment_and_score_genome(
+            {
+                "chr1": ContigSegmentationInput(
+                    starts=starts,
+                    ends=ends,
+                    ratios=ratios,
+                    weights=prec,
+                    contig_length=500,
+                )
+            },
             penalty=0.5,
             min_size=2,
         )
-        self.assertEqual(len(genome_segments), len(segments))
+        self.assertGreaterEqual(len(scored), 1)
 
+    def test_poisson_covariates_and_prenatal_stats(self) -> None:
+        rng = np.random.default_rng(7)
+        usable = np.ones(40, dtype=bool)
+        gc_q = np.tile(np.linspace(0.30, 0.65, 8, dtype=np.float32), (40, 1))
+        gc_q[:, 3] = np.linspace(0.35, 0.60, 40, dtype=np.float32)
+        basis = build_exogenous_covariate_basis(
+            usable,
+            bin_size=5000,
+            gc=np.linspace(0.38, 0.55, 40),
+            gc_quantiles=gc_q,
+            mappability=np.linspace(0.7, 1.0, 40),
+        )
+        self.assertEqual(basis.shape[0], 40)
+        self.assertGreater(basis.shape[1], 0)
 
-class TestRegression(unittest.TestCase):
-    def test_build_1d_basis(self) -> None:
-        x = np.linspace(0.1, 0.9, 50)
-        basis = build_1d_basis(x, degree=2)
-        self.assertIsNotNone(basis)
-        assert basis is not None
-        self.assertEqual(basis.shape, (50, 3))
+        counts = rng.poisson(120.0, size=(40, 2)).astype(np.float32)
+        mult = fit_poisson_covariate_trends(
+            counts,
+            np.array([1.0, 1.0], dtype=np.float64),
+            np.ones(40, dtype=np.float64),
+            usable,
+            basis,
+        )
+        self.assertEqual(mult.shape, (40, 2))
+        self.assertTrue(np.all(mult > 0.0))
 
-        # Constant array -> None
-        const_x = np.ones(50) * 0.5
-        self.assertIsNone(build_1d_basis(const_x, degree=2))
-
-    def test_fit_sample_trend_and_apply_1d_correction(self) -> None:
-        x = np.linspace(0.2, 0.8, 100)
-        basis = build_1d_basis(x, degree=2)
-        assert basis is not None
-
-        trend_true = 1.0 + 0.5 * (x - 0.5)
-        raw_cov = 100.0 * trend_true
-        fitted_trend = fit_sample_trend(basis, raw_cov)
-        self.assertEqual(fitted_trend.shape, (100,))
-        self.assertTrue(np.all(np.isfinite(fitted_trend)))
-
-        corrected = apply_1d_correction(raw_cov, basis)
+        z_col = standardize_column(np.linspace(1.0, 5.0, 20))
+        self.assertIsNotNone(z_col)
+        assert z_col is not None
+        self.assertAlmostEqual(float(np.mean(z_col)), 0.0, places=6)
         self.assertAlmostEqual(
-            float(np.sum(corrected)), float(np.sum(raw_cov)), places=4
+            half_sample_mode(rng.normal(2.0, 0.01, 50)), 2.0, delta=0.05
         )
 
-    def test_build_joint_covariate_basis(self) -> None:
-        self.assertIsNone(build_joint_covariate_basis(None, None))
+        sex_model = fit_msy_sex_mixture(
+            np.array([2, 3, 1, 2, 80, 95, 110, 90], dtype=np.float64),
+            np.full(8, 2_000.0),
+        )
+        self.assertTrue(sex_model.bimodal)
+        self.assertGreater(sex_model.bg_rate, 0.0)
+        b0, b1 = ols_fit(np.array([1.0, 2.0, 3.0]), np.array([3.0, 5.0, 7.0]))
+        self.assertAlmostEqual(b0, 1.0, places=6)
+        self.assertAlmostEqual(b1, 2.0, places=6)
 
-        gc = np.linspace(0.3, 0.7, 50)
-        mapp = np.linspace(0.6, 1.0, 50)
+        fused_ff, fused_se = fuse_active_fetal_fraction_student_t4(
+            [0.10, 0.105, 0.098], [0.008, 0.02, 0.018]
+        )
+        self.assertAlmostEqual(fused_ff, 0.10, delta=0.01)
+        self.assertGreater(fused_se, 0.0)
 
-        # GC only: degree=3, n_knots=5 -> 5 + 3 - 1 = 7 columns
-        gc_only = build_joint_covariate_basis(gc, None)
-        self.assertIsNotNone(gc_only)
-        assert gc_only is not None
-        self.assertEqual(gc_only.shape, (50, 7))
-
-        # Mappability only: degree=2, n_knots=4 -> 4 + 2 - 1 = 5 columns
-        map_only = build_joint_covariate_basis(None, mapp)
-        self.assertIsNotNone(map_only)
-        assert map_only is not None
-        self.assertEqual(map_only.shape, (50, 5))
-
-        # Both: 1 + 6 (gc) + 4 (map) + 1 (interaction) = 12 columns
-        joint = build_joint_covariate_basis(gc, mapp)
-        self.assertIsNotNone(joint)
-        assert joint is not None
-        self.assertEqual(joint.shape, (50, 12))
-        np.testing.assert_allclose(joint[:, 0], np.ones(50))
-
-
-class TestPrenatalMath(unittest.TestCase):
-    def test_infer_sex_gmm_1d(self) -> None:
-        y_females = np.array([0.0001, 0.0002, 0.00015, 0.0003])
-        y_males = np.array([0.015, 0.02, 0.018, 0.022])
-        combined = np.concatenate([y_females, y_males])
-        is_male, threshold = infer_sex_gmm_1d(combined)
-        self.assertEqual(is_male.shape, (8,))
-        self.assertTrue(np.all(~is_male[:4]))
-        self.assertTrue(np.all(is_male[4:]))
-        self.assertGreater(threshold, 0.0005)
-        self.assertLess(threshold, 0.01)
-
-    def test_ols_and_rlm(self) -> None:
-        x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        y = 2.0 * x + 1.0
-
-        intercept, slope = ols_fit(x, y)
-        self.assertAlmostEqual(intercept, 1.0)
-        self.assertAlmostEqual(slope, 2.0)
-
-        intercept_h, slope_h = rlm_huber(x, y)
-        self.assertAlmostEqual(intercept_h, 1.0, places=4)
-        self.assertAlmostEqual(slope_h, 2.0, places=4)
+        call, _posteriors, act_ff, act_se, _src = classify_sca_ray_4d(
+            delta_x=-0.05,
+            sigma_x=0.005,
+            ffy=0.10,
+            sigma_ffy=0.008,
+            ffa=0.10,
+            sigma_ffa=0.02,
+            ff_size=0.10,
+            sigma_size=0.018,
+        )
+        self.assertEqual(call, "XY")
+        self.assertAlmostEqual(act_ff, 0.10, delta=0.015)
+        self.assertGreater(act_se, 0.0)
 
 
 if __name__ == "__main__":

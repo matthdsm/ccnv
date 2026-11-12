@@ -23,9 +23,9 @@ from ccnv.models import (
     ReferenceConfig,
     ReferenceError,
     ReferenceMetadata,
-    SampleEntry,
     build_reference_schema,
 )
+from ccnv.models import SamplesheetEntry as SampleEntry
 from ccnv.predict import build_branch_model, extract_for_predict
 from ccnv.reference import run as build_reference
 from ccnv.stats.neighbors import (
@@ -411,7 +411,7 @@ def test_end_to_end_reference_and_parallel_bam_predict(tmp_path: Path) -> None:
     ref_prefix = tmp_path / "ref"
     ref_path = build_reference(
         ReferenceConfig(
-            samples=tuple(sample_paths),
+            entries=tuple(SampleEntry(filepath=p) for p in sample_paths),
             prefix=ref_prefix,
             bin_size=200,
             threads=2,
@@ -425,10 +425,10 @@ def test_end_to_end_reference_and_parallel_bam_predict(tmp_path: Path) -> None:
     _, ref_meta = read_reference_parquet(ref_path, branches=[BRANCH_AUTOSOMAL])
     bam_path = _write_synthetic_bam(tmp_path / "query.bam")
     extracted = extract_for_predict(bam_path, ref_meta, threads=2, collect_bands=False)
-    assert extracted["frag_bands"] is None
-    assert isinstance(extracted["counts"], np.ndarray)
-    assert extracted["counts"].shape == (20,)
-    assert int(np.sum(extracted["counts"])) > 0
+    assert extracted.frag_bands is None
+    assert isinstance(extracted.count, np.ndarray)
+    assert extracted.count.shape == (20,)
+    assert int(np.sum(extracted.count)) > 0
 
     from unittest.mock import patch
 
@@ -436,7 +436,7 @@ def test_end_to_end_reference_and_parallel_bam_predict(tmp_path: Path) -> None:
     from ccnv.predict import load_inputs
 
     with patch(
-        "ccnv.extract.extracted_to_sample_table",
+        "ccnv.models.schemas.SampleBuffers.to_table",
         side_effect=AssertionError("must not materialize SAMPLE_SCHEMA table"),
     ):
         direct_inputs = load_inputs(bam_path, ref_path, mode="germline", threads=2)
@@ -519,8 +519,8 @@ def test_extract_for_predict_contig_naming_resolution_and_default_mapq_1(
 
     # Finding #1 & #4: Ensembl ("1", "2", "X", "Y") reference resolves UCSC BAM and keeps MAPQ=5 reads
     extracted = extract_for_predict(ucsc_bam, ref_partial_filters, threads=1)
-    assert extracted["contig_order"] == ["1", "2", "X", "Y"]
-    assert int(np.sum(np.asarray(extracted["counts"]))) == 3
+    assert list(extracted.meta.contig_order) == ["1", "2", "X", "Y"]
+    assert int(np.sum(extracted.count)) == 3
 
     # Build Ensembl ("1", "2") reference Parquet and run load_inputs against UCSC BAM
     cohort_paths: list[Path] = []
@@ -540,7 +540,7 @@ def test_extract_for_predict_contig_naming_resolution_and_default_mapq_1(
         cohort_paths.append(p)
     ens_ref_path = build_reference(
         ReferenceConfig(
-            samples=tuple(cohort_paths),
+            entries=tuple(SampleEntry(filepath=p) for p in cohort_paths),
             prefix=tmp_path / "ens_ref",
             bin_size=200,
             min_cohort_size=4,
@@ -682,8 +682,8 @@ def test_write_reference_parquet_handles_string_and_duplicate_vocab_branch_colum
     mc_out = write_reference_parquet(multichunk_table, tmp_path / "mc_branch.ccnv")
     assert pq.ParquetFile(mc_out).num_row_groups == 1
 
-    # 4. Malformed extracted payloads raise ExtractError (never bare AssertionError)
-    from ccnv.extract import ExtractError, extracted_to_sample_buffers
+    # 4. Malformed sample payloads raise SchemaError (never bare AssertionError)
+    from ccnv.models import SampleBuffers, SchemaError
 
-    with pytest.raises(ExtractError):
-        extracted_to_sample_buffers({"sample_metadata": "invalid"})
+    with pytest.raises(SchemaError):
+        SampleBuffers.from_table(pa.table({"count": [1]}))

@@ -1,3 +1,4 @@
+import logging
 import tempfile
 import unittest
 from pathlib import Path
@@ -44,9 +45,16 @@ def _build_test_cohort(tmpdir: Path, n_samples: int = 4) -> tuple[list[Path], Pa
         )
         assert result.exit_code == 0, result.output
         sample_paths.append(parquet_path(prefix))
+    sheet_path = tmpdir / "samplesheet.yaml"
+    sheet_path.write_text(
+        "".join(f"- filepath: {p}\n" for p in sample_paths),
+        encoding="utf-8",
+    )
     ref_prefix = tmpdir / "reference"
     cmd = [
         "reference",
+        "-s",
+        str(sheet_path),
         "--prefix",
         str(ref_prefix),
         "--bin-size",
@@ -55,15 +63,18 @@ def _build_test_cohort(tmpdir: Path, n_samples: int = 4) -> tuple[list[Path], Pa
         str(n_samples),
         "--pca-components",
         "2",
-        "--nearest-bins",
-        "5",
-    ] + [str(p) for p in sample_paths]
+    ]
     res = CliRunner().invoke(app, cmd)
     assert res.exit_code == 0, res.output
     return sample_paths, parquet_path(ref_prefix)
 
 
 class TestLoggingVerbosity(unittest.TestCase):
+    def tearDown(self) -> None:
+        ccnv_logger = logging.getLogger("ccnv")
+        ccnv_logger.handlers.clear()
+        ccnv_logger.setLevel(logging.WARNING)
+
     def test_extract_debug_vs_default_logging(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -114,13 +125,16 @@ class TestLoggingVerbosity(unittest.TestCase):
     def test_reference_and_qc_debug_logging(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            samples, _ = _build_test_cohort(root, n_samples=4)
+            _samples, _ = _build_test_cohort(root, n_samples=4)
             ref_prefix = root / "ref_debug"
 
+            sheet_path = root / "samplesheet.yaml"
             res = CliRunner().invoke(
                 app,
                 [
                     "reference",
+                    "-s",
+                    str(sheet_path),
                     "--prefix",
                     str(ref_prefix),
                     "--bin-size",
@@ -129,12 +143,9 @@ class TestLoggingVerbosity(unittest.TestCase):
                     "4",
                     "--pca-components",
                     "2",
-                    "--nearest-bins",
-                    "5",
                     "--loglevel",
                     "DEBUG",
-                ]
-                + [str(p) for p in samples],
+                ],
             )
             self.assertEqual(res.exit_code, 0, res.output)
             self.assertIn("starting reference:", res.output)
@@ -142,7 +153,6 @@ class TestLoggingVerbosity(unittest.TestCase):
             self.assertIn("PCA fitted", res.output)
             self.assertIn("components: explained variance", res.output)
             self.assertIn("mask kept", res.output)
-            self.assertIn("fitting prototype graph", res.output)
             self.assertIn("null models computed for", res.output)
             self.assertIn("wrote reference parquet", res.output)
             self.assertIn("evaluating reference QC", res.output)
@@ -187,7 +197,7 @@ class TestLoggingVerbosity(unittest.TestCase):
             self.assertIn("normalizing branch autosomal", res.output)
             self.assertIn("within-sample iteration", res.output)
             self.assertIn("median shift=", res.output)
-            self.assertIn("segmenting and scoring 2 contigs with pelt", res.output)
+            self.assertIn("segmenting and scoring 2 contigs with PELT", res.output)
             self.assertIn("segment and score finished:", res.output)
             self.assertIn("called", res.output)
             self.assertIn("writing prediction outputs", res.output)

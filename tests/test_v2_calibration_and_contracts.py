@@ -16,6 +16,7 @@ from scipy.stats import norm
 from ccnv._core import FRAG_BAND_EDGES
 from ccnv.extract import run as run_extract
 from ccnv.features.prenatal_origin import (
+    BandPrefixSums,
     PrenatalLoDMetrics,
     annotate_prenatal_origin_and_lod,
 )
@@ -24,6 +25,7 @@ from ccnv.models import (
     PredictConfig,
     PredictionOutputs,
     ReferenceConfig,
+    SamplesheetEntry,
 )
 from ccnv.models.results import SegmentResult
 from ccnv.predict import run as run_predict
@@ -107,11 +109,10 @@ class TestV2CalibrationAndContracts(unittest.TestCase):
         ref_pfx = root / "reference"
         run_reference(
             ReferenceConfig(
-                tuple(sample_paths),
-                ref_pfx,
+                prefix=ref_pfx,
+                entries=tuple(SamplesheetEntry(filepath=p) for p in sample_paths),
                 bin_size=CALIBRATION_BIN_SIZE,
                 pca_components=2,
-                nearest_bins=10,
                 min_cohort_size=8,
                 all_contigs=True,
             )
@@ -378,11 +379,13 @@ class TestV2CalibrationAndContracts(unittest.TestCase):
             call="gain",
         )
 
+        prefix_sums = BandPrefixSums(
+            sample_bands, bin_contigs, contig_names, bin_starts, bin_ends, bin_usable
+        )
         annotated, lod = annotate_prenatal_origin_and_lod(
             segments=(seg0, seg1, seg2, seg3),
             sample_bands=sample_bands,
-            bin_contigs=bin_contigs,
-            contig_names=contig_names,
+            prefix_sums=prefix_sums,
             bin_usable=bin_usable,
             p_fetal_24=p_f_24,
             mu_fetal_w=1.0,
@@ -392,8 +395,6 @@ class TestV2CalibrationAndContracts(unittest.TestCase):
             sca_call="XX",
             sample_depth_per_mb=25_000.0,
             sys_var_per_mb=0.0001,
-            bin_starts=bin_starts,
-            bin_ends=bin_ends,
             p_maternal_24=p_m_24,
         )
 
@@ -412,7 +413,7 @@ class TestV2CalibrationAndContracts(unittest.TestCase):
         self.assertLess(lod.lod_ff_3mb, 0.50)
 
     def test_repository_line_count_invariants(self) -> None:
-        """Enforce strict < 1,000 line length limit across all Python modules in src/ and tests/."""
+        """Enforce strict < 1,000 line length limit across all Python and Rust modules."""
         repo_root = Path(__file__).resolve().parent.parent
         long_files: list[tuple[str, int]] = []
 
@@ -421,6 +422,10 @@ class TestV2CalibrationAndContracts(unittest.TestCase):
                 line_count = len(py_path.read_text(encoding="utf-8").splitlines())
                 if line_count >= 1_000:
                     long_files.append((str(py_path.relative_to(repo_root)), line_count))
+        for rs_path in (repo_root / "crates").glob("**/*.rs"):
+            line_count = len(rs_path.read_text(encoding="utf-8").splitlines())
+            if line_count >= 1_000:
+                long_files.append((str(rs_path.relative_to(repo_root)), line_count))
 
         self.assertEqual(
             long_files,
@@ -429,9 +434,10 @@ class TestV2CalibrationAndContracts(unittest.TestCase):
         )
 
     def test_ast_cleanliness_zero_any_type_ignore_bare_assert(self) -> None:
-        """Verify zero typing.Any, zero bare assert statements, and zero # type: ignore in src/."""
+        """Verify zero typing.Any, typing.cast, bare assert, and # type: ignore in src/."""
         repo_root = Path(__file__).resolve().parent.parent
         any_violations: list[tuple[str, int]] = []
+        cast_violations: list[tuple[str, int]] = []
         assert_violations: list[tuple[str, int]] = []
         type_ignore_violations: list[tuple[str, int, str]] = []
 
@@ -450,11 +456,18 @@ class TestV2CalibrationAndContracts(unittest.TestCase):
                     for alias in node.names:
                         if alias.name == "Any":
                             any_violations.append((rel_path, node.lineno))
+                        elif alias.name == "cast":
+                            cast_violations.append((rel_path, node.lineno))
 
         self.assertEqual(
             any_violations,
             [],
             f"Found forbidden typing.Any imports in src/: {any_violations}",
+        )
+        self.assertEqual(
+            cast_violations,
+            [],
+            f"Found forbidden typing.cast imports in src/: {cast_violations}",
         )
         self.assertEqual(
             assert_violations,

@@ -14,7 +14,14 @@ from typer.testing import CliRunner
 
 from ccnv.cli import app
 from ccnv.io.parquet import write_reference_parquet, write_sample_parquet
-from ccnv.models import PredictConfig, ReadFilters, ReferenceConfig, parquet_path
+from ccnv.models import (
+    PredictConfig,
+    ReadFilters,
+    ReferenceConfig,
+    SampleBuffers,
+    SamplesheetEntry,
+    parquet_path,
+)
 from ccnv.models.results import BinResult, SegmentResult
 from ccnv.models.schemas import (
     BRANCH_AUTOSOMAL,
@@ -24,16 +31,15 @@ from ccnv.models.schemas import (
     PRENATAL_METADATA_KEY,
     ArtifactKind,
     PrenatalModelMetadata,
-    decode_metadata,
     metadata_for,
 )
 from ccnv.predict import (
     BranchModel,
     PredictError,
     PredictionInput,
-    call_segment,
     load_inputs,
     normalize_branch,
+    normalize_sample_branch,
     segment_and_call,
 )
 from ccnv.predict import run as run_predict
@@ -78,7 +84,7 @@ def _reference_table() -> pa.Table:
         pca_loadings=[[0.0], [0.0]],
         mean_distance=[1.0, 1.0],
         null_mean=[0.0, 0.0],
-        null_std=[0.141421356, 0.141421356],
+        bio_dispersion=[0.02, 0.02],
         model={"branches": [BRANCH_AUTOSOMAL], "bin_size": 100},
     )
 
@@ -182,7 +188,7 @@ def _prenatal_reference_table() -> pa.Table:
         pca_loadings=pca_loadings,
         mean_distance=[1.0] * n_rows,
         null_mean=[0.0] * n_rows,
-        null_std=[0.1] * n_rows,
+        bio_dispersion=[0.01] * n_rows,
         metadata=metadata,
     )
 
@@ -250,7 +256,7 @@ class TestNormalization(unittest.TestCase):
             proto_weights=pweights,
             mean_distance=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
             null_mean=np.zeros(4, dtype=np.float64),
-            null_std=np.full(4, 0.1, dtype=np.float64),
+            bio_dispersion=np.full(4, 0.01, dtype=np.float64),
         )
         config = PredictConfig(
             Path("sample"),
@@ -264,65 +270,69 @@ class TestNormalization(unittest.TestCase):
         self.assertEqual(result.ratios.shape, (4,))
         self.assertTrue(np.all(np.isfinite(result.ratios)))
         self.assertTrue(np.all(np.isfinite(result.zscores)))
-        np.testing.assert_allclose(result.ratios, 0.0)
+        np.testing.assert_allclose(result.ratios, 0.0, atol=1e-6)
 
-    def test_project_coverage_lstsq_reconstruction_with_masked_and_empty_active(
+    def test_normalize_sample_branch_with_masked_and_empty_active(
         self,
     ) -> None:
-        from ccnv.predict import project_coverage
-
-        pids, pweights = _proto_arrays(4)
+        pids, pweights = _proto_arrays(6)
+        counts = np.array([20.0, 30.0, 20.0, 30.0, 25.0, 25.0])
         model = BranchModel(
             branch=BRANCH_AUTOSOMAL,
-            contigs=("chr1", "chr1", "chr2", "chr2"),
-            starts=np.array([0, 100, 0, 100], dtype=np.int64),
-            ends=np.array([100, 200, 100, 200], dtype=np.int64),
-            counts=np.array([20.0, 30.0, 20.0, 30.0]),
-            masked=np.zeros(4, dtype=np.bool_),
-            pca_mean=np.full(4, 0.25),
-            pca_loadings=np.full((1, 4), 0.5, dtype=np.float32),
+            contigs=("chr1", "chr1", "chr2", "chr2", "chr3", "chr3"),
+            starts=np.array([0, 100, 0, 100, 0, 100], dtype=np.int64),
+            ends=np.array([100, 200, 100, 200, 100, 200], dtype=np.int64),
+            counts=counts,
+            masked=np.zeros(6, dtype=np.bool_),
+            pca_mean=np.full(6, 1.0),
+            pca_loadings=np.zeros((0, 6), dtype=np.float32),
             proto_ids=pids,
             proto_weights=pweights,
-            mean_distance=np.ones(4, dtype=np.float32),
-            null_mean=np.zeros(4, dtype=np.float64),
-            null_std=np.full(4, 0.1, dtype=np.float64),
+            mean_distance=np.ones(6, dtype=np.float32),
+            null_mean=np.zeros(6, dtype=np.float64),
+            bio_dispersion=np.full(6, 0.01, dtype=np.float64),
+            bin_size=100,
         )
 
-        n_mask = np.array([True, True, False, False])
-        proj = project_coverage(model, n_mask_override=n_mask)
-        self.assertTrue(np.all(proj.usable == np.array([False, False, True, True])))
-        self.assertLess(proj.corrected[2], 1.0)
-        self.assertGreater(proj.corrected[3], 1.0)
-        self.assertAlmostEqual(
-            proj.corrected[3] / proj.corrected[2], 30.5 / 20.5, places=5
+        n_mask = np.array([True, True, False, False, False, False])
+        norm = normalize_sample_branch(
+            counts,
+            np.ones(6, dtype=np.float32),
+            model,
+            n_mask_override=n_mask,
+            min_reference_bins=1,
         )
-
-        all_masked = np.ones(4, dtype=np.bool_)
-        with self.assertRaises(PredictError):
-            project_coverage(model, n_mask_override=all_masked)
-
-        one_active_mask = np.array([True, True, True, False])
-        proj_one = project_coverage(model, n_mask_override=one_active_mask)
-        self.assertTrue(
-            np.all(proj_one.usable == np.array([False, False, False, True]))
+        np.testing.assert_array_equal(
+            norm.usable, [False, False, True, True, True, True]
         )
-        self.assertAlmostEqual(proj_one.corrected[3], 1.0, places=6)
+        self.assertLess(norm.ratios[2], 0.0)
+        self.assertGreater(norm.ratios[3], 0.0)
 
-    def test_project_coverage_huber_resists_trisomy_outlier_chromosome(self) -> None:
-        from ccnv.predict import project_coverage
+        all_masked = np.ones(6, dtype=np.bool_)
+        with self.assertRaisesRegex(PredictError, "zero sample coverage"):
+            normalize_sample_branch(
+                counts,
+                np.ones(6, dtype=np.float32),
+                model,
+                n_mask_override=all_masked,
+                min_reference_bins=1,
+            )
 
+    def test_normalize_sample_branch_huber_resists_trisomy_outlier_chromosome(
+        self,
+    ) -> None:
         loadings = np.linspace(-1.0, 1.0, 20, dtype=np.float32).reshape(1, 20)
-        pca_mean = np.full(20, 0.05)
-        true_c = 0.02
-        counts = (pca_mean + true_c * loadings.astype(np.float64).ravel()) * 1000.0
+        pca_mean = np.full(20, 1.0)
+        true_c = 0.25
+        counts = 100.0 * pca_mean * np.exp(true_c * loadings.astype(np.float64).ravel())
         counts[16:] *= 1.8
 
         pids, pweights = _proto_arrays(20)
         model = BranchModel(
             branch=BRANCH_AUTOSOMAL,
-            contigs=("chr1",) * 16 + ("chr21",) * 4,
-            starts=np.arange(20, dtype=np.int64) * 100,
-            ends=np.arange(1, 21, dtype=np.int64) * 100,
+            contigs=("chr1",) * 8 + ("chr2",) * 8 + ("chr21",) * 4,
+            starts=np.tile(np.arange(4, dtype=np.int64) * 100, 5),
+            ends=np.tile(np.arange(1, 5, dtype=np.int64) * 100, 5),
             counts=counts,
             masked=np.zeros(20, dtype=np.bool_),
             pca_mean=pca_mean,
@@ -331,26 +341,48 @@ class TestNormalization(unittest.TestCase):
             proto_weights=pweights,
             mean_distance=np.ones(20, dtype=np.float32),
             null_mean=np.zeros(20, dtype=np.float64),
-            null_std=np.full(20, 0.05, dtype=np.float64),
+            bio_dispersion=np.full(20, 0.005, dtype=np.float64),
+            bin_size=100,
         )
-        proj = project_coverage(model)
-        # Diploid bins (0..15) should have near-flat corrected ratios (~1.0), not tilted by chr21
-        self.assertLess(float(np.std(proj.corrected[:16])), 0.05)
-        self.assertGreater(float(np.mean(proj.corrected[16:])), 1.4)
+        norm = normalize_sample_branch(
+            counts, np.ones(20, dtype=np.float32), model, min_reference_bins=2
+        )
+        # Diploid bins (0..15) should have near-zero log2 ratios (~0.0), not tilted by chr21
+        self.assertLess(float(np.std(norm.ratios[:16])), 0.08)
+        self.assertGreater(float(np.mean(norm.ratios[16:])), 0.5)
 
 
 class TestCalling(unittest.TestCase):
     def test_calls_symmetric_z_and_ratio_thresholds(self) -> None:
-        self.assertEqual(
-            call_segment(0.1, 4.0, z_threshold=3.0, ratio_threshold=None), "gain"
-        )
-        self.assertEqual(
-            call_segment(-0.1, -4.0, z_threshold=3.0, ratio_threshold=None), "loss"
-        )
-        self.assertEqual(
-            call_segment(0.3, 0.0, z_threshold=3.0, ratio_threshold=0.2), "gain"
-        )
-        self.assertIsNone(call_segment(0.1, 2.0, z_threshold=3.0, ratio_threshold=None))
+        def _single_seg_call(
+            ratio: float, z: float, *, ratio_threshold: float | None = None
+        ) -> str | None:
+            bins = (
+                BinResult(
+                    branch=BRANCH_AUTOSOMAL,
+                    contigs=("chr1",) * 8,
+                    starts=np.arange(8, dtype=np.int64) * 100,
+                    ends=np.arange(1, 9, dtype=np.int64) * 100,
+                    ratios=np.full(8, ratio, dtype=np.float64),
+                    zscores=np.full(8, z, dtype=np.float64),
+                    weights=np.full(8, 25.0, dtype=np.float64),
+                    reference_sizes=np.full(8, 10, dtype=np.int64),
+                    masked=np.zeros(8, dtype=np.bool_),
+                ),
+            )
+            segs = segment_and_call(
+                bins,
+                {"chr1": 800},
+                penalty=1.0,
+                z_threshold=3.0,
+                ratio_threshold=ratio_threshold,
+            )
+            return segs[0].call
+
+        self.assertEqual(_single_seg_call(0.585, 3.0), "gain")
+        self.assertEqual(_single_seg_call(-0.95, -3.0), "loss")
+        self.assertIsNone(_single_seg_call(0.18, 4.0, ratio_threshold=0.35))
+        self.assertIsNone(_single_seg_call(0.05, 0.5))
 
     def test_segment_and_call_stouffer_zscore_accumulates_evidence_and_corrects_autocorr(
         self,
@@ -373,12 +405,12 @@ class TestCalling(unittest.TestCase):
         segs = segment_and_call(
             bins,
             {"chr1": 2500},
-            penalty=5.0,
+            penalty=1.0,
             z_threshold=3.0,
             ratio_threshold=None,
         )
         self.assertEqual(len(segs), 1)
-        # Mean Z would be ~1.8 (<3.0, missed); Stouffer Z is ~1.8 * sqrt(25) = 9.0 (>3.0, called gain)
+        # Mean Z would be ~1.8 (<3.0, missed); BLUE Z is ~1.8 * sqrt(25) = 9.0 (>3.0, called gain)
         self.assertGreater(segs[0].zscore, 8.0)
         self.assertEqual(segs[0].call, "gain")
 
@@ -386,29 +418,32 @@ class TestCalling(unittest.TestCase):
         bins = (
             BinResult(
                 branch=BRANCH_AUTOSOMAL,
-                contigs=("chr1",) * 6,
-                starts=np.arange(6, dtype=np.int64) * 100,
-                ends=np.arange(1, 7, dtype=np.int64) * 100,
-                ratios=np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0], dtype=np.float64),
-                zscores=np.array(
-                    [3.5, 3.5, 3.5, np.nan, np.nan, np.nan], dtype=np.float64
+                contigs=("chr1",) * 8,
+                starts=np.arange(8, dtype=np.int64) * 100,
+                ends=np.arange(1, 9, dtype=np.int64) * 100,
+                ratios=np.array(
+                    [0.585, 0.585, 0.585, 0.585, 0.0, 0.0, 0.0, 0.0], dtype=np.float64
                 ),
-                weights=np.ones(6, dtype=np.float64),
-                reference_sizes=np.full(6, 10, dtype=np.int64),
-                masked=np.zeros(6, dtype=np.bool_),
+                zscores=np.array(
+                    [3.5, 3.5, 3.5, 3.5, np.nan, np.nan, np.nan, np.nan],
+                    dtype=np.float64,
+                ),
+                weights=np.full(8, 200.0, dtype=np.float64),
+                reference_sizes=np.full(8, 10, dtype=np.int64),
+                masked=np.zeros(8, dtype=np.bool_),
             ),
         )
         segs = segment_and_call(
             bins,
-            {"chr1": 600},
-            penalty=0.1,
+            {"chr1": 800},
+            penalty=0.5,
             z_threshold=3.0,
             ratio_threshold=None,
         )
         self.assertEqual(len(segs), 2)
         matched = False
         for s in segs:
-            if s.start == 300 and s.end == 600:
+            if s.start == 400 and s.end == 800:
                 self.assertEqual(s.zscore, 0.0)
                 self.assertIsNone(s.call)
                 matched = True
@@ -435,7 +470,7 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
             SegmentResult("chr1", 95, 100, 0.0, 0.0, 0.0, 1, None),
         )
         inputs = PredictionInput(
-            _sample_table(),
+            SampleBuffers.from_table(_sample_table()),
             _reference_table(),
             {"chr1": 100, "chr2": 80},
             None,
@@ -534,12 +569,8 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
             inputs = load_inputs(sample_path, reference_path)
 
             self.assertEqual(inputs.sample.num_rows, 2)
-            self.assertEqual(
-                decode_metadata(inputs.sample.schema.metadata)["bin_size"], 100
-            )
-            np.testing.assert_allclose(
-                inputs.sample.column("count").to_pylist(), [10.0, 10.0]
-            )
+            self.assertEqual(inputs.sample.meta.bin_size, 100)
+            np.testing.assert_allclose(inputs.sample.count, [10.0, 10.0])
             self.assertEqual(reference_path.read_bytes(), ref_bytes_before)
             self.assertEqual(reference_path.stat().st_mtime_ns, ref_mtime_before)
 
@@ -567,7 +598,7 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
         from ccnv.predict import build_branch_model
 
         ref = _reference_table()
-        bad_sample = _sample_table(include_chr2=False)
+        bad_sample = SampleBuffers.from_table(_sample_table(include_chr2=False))
         inputs = PredictionInput(
             bad_sample,
             ref,
@@ -710,10 +741,12 @@ class TestPredictPublishedCrams(unittest.TestCase):
             reference_prefix = root / "reference"
             build_reference(
                 ReferenceConfig(
-                    samples=(sample_a, sample_b),
+                    entries=(
+                        SamplesheetEntry(filepath=sample_a),
+                        SamplesheetEntry(filepath=sample_b),
+                    ),
                     prefix=reference_prefix,
                     pca_components=1,
-                    nearest_bins=16,
                     min_cohort_size=2,
                 )
             )
@@ -808,7 +841,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
                 records = list(tb.fetch("chr21", 0, CHR21_LENGTH))
                 self.assertEqual(len(records), 468)
 
-    def test_normalize_branch_zero_null_std_mad_fallback(self) -> None:
+    def test_normalize_branch_zero_bio_dispersion(self) -> None:
         pids, pweights = _proto_arrays(4)
         model = BranchModel(
             branch=BRANCH_AUTOSOMAL,
@@ -823,7 +856,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
             proto_weights=pweights,
             mean_distance=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
             null_mean=np.zeros(4, dtype=np.float64),
-            null_std=np.zeros(4, dtype=np.float64),
+            bio_dispersion=np.zeros(4, dtype=np.float64),
         )
         config = PredictConfig(
             Path("sample"),
@@ -835,7 +868,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
         self.assertEqual(result.ratios.shape, (4,))
         self.assertTrue(np.all(np.isfinite(result.zscores)))
 
-    def test_normalize_branch_zero_mad_fallback_to_std(self) -> None:
+    def test_normalize_branch_flat_diploid_with_outlier_bin(self) -> None:
         pids, pweights = _proto_arrays(6)
         model = BranchModel(
             branch=BRANCH_AUTOSOMAL,
@@ -850,7 +883,7 @@ class TestPredictPublishedCrams(unittest.TestCase):
             proto_weights=pweights,
             mean_distance=np.ones(6, dtype=np.float32),
             null_mean=np.zeros(6, dtype=np.float64),
-            null_std=np.zeros(6, dtype=np.float64),
+            bio_dispersion=np.zeros(6, dtype=np.float64),
         )
         config = PredictConfig(
             Path("sample"),
@@ -866,13 +899,13 @@ class TestPredictPublishedCrams(unittest.TestCase):
     def test_resolve_sample_sex_inferences_and_validations(self) -> None:
         from ccnv.predict import _resolve_sample_sex
 
-        sample = pa.table(
-            {
-                "contig": ["chr1", "chrY"],
-                "start": [0, 0],
-                "end": [100, 100],
-                "count": [90.0, 10.0],
-            }
+        sample = make_sample_table(
+            [90, 10],
+            contigs=["chr1", "chrY"],
+            starts=[0, 0],
+            ends=[100, 100],
+            contig_lengths={"chr1": 100, "chrY": 100},
+            bin_size=100,
         )
         self.assertEqual(_resolve_sample_sex("female", sample, {}, set()), "female")
         self.assertEqual(_resolve_sample_sex("male", sample, {}, set()), "male")

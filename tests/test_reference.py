@@ -7,6 +7,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pysam
+import yaml
 from helpers import make_reference_table, make_sample_table
 from published_fixtures import (
     CHR21_LENGTH,
@@ -24,12 +25,11 @@ from ccnv.cli import app
 from ccnv.features.cohort import (
     cohort_from_fasta,
     infer_sample_sexes,
-    mask_low_coverage,
-    normalize_depth,
+    load_and_assemble_cohort,
+    mask_low_coverage_per_contig,
     validate_cohort,
 )
 from ccnv.io.parquet import read_sample_parquet
-from ccnv.io.parquet import read_sample_tables as load_cohort
 from ccnv.io.tracks import read_fasta_contigs
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
@@ -39,6 +39,7 @@ from ccnv.models import (
     ReferenceConfig,
     ReferenceError,
     SampleMetadata,
+    SamplesheetEntry,
     parquet_path,
 )
 from ccnv.models.schemas import (
@@ -53,7 +54,7 @@ from ccnv.reference import (
     build_reference_table,
     run,
 )
-from ccnv.stats.pca import fit_pca
+from ccnv.stats.pca import fit_whitened_pca
 
 
 def _sample_table(
@@ -98,7 +99,7 @@ class TestReferenceSchemaRejection(unittest.TestCase):
             with self.assertRaisesRegex(
                 ReferenceError, "artifact_kind|fields do not match"
             ):
-                load_cohort((path,))
+                load_and_assemble_cohort((SamplesheetEntry(filepath=path),))
 
     def test_validate_table_rejects_duplicate_branch_bins(self) -> None:
         table = make_reference_table(
@@ -123,24 +124,34 @@ class TestMaskingAndPca(unittest.TestCase):
                 [100.0, 100.0, 100.0],
                 [0.0, 0.0, 0.0],
                 [1.0, 1.0, 1.0],
-            ]
+            ],
+            dtype=np.float32,
         )
-        normalized = normalize_depth(counts)
-        mask = mask_low_coverage(normalized)
+        mask = mask_low_coverage_per_contig(
+            counts,
+            np.zeros(3, dtype=np.int16),
+            np.ones(3, dtype=np.float32),
+        )
         np.testing.assert_array_equal(mask, [True, False, False])
 
     def test_pca_is_deterministic_and_matches_unmasked_bins(self) -> None:
         rng = np.random.default_rng(0)
-        data = rng.random((12, 6)) + 0.2
-        first = fit_pca(data, n_components=3)
-        second = fit_pca(data, n_components=3)
-        np.testing.assert_allclose(first[0], second[0])
-        np.testing.assert_allclose(first[1], second[1])
-        np.testing.assert_allclose(first[2], second[2])
-        self.assertEqual(first[1].shape, (12,))
-        self.assertGreaterEqual(first[2].shape[0], 1)
-        self.assertLessEqual(first[2].shape[0], 3)
-        self.assertEqual(first[2].shape[1], 12)
+        expected = np.full((12, 6), 100.0, dtype=np.float32)
+        u = rng.normal(0.0, 0.25, size=(12, 2))
+        v = rng.normal(0.0, 1.0, size=(2, 6))
+        counts = rng.poisson(expected.astype(np.float64) * np.exp(u @ v)).astype(
+            np.float32
+        )
+        usable = np.ones(12, dtype=bool)
+        first = fit_whitened_pca(counts, expected, usable, max_components=3)
+        second = fit_whitened_pca(counts, expected, usable, max_components=3)
+        np.testing.assert_allclose(first.mean_rate, second.mean_rate)
+        np.testing.assert_allclose(first.loadings, second.loadings)
+        np.testing.assert_allclose(first.singular_values, second.singular_values)
+        self.assertEqual(first.mean_rate.shape, (12,))
+        self.assertGreaterEqual(first.loadings.shape[0], 1)
+        self.assertLessEqual(first.loadings.shape[0], 3)
+        self.assertEqual(first.loadings.shape[1], 12)
 
 
 class TestSexInference(unittest.TestCase):
@@ -192,10 +203,12 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             cohort,
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.ccnv") for index in range(6)),
+                entries=tuple(
+                    SamplesheetEntry(filepath=Path(f"{index}.ccnv"))
+                    for index in range(6)
+                ),
                 prefix=Path("unused"),
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
                 min_sex_group_size=3,
             ),
@@ -230,10 +243,12 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.ccnv") for index in range(6)),
+                entries=tuple(
+                    SamplesheetEntry(filepath=Path(f"{index}.ccnv"))
+                    for index in range(6)
+                ),
                 prefix=Path("unused"),
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
                 min_sex_group_size=3,
             ),
@@ -259,12 +274,14 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
+                entries=tuple(
+                    SamplesheetEntry(filepath=Path(f"{index}.ccnv"))
+                    for index in range(4)
+                ),
                 prefix=Path("unused"),
                 sex_contigs=DEFAULT_SEX_CONTIGS,
                 sex_signal_contig="chrY",
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
                 min_sex_group_size=2,
             ),
@@ -290,12 +307,14 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
+                entries=tuple(
+                    SamplesheetEntry(filepath=Path(f"{index}.ccnv"))
+                    for index in range(4)
+                ),
                 prefix=Path("unused"),
                 sex_contigs=DEFAULT_SEX_CONTIGS,
                 sex_signal_contig="chrY",
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
             ),
         )
@@ -320,11 +339,12 @@ class TestSexInference(unittest.TestCase):
         ]
         cohort = validate_cohort(tuple(tables))
         config = ReferenceConfig(
-            samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
+            entries=tuple(
+                SamplesheetEntry(filepath=Path(f"{index}.ccnv")) for index in range(4)
+            ),
             prefix=Path("unused"),
             sex_contigs=("chrZ",),
             pca_components=2,
-            nearest_bins=1,
             min_cohort_size=4,
         )
         with self.assertRaisesRegex(ReferenceError, "unknown sex contig"):
@@ -343,11 +363,12 @@ class TestSexInference(unittest.TestCase):
             for index in range(4)
         ]
         config = ReferenceConfig(
-            samples=tuple(Path(f"{index}.ccnv") for index in range(4)),
+            entries=tuple(
+                SamplesheetEntry(filepath=Path(f"{index}.ccnv")) for index in range(4)
+            ),
             prefix=Path("unused"),
             sex_signal_contig="chrZ",
             pca_components=2,
-            nearest_bins=1,
             min_cohort_size=4,
         )
         with self.assertRaisesRegex(ReferenceError, "unknown sex-signal contig"):
@@ -376,11 +397,13 @@ class TestSexInference(unittest.TestCase):
         table = build_reference_table(
             validate_cohort(tuple(tables)),
             ReferenceConfig(
-                samples=tuple(Path(f"{index}.ccnv") for index in range(6)),
+                entries=tuple(
+                    SamplesheetEntry(filepath=Path(f"{index}.ccnv"))
+                    for index in range(6)
+                ),
                 prefix=Path("unused"),
                 sex_cutoff=0.1,
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
                 min_sex_group_size=3,
             ),
@@ -422,12 +445,11 @@ class TestSexInference(unittest.TestCase):
                 for index, counts in enumerate(female_counts + male_counts)
             ]
             config = ReferenceConfig(
-                samples=tuple(paths),
+                entries=tuple(SamplesheetEntry(filepath=p) for p in paths),
                 prefix=root / "ref",
                 sex_contigs=("chrY",),
                 sex_signal_contig="chrY",
                 pca_components=2,
-                nearest_bins=1,
                 min_cohort_size=4,
                 min_sex_group_size=3,
             )
@@ -473,10 +495,9 @@ class TestSexInference(unittest.TestCase):
 
                 ref_prefix = root / f"ref_{cohort_size}"
                 config = ReferenceConfig(
-                    samples=tuple(paths),
+                    entries=tuple(SamplesheetEntry(filepath=p) for p in paths),
                     prefix=ref_prefix,
                     pca_components=2,
-                    nearest_bins=1,
                     min_cohort_size=4,
                 )
                 run(config)
@@ -530,12 +551,18 @@ class TestReferencePublishedCrams(unittest.TestCase):
                 ("chr21",),
             )
 
+            sheet_path = root / "samplesheet.yaml"
+            sheet_path.write_text(
+                yaml.safe_dump([{"filepath": str(p)} for p in sample_paths]),
+                encoding="utf-8",
+            )
             reference_prefix = root / "reference"
             result = runner.invoke(
                 app,
                 [
                     "reference",
-                    *(str(path) for path in sample_paths),
+                    "--samplesheet",
+                    str(sheet_path),
                     "--prefix",
                     str(reference_prefix),
                     "--bin-size",
@@ -544,8 +571,6 @@ class TestReferencePublishedCrams(unittest.TestCase):
                     "2",
                     "--pca-components",
                     "1",
-                    "--nearest-bins",
-                    "16",
                 ],
             )
             self.assertEqual(result.exit_code, 0, result.output)
@@ -578,7 +603,7 @@ class TestFlatFastaReference(unittest.TestCase):
                 (("chr1", 250), ("chr2", 150), ("chrX", 100)),
             )
             contigs_dict = read_fasta_contigs(fasta)
-            cohort = cohort_from_fasta(contigs_dict, 100, n_samples=2, fasta_path=fasta)
+            cohort = cohort_from_fasta(contigs_dict, 100, fasta_path=fasta)
 
             self.assertEqual(cohort.bin_size, 100)
             self.assertEqual(
@@ -586,20 +611,15 @@ class TestFlatFastaReference(unittest.TestCase):
             )
             np.testing.assert_array_equal(cohort.starts, [0, 100, 200, 0, 100, 0])
             np.testing.assert_array_equal(cohort.ends, [100, 200, 250, 100, 150, 100])
-            np.testing.assert_array_equal(
-                cohort.counts[:, 0], [100, 100, 50, 100, 50, 100]
-            )
-            np.testing.assert_array_equal(cohort.counts[:, 0], cohort.counts[:, 1])
+            self.assertEqual(cohort.counts.shape, (6, 0))
 
             prefix = Path(tmpdir) / "ref"
             run(
                 ReferenceConfig(
-                    samples=(),
                     prefix=prefix,
                     fasta=fasta,
                     bin_size=100,
                     pca_components=1,
-                    nearest_bins=2,
                     min_cohort_size=2,
                 )
             )
@@ -627,12 +647,10 @@ class TestFlatFastaReference(unittest.TestCase):
             reference_prefix = root / "ref"
             run(
                 ReferenceConfig(
-                    samples=(),
                     prefix=reference_prefix,
                     fasta=fasta,
                     bin_size=100,
                     pca_components=1,
-                    nearest_bins=2,
                     min_cohort_size=2,
                     qc_report=False,
                 )
@@ -672,6 +690,7 @@ class TestFlatFastaReference(unittest.TestCase):
                 app,
                 [
                     "reference",
+                    "--fasta",
                     str(fasta),
                     "--prefix",
                     str(prefix),
@@ -681,8 +700,6 @@ class TestFlatFastaReference(unittest.TestCase):
                     "2",
                     "--pca-components",
                     "1",
-                    "--nearest-bins",
-                    "2",
                 ],
             )
             self.assertEqual(result.exit_code, 0, result.output)
@@ -698,7 +715,7 @@ class TestFlatFastaReference(unittest.TestCase):
             with self.assertRaisesRegex(ReferenceError, "not both"):
                 run(
                     ReferenceConfig(
-                        samples=(Path("sample.ccnv"),),
+                        entries=(SamplesheetEntry(filepath=Path("sample.ccnv")),),
                         prefix=Path(tmpdir) / "ref",
                         fasta=fasta,
                         bin_size=100,
@@ -706,8 +723,10 @@ class TestFlatFastaReference(unittest.TestCase):
                 )
 
     def test_neither_samples_nor_fasta_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ReferenceError, "sample Parquet paths or a FASTA"):
-            run(ReferenceConfig(samples=(), prefix=Path("ref")))
+        with self.assertRaisesRegex(
+            ReferenceError, "sample Parquet entries or a FASTA"
+        ):
+            run(ReferenceConfig(prefix=Path("ref")))
 
     def test_prenatal_mode_rejects_fasta(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

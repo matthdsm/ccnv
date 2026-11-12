@@ -10,12 +10,12 @@ import pyarrow as pa
 from ccnv.io.alignments import (
     alignment_format,
     read_alignment_header,
-    rejection_reason,
     validate_alignment_inputs,
 )
 from ccnv.io.parquet import (
     is_sample_parquet,
     read_reference_parquet,
+    read_sample_buffers,
     read_sample_parquet,
     write_reference_parquet,
     write_sample_parquet,
@@ -50,31 +50,6 @@ from ccnv.models.schemas import (
 )
 
 
-class FakeRead:
-    """Minimal fake aligned read for filter tests."""
-
-    def __init__(
-        self,
-        reference_start: int | None = 0,
-        mapping_quality: int = 60,
-        *,
-        is_unmapped: bool = False,
-        is_secondary: bool = False,
-        is_supplementary: bool = False,
-        is_duplicate: bool = False,
-        is_paired: bool = False,
-        is_proper_pair: bool = True,
-    ) -> None:
-        self.reference_start = reference_start
-        self.mapping_quality = mapping_quality
-        self.is_unmapped = is_unmapped
-        self.is_secondary = is_secondary
-        self.is_supplementary = is_supplementary
-        self.is_duplicate = is_duplicate
-        self.is_paired = is_paired
-        self.is_proper_pair = is_proper_pair
-
-
 class TestAlignmentsIO(unittest.TestCase):
     def test_alignment_format_valid(self) -> None:
         self.assertEqual(alignment_format(Path("sample.bam")), "bam")
@@ -103,43 +78,9 @@ class TestAlignmentsIO(unittest.TestCase):
         with self.assertRaises(AlignmentError):
             read_alignment_header(Path("/nonexistent/sample.bam"))
 
-    def test_rejection_reason(self) -> None:
-        filters = ReadFilters(
-            min_mapping_quality=20,
-            exclude_duplicates=True,
-            exclude_secondary=True,
-            exclude_supplementary=True,
-            require_proper_pair=True,
-        )
-        self.assertIsNone(rejection_reason(FakeRead(mapping_quality=60), filters))
-        self.assertEqual(
-            rejection_reason(FakeRead(is_unmapped=True), filters), "filter_unmapped"
-        )
-        self.assertEqual(
-            rejection_reason(FakeRead(reference_start=None), filters),
-            "filter_no_start",
-        )
-        self.assertEqual(
-            rejection_reason(FakeRead(mapping_quality=10), filters), "filter_mapq"
-        )
-        self.assertEqual(
-            rejection_reason(FakeRead(is_duplicate=True), filters), "filter_duplicate"
-        )
-        self.assertEqual(
-            rejection_reason(FakeRead(is_secondary=True), filters), "filter_secondary"
-        )
-        self.assertEqual(
-            rejection_reason(FakeRead(is_supplementary=True), filters),
-            "filter_supplementary",
-        )
-        self.assertEqual(
-            rejection_reason(FakeRead(is_paired=True, is_proper_pair=False), filters),
-            "filter_improper_pair",
-        )
-
 
 class TestParquetIO(unittest.TestCase):
-    def test_sample_parquet_roundtrip_both_signatures(self) -> None:
+    def test_sample_parquet_roundtrip_and_buffers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "sample.parquet"
             metadata = metadata_for(
@@ -168,17 +109,19 @@ class TestParquetIO(unittest.TestCase):
                 },
                 schema=SAMPLE_SCHEMA.with_metadata(metadata),
             )
-            # Write (table, path)
             out = write_sample_parquet(table, path)
             self.assertEqual(out, path)
             self.assertTrue(path.is_file())
 
-            # Read back
             loaded = read_sample_parquet(path)
             self.assertEqual(loaded.num_rows, 2)
             _, _, starts, _ = reconstruct_sample_grid(SampleMetadata.from_table(loaded))
             self.assertEqual(starts.tolist(), [0, 100])
             self.assertTrue(is_sample_parquet(path))
+
+            bufs = read_sample_buffers(path)
+            self.assertEqual(bufs.num_rows, 2)
+            self.assertEqual(bufs.count.tolist(), [10, 20])
 
     def test_reference_parquet_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

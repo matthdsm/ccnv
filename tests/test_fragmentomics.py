@@ -4,7 +4,13 @@ import unittest
 
 import numpy as np
 
-from ccnv.models.schemas import FragmentomicsMetadata, PrenatalModelMetadata
+from ccnv._core import FRAG_BAND_EDGES
+from ccnv.models.schemas import (
+    NUM_FRAG_BANDS,
+    FragmentomicsMetadata,
+    PrenatalModelMetadata,
+    SampleBuffers,
+)
 from ccnv.stats.fragmentomics import (
     CANONICAL_CHROMATOSOME_BP,
     FRAG_MAX_LEN,
@@ -12,15 +18,15 @@ from ccnv.stats.fragmentomics import (
     FRAG_NUM_BINS,
     align_histogram,
     build_fragmentomic_feature_vector,
+    compute_band_fisher_weights,
     compute_helical_periodicity,
     compute_motif_diversity_score,
     deconvolve_fetal_maternal_densities,
     encode_kmer_4,
     estimate_sample_landmarks,
-    fisher_optimal_weights,
+    evaluate_band_weighted_counts,
     fit_ff_fragmentomics_ensemble,
     predict_ff_fragmentomics,
-    segment_fragment_llr,
 )
 
 
@@ -197,22 +203,21 @@ class TestFragmentomicsKernels(unittest.TestCase):
         self.assertTrue(138 <= mode_f <= 148, f"p_f mode was {mode_f}")
         self.assertTrue(162 <= mode_m <= 170, f"p_m mode was {mode_m}")
 
-        # Fisher-optimal weights
-        weights = fisher_optimal_weights(p_f_hat, p_m_hat, f0=0.10)
-        self.assertEqual(len(weights), FRAG_NUM_BINS)
-        self.assertTrue(np.all(weights >= 0.25))
-        self.assertTrue(np.all(weights <= 3.0))
+        # 24-band Fisher-optimal weights
+        w_24, mu_f_w, mu_m_w = compute_band_fisher_weights(p_f_hat, p_m_hat, f0=0.10)
+        self.assertEqual(len(w_24), NUM_FRAG_BANDS)
+        self.assertTrue(np.all(w_24 >= 0.25))
+        self.assertTrue(np.all(w_24 <= 3.0))
 
-        # Weight depth conservation: E_{mix}[w*] == 1.0
-        p_mix = 0.10 * p_f_hat + 0.90 * p_m_hat
-        expected_coverage = np.sum(p_mix * weights)
-        self.assertAlmostEqual(expected_coverage, 1.0, places=4)
+        # Maternal density normalizes to unit mean weight; fetal density enriches > 1.0
+        self.assertAlmostEqual(mu_m_w, 1.0, places=4)
+        self.assertGreater(mu_f_w, 1.0)
 
-        # Fetal lengths (143 bp) must have weight > 1.0, maternal (166 bp) weight < 1.0
-        idx_143 = 143 - FRAG_MIN_LEN
-        idx_166 = 166 - FRAG_MIN_LEN
-        self.assertGreater(weights[idx_143], 1.0)
-        self.assertLess(weights[idx_166], 1.0)
+        # Band containing 143 bp has weight > 1.0; band containing 166 bp has weight < 1.0
+        band_143 = int(np.searchsorted(FRAG_BAND_EDGES, 143, side="right") - 1)
+        band_166 = int(np.searchsorted(FRAG_BAND_EDGES, 166, side="right") - 1)
+        self.assertGreater(w_24[band_143], 1.0)
+        self.assertLess(w_24[band_166], 1.0)
 
     def test_deconvolve_low_male_fallback(self) -> None:
         # Cohort with 0 males falls back smoothly to parametric templates
@@ -323,117 +328,54 @@ class TestFragmentomicsKernels(unittest.TestCase):
         assert pred is not None
         self.assertTrue(0.001 < pred < 0.999)
 
-    def test_segment_fragment_llr(self) -> None:
-        lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1)
-        p_f = np.exp(-0.5 * ((lengths - 143.0) / 10.0) ** 2)
-        p_f /= np.sum(p_f)
-        p_m = np.exp(-0.5 * ((lengths - 166.0) / 12.0) ** 2)
-        p_m /= np.sum(p_m)
-
-        # Segment with predominantly short fragments (fetal gain)
-        fetal_segment_lengths = np.random.choice(lengths, size=2000, p=p_f)
-        short_ratio, llr_gain = segment_fragment_llr(
-            lengths=fetal_segment_lengths,
-            shift_bp=0.0,
-            p_fetal=p_f,
-            p_maternal=p_m,
-            active_ff=0.10,
-            is_gain=True,
-        )
-        self.assertGreater(short_ratio, 0.40)
-        # Positive LLR supports fetal origin over maternal origin
-        self.assertGreater(llr_gain, 1.0)
-
-        # Segment with predominantly long maternal fragments
-        maternal_segment_lengths = np.random.choice(lengths, size=2000, p=p_m)
-        _, llr_mat = segment_fragment_llr(
-            lengths=maternal_segment_lengths,
-            shift_bp=0.0,
-            p_fetal=p_f,
-            p_maternal=p_m,
-            active_ff=0.10,
-            is_gain=True,
-        )
-        # Negative LLR supports maternal origin over fetal origin
-        self.assertLess(llr_mat, -1.0)
-
-        # Empty segment or unknown-only (0) lengths return 0.0, 0.0 and 0s are ignored
-        empty_res = segment_fragment_llr(
-            lengths=np.array([], dtype=np.uint16),
-            shift_bp=0.0,
-            p_fetal=p_f,
-            p_maternal=p_m,
-            active_ff=0.10,
-            is_gain=True,
-        )
-        self.assertEqual(empty_res, (0.0, 0.0))
-        zero_only = segment_fragment_llr(
-            lengths=np.array([0, 0, 0], dtype=np.uint16),
-            shift_bp=0.0,
-            p_fetal=p_f,
-            p_maternal=p_m,
-            active_ff=0.10,
-            is_gain=True,
-        )
-        self.assertEqual(zero_only, (0.0, 0.0))
-        sr_padded, llr_padded = segment_fragment_llr(
-            lengths=np.concatenate(
-                [maternal_segment_lengths, np.zeros(500, dtype=int)]
-            ),
-            shift_bp=0.0,
-            p_fetal=p_f,
-            p_maternal=p_m,
-            active_ff=0.10,
-            is_gain=True,
-        )
-        sr_clean, llr_clean = segment_fragment_llr(
-            lengths=maternal_segment_lengths,
-            shift_bp=0.0,
-            p_fetal=p_f,
-            p_maternal=p_m,
-            active_ff=0.10,
-            is_gain=True,
-        )
-        self.assertAlmostEqual(sr_padded, sr_clean)
-        self.assertAlmostEqual(llr_padded, llr_clean)
-
-    def test_evaluate_weighted_coverage(self) -> None:
+    def test_evaluate_band_weighted_counts(self) -> None:
         from helpers import make_sample_table
 
-        from ccnv.features.fragmentomics import evaluate_weighted_coverage
-
-        # 3 bins: bin 0 has lengths [100, 150], bin 1 is empty, bin 2 has length [200]
-        frag_lens = [[100, 150], [], [200]]
         table = make_sample_table(
             [2, 0, 1],
             contigs=["chr1", "chr1", "chr1"],
             starts=[0, 100, 200],
             ends=[100, 200, 300],
-            fragment_lengths=frag_lens,
+            fragment_lengths=[[105, 155], [], [205]],
         )
+        bufs = SampleBuffers.from_table(table)
+        assert bufs.frag_bands is not None
 
-        weights_571 = np.ones(571, dtype=np.float64)
-        # Band [100, 110) -> weight 2.0; band [150, 160) -> weight 0.5; band [200, 220) -> weight 3.0
-        weights_571[100 - 30 : 110 - 30] = 2.0
-        weights_571[150 - 30 : 160 - 30] = 0.5
-        weights_571[200 - 30 : 220 - 30] = 3.0
+        w_24 = np.ones(NUM_FRAG_BANDS, dtype=np.float64)
+        band_105 = int(np.searchsorted(FRAG_BAND_EDGES, 105, side="right") - 1)
+        band_155 = int(np.searchsorted(FRAG_BAND_EDGES, 155, side="right") - 1)
+        band_205 = int(np.searchsorted(FRAG_BAND_EDGES, 205, side="right") - 1)
+        w_24[band_105] = 2.0
+        w_24[band_155] = 0.5
+        w_24[band_205] = 3.0
 
-        eff_cov = evaluate_weighted_coverage(table, weights_571, shift_bp=0.0)
+        eff_cov, kappa = evaluate_band_weighted_counts(
+            bufs.frag_bands, bufs.count, bufs.paired_count, w_24
+        )
         self.assertEqual(len(eff_cov), 3)
-        self.assertAlmostEqual(eff_cov[0], 2.0 + 0.5)
+        self.assertAlmostEqual(eff_cov[0], 2.5)
         self.assertAlmostEqual(eff_cov[1], 0.0)
         self.assertAlmostEqual(eff_cov[2], 3.0)
+        self.assertTrue(np.all(kappa >= 1.0))
 
-        # Fallback to count when fragment_lengths is empty (single-end)
+        # Single-end / zero-paired fallback preserves unweighted counts
         table_se = make_sample_table(
             [5, 10, 15],
             contigs=["chr1", "chr1", "chr1"],
             starts=[0, 100, 200],
             ends=[100, 200, 300],
-            fragment_lengths=[[], [], []],
         )
-        eff_se = evaluate_weighted_coverage(table_se, weights_571)
+        bufs_se = SampleBuffers.from_table(table_se)
+        bands_se = (
+            bufs_se.frag_bands
+            if bufs_se.frag_bands is not None
+            else np.zeros((3, NUM_FRAG_BANDS), dtype=np.uint32)
+        )
+        eff_se, kappa_se = evaluate_band_weighted_counts(
+            bands_se, bufs_se.count, bufs_se.paired_count, w_24
+        )
         np.testing.assert_allclose(eff_se, [5.0, 10.0, 15.0])
+        np.testing.assert_allclose(kappa_se, [1.0, 1.0, 1.0])
 
     def test_extract_bin_fragmentomic_covariates(self) -> None:
         from helpers import make_sample_table
@@ -461,22 +403,10 @@ class TestFragmentomicsKernels(unittest.TestCase):
         # Bin 1 (empty): imputed to median of non-empty bins = median([130, 180]) = 155.0
         self.assertAlmostEqual(mean_lens[1], 155.0)
 
-        # Endpoint ratios: 4/2 = 2.0, 0/1 = 0.0, 2/1 = 2.0
+        # Endpoint ratios: 4/2 = 2.0, 0/max(0,1) = 0.0, 2/1 = 2.0
         self.assertAlmostEqual(ep_ratios[0], 2.0)
         self.assertAlmostEqual(ep_ratios[1], 0.0)
         self.assertAlmostEqual(ep_ratios[2], 2.0)
-
-        # Out-of-range sentinel 0 in fragment_lengths is excluded from mean/count
-        table_with_zeros = make_sample_table(
-            [3, 1, 1],
-            contigs=["chr1", "chr1", "chr1"],
-            starts=[0, 100, 200],
-            ends=[100, 200, 300],
-            fragment_lengths=[[0, 120, 140], [0], [180]],
-            endpoint_counts=[4, 0, 2],
-        )
-        mean_z, _ = extract_bin_fragmentomic_covariates(table_with_zeros)
-        np.testing.assert_allclose(mean_z, [130.0, 155.0, 180.0])
 
     def test_fit_cohort_fragmentomics_model_fewer_than_five_samples_skips_ensemble(
         self,
@@ -548,10 +478,11 @@ class TestFragmentomicsKernels(unittest.TestCase):
             p_fetal_density=[1.0 / 571] * 571,
             p_maternal_density=[1.0 / 571] * 571,
         )
-        weighted_tbl = apply_prenatal_fisher_weighting(sample_tbl, dummy_meta)
-        self.assertIn("kappa_frag", weighted_tbl.column_names)
-        kappa = weighted_tbl.column("kappa_frag").to_numpy()
-        self.assertTrue(np.all(kappa >= 1.0))
+        weighted_bufs = apply_prenatal_fisher_weighting(sample_tbl, dummy_meta)
+        self.assertIsInstance(weighted_bufs, SampleBuffers)
+        self.assertIsNotNone(weighted_bufs.kappa_frag)
+        assert weighted_bufs.kappa_frag is not None
+        self.assertTrue(np.all(weighted_bufs.kappa_frag >= 1.0))
 
 
 if __name__ == "__main__":

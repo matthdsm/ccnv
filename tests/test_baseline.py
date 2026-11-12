@@ -5,7 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
-from ccnv.predict import call_segment
+from ccnv.models import BinResult
+from ccnv.predict import segment_and_call
 from ccnv.stats.segmentation import segment_contig
 
 FIXTURES = Path(__file__).parent / "fixtures" / "benchmark"
@@ -14,11 +15,15 @@ BIN_SIZE = 100_000
 
 class TestBenchmarkNumericAgreement(unittest.TestCase):
     def test_synthetic_segment_means_and_calls_are_concordant(self) -> None:
-        bins_by_contig: dict[str, list[tuple[float, float]]] = {}
+        bins_by_contig: dict[str, list[tuple[float, float, float]]] = {}
         with (FIXTURES / "synthetic" / "normalized_bins.tsv").open() as handle:
             for row in csv.DictReader(handle, delimiter="\t"):
                 bins_by_contig.setdefault(row["chr"], []).append(
-                    (float(row["ratio"]), float(row["weight"]))
+                    (
+                        float(row["ratio"]),
+                        float(row["zscore"]),
+                        float(row["weight"]),
+                    )
                 )
         with (FIXTURES / "synthetic" / "expected_segments.tsv").open() as handle:
             expected_segments = {
@@ -38,14 +43,17 @@ class TestBenchmarkNumericAgreement(unittest.TestCase):
         observed_calls: set[tuple[str, str]] = set()
         absolute_errors: list[float] = []
         for contig, rows in bins_by_contig.items():
-            ratios, weights = zip(*rows, strict=True)
+            ratios, zscores, weights = zip(*rows, strict=True)
+            starts = np.arange(len(rows), dtype=np.int64) * BIN_SIZE
+            ends = np.arange(1, len(rows) + 1, dtype=np.int64) * BIN_SIZE
+            c_len = len(rows) * BIN_SIZE
             segments = segment_contig(
                 contig=contig,
-                starts=np.arange(len(rows)) * BIN_SIZE,
-                ends=np.arange(1, len(rows) + 1) * BIN_SIZE,
+                starts=starts,
+                ends=ends,
                 ratios=ratios,
                 weights=weights,
-                contig_length=len(rows) * BIN_SIZE,
+                contig_length=c_len,
                 penalty=0.01,
             )
             self.assertEqual(len(segments), 1)
@@ -59,14 +67,37 @@ class TestBenchmarkNumericAgreement(unittest.TestCase):
                 BIN_SIZE,
             )
             absolute_errors.append(abs(segments[0].mean - expected_ratio))
-            call = call_segment(
-                segments[0].mean,
-                math.nan,
+
+            r_arr = np.asarray(ratios, dtype=np.float64)
+            z_arr = np.asarray(zscores, dtype=np.float64)
+            w_mask = np.asarray(weights, dtype=np.float64) > 0.0
+            nz = np.abs(r_arr) > 1e-9
+            prec_arr = np.where(
+                w_mask,
+                np.where(nz, np.square(z_arr / np.where(nz, r_arr, 1.0)), 100.0),
+                0.0,
+            )
+            bin_res = BinResult(
+                branch="autosomal",
+                contigs=(contig,) * len(rows),
+                starts=starts,
+                ends=ends,
+                ratios=r_arr,
+                zscores=z_arr,
+                weights=prec_arr,
+                reference_sizes=np.full(len(rows), 10, dtype=np.int64),
+                masked=~(np.isfinite(r_arr) & w_mask),
+            )
+            called = segment_and_call(
+                (bin_res,),
+                {contig: c_len},
+                penalty=0.01,
                 z_threshold=3.0,
                 ratio_threshold=0.2,
             )
-            if call is not None:
-                observed_calls.add((contig, call))
+            for seg in called:
+                if seg.call is not None:
+                    observed_calls.add((contig, seg.call))
 
         self.assertLessEqual(float(np.max(absolute_errors)), 1e-12)
         self.assertEqual(observed_calls, expected_calls)
@@ -107,13 +138,8 @@ class TestBenchmarkNumericAgreement(unittest.TestCase):
                 contig_length=int(columns[1][-1]),
                 penalty=0.05,
             ):
-                call = call_segment(
-                    segment.mean,
-                    math.nan,
-                    z_threshold=3.0,
-                    ratio_threshold=0.05,
-                )
-                if call is not None:
+                if math.isfinite(segment.mean) and abs(segment.mean) > 0.05:
+                    call = "gain" if segment.mean > 0.0 else "loss"
                     observed.append((contig, segment.start, segment.end, call))
 
         self.assertEqual(len(expected), 1)

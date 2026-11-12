@@ -4,8 +4,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import pyarrow as pa
-import pyarrow.parquet as pq
 import yaml
 from helpers import (
     make_reference_table,
@@ -14,7 +12,7 @@ from helpers import (
 )
 from typer.testing import CliRunner
 
-from ccnv.cli import SampleInputError, app, expand_sample_inputs
+from ccnv.cli import app
 from ccnv.reference import DEFAULT_SEX_CONTIGS, DEFAULT_SEX_SIGNAL_CONTIGS
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -68,27 +66,6 @@ class TestCliPathChecks(unittest.TestCase):
 
 
 class TestReferenceSampleExpansion(unittest.TestCase):
-    def test_directory_is_searched_recursively_for_sample_parquet(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            nested = root / "batch" / "lane"
-            nested.mkdir(parents=True)
-            first = _write_sample(nested / "a.ccnv")
-            second = _write_sample(root / "batch" / "c.ccnv")
-            (nested / "notes.txt").write_text("ignore")
-            pq.write_table(pa.table({"x": [1]}), nested / "other.ccnv")
-            extra = _write_sample(root / "explicit.ccnv")
-
-            expanded = expand_sample_inputs([root / "batch", extra])
-            self.assertEqual(expanded, (second, first, extra.resolve()))
-
-    def test_empty_directory_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            empty = Path(tmpdir) / "empty"
-            empty.mkdir()
-            with self.assertRaisesRegex(SampleInputError, "no sample CCNV files"):
-                expand_sample_inputs([empty])
-
     def test_cli_reference_with_samplesheet(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -141,7 +118,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
         self.assertIn("chrY]", _cli_text(result.output))
         self.assertIn("[default: chrY]", _cli_text(result.output))
         self.assertIn("[default: 5]", _cli_text(result.output))
-        self.assertIn("[default: 300]", _cli_text(result.output))
+        self.assertNotIn("--nearest-bins", _cli_text(result.output))
         self.assertIn("--samplesheet", _cli_text(result.output))
         self.assertIn("-s", _cli_text(result.output))
         self.assertIn("--fasta", _cli_text(result.output))
@@ -320,17 +297,11 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 _cli_text(result.output),
             )
 
-    def test_reference_rejects_samples_with_samplesheet_or_fasta(self) -> None:
+    def test_reference_rejects_positional_samples_and_nearest_bins(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.ccnv")
             sheet = _write_samplesheet(root / "samples.yaml", [sample])
-            fasta = root / "genome.fa"
-            fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
-            expected = (
-                "cannot combine positional sample arguments with "
-                "--samplesheet or --fasta"
-            )
 
             res1 = CliRunner().invoke(
                 app,
@@ -343,22 +314,23 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                     str(root / "ref"),
                 ],
             )
-            self.assertEqual(res1.exit_code, 2)
-            self.assertIn(expected, _cli_text(res1.output))
+            self.assertNotEqual(res1.exit_code, 0)
+            self.assertIn("unexpected extra argument", _cli_text(res1.output).lower())
 
             res2 = CliRunner().invoke(
                 app,
                 [
                     "reference",
-                    str(sample),
-                    "--fasta",
-                    str(fasta),
+                    "--samplesheet",
+                    str(sheet),
+                    "--nearest-bins",
+                    "10",
                     "--prefix",
                     str(root / "ref"),
                 ],
             )
-            self.assertEqual(res2.exit_code, 2)
-            self.assertIn(expected, _cli_text(res2.output))
+            self.assertNotEqual(res2.exit_code, 0)
+            self.assertIn("No such option", _cli_text(res2.output))
 
     def test_reference_forwards_fasta(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -633,7 +605,6 @@ def _write_reference(path: Path) -> Path:
             "sample_sexes": None,
             "sex_inference": None,
             "pca_components": 1,
-            "nearest_bins": 1,
             "max_batch_memory_mb": 64,
             "flat": False,
         },

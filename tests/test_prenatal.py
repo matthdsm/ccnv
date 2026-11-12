@@ -19,18 +19,20 @@ import yaml
 from ccnv.cli import AnalysisMode
 from ccnv.features.binning import bin_intervals
 from ccnv.features.prenatal import (
-    annotate_prenatal_segments,
-    classify_sca,
+    _evaluate_sca_and_active_ff,
     fit_prenatal_models,
     predict_prenatal,
 )
+from ccnv.features.prenatal_origin import annotate_prenatal_origin_and_lod
 from ccnv.io.parquet import write_sample_parquet
 from ccnv.models import (
     NUM_FRAG_BANDS,
+    FetalSex,
     PredictConfig,
     ReadFilters,
     ReferenceConfig,
     SamplesheetEntry,
+    assemble_reference_table,
     parquet_path,
 )
 from ccnv.models.results import (
@@ -120,6 +122,43 @@ def _build_synthetic_sample(
         },
         schema=SAMPLE_SCHEMA.with_metadata(metadata),
     )
+
+
+def classify_sca(
+    fetal_sex: FetalSex,
+    *,
+    ffy: float | None,
+    ffx: float,
+    ffa: float,
+    chrx_ratio: float,
+    prenatal_meta: PrenatalModelMetadata,
+) -> SCAResult:
+    """Thin test wrapper around 4D ray SCA classification."""
+    sca, _, _, _ = _evaluate_sca_and_active_ff(
+        fetal_sex=fetal_sex,
+        ffy=ffy,
+        ffx=ffx,
+        ffa=ffa,
+        chrx_ratio=chrx_ratio,
+        prenatal_meta=prenatal_meta,
+    )
+    return sca
+
+
+def annotate_prenatal_segments(
+    segments: list[SegmentResult],
+    prenatal_result: FetalFractionResult,
+    *,
+    z_threshold: float = 3.0,
+) -> list[SegmentResult]:
+    """Thin test wrapper around annotate_prenatal_origin_and_lod."""
+    annotated, _ = annotate_prenatal_origin_and_lod(
+        segments,
+        active_ff=prenatal_result.active_ff,
+        sca_call=prenatal_result.sca.call,
+        z_threshold=z_threshold,
+    )
+    return list(annotated)
 
 
 class TestClassifySCA(unittest.TestCase):
@@ -472,13 +511,15 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
             )
 
     def test_fit_prenatal_models(self) -> None:
-        auto_tbl, ffy_tbl, meta, resolved_sex = fit_prenatal_models(
+        auto_fit, ffy_fit, meta, resolved_sex = fit_prenatal_models(
             self.sample_tables,
             self.entries,
             bin_size=5000,
             prenatal_bin_size=100000,
             seed=42,
         )
+        auto_tbl = auto_fit.to_table(target_pca_rank=len(meta.olm_weights))
+        ffy_tbl = ffy_fit.to_table(target_pca_rank=len(meta.olm_weights))
 
         # Validate returned table schemas
         expected_schema = build_reference_schema(len(meta.olm_weights))
@@ -502,7 +543,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         self.assertTrue(meta.ffa_logit_mode)
 
     def test_predict_prenatal(self) -> None:
-        auto_tbl, ffy_tbl, meta, _ = fit_prenatal_models(
+        auto_fit, ffy_fit, meta, _ = fit_prenatal_models(
             self.sample_tables,
             self.entries,
             bin_size=5000,
@@ -511,7 +552,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         )
 
         # Combine into reference table
-        ref_table = pa.concat_tables([auto_tbl, ffy_tbl])
+        ref_table = assemble_reference_table([auto_fit, ffy_fit])
 
         # Predict on a male sample
         male_sample = self.sample_tables[4]
@@ -519,7 +560,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         self.assertEqual(res_male.fetal_sex, "M")
         self.assertIsNotNone(res_male.ffy)
         self.assertGreater(res_male.active_ff, 0.0)
-        self.assertEqual(res_male.active_ff_source, "FFY")
+        self.assertIn(res_male.active_ff_source, ("FFY", "FUSED"))
 
         # Predict on a female sample
         female_sample = self.sample_tables[1]
@@ -531,14 +572,14 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         self.assertEqual(res_female.active_ff_source, "FFA")
 
     def test_predict_prenatal_olm_fallback(self) -> None:
-        auto_tbl, ffy_tbl, meta, _ = fit_prenatal_models(
+        auto_fit, ffy_fit, meta, _ = fit_prenatal_models(
             self.sample_tables,
             self.entries,
             bin_size=5000,
             prenatal_bin_size=100000,
             seed=42,
         )
-        ref_table = pa.concat_tables([auto_tbl, ffy_tbl])
+        ref_table = assemble_reference_table([auto_fit, ffy_fit])
         fallback_meta = replace(
             meta,
             olm_weights=[0.0] * len(meta.olm_weights),
@@ -560,28 +601,28 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
     def test_fit_prenatal_models_all_female_cohort(self) -> None:
         females = self.sample_tables[:3]
         f_entries = self.entries[:3]
-        auto_tbl, ffy_tbl, meta, resolved_sex = fit_prenatal_models(
+        auto_fit, ffy_fit, meta, resolved_sex = fit_prenatal_models(
             females, f_entries, bin_size=5000, prenatal_bin_size=100000
         )
         self.assertEqual(resolved_sex, (False, False, False))
-        self.assertEqual(auto_tbl.num_rows, 4)
-        self.assertEqual(ffy_tbl.num_rows, 60)
+        self.assertEqual(auto_fit.num_rows, 4)
+        self.assertEqual(ffy_fit.num_rows, 60)
         self.assertIsNotNone(meta)
 
     def test_predict_prenatal_missing_branch_errors(self) -> None:
-        auto_tbl, ffy_tbl, meta, _ = fit_prenatal_models(
+        auto_fit, ffy_fit, meta, _ = fit_prenatal_models(
             self.sample_tables, self.entries, 5000, 100000
         )
         with self.assertRaises(ValueError):
-            predict_prenatal(self.sample_tables[0], auto_tbl, meta)
+            predict_prenatal(self.sample_tables[0], auto_fit.to_table(), meta)
         with self.assertRaises(ValueError):
-            predict_prenatal(self.sample_tables[0], ffy_tbl, meta)
+            predict_prenatal(self.sample_tables[0], ffy_fit.to_table(), meta)
 
     def test_predict_prenatal_low_ff_warning(self) -> None:
-        auto_tbl, ffy_tbl, meta, _ = fit_prenatal_models(
+        auto_fit, ffy_fit, meta, _ = fit_prenatal_models(
             self.sample_tables, self.entries, 5000, 100000
         )
-        ref_table = pa.concat_tables([auto_tbl, ffy_tbl])
+        ref_table = assemble_reference_table([auto_fit, ffy_fit])
 
         # High min_ff_warning threshold (0.50) triggers low_ff_warning
         res = predict_prenatal(
@@ -609,10 +650,10 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
     def test_predict_prenatal_autosomal_coordinate_fallback_with_extra_contigs(
         self,
     ) -> None:
-        auto_tbl, ffy_tbl, meta, _ = fit_prenatal_models(
+        auto_fit, ffy_fit, meta, _ = fit_prenatal_models(
             self.sample_tables, self.entries, 5000, 100000
         )
-        ref_table = pa.concat_tables([auto_tbl, ffy_tbl])
+        ref_table = assemble_reference_table([auto_fit, ffy_fit])
 
         # Extra contigs (chr13, chr18, chr21) present in sample
         # but not in prenatal_autosomal reference
@@ -646,10 +687,10 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
     def test_predict_prenatal_chry_coordinate_fallback_with_mismatched_bins(
         self,
     ) -> None:
-        auto_tbl, ffy_tbl, meta, _ = fit_prenatal_models(
+        auto_fit, ffy_fit, meta, _ = fit_prenatal_models(
             self.sample_tables, self.entries, 5000, 100000
         )
-        ref_table = pa.concat_tables([auto_tbl, ffy_tbl])
+        ref_table = assemble_reference_table([auto_fit, ffy_fit])
 
         # Fewer chrY bins (200 kb vs reference 300 kb)
         sample_lengths = {
@@ -735,7 +776,6 @@ def _setup_synthetic_cohort_and_references(
             prenatal_bin_size=100000,
             min_cohort_size=4,
             min_sex_group_size=2,
-            nearest_bins=5,
             pca_components=2,
             qc_report=qc_report,
         )
@@ -752,7 +792,6 @@ def _setup_synthetic_cohort_and_references(
                 bin_size=5000,
                 min_cohort_size=4,
                 min_sex_group_size=2,
-                nearest_bins=5,
                 pca_components=2,
                 qc_report=qc_report,
             )
@@ -848,7 +887,7 @@ class TestPrenatalEndToEndIntegration(unittest.TestCase):
                 self.assertIn(key, p_qc)
             self.assertEqual(p_qc["fetal_sex"], "M")
             self.assertGreater(p_qc["active_ff"], 0.0)
-            self.assertEqual(p_qc["active_ff_source"], "FFY")
+            self.assertIn(p_qc["active_ff_source"], ("FFY", "FUSED"))
             self.assertTrue(any(s.discordant for s in outputs.segments))
 
             # 2. Assert <prefix>_segments.bed.gz (15 columns with #contig header)

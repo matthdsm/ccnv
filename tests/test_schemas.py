@@ -36,7 +36,6 @@ from ccnv.models.schemas import (
     ReferenceMetadata,
     SchemaError,
     SchemaVersionError,
-    bin_coordinates,
     build_reference_schema,
     decode_metadata,
     metadata_for,
@@ -390,10 +389,14 @@ class TestSchemaContracts(unittest.TestCase):
             },
             schema=SAMPLE_SCHEMA.with_metadata(metadata),
         )
-        self.assertEqual(
-            bin_coordinates(table),
-            (("chr1", 0, 100), ("chr2", 0, 80)),
+        codes, names, starts, ends = reconstruct_sample_grid(
+            validate_sample_table(table)
         )
+        coords = tuple(
+            (names[int(c)], int(s), int(e))
+            for c, s, e in zip(codes, starts, ends, strict=True)
+        )
+        self.assertEqual(coords, (("chr1", 0, 100), ("chr2", 0, 80)))
 
     def test_reference_schema_accepted_and_old_rejected(self) -> None:
         ref_meta = metadata_for(
@@ -521,7 +524,7 @@ class TestSchemaContracts(unittest.TestCase):
         self.assertEqual(loaded.ffy_std, 0.01)
         self.assertEqual(loaded.ffa_std, 0.02)
         self.assertEqual(loaded.ffx_std, 0.025)
-        self.assertFalse(loaded.ffa_logit_mode)
+        self.assertTrue(loaded.ffa_logit_mode)
 
     def test_prenatal_model_metadata_rejects_missing_keys_or_empty_dict(self) -> None:
         with self.assertRaises(KeyError):

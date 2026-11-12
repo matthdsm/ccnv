@@ -8,7 +8,6 @@ import numpy as np
 
 from ccnv.features.covariates import (
     build_exogenous_covariate_basis,
-    correct_covariate_bias,
     fit_poisson_covariate_trends,
 )
 from ccnv.models import InvalidInputError
@@ -175,18 +174,6 @@ class TestPoissonCovariates(unittest.TestCase):
         diploid[500:750] = False
         mosaic_ratio = float(np.median(ratios[500:750]) / np.median(ratios[diploid]))
         self.assertAlmostEqual(mosaic_ratio, 1.20, delta=0.03)
-
-        # Compatibility bridge ignores endogenous sample-level fragmentomics
-        bridged = correct_covariate_bias(
-            counts[:, 0],
-            usable,
-            gc=gc,
-            mappability=mapp,
-            mean_frag_len=sample_frag_len,
-            endpoint_ratio=sample_ep_ratio,
-        )
-        bridge_ratio = float(np.median(bridged[500:750]) / np.median(bridged[diploid]))
-        self.assertAlmostEqual(bridge_ratio, 1.20, delta=0.04)
 
     def test_cnv_outlier_winsorization_resists_focal_amplicon_and_deletion(
         self,

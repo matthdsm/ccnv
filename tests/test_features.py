@@ -8,38 +8,35 @@ import numpy as np
 from helpers import make_sample_table
 
 from ccnv.features.binning import (
-    bin_counts,
     bin_intervals,
+    compute_bin_exposure,
     rebin_counts,
 )
 from ccnv.features.cohort import (
     Cohort,
+    estimate_superblock_size_factors,
     infer_sample_sexes,
-    mask_low_coverage,
-    normalize_depth,
-    rebin_sample_table,
+    mask_low_coverage_per_contig,
     validate_cohort,
 )
 from ccnv.features.covariates import (
     DEFAULT_MIN_MAPPABILITY,
-    correct_covariate_bias,
+    build_exogenous_covariate_basis,
     covariate_features,
+    fit_poisson_covariate_trends,
     mask_covariates,
     validate_min_mappability,
 )
-from ccnv.features.prenatal import (
-    annotate_prenatal_segments,
-    classify_sca,
-)
+from ccnv.features.prenatal_origin import annotate_prenatal_origin_and_lod
+from ccnv.features.rebinning import rebin_sample_buffers, rebin_sample_sketch
 from ccnv.models import (
     BinCompatibilityError,
     CovariateError,
-    FetalFractionResult,
-    PrenatalModelMetadata,
     ReferenceError,
-    SCAResult,
+    SampleBuffers,
     SegmentResult,
 )
+from ccnv.stats.prenatal_math import classify_sca_ray_4d
 
 
 class TestFeaturesBinning(unittest.TestCase):
@@ -54,16 +51,11 @@ class TestFeaturesBinning(unittest.TestCase):
         with self.assertRaises(ValueError):
             bin_intervals(100, 0)
 
-    def test_bin_counts(self) -> None:
-        starts = np.array([5, 12, 105, 199, 250], dtype=np.int64)
-        counts = bin_counts(starts, bin_size=100, n_bins=3)
-        np.testing.assert_array_equal(counts, [2, 2, 1])
-
-    def test_bin_counts_empty_and_invalid(self) -> None:
-        counts = bin_counts(np.empty(0, dtype=np.int64), bin_size=100, n_bins=3)
-        np.testing.assert_array_equal(counts, [0, 0, 0])
-        with self.assertRaises(ValueError):
-            bin_counts(np.array([1]), 100, 0)
+    def test_compute_bin_exposure(self) -> None:
+        starts = np.array([0, 100, 200], dtype=np.int64)
+        ends = np.array([100, 200, 250], dtype=np.int64)
+        exp = compute_bin_exposure(starts, ends, 100)
+        np.testing.assert_allclose(exp, [1.0, 1.0, 0.5])
 
     def test_rebin_counts_coarsening(self) -> None:
         src_s = np.array([0, 50, 100, 150], dtype=np.int64)
@@ -99,20 +91,33 @@ class TestFeaturesBinning(unittest.TestCase):
 
 
 class TestFeaturesCohort(unittest.TestCase):
-    def test_normalize_depth(self) -> None:
-        counts = np.array([[10.0, 20.0], [30.0, 60.0]], dtype=np.float64)
-        norm = normalize_depth(counts)
-        np.testing.assert_allclose(norm[:, 0], [15.0, 45.0])
-        np.testing.assert_allclose(norm[:, 1], [15.0, 45.0])
+    def test_superblock_size_factors(self) -> None:
+        counts = np.array([[10.0, 20.0], [30.0, 60.0]], dtype=np.float32)
+        contigs = ("chr1", "chr1")
+        starts = np.array([0, 100], dtype=np.int64)
+        ends = np.array([100, 200], dtype=np.int64)
+        usable = np.ones(2, dtype=np.bool_)
+        sf = estimate_superblock_size_factors(
+            counts, contigs, starts, ends, usable, block_bp=100
+        )
+        np.testing.assert_allclose(sf[1] / sf[0], 2.0, rtol=1e-6)
 
-    def test_normalize_depth_zero_sum_fails(self) -> None:
-        counts = np.array([[0.0, 10.0], [0.0, 20.0]])
+    def test_superblock_size_factors_zero_sum_fails(self) -> None:
+        counts = np.array([[0.0, 10.0], [0.0, 20.0]], dtype=np.float32)
         with self.assertRaises(ReferenceError):
-            normalize_depth(counts)
+            estimate_superblock_size_factors(
+                counts,
+                ("chr1", "chr1"),
+                np.array([0, 100], dtype=np.int64),
+                np.array([100, 200], dtype=np.int64),
+                np.ones(2, dtype=np.bool_),
+                block_bp=100,
+            )
 
-    def test_mask_low_coverage(self) -> None:
-        norm = np.array([[0.0], [0.01], [1.0], [1.1], [1.0]], dtype=np.float64)
-        mask = mask_low_coverage(norm)
+    def test_mask_low_coverage_per_contig(self) -> None:
+        counts = np.array([[0.0], [0.01], [100.0], [110.0], [100.0]], dtype=np.float32)
+        exp = np.ones(5, dtype=np.float32)
+        mask = mask_low_coverage_per_contig(counts, ("chr1",) * 5, exp)
         self.assertFalse(mask[0])
         self.assertFalse(mask[1])
         self.assertTrue(mask[2])
@@ -145,13 +150,15 @@ class TestFeaturesCohort(unittest.TestCase):
         np.testing.assert_allclose(cohort.counts[:, 0], [10.0, 20.0])
         np.testing.assert_allclose(cohort.counts[:, 1], [10.0, 20.0])
 
-    def test_rebin_sample_table(self) -> None:
+    def test_rebin_sample_sketch_and_buffers(self) -> None:
         t = make_sample_table([5, 5, 10, 10], contig_lengths={"chr1": 200}, bin_size=50)
-        rebinned = rebin_sample_table(t, target_bin_size=100)
+        rebinned = rebin_sample_sketch(t, target_bin_size=100)
         self.assertEqual(rebinned.num_rows, 2)
         np.testing.assert_allclose(rebinned.column("count").to_numpy(), [10, 20])
+        bufs = rebin_sample_buffers(SampleBuffers.from_table(t), 100)
+        np.testing.assert_allclose(bufs.count, [10, 20])
         with self.assertRaises(BinCompatibilityError):
-            rebin_sample_table(t, target_bin_size=25)
+            rebin_sample_sketch(t, target_bin_size=25)
 
 
 class TestFeaturesCovariates(unittest.TestCase):
@@ -184,7 +191,7 @@ class TestFeaturesCovariates(unittest.TestCase):
         self.assertFalse(masked[2])
         self.assertFalse(masked[3])
 
-    def test_covariate_features(self) -> None:
+    def test_covariate_features_and_poisson_trend(self) -> None:
         usable = np.array([True, True, True, True, False])
         gc = np.array([0.3, 0.4, 0.5, 0.6, 0.9])
         mappability = np.array([0.8, 0.85, 0.9, 0.95, 0.5])
@@ -195,79 +202,95 @@ class TestFeaturesCovariates(unittest.TestCase):
         self.assertEqual(features.shape, (4, 2))
         np.testing.assert_allclose(np.mean(features, axis=0), [0.0, 0.0], atol=1e-10)
 
-    def test_correct_covariate_bias(self) -> None:
-        usable = np.ones(10, dtype=np.bool_)
-        gc = np.linspace(0.3, 0.7, 10)
-        counts = 100.0 * (1.0 + 2.0 * gc)
-        corrected = correct_covariate_bias(counts, usable, gc=gc)
-        self.assertEqual(corrected.shape, (10,))
-        self.assertLess(np.std(corrected), np.std(counts))
+        usable_10 = np.ones(10, dtype=np.bool_)
+        gc_10 = np.linspace(0.3, 0.7, 10)
+        counts_10 = (100.0 * (1.0 + 2.0 * gc_10)).astype(np.float64)
+        design = build_exogenous_covariate_basis(usable_10, bin_size=5000, gc=gc_10)
+        trends = fit_poisson_covariate_trends(
+            counts_10,
+            np.array([1.0], dtype=np.float64),
+            np.ones(10, dtype=np.float64),
+            usable_10,
+            design,
+        )[:, 0]
+        self.assertEqual(trends.shape, (10,))
+        self.assertLess(np.std(counts_10 / trends), np.std(counts_10))
 
 
 class TestFeaturesPrenatal(unittest.TestCase):
-    def setUp(self) -> None:
-        self.meta = PrenatalModelMetadata(
-            prenatal_bin_size=100_000,
-            yfrac_threshold=0.002,
-            ffy_intercept=0.0,
-            ffy_slope=1.0,
-            olm_weights=[0.1],
-            olm_bias=0.0,
-            ffx_intercept=2.0,
-            ffx_slope=-2.0,
-            female_chrx_ratio_mean=1.0,
-            female_chrx_ratio_std=0.02,
-        )
-
-    def test_classify_sca_female(self) -> None:
-        res_xx = classify_sca(
-            "F", None, ffx=0.0, ffa=0.1, chrx_ratio=1.0, prenatal_meta=self.meta
-        )
-        self.assertEqual(res_xx.call, "XX")
-        self.assertFalse(res_xx.is_aneuploid)
-
-        res_xo = classify_sca(
-            "F", None, ffx=0.2, ffa=0.1, chrx_ratio=0.9, prenatal_meta=self.meta
-        )
-        self.assertEqual(res_xo.call, "XO")
-        self.assertTrue(res_xo.is_aneuploid)
-
-        res_xxx = classify_sca(
-            "F", None, ffx=-0.2, ffa=0.1, chrx_ratio=1.1, prenatal_meta=self.meta
-        )
-        self.assertEqual(res_xxx.call, "XXX")
-        self.assertTrue(res_xxx.is_aneuploid)
-
-    def test_classify_sca_male(self) -> None:
-        res_xy = classify_sca(
-            "M", ffy=0.1, ffx=0.1, ffa=0.1, chrx_ratio=0.95, prenatal_meta=self.meta
-        )
-        self.assertEqual(res_xy.call, "XY")
-        self.assertFalse(res_xy.is_aneuploid)
-
-        res_xxy = classify_sca(
-            "M", ffy=0.1, ffx=-0.1, ffa=0.1, chrx_ratio=1.0, prenatal_meta=self.meta
-        )
-        self.assertEqual(res_xxy.call, "XXY")
-        self.assertTrue(res_xxy.is_aneuploid)
-
-    def test_annotate_prenatal_segments(self) -> None:
-        sca = SCAResult("XY", False, 0.9, 0.0, 0.0)
-        ff_res = FetalFractionResult(
-            fetal_sex="M",
-            active_ff=0.10,
-            active_ff_source="FFY",
-            ffy=0.10,
-            ffx=0.10,
+    def test_classify_sca_ray_4d_female_and_male(self) -> None:
+        fem_priors = {
+            "XX": 0.90,
+            "XO": 0.05,
+            "XXX": 0.05,
+            "XY": 1e-6,
+            "XXY": 1e-6,
+            "XYY": 1e-6,
+        }
+        male_priors = {
+            "XY": 0.90,
+            "XXY": 0.05,
+            "XYY": 0.05,
+            "XX": 1e-6,
+            "XO": 1e-6,
+            "XXX": 1e-6,
+        }
+        call_xx, *_ = classify_sca_ray_4d(
+            delta_x=0.0,
+            sigma_x=0.02,
+            ffy=0.0,
+            sigma_ffy=0.01,
             ffa=0.10,
-            chrx_ratio=0.95,
-            chry_score=0.01,
-            yfrac_threshold=0.002,
-            sca=sca,
-            low_ff_warning=False,
-            warnings=(),
+            sigma_ffa=0.02,
+            clinical_priors=fem_priors,
         )
+        self.assertEqual(call_xx, "XX")
 
+        call_xo, *_ = classify_sca_ray_4d(
+            delta_x=-0.05,
+            sigma_x=0.01,
+            ffy=0.0,
+            sigma_ffy=0.01,
+            ffa=0.10,
+            sigma_ffa=0.02,
+            clinical_priors=fem_priors,
+        )
+        self.assertEqual(call_xo, "XO")
+
+        call_xxx, *_ = classify_sca_ray_4d(
+            delta_x=0.05,
+            sigma_x=0.01,
+            ffy=0.0,
+            sigma_ffy=0.01,
+            ffa=0.10,
+            sigma_ffa=0.02,
+            clinical_priors=fem_priors,
+        )
+        self.assertEqual(call_xxx, "XXX")
+
+        call_xy, *_ = classify_sca_ray_4d(
+            delta_x=-0.05,
+            sigma_x=0.02,
+            ffy=0.10,
+            sigma_ffy=0.01,
+            ffa=0.10,
+            sigma_ffa=0.02,
+            clinical_priors=male_priors,
+        )
+        self.assertEqual(call_xy, "XY")
+
+        call_xxy, *_ = classify_sca_ray_4d(
+            delta_x=0.0,
+            sigma_x=0.01,
+            ffy=0.10,
+            sigma_ffy=0.01,
+            ffa=0.10,
+            sigma_ffa=0.02,
+            clinical_priors=male_priors,
+        )
+        self.assertEqual(call_xxy, "XXY")
+
+    def test_annotate_prenatal_origin_and_lod(self) -> None:
         segments = [
             SegmentResult(
                 contig="chr1",
@@ -291,7 +314,11 @@ class TestFeaturesPrenatal(unittest.TestCase):
             ),
         ]
 
-        annotated = annotate_prenatal_segments(segments, ff_res)
+        annotated, _ = annotate_prenatal_origin_and_lod(
+            segments,
+            active_ff=0.10,
+            sca_call="XY",
+        )
         self.assertEqual(len(annotated), 2)
         self.assertFalse(annotated[0].discordant)
         self.assertTrue(annotated[1].discordant)

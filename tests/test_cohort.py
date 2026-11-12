@@ -5,12 +5,19 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
 import pyarrow.parquet as pq
 from helpers import make_sample_table
 
-from ccnv.features.cohort import rebin_cohort, validate_cohort
-from ccnv.io.parquet import read_sample_tables
+from ccnv.features.cohort import (
+    Cohort,
+    InvalidInputError,
+    estimate_size_factors,
+    load_and_assemble_cohort,
+    rebin_cohort,
+    validate_cohort,
+)
+from ccnv.features.rebinning import rebin_sample_buffers, rebin_sample_sketch
+from ccnv.models import SamplesheetEntry
 from ccnv.models.exceptions import ReferenceError
 
 
@@ -93,8 +100,9 @@ class TestCohortLoading(unittest.TestCase):
                 pq.write_table(t, p)
                 paths.append(p)
 
-            cohort_seq = validate_cohort(read_sample_tables(tuple(paths), threads=1))
-            cohort_par = validate_cohort(read_sample_tables(tuple(paths), threads=2))
+            entries = tuple(SamplesheetEntry(filepath=p) for p in paths)
+            cohort_seq = load_and_assemble_cohort(entries, threads=1)
+            cohort_par = load_and_assemble_cohort(entries, threads=2)
 
             np.testing.assert_array_equal(cohort_seq.counts, cohort_par.counts)
             self.assertEqual(cohort_seq.contigs, cohort_par.contigs)
@@ -112,8 +120,6 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
     def test_normalize_depth_median_of_ratios_matches_deseq2_and_resists_trisomy(
         self,
     ) -> None:
-        from ccnv.features.cohort import estimate_size_factors, normalize_depth
-
         # 10 bins x 4 samples; sample 0 has 2x library depth and a 10x amplification in bins 0..2
         base = np.full((10, 4), 100.0, dtype=np.float64)
         base[:, 0] = 200.0
@@ -129,20 +135,17 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             rtol=1e-12,
         )
 
-        normed = normalize_depth(base)
+        normed = base / sf
         # Unamplified diploid bins (3..9) in sample 0 must equal diploid bins in samples 1..3
         np.testing.assert_allclose(normed[3:, 0], normed[3:, 1], rtol=1e-12)
 
     def test_normalize_depth_sparse_zero_fallback(self) -> None:
-        from ccnv.features.cohort import normalize_depth
-
         sparse = np.array([[10.0, 0.0], [0.0, 20.0]], dtype=np.float64)
-        normed = normalize_depth(sparse)
+        sf = estimate_size_factors(sparse)
+        normed = sparse / sf
         np.testing.assert_allclose(normed.sum(axis=0), [15.0, 15.0], rtol=1e-12)
 
     def test_rebin_cohort_polars_fast_path_coarsening(self) -> None:
-        from ccnv.features.cohort import Cohort, rebin_cohort
-
         cohort = Cohort(
             counts=np.arange(1, 9, dtype=np.float64).reshape(4, 2),
             contigs=("chr1", "chr1", "chr1", "chr1"),
@@ -159,8 +162,6 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         np.testing.assert_allclose(rebinned.counts, [[4.0, 6.0], [12.0, 14.0]])
 
     def test_estimate_size_factors_validation(self) -> None:
-        from ccnv.features.cohort import InvalidInputError, estimate_size_factors
-
         with self.assertRaises(InvalidInputError):
             estimate_size_factors(np.array([1.0, 2.0]))
 
@@ -183,7 +184,6 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             )
 
     def test_rebin_sample_table_polars_fast_path(self) -> None:
-        from ccnv.features.cohort import rebin_sample_table
         from ccnv.models import SampleMetadata, reconstruct_sample_grid
 
         table = make_sample_table(
@@ -194,7 +194,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             contig_lengths={"chr1": 180, "chr2": 100},
             bin_size=50,
         )
-        rebinned = rebin_sample_table(table, 100)
+        rebinned = rebin_sample_sketch(table, 100)
         codes, names, starts, ends = reconstruct_sample_grid(
             SampleMetadata.from_table(rebinned)
         )
@@ -204,7 +204,6 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         self.assertEqual([names[int(c)] for c in codes], ["chr1", "chr1", "chr2"])
 
     def test_rebin_sample_table_boundary_crossing_overlap_redistribution(self) -> None:
-        from ccnv.features.cohort import rebin_sample_table
         from ccnv.models import SampleMetadata, reconstruct_sample_grid
 
         # Non-nested coarsening 20 bp -> 50 bp across 140 bp contig (7 bins -> 3 bins)
@@ -216,7 +215,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             contig_lengths={"chr1": 140},
             bin_size=20,
         )
-        rebinned = rebin_sample_table(table, 50)
+        rebinned = rebin_sample_sketch(table, 50)
         _, _, starts, ends = reconstruct_sample_grid(
             SampleMetadata.from_table(rebinned)
         )
@@ -227,15 +226,22 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         )
 
     def test_rebin_cohort_boundary_crossing_overlap_redistribution(self) -> None:
-        from ccnv.features.cohort import Cohort, rebin_cohort
-
         cohort = Cohort(
-            counts=np.array([[20.0, 40.0], [30.0, 60.0], [40.0, 80.0]]),
-            contigs=("chr1", "chr1", "chr1"),
-            starts=np.array([10, 45, 90], dtype=np.int64),
-            ends=np.array([30, 75, 110], dtype=np.int64),
+            counts=np.array(
+                [
+                    [30.0, 60.0],
+                    [30.0, 60.0],
+                    [60.0, 120.0],
+                    [30.0, 60.0],
+                    [0.0, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+            contigs=("chr1", "chr1", "chr1", "chr1", "chr1"),
+            starts=np.array([0, 30, 60, 90, 120], dtype=np.int64),
+            ends=np.array([30, 60, 90, 120, 150], dtype=np.int64),
             contig_lengths={"chr1": 150},
-            bin_size=20,
+            bin_size=30,
             identities=({"id": "a"}, {"id": "b"}),
             paths=(Path("a.ccnv"), Path("b.ccnv")),
         )
@@ -244,13 +250,13 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         np.testing.assert_array_equal(rebinned.ends, [50, 100, 150])
         np.testing.assert_allclose(
             rebinned.counts,
-            [[25.0, 50.0], [45.0, 90.0], [20.0, 40.0]],
+            [[50.0, 100.0], [80.0, 160.0], [20.0, 40.0]],
         )
 
     def test_rebin_sample_table_preserves_fragmentomic_columns(self) -> None:
-        from ccnv.features.cohort import rebin_sample_table
         from ccnv.models import (
             NUM_FRAG_BANDS,
+            SampleBuffers,
             SampleMetadata,
             fixed_size_list_to_numpy,
             reconstruct_sample_grid,
@@ -269,7 +275,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             frag_gc_sums=[0.8, 0.4, 0.9, 0.5],
         )
 
-        rebinned = rebin_sample_table(table, 100)
+        rebinned = rebin_sample_sketch(table, 100)
         self.assertEqual(rebinned.num_rows, 2)
         _, _, starts, ends = reconstruct_sample_grid(
             SampleMetadata.from_table(rebinned)
@@ -289,33 +295,8 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             rebinned.column("frag_gc_sum").to_pylist(), [1.2, 1.4], rtol=1e-5
         )
 
-    def test_rebin_sample_table_drops_null_elements_in_fragment_lengths(self) -> None:
-        from ccnv.features.cohort import rebin_sample_table
-        from ccnv.models import NUM_FRAG_BANDS, fixed_size_list_to_numpy
-
-        table = make_sample_table(
-            [10, 20],
-            contigs=["chr1", "chr1"],
-            starts=[0, 50],
-            ends=[50, 100],
-            contig_lengths={"chr1": 100},
-            bin_size=50,
-            fragment_lengths=[[120, 130], [140]],
-        )
-        frag_idx = table.schema.get_field_index("frag_bands")
-        orig_bands = table.column("frag_bands").to_pylist()
-        table = table.set_column(
-            frag_idx,
-            pa.field(
-                "frag_bands", pa.list_(pa.uint32(), NUM_FRAG_BANDS), nullable=True
-            ),
-            pa.array([None, orig_bands[1]], type=pa.list_(pa.uint32(), NUM_FRAG_BANDS)),
-        )
-        rebinned = rebin_sample_table(table, 100)
-        bands = fixed_size_list_to_numpy(
-            rebinned.column("frag_bands"), NUM_FRAG_BANDS, np.uint32
-        )
-        self.assertEqual(int(bands.sum()), 1)
+        bufs = rebin_sample_buffers(SampleBuffers.from_table(table), 100)
+        self.assertEqual(bufs.count.tolist(), [30, 70])
 
     def test_rebin_sample_table_non_nested_drops_fragmentomic_metadata_with_warning(
         self,
@@ -323,7 +304,6 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         import json
         from dataclasses import asdict
 
-        from ccnv.features.cohort import rebin_sample_table
         from ccnv.models.schemas import (
             FRAGMENTOMICS_METADATA_KEY,
             FragmentomicsMetadata,
@@ -360,7 +340,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         table_with_frag = table.replace_schema_metadata(meta_dict)
 
         with self.assertLogs("ccnv.features.rebinning", level="WARNING") as cm:
-            rebinned = rebin_sample_table(table_with_frag, 50)
+            rebinned = rebin_sample_sketch(table_with_frag, 50)
 
         self.assertTrue(any("clears fragmentomic channels" in msg for msg in cm.output))
         self.assertNotIn(FRAGMENTOMICS_METADATA_KEY, rebinned.schema.metadata or {})
@@ -389,9 +369,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         ):
             validate_cohort([s1, s2])
 
-    def test_load_sample_or_extract_parquet_and_bam(self) -> None:
-        import tempfile
-
+    def test_read_sample_parquet_and_extract_cram(self) -> None:
         from published_fixtures import (
             PUBLISHED_BIN_SIZE,
             PUBLISHED_CRAM,
@@ -400,20 +378,22 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             ensure_published_file,
         )
 
-        from ccnv.io.parquet import load_sample_or_extract, write_sample_parquet
+        from ccnv.extract import extract_sample_table
+        from ccnv.io.parquet import read_sample_parquet, write_sample_parquet
+        from ccnv.models import ExtractConfig
 
         table = make_sample_table([5, 10], contig_lengths={"chr1": 200}, bin_size=100)
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "sample.parquet"
             write_sample_parquet(table, p)
-            loaded = load_sample_or_extract(p)
+            loaded = read_sample_parquet(p)
             self.assertEqual(loaded.num_rows, table.num_rows)
             self.assertEqual(loaded.column("count").to_pylist(), [5, 10])
 
         cram = ensure_published_file(PUBLISHED_CRAM, PUBLISHED_CRAM_URL)
         fasta = ensure_published_fasta()
-        cram_table = load_sample_or_extract(
-            cram, fasta=fasta, bin_size=PUBLISHED_BIN_SIZE
+        cram_table = extract_sample_table(
+            ExtractConfig(cram, Path("unused"), PUBLISHED_BIN_SIZE, fasta=fasta)
         )
         self.assertEqual(cram_table.num_rows, 468)
         self.assertIn("frag_bands", cram_table.column_names)

@@ -16,7 +16,6 @@ from ccnv.features.cohort import (
     estimate_superblock_size_factors,
     infer_germline_sex_2d,
     mask_low_coverage_per_contig,
-    normalize_depth,
 )
 from ccnv.io.parquet import write_reference_parquet, write_sample_parquet
 from ccnv.models import (
@@ -92,13 +91,10 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
         )
         self.assertLess(float(np.max(rel_err)), 0.04)
 
-        normed = normalize_depth(
-            counts[:, :8],
-            mask=usable,
-            contigs=contig_ids,
-            starts=starts,
-            ends=ends,
+        sf_sub = estimate_superblock_size_factors(
+            counts[:, :8], contig_ids, starts, ends, usable
         )
+        normed = counts[:, :8] / sf_sub[np.newaxis, :]
         # Must stay on O(lambda) read-count scale (~0.35 reads/bin), never 1e-5 library fraction
         diploid_usable = usable & (contig_ids > 0)
         self.assertGreater(float(np.mean(normed[diploid_usable, 0])), 0.25)
@@ -287,10 +283,11 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
         ref_unlabeled = build_reference_table(
             cohort_with_xxy_and_mloy,
             ReferenceConfig(
-                samples=tuple(e.filepath for e in labeled_entries),
+                entries=tuple(
+                    SamplesheetEntry(filepath=e.filepath) for e in labeled_entries
+                ),
                 prefix=Path("ref_unlabeled"),
                 pca_components=2,
-                nearest_bins=4,
                 min_cohort_size=5,
                 min_sex_group_size=5,
             ),
@@ -298,11 +295,9 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
         ref_labeled = build_reference_table(
             cohort_with_xxy_and_mloy,
             ReferenceConfig(
-                samples=tuple(e.filepath for e in labeled_entries),
                 entries=labeled_entries,
                 prefix=Path("ref_labeled"),
                 pca_components=2,
-                nearest_bins=4,
                 min_cohort_size=5,
                 min_sex_group_size=5,
             ),
@@ -391,11 +386,9 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
         ref_tbl = build_reference_table(
             cohort,
             ReferenceConfig(
-                samples=tuple(e.filepath for e in entries),
                 entries=entries,
                 prefix=Path("ref_all_m"),
                 pca_components=2,
-                nearest_bins=4,
                 min_cohort_size=5,
                 min_sex_group_size=5,
             ),
@@ -428,11 +421,9 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
         ref_tbl = build_reference_table(
             cohort,
             ReferenceConfig(
-                samples=tuple(e.filepath for e in entries),
                 entries=entries,
                 prefix=Path("ref_all_f"),
                 pca_components=2,
-                nearest_bins=4,
                 min_cohort_size=5,
                 min_sex_group_size=5,
             ),
@@ -465,11 +456,9 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
         ref_tbl = build_reference_table(
             cohort,
             ReferenceConfig(
-                samples=tuple(e.filepath for e in entries),
                 entries=entries,
                 prefix=Path("ref_swapped"),
                 pca_components=2,
-                nearest_bins=4,
                 min_cohort_size=5,
                 min_sex_group_size=5,
             ),

@@ -19,12 +19,14 @@ from published_fixtures import (
 from scipy.stats import norm
 
 from ccnv.features.fragmentomics import resolve_fragmentomics_compatibility
-from ccnv.features.prenatal import annotate_prenatal_segments
+from ccnv.features.prenatal_origin import annotate_sample_prenatal_segments
 from ccnv.io.parquet import write_reference_parquet, write_sample_parquet
 from ccnv.models import (
     PredictConfig,
     PredictError,
     ReferenceConfig,
+    SampleBuffers,
+    SamplesheetEntry,
     SegmentResult,
 )
 from ccnv.models.results import FetalFractionResult, SCAResult
@@ -57,7 +59,7 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
             ref_path = root / "cohort_ref.ccnv"
             run_reference(
                 ReferenceConfig(
-                    samples=(s1, s2),
+                    entries=tuple(SamplesheetEntry(filepath=p) for p in (s1, s2)),
                     prefix=root / "cohort_ref",
                     bin_size=100000,
                     min_cohort_size=2,
@@ -66,12 +68,10 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
 
             from unittest.mock import patch
 
-            from ccnv.models import SampleBuffers
-
             fasta = ensure_published_fasta()
             # Direct CRAM path in germline mode skips frag_bands and SAMPLE_SCHEMA table construction
             with patch(
-                "ccnv.extract.extracted_to_sample_table",
+                "ccnv.models.schemas.SampleBuffers.to_table",
                 side_effect=AssertionError("must not materialize SAMPLE_SCHEMA table"),
             ):
                 inputs = load_inputs(
@@ -82,7 +82,6 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
                     fasta=fasta,
                 )
             self.assertIsInstance(inputs.sample, SampleBuffers)
-            assert isinstance(inputs.sample, SampleBuffers)
             self.assertIsNone(inputs.sample.frag_bands)
             self.assertIsNotNone(inputs.sample.meta.fragmentomics)
             self.assertGreater(inputs.sample.num_rows, 0)
@@ -159,11 +158,11 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
             ),
         ]
 
-        annotated = annotate_prenatal_segments(
+        annotated, _lod = annotate_sample_prenatal_segments(
             segs,
-            prenatal_res,
-            sample_table=sample,
+            sample,
             prenatal_meta=prenatal_meta,
+            prenatal_result=prenatal_res,
         )
 
         self.assertEqual(len(annotated), 2)
@@ -239,7 +238,7 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
                 pca_mean=[100.0, 120.0],
                 mean_distance=[0.5, 0.5],
                 null_mean=[0.0, 0.0],
-                null_std=[0.05, 0.05],
+                bio_dispersion=[0.0025, 0.0025],
                 model=model_dict,
                 sample_identities=["s1"],
             )
@@ -266,10 +265,10 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
         self.assertFalse(resolve_fragmentomics_compatibility(se_sample, flat_ref))
         self.assertTrue(resolve_fragmentomics_compatibility(pe_sample, flat_ref))
 
-        # Single-end build_branch_model leaves mean_frag_len & endpoint_ratio as None
+        # Single-end build_branch_model leaves ref_frag_len & ref_ep_rate as None
         se_bm = build_branch_model(
             PredictionInput(
-                sample=se_sample,
+                sample=SampleBuffers.from_table(se_sample),
                 reference=se_ref,
                 contig_lengths={"chr1": 20000},
                 sex=None,
@@ -277,8 +276,8 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
             ),
             BRANCH_AUTOSOMAL,
         )
-        self.assertIsNone(se_bm.mean_frag_len)
-        self.assertIsNone(se_bm.endpoint_ratio)
+        self.assertIsNone(se_bm.ref_frag_len)
+        self.assertIsNone(se_bm.ref_ep_rate)
 
         # 2. Prenatal prediction QC preserves observed (unweighted) sample counts
         grid = np.arange(30, 601, dtype=np.float64)
@@ -316,7 +315,7 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
             pca_loadings=[[], [], [1.0], [0.5], [0.5]],
             mean_distance=[0.5, 0.5, 0.0, 0.0, 0.0],
             null_mean=[0.0] * 5,
-            null_std=[0.05, 0.05, 0.0, 0.0, 0.0],
+            bio_dispersion=[0.0025, 0.0025, 0.0, 0.0, 0.0],
             model={
                 "bin_size": 10000,
                 "mode": "prenatal",

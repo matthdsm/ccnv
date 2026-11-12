@@ -231,11 +231,13 @@ class TestRaySCAAndSelfRefOrigin(unittest.TestCase):
             call="gain",
         )
 
+        prefix_sums = BandPrefixSums(
+            sample_bands, bin_contigs, contig_names, bin_starts, bin_ends, bin_usable
+        )
         annotated, lod = annotate_prenatal_origin_and_lod(
             segments=(seg0, seg1, seg2, seg3),
             sample_bands=sample_bands,
-            bin_contigs=bin_contigs,
-            contig_names=contig_names,
+            prefix_sums=prefix_sums,
             bin_usable=bin_usable,
             p_fetal_24=self.p_f_24,
             mu_fetal_w=1.0,
@@ -245,8 +247,6 @@ class TestRaySCAAndSelfRefOrigin(unittest.TestCase):
             sca_call="XX",
             sample_depth_per_mb=25000.0,
             sys_var_per_mb=0.0001,
-            bin_starts=bin_starts,
-            bin_ends=bin_ends,
             p_maternal_24=self.p_m_24,
         )
 

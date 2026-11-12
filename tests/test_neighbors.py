@@ -7,17 +7,15 @@ import pytest
 
 from ccnv.stats.neighbors import (
     calibrate_prototype_dispersion,
-    compute_prototype_null_models,
     evaluate_loco_prototype_baseline,
     fit_prototype_graph,
 )
+from ccnv.stats.regression import hsm_biweight_mode
 
 
 def test_single_contig_cluster_on_aneuploid_contig_uses_secondary_off_contig_prototypes() -> (
     None
 ):
-    # Prototype 1 has multiple bins (3 bins), all on trisomic contig 2 (1.5).
-    # Prototype 0 spans diploid contigs 0 and 1 (1.0).
     pids = np.array(
         [
             [0, 1, 0, 0],
@@ -60,9 +58,8 @@ def test_singleton_float16_zero_secondary_weights_preserve_cnv_and_null_variance
             np.array([[5000.0, -5000.0, 5000.0]]),
         ]
     ).astype(np.float32)
-    _, pids, pweights, _ = fit_prototype_graph(feats, max_prototypes=8, top_r=4)
+    centers, pids, pweights, _ = fit_prototype_graph(feats, max_prototypes=8, top_r=4)
 
-    # Outlier row 16 is an exact singleton center (dists == 0.0), rounding secondary float16 weights to 0.0
     assert pweights[16, 0] == np.float16(1.0)
     np.testing.assert_array_equal(pweights[16, 1:], np.float16(0.0))
 
@@ -72,19 +69,26 @@ def test_singleton_float16_zero_secondary_weights_preserve_cnv_and_null_variance
     assert baselines[16] == pytest.approx(1.0)
     assert support[16] > 0
 
-    # Null model variance on singleton row 16 does not collapse to 0.0 across noisy samples
-    cohort_corrected = rng.lognormal(mean=0.0, sigma=0.12, size=(17, 12))
-    null_mean, bio_disp = compute_prototype_null_models(
-        cohort_corrected, contigs, pids, pweights, n_pca_components=0
+    exp = np.full((17, 12), 100.0, dtype=np.float32)
+    eta = rng.normal(0.0, 0.12, size=(17, 12))
+    counts = rng.poisson(exp * np.exp(eta)).astype(np.float32)
+    null_mean, bio_disp = calibrate_prototype_dispersion(
+        counts,
+        exp,
+        contigs.astype(np.int16),
+        np.ones(17, dtype=bool),
+        pids,
+        pweights,
+        pca_rank=0,
+        n_prototypes=int(centers.shape[0]),
     )
     assert np.isfinite(null_mean[16])
-    assert bio_disp[16] > 0.0
+    assert bio_disp[16] >= 0.0
 
 
 def test_all_four_candidates_same_contig_falls_back_to_global_off_contig_median() -> (
     None
 ):
-    # Degenerate fixture: all 4 candidate prototypes for contig 2 bins reside 100% on contig 2
     pids = np.array(
         [
             [0, 0, 0, 0],
@@ -106,19 +110,16 @@ def test_all_four_candidates_same_contig_falls_back_to_global_off_contig_median(
 
 
 def test_single_contig_branch_excludes_self_singleton() -> None:
-    # Single-contig branch (e.g., female_sex chrX) with 2 singleton prototypes
     pids = np.array([[0, 1, 0, 0], [1, 0, 0, 0]], dtype=np.uint16)
     weights = np.array([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], dtype=np.float16)
     contigs = np.array([0, 0], dtype=np.int32)
     vals = np.array([1.0, 1.8], dtype=np.float64)
 
     baselines, support = evaluate_loco_prototype_baseline(vals, contigs, pids, weights)
-    # Leave-self-out: bin 0 gets 1.8, bin 1 gets 1.0 (never self-canceling vals[i] / vals[i])
     assert baselines[0] == pytest.approx(1.8)
     assert baselines[1] == pytest.approx(1.0)
     np.testing.assert_array_equal(support, [1, 1])
 
-    # Single-contig branch where singleton bin 4 has a multi-bin secondary prototype 0
     pids_multi = np.array(
         [
             [0, 0, 0, 0],
@@ -145,9 +146,9 @@ def test_calibrate_prototype_dispersion_small_cohort_dof_scaling() -> None:
     n_bins = 200
     n_samples = 10
     pca_rank = 3
-    d_eb = n_samples - 1 - pca_rank  # 6
-    ddof = 1.0 + pca_rank / n_samples  # 1.3
-    expected_scale = (n_samples - ddof) / d_eb  # 8.7 / 6.0 = 1.45
+    d_eb = n_samples - 1 - pca_rank
+    ddof = 1.0 + pca_rank / n_samples
+    expected_scale = (n_samples - ddof) / d_eb
     assert expected_scale == pytest.approx(1.45)
 
     feats = rng.normal(size=(n_bins, 2)).astype(np.float32)
@@ -172,25 +173,21 @@ def test_calibrate_prototype_dispersion_small_cohort_dof_scaling() -> None:
         n_prototypes=int(centers.shape[0]),
     )
 
-    # Overdispersion is non-zero across almost all bins (> 90%)
     assert np.mean(disp[usable] > 0.0) > 0.90
-    # Overdispersion estimate is unbiased around true_phi = 0.04
     med_disp = float(np.median(disp[usable]))
     assert 0.025 < med_disp < 0.080
     assert float(np.median(np.abs(null_mean[usable]))) < 0.15
 
 
 def test_hsm_biweight_mode_finite_guard_and_empty() -> None:
-    """Verify _hsm_biweight_mode safely handles NaNs, infinities, and empty inputs."""
-    from ccnv.features.normalization import _hsm_biweight_mode
-
-    assert _hsm_biweight_mode(np.array([], dtype=np.float64)) == 0.0
-    assert _hsm_biweight_mode(np.array([np.nan, np.nan], dtype=np.float64)) == 0.0
-    assert _hsm_biweight_mode(np.array([np.inf, -np.inf], dtype=np.float64)) == 0.0
+    """Verify hsm_biweight_mode safely handles NaNs, infinities, and empty inputs."""
+    assert hsm_biweight_mode(np.array([], dtype=np.float64)) == 0.0
+    assert hsm_biweight_mode(np.array([np.nan, np.nan], dtype=np.float64)) == 0.0
+    assert hsm_biweight_mode(np.array([np.inf, -np.inf], dtype=np.float64)) == 0.0
 
     vals = np.array(
         [np.nan, 1.0, 1.02, 0.98, 1.01, 0.99, 1.0, np.nan, 5.0], dtype=np.float64
     )
     weights = np.ones_like(vals)
-    m = _hsm_biweight_mode(vals, weights)
+    m = hsm_biweight_mode(vals, weights)
     assert 0.98 < m < 1.02

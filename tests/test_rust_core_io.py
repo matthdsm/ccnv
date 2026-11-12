@@ -456,7 +456,10 @@ class TestRustCoreIO(unittest.TestCase):
             contigs = ["chr1", "chr1", "chr1", "chr1"]
             starts = np.array([0, 5_000, 10_000, 15_000], dtype=np.int64)
             ends = np.array([5_000, 10_000, 15_000, 20_000], dtype=np.int64)
-            gc_track, n_mask = load_gc_track(corrupt_bed_path, contigs, starts, ends)
+            gc_track, n_mask, gc_q = load_gc_track(
+                corrupt_bed_path, contigs, starts, ends
+            )
+            self.assertIsNone(gc_q)
             self.assertTrue(np.isnan(gc_track[1]))
             self.assertTrue(bool(n_mask[1]))
             self.assertGreater(float(gc_track[0]), 0.35)
@@ -605,7 +608,8 @@ class TestRustCoreIO(unittest.TestCase):
             contigs = ["chr1", "chr1", "chr1", "chr1"]
             starts = np.array([0, 5_000, 10_000, 15_000], dtype=np.int64)
             ends = np.array([5_000, 10_000, 15_000, 20_000], dtype=np.int64)
-            gc_track, n_mask = load_gc_track(bedgraph_path, contigs, starts, ends)
+            gc_track, n_mask, gc_q = load_gc_track(bedgraph_path, contigs, starts, ends)
+            self.assertIsNone(gc_q)
             np.testing.assert_allclose(gc_track, [0.44, 0.51, 0.39, 0.48], atol=1e-6)
             self.assertFalse(bool(np.any(n_mask)))
 

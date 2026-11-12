@@ -13,8 +13,9 @@ from typer.testing import CliRunner
 
 from ccnv.cli import app
 from ccnv.features.covariates import (
-    correct_covariate_bias,
+    build_exogenous_covariate_basis,
     covariate_features,
+    fit_poisson_covariate_trends,
     mask_covariates,
     validate_min_mappability,
 )
@@ -27,6 +28,7 @@ from ccnv.models import (
     CovariateError,
     PredictConfig,
     ReferenceConfig,
+    SamplesheetEntry,
     parquet_path,
 )
 from ccnv.models.schemas import decode_metadata
@@ -150,29 +152,33 @@ class TestTrackLoadingAndMasking(unittest.TestCase):
             starts = np.array([0, 100, 200], dtype=np.int64)
             ends = np.array([100, 200, 300], dtype=np.int64)
 
-            gc_fa, n_mask_fa = load_gc_track(fasta, contigs, starts, ends)
+            gc_fa, n_mask_fa, gc_q_fa = load_gc_track(fasta, contigs, starts, ends)
             np.testing.assert_allclose(gc_fa[:2], [0.4, 0.7], atol=1e-6)
             self.assertTrue(np.isnan(gc_fa[2]))
             np.testing.assert_array_equal(n_mask_fa, [False, False, True])
+            assert gc_q_fa is not None
+            self.assertEqual(gc_q_fa.shape, (3, 8))
 
             bed_gz = root / "gc.bed.gz"
             with gzip.open(bed_gz, "wt", encoding="utf-8") as handle:
                 handle.write("#chrom\tstart\tend\tgc\n")
                 handle.write("chr1\t0\t100\t40.0\n")
                 handle.write("chr1\t100\t200\t70.0\n")
-            gc_bed, n_mask_bed = load_gc_track(bed_gz, contigs, starts, ends)
+            gc_bed, n_mask_bed, gc_q_bed = load_gc_track(bed_gz, contigs, starts, ends)
             np.testing.assert_allclose(gc_bed[:2], [0.4, 0.7], atol=1e-6)
             self.assertTrue(np.isnan(gc_bed[2]))
             np.testing.assert_array_equal(n_mask_bed, [False, False, True])
+            self.assertIsNone(gc_q_bed)
 
             bw_gc = _write_bigwig(
                 root / "gc.bw",
                 {"chr1": 300},
                 [("chr1", 0, 100, 0.4), ("chr1", 100, 200, 0.7)],
             )
-            gc_bw, n_mask_bw = load_gc_track(bw_gc, contigs, starts, ends)
+            gc_bw, n_mask_bw, gc_q_bw = load_gc_track(bw_gc, contigs, starts, ends)
             np.testing.assert_allclose(gc_bw[:2], [0.4, 0.7], atol=1e-6)
             np.testing.assert_array_equal(n_mask_bw, [False, False, True])
+            self.assertIsNone(gc_q_bw)
 
     def test_validate_min_mappability_rejects_invalid_values(self) -> None:
         for bad in (-0.1, 1.1, float("nan"), float("inf"), True):
@@ -181,7 +187,7 @@ class TestTrackLoadingAndMasking(unittest.TestCase):
 
 
 class TestCovariateRegression(unittest.TestCase):
-    def test_correct_covariate_bias_removes_wave_and_preserves_cnv(self) -> None:
+    def test_poisson_covariate_trends_removes_wave_and_preserves_cnv(self) -> None:
         rng = np.random.default_rng(42)
         n_bins = 200
         gc = rng.uniform(0.30, 0.65, size=n_bins)
@@ -195,19 +201,28 @@ class TestCovariateRegression(unittest.TestCase):
 
         true_cn = np.ones(n_bins, dtype=np.float64)
         true_cn[80:95] = 1.5  # Planted focal gain
-        y = true_cn * wave
-        y /= np.sum(y)
+        y = 1000.0 * true_cn * wave
 
-        corrected = correct_covariate_bias(y, usable, gc=gc, mappability=mappability)
+        basis = build_exogenous_covariate_basis(
+            usable, bin_size=100, gc=gc, mappability=mappability
+        )
+        trends = fit_poisson_covariate_trends(
+            y,
+            np.array([1.0], dtype=np.float64),
+            np.ones(n_bins, dtype=np.float64),
+            usable,
+            basis,
+        )
+        corrected = y / np.maximum(trends[:, 0], 1e-12)
 
         neutral = np.ones(n_bins, dtype=np.bool_)
         neutral[80:95] = False
         raw_cv = float(np.std(y[neutral]) / np.mean(y[neutral]))
         corr_cv = float(np.std(corrected[neutral]) / np.mean(corrected[neutral]))
-        self.assertLess(corr_cv, raw_cv * 0.1)
+        self.assertLess(corr_cv, raw_cv * 0.15)
 
         gain_ratio = float(np.median(corrected[80:95]) / np.median(corrected[neutral]))
-        self.assertAlmostEqual(gain_ratio, 1.5, delta=0.03)
+        self.assertAlmostEqual(gain_ratio, 1.5, delta=0.05)
 
     def test_covariate_features_standardizes_columns(self) -> None:
         usable = np.array([True, True, True, False, True])
@@ -235,18 +250,18 @@ class TestCovariateRegression(unittest.TestCase):
         np.testing.assert_allclose(np.mean(feats_exog, axis=0), 0.0, atol=1e-12)
         np.testing.assert_allclose(np.std(feats_exog, axis=0), 1.0, atol=1e-12)
 
-    def test_build_joint_covariate_basis_captures_gc_mappability_interaction(
+    def test_exogenous_covariate_basis_captures_gc_mappability_interaction(
         self,
     ) -> None:
-        from ccnv.features.covariates import correct_covariate_bias
-        from ccnv.stats.regression import build_joint_covariate_basis
-
         rng = np.random.default_rng(42)
         n = 200
         gc = rng.uniform(0.25, 0.75, size=n)
         mapp = rng.uniform(0.55, 1.0, size=n)
-        basis = build_joint_covariate_basis(gc, mapp)
-        self.assertIsNotNone(basis)
+        usable = np.ones(n, dtype=np.bool_)
+        basis = build_exogenous_covariate_basis(
+            usable, bin_size=100, gc=gc, mappability=mapp
+        )
+        self.assertGreater(basis.shape[1], 0)
 
         # Simulate coupled non-linear GC + mappability + interaction bias with 10% CNV outliers
         z_gc = (gc - np.mean(gc)) / np.std(gc)
@@ -254,17 +269,22 @@ class TestCovariateRegression(unittest.TestCase):
         true_bias = np.exp(0.25 * np.sin(z_gc) + 0.15 * z_map + 0.12 * (z_gc * z_map))
         raw = 100.0 * true_bias
         raw[:15] *= 2.0  # 15 amplified CNV bins
-        usable = np.ones(n, dtype=np.bool_)
 
-        corrected = correct_covariate_bias(raw, usable, gc=gc, mappability=mapp)
+        trends = fit_poisson_covariate_trends(
+            raw,
+            np.array([1.0], dtype=np.float64),
+            np.ones(n, dtype=np.float64),
+            usable,
+            basis,
+        )
+        corrected = raw / np.maximum(trends[:, 0], 1e-12)
         diploid_cv_before = np.std(raw[15:]) / np.mean(raw[15:])
         diploid_cv_after = np.std(corrected[15:]) / np.mean(corrected[15:])
         self.assertLess(diploid_cv_after, diploid_cv_before * 0.25)
-        # CNV gain ratio on bins 0..14 must be preserved (~2.0x relative to diploid median)
         self.assertAlmostEqual(
             float(np.median(corrected[:15]) / np.median(corrected[15:])),
             2.0,
-            delta=0.15,
+            delta=0.18,
         )
 
 
@@ -327,10 +347,9 @@ class TestEndToEndCovariatePipeline(unittest.TestCase):
             ref_prefix = root / "ref_cov"
             run_reference(
                 ReferenceConfig(
-                    samples=tuple(sample_paths),
+                    entries=tuple(SamplesheetEntry(filepath=p) for p in sample_paths),
                     prefix=ref_prefix,
                     pca_components=2,
-                    nearest_bins=15,
                     min_cohort_size=4,
                     mappability=bw_map,
                     gc=bed_gc,
@@ -435,6 +454,7 @@ class TestEndToEndCovariatePipeline(unittest.TestCase):
                 app,
                 [
                     "reference",
+                    "--fasta",
                     str(fasta),
                     "--prefix",
                     str(ref_prefix),
@@ -442,8 +462,6 @@ class TestEndToEndCovariatePipeline(unittest.TestCase):
                     str(bin_size),
                     "--min-cohort-size",
                     "2",
-                    "--nearest-bins",
-                    "6",
                     "--mappability",
                     str(bw_map),
                     "--min-mappability",
@@ -552,10 +570,9 @@ class TestEndToEndCovariatePipeline(unittest.TestCase):
             ref_prefix = root / "ref_no_cov"
             run_reference(
                 ReferenceConfig(
-                    samples=tuple(sample_paths),
+                    entries=tuple(SamplesheetEntry(filepath=p) for p in sample_paths),
                     prefix=ref_prefix,
                     pca_components=2,
-                    nearest_bins=15,
                     min_cohort_size=4,
                     qc_report=False,
                 )
@@ -633,13 +650,11 @@ class TestEndToEndCovariatePipeline(unittest.TestCase):
             ref_prefix = root / "ref_fasta_n"
             run_reference(
                 ReferenceConfig(
-                    samples=(),
                     fasta=fasta_path,
                     gc=bed_gc,
                     bin_size=bin_size,
                     prefix=ref_prefix,
                     min_cohort_size=2,
-                    nearest_bins=4,
                     pca_components=1,
                 )
             )

@@ -2,271 +2,172 @@ from __future__ import annotations
 
 import math
 import unittest
-import unittest.mock
 
 import numpy as np
+from scipy.special import expit
 
 from ccnv.stats.pca import pca_irlba_numpy
 from ccnv.stats.prenatal_math import (
-    infer_sex_gmm_1d,
+    evaluate_poisson_msy_ffy,
+    fit_ffa_logit_ensemble,
+    fit_forward_ffx_model,
+    fit_msy_sex_mixture,
+    fit_poisson_msy_ffy,
     ols_fit,
-    rlm_huber,
 )
 
 
-class TestInferSexGMM1D(unittest.TestCase):
-    def test_bimodal_separation(self) -> None:
+class TestMSYSexMixtureAndPoissonFFY(unittest.TestCase):
+    def test_fit_msy_sex_mixture_bimodal_and_unimodal(self) -> None:
         rng = np.random.default_rng(123)
-        females = rng.normal(loc=0.001, scale=0.0002, size=50)
-        males = rng.normal(loc=0.020, scale=0.002, size=50)
-        yfracs = np.concatenate([females, males])
+        exposure = np.full(60, 1000.0, dtype=np.float64)
+        fem_counts = rng.poisson(0.5, size=30).astype(np.float64)
+        male_counts = rng.poisson(60.0, size=30).astype(np.float64)
+        counts = np.concatenate([fem_counts, male_counts])
 
-        is_male, threshold = infer_sex_gmm_1d(yfracs)
+        res = fit_msy_sex_mixture(counts, exposure)
+        self.assertTrue(res.bimodal)
+        self.assertTrue(np.all(res.p_male[:30] < 0.05))
+        self.assertTrue(np.all(res.p_male[30:] > 0.95))
 
-        self.assertGreater(threshold, 0.002)
-        self.assertLess(threshold, 0.015)
-        np.testing.assert_array_equal(is_male[:50], False)
-        np.testing.assert_array_equal(is_male[50:], True)
+        unimodal = fit_msy_sex_mixture(np.full(20, 2.0), np.full(20, 1000.0))
+        self.assertFalse(unimodal.bimodal)
+        self.assertEqual(unimodal.p_male.shape, (20,))
+        self.assertTrue(np.all(unimodal.p_male == 0.0))
 
-    def test_empty_and_single_input(self) -> None:
-        empty_flags, empty_thresh = infer_sex_gmm_1d(np.array([]))
-        self.assertEqual(len(empty_flags), 0)
-        self.assertEqual(empty_thresh, 0.0)
-
-        single_flags, single_thresh = infer_sex_gmm_1d(np.array([0.05]))
-        self.assertEqual(len(single_flags), 1)
-        self.assertFalse(single_flags[0])
-        self.assertEqual(single_thresh, 0.05)
-
-    def test_unimodal_identical_values(self) -> None:
-        yfracs = np.full(20, 0.01)
-        is_male, threshold = infer_sex_gmm_1d(yfracs)
-        self.assertEqual(threshold, 0.01)
-        self.assertTrue(np.all(is_male))
-
-    def test_deterministic(self) -> None:
+    def test_poisson_msy_ffy_recovers_calibrated_fetal_fraction(self) -> None:
         rng = np.random.default_rng(42)
-        yfracs = rng.uniform(0.0, 0.05, size=40)
-        flags1, thresh1 = infer_sex_gmm_1d(yfracs)
-        flags2, thresh2 = infer_sex_gmm_1d(yfracs)
-        self.assertEqual(thresh1, thresh2)
-        np.testing.assert_array_equal(flags1, flags2)
+        n_bins, n_fem, n_male = 40, 10, 10
+        n_samples = n_fem + n_male
+        mappability = np.ones(n_bins, dtype=np.float64)
+        mappability[:5] = 0.20  # Low-mappability bins excluded from clean set
+        exposure = np.full((n_bins, n_samples), 200.0, dtype=np.float64)
+        fem_mask = np.array([True] * n_fem + [False] * n_male)
+        male_mask = ~fem_mask
 
+        true_ff = np.zeros(n_samples, dtype=np.float64)
+        true_ff[n_fem:] = np.linspace(0.05, 0.22, n_male)
+        counts = np.zeros((n_bins, n_samples), dtype=np.float64)
+        # Simulate slight empirical capture scale 0.85 so kappa_cal ~= 1 / 0.85
+        for s in range(n_samples):
+            lam = exposure[:, s] * (0.001 + 0.5 * 0.85 * true_ff[s])
+            lam[:5] = 25.0  # Noisy repetitive bins
+            counts[:, s] = rng.poisson(lam)
 
-class TestFitElasticNetFFY(unittest.TestCase):
-    def test_ffy_elasticnet_retains_correlated_chry_bins_when_p_gt_n(self) -> None:
-        from ccnv.stats.prenatal_math import fit_elasticnet_ffy
-
-        rng = np.random.default_rng(42)
-        # S = 20 samples, B_Y = 200 correlated euchromatic chrY bins
-        true_ff = np.concatenate([np.zeros(10), rng.uniform(0.04, 0.25, size=10)])
-        X = np.outer(true_ff, np.ones(200)) + rng.normal(0.0, 0.005, size=(20, 200))
-        X = np.clip(X, 0.0, None)
-
-        weights, intercept = fit_elasticnet_ffy(X, true_ff, seed=42)
-        self.assertTrue(np.all(weights >= 0.0))
-        # Pure Lasso caps non-zeros at <= 20; ElasticNet with l1_ratio <= 0.1 retains > 80 bins
-        self.assertGreater(int(np.count_nonzero(weights > 0)), 80)
-        preds = intercept + X @ weights
-        np.testing.assert_allclose(preds[10:], true_ff[10:], atol=0.02)
-
-    def test_empty_or_zero_input(self) -> None:
-        from ccnv.stats.prenatal_math import fit_elasticnet_ffy
-
-        w, b = fit_elasticnet_ffy(np.empty((0, 5)), np.empty(0))
-        self.assertEqual(w.shape, (5,))
-        self.assertEqual(b, 0.0)
-
-
-class TestFitFFALogitEnsemble(unittest.TestCase):
-    def test_recovers_smooth_bounded_fetal_fraction(self) -> None:
-        from ccnv.stats.prenatal_math import (
-            fit_ffa_logit_ensemble,
-            fit_preface_logit_ensemble,
+        model = fit_poisson_msy_ffy(
+            counts,
+            exposure,
+            mappability,
+            fem_mask,
+            male_mask,
+            labeled_ff=true_ff,
         )
+        self.assertEqual(model.clean_bin_indices.size, 35)
+        self.assertGreater(model.kappa_cal, 1.05)
+        self.assertLess(model.kappa_cal, 1.35)
 
+        ffy_hat, ffy_se = evaluate_poisson_msy_ffy(
+            counts[:, -1], exposure[:, -1], model
+        )
+        self.assertAlmostEqual(ffy_hat, float(true_ff[-1]), delta=0.025)
+        self.assertGreater(ffy_se, 0.0)
+
+
+class TestForwardFFXAndFFALogitEnsemble(unittest.TestCase):
+    def test_fit_forward_ffx_model_recovers_intercept_and_negative_slope(self) -> None:
+        f_targets = np.array([0.0, 0.0, 0.0, 0.06, 0.10, 0.16, 0.20])
+        chrx_ratios = 1.0 - 0.5 * f_targets
+        valid = np.ones_like(f_targets, dtype=np.bool_)
+        alpha_0, alpha_1, sigma_sys = fit_forward_ffx_model(
+            chrx_ratios, f_targets, valid
+        )
+        self.assertAlmostEqual(alpha_0, 1.0, places=4)
+        self.assertAlmostEqual(alpha_1, -0.5, places=4)
+        self.assertGreaterEqual(sigma_sys, 0.005)
+
+    def test_recovers_smooth_bounded_fetal_fraction(self) -> None:
         rng = np.random.default_rng(42)
         n_samples = 30
         n_features = 10
-        X = rng.standard_normal((n_samples, n_features))
+        x_mat = rng.standard_normal((n_samples, n_features))
         true_beta = rng.uniform(-0.5, 0.5, size=n_features)
-        true_logits = X @ true_beta - 2.0
-        from scipy.special import expit
+        true_ff = expit(x_mat @ true_beta - 2.0)
 
-        true_ff = expit(true_logits)
-
-        weights, bias, sigma = fit_ffa_logit_ensemble(X, true_ff, seed=42)
+        weights, bias, sigma = fit_ffa_logit_ensemble(x_mat, true_ff, seed=42)
         self.assertEqual(weights.shape, (n_features,))
         self.assertTrue(math.isfinite(bias))
         self.assertGreater(sigma, 0.0)
         self.assertLess(sigma, 0.10)
 
-        preds = expit(X @ weights + bias)
+        preds = expit(x_mat @ weights + bias)
         self.assertTrue(np.all((preds > 0.0) & (preds < 1.0)))
         np.testing.assert_allclose(preds, true_ff, atol=0.05)
-
-        # Test alias compatibility
-        w_pref, b_pref, s_pref = fit_preface_logit_ensemble(X, true_ff, seed=42)
-        np.testing.assert_array_equal(weights, w_pref)
-        self.assertEqual(bias, b_pref)
-        self.assertEqual(sigma, s_pref)
 
 
 class TestPCAIrlbaNumpy(unittest.TestCase):
     def test_orthogonality_and_centering_svd_branch(self) -> None:
         rng = np.random.default_rng(42)
-        # n_samples > n_features
         x = rng.normal(loc=5.0, scale=2.0, size=(60, 10))
         scores, center, rotation = pca_irlba_numpy(x, n_components=4, seed=42)
 
         self.assertEqual(scores.shape, (60, 4))
         self.assertEqual(rotation.shape, (10, 4))
         np.testing.assert_allclose(center, np.mean(x, axis=0), atol=1e-12)
-
-        # Orthogonality: V^T V = I
-        ident = rotation.T @ rotation
-        np.testing.assert_allclose(ident, np.eye(4), atol=1e-7)
-
-        # Descending variance of components
+        np.testing.assert_allclose(rotation.T @ rotation, np.eye(4), atol=1e-7)
         variances = np.var(scores, axis=0)
         self.assertTrue(np.all(np.diff(variances) <= 1e-12))
 
     def test_gram_matrix_branch_samples_le_features(self) -> None:
         rng = np.random.default_rng(101)
-        # n_samples <= n_features
         x = rng.standard_normal(size=(8, 25))
         scores, center, rotation = pca_irlba_numpy(x, n_components=3, seed=101)
 
         self.assertEqual(scores.shape, (8, 3))
         self.assertEqual(rotation.shape, (25, 3))
         np.testing.assert_allclose(center, np.mean(x, axis=0), atol=1e-12)
+        np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-7)
 
-        ident = rotation.T @ rotation
-        np.testing.assert_allclose(ident, np.eye(3), atol=1e-7)
-
-    def test_sign_canonicalization(self) -> None:
+    def test_sign_canonicalization_and_determinism(self) -> None:
         rng = np.random.default_rng(7)
         x = rng.standard_normal(size=(50, 12))
-        _, _, rotation = pca_irlba_numpy(x, n_components=5, seed=7)
-
-        for j in range(5):
-            col = rotation[:, j]
-            max_idx = int(np.argmax(np.abs(col)))
-            self.assertGreaterEqual(col[max_idx], 0.0)
-
-    def test_deterministic_seeding(self) -> None:
-        rng = np.random.default_rng(1234)
-        x = rng.standard_normal(size=(30, 8))
-        sc1, c1, rot1 = pca_irlba_numpy(x, n_components=3, seed=999)
-        sc2, c2, rot2 = pca_irlba_numpy(x, n_components=3, seed=999)
-
+        sc1, c1, rot1 = pca_irlba_numpy(x, n_components=5, seed=7)
+        sc2, c2, rot2 = pca_irlba_numpy(x, n_components=5, seed=7)
         np.testing.assert_array_equal(sc1, sc2)
         np.testing.assert_array_equal(c1, c2)
         np.testing.assert_array_equal(rot1, rot2)
 
-    def test_components_exceeding_rank(self) -> None:
+        for j in range(5):
+            col = rot1[:, j]
+            max_idx = int(np.argmax(np.abs(col)))
+            self.assertGreaterEqual(col[max_idx], 0.0)
+
+    def test_components_exceeding_rank_and_all_nan_column(self) -> None:
         rng = np.random.default_rng(1)
         x = rng.standard_normal(size=(5, 10))
+        x[:, 3] = np.nan
         scores, center, rotation = pca_irlba_numpy(x, n_components=8, seed=1)
 
         self.assertEqual(scores.shape, (5, 8))
         self.assertEqual(rotation.shape, (10, 8))
-        np.testing.assert_allclose(center, np.mean(x, axis=0), atol=1e-12)
-
-    def test_pca_irlba_numpy_all_nan_column_imputed_to_zero(self) -> None:
-        rng = np.random.default_rng(42)
-        x = rng.normal(size=(15, 8))
-        x[:, 3] = np.nan
-        scores, center, rotation = pca_irlba_numpy(x, n_components=3, seed=42)
-        self.assertEqual(scores.shape, (15, 3))
         self.assertEqual(center[3], 0.0)
         self.assertTrue(np.all(np.isfinite(scores)))
         self.assertTrue(np.all(np.isfinite(rotation)))
 
 
 class TestOLSFit(unittest.TestCase):
-    def test_recovers_exact_line(self) -> None:
+    def test_recovers_exact_line_and_zero_variance_fallback(self) -> None:
         x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
         y = 2.5 + 1.8 * x
-
         intercept, slope = ols_fit(x, y)
         self.assertAlmostEqual(intercept, 2.5, places=6)
         self.assertAlmostEqual(slope, 1.8, places=6)
 
-    def test_zero_variance_fallback(self) -> None:
-        x_const = np.array([3.0, 3.0, 3.0, 3.0])
-        y = np.array([1.0, 2.0, 3.0, 4.0])
-
-        intercept, slope = ols_fit(x_const, y)
-        self.assertEqual(intercept, 0.0)
-        self.assertEqual(slope, 1.0)
-
-
-class TestRLMHuber(unittest.TestCase):
-    def test_outlier_robustness_compared_to_ols(self) -> None:
-        rng = np.random.default_rng(42)
-        n = 100
-        x = np.linspace(-10.0, 10.0, n)
-        true_intercept = 1.5
-        true_slope = 2.0
-        y = true_intercept + true_slope * x + rng.normal(0.0, 0.1, size=n)
-
-        # Inject 10% severe outliers
-        outlier_indices = rng.choice(n, size=10, replace=False)
-        y[outlier_indices] += rng.choice([-1, 1], size=10) * 80.0
-
-        ols_intercept, ols_slope = ols_fit(x, y)
-        huber_intercept, huber_slope = rlm_huber(x, y)
-
-        # Huber should remain close to the true slope
-        self.assertLess(abs(huber_slope - true_slope), 0.15)
-        self.assertLess(abs(huber_intercept - true_intercept), 0.5)
-
-        # OLS error should be much larger than Huber error
-        huber_slope_err = abs(huber_slope - true_slope)
-        ols_slope_err = abs(ols_slope - true_slope)
-        self.assertGreater(ols_slope_err, huber_slope_err * 2.0)
-
-        huber_int_err = abs(huber_intercept - true_intercept)
-        ols_int_err = abs(ols_intercept - true_intercept)
-        self.assertGreater(ols_int_err, huber_int_err * 2.0)
-
-    def test_zero_variance_fallback(self) -> None:
-        x = np.array([4.0, 4.0, 4.0])
-        y = np.array([1.0, 2.0, 3.0])
-        intercept, slope = rlm_huber(x, y)
-        self.assertEqual(intercept, 0.0)
-        self.assertEqual(slope, 1.0)
-
-    def test_clean_data_matches_ols(self) -> None:
-        x = np.linspace(-5.0, 5.0, 40)
-        y = -0.5 + 3.2 * x
-        h_intercept, h_slope = rlm_huber(x, y)
-        o_intercept, o_slope = ols_fit(x, y)
-        self.assertAlmostEqual(h_intercept, o_intercept, places=5)
-        self.assertAlmostEqual(h_slope, o_slope, places=5)
-
-    def test_rlm_huber_matches_sklearn_huber_on_clean_and_outlier_data(self) -> None:
-        from sklearn.linear_model import HuberRegressor
-
-        x = np.linspace(0.0, 10.0, 50)
-        y = 1.5 - 0.5 * x
-        y[0] = 50.0
-        huber = HuberRegressor(alpha=0.0, epsilon=1.345, max_iter=100).fit(
-            x.reshape(-1, 1), y
+        intercept_c, slope_c = ols_fit(
+            np.array([3.0, 3.0, 3.0]), np.array([1.0, 2.0, 3.0])
         )
-        intercept, slope = rlm_huber(x, y)
-        self.assertAlmostEqual(intercept, float(huber.intercept_), places=6)
-        self.assertAlmostEqual(slope, float(huber.coef_[0]), places=6)
+        self.assertEqual(intercept_c, 0.0)
+        self.assertEqual(slope_c, 1.0)
 
-    def test_rlm_huber_fallback_on_value_error(self) -> None:
-        x = np.array([1.0, 2.0, 3.0, 4.0])
-        y = np.array([2.0, 4.0, 6.0, 8.0])
-        with unittest.mock.patch(
-            "ccnv.stats.prenatal_math.HuberRegressor.fit",
-            side_effect=ValueError("convergence failed"),
-        ):
-            intercept, slope = rlm_huber(x, y)
-        o_intercept, o_slope = ols_fit(x, y)
-        self.assertAlmostEqual(intercept, o_intercept, places=9)
-        self.assertAlmostEqual(slope, o_slope, places=9)
+
+if __name__ == "__main__":
+    unittest.main()

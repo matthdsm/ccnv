@@ -67,42 +67,16 @@ class TestReferenceConfig(unittest.TestCase):
         self.assertEqual(config.mode, "germline")
         self.assertEqual(config.prenatal_bin_size, 100000)
         self.assertIsNone(config.samplesheet_path)
+        self.assertIsNone(config.pca_components)
         self.assertEqual(config.entries, ())
-        self.assertEqual(config.samples, ())
-        self.assertEqual(config.input_paths, ())
         self.assertEqual(config.threads, 1)
 
-    def test_reference_config_single_sample_path_preserves_prefix(self) -> None:
-        config = ReferenceConfig(samples=Path("s1.ccnv"), prefix=Path("ref_out"))
-        self.assertEqual(config.prefix, Path("ref_out"))
-        self.assertEqual(config.samples, (Path("s1.ccnv"),))
-
-    def test_reference_config_positional_samples_and_prefix(self) -> None:
-        p1 = Path("s1.ccnv")
-        p2 = Path("s2.ccnv")
-        config = ReferenceConfig((p1, p2), Path("ref_out"))
-        self.assertEqual(config.samples, (p1, p2))
-        self.assertEqual(config.prefix, Path("ref_out"))
-        self.assertEqual(config.input_paths, (p1, p2))
-
-    def test_reference_config_samples_synchronization(self) -> None:
-        p1 = Path("s1.ccnv")
-        p2 = Path("s2.ccnv")
-        config = ReferenceConfig(prefix=Path("ref"), samples=(p1, p2))
-        self.assertEqual(config.samples, (p1, p2))
-        self.assertEqual(config.input_paths, (p1, p2))
-        self.assertEqual(
-            config.entries,
-            (SamplesheetEntry(filepath=p1), SamplesheetEntry(filepath=p2)),
-        )
-
-    def test_reference_config_entries_synchronization(self) -> None:
+    def test_reference_config_entries_preserved(self) -> None:
         e1 = SamplesheetEntry(filepath=Path("s1.ccnv"), sex="M", ff=0.10)
         e2 = SamplesheetEntry(filepath=Path("s2.ccnv"), sex="F", ff=None)
         config = ReferenceConfig(prefix=Path("ref"), entries=(e1, e2))
         self.assertEqual(config.entries, (e1, e2))
-        self.assertEqual(config.samples, (Path("s1.ccnv"), Path("s2.ccnv")))
-        self.assertEqual(config.input_paths, (Path("s1.ccnv"), Path("s2.ccnv")))
+        self.assertEqual(config.prefix, Path("ref"))
 
     def test_reference_config_prenatal_mode(self) -> None:
         config = ReferenceConfig(
@@ -332,7 +306,6 @@ class TestFetalFractionResult(unittest.TestCase):
         self.assertEqual(ff_res.ffy, 0.105)
         self.assertEqual(ff_res.ffx, 0.098)
         self.assertEqual(ff_res.ffa, 0.112)
-        self.assertEqual(ff_res.preface, 0.112)
         self.assertEqual(ff_res.sca, sca)
         self.assertFalse(ff_res.low_ff_warning)
         self.assertEqual(ff_res.warnings, ())
@@ -375,8 +348,22 @@ class TestFetalFractionResult(unittest.TestCase):
                 yfrac_threshold=0.01,
                 sca=sca,
             )
+        ffx_res = FetalFractionResult(
+            fetal_sex="F",
+            active_ff=0.09,
+            active_ff_source="FFX",
+            ffy=None,
+            ffx=0.09,
+            ffa=None,
+            chrx_ratio=1.0,
+            chry_score=0.0,
+            yfrac_threshold=0.01,
+            sca=sca,
+        )
+        self.assertEqual(ffx_res.active_ff_source, "FFX")
         with self.assertRaisesRegex(
-            ValueError, "active_ff_source must be 'FFY', 'FFA', 'FF_SIZE', or 'FUSED'"
+            ValueError,
+            "active_ff_source must be 'FFY', 'FFA', 'FFX', 'FF_SIZE', or 'FUSED'",
         ):
             FetalFractionResult(
                 fetal_sex="F",
@@ -497,33 +484,13 @@ class TestExceptions(unittest.TestCase):
 
 
 class TestDomainModels(unittest.TestCase):
-    def test_contig_validation(self) -> None:
-        from ccnv.models.domain import Contig
+    def test_contig_lookup(self) -> None:
+        from ccnv.models.domain import ContigLookup
 
-        c = Contig("chr1", 1000)
-        self.assertEqual(c.name, "chr1")
-        self.assertEqual(c.length, 1000)
-        with self.assertRaisesRegex(ValueError, "contig name must not be empty"):
-            Contig("", 1000)
-        with self.assertRaisesRegex(ValueError, "contig length must be positive"):
-            Contig("chr1", 0)
-
-    def test_genome_profile(self) -> None:
-        from ccnv.models.domain import Contig, GenomeProfile
-
-        c1 = Contig("chr1", 1000)
-        c2 = Contig("chr2", 2000)
-        gp = GenomeProfile((c1, c2))
-        self.assertEqual(gp.names, ("chr1", "chr2"))
-        self.assertEqual(gp.lengths, (1000, 2000))
-        self.assertEqual(gp.length_map(), {"chr1": 1000, "chr2": 2000})
-
-        with self.assertRaisesRegex(
-            ValueError, "genome profile must contain at least one contig"
-        ):
-            GenomeProfile(())
-        with self.assertRaisesRegex(ValueError, "contig names must be unique"):
-            GenomeProfile((c1, Contig("chr1", 500)))
+        lookup = ContigLookup.from_names(["chr1", "chrX"])
+        self.assertEqual(lookup.resolve("1"), "chr1")
+        self.assertEqual(lookup.resolve("CHRX"), "chrX")
+        self.assertIsNone(lookup.resolve("chrY"))
 
     def test_cytoband(self) -> None:
         from ccnv.models.domain import Cytoband
@@ -564,9 +531,8 @@ class TestDomainModels(unittest.TestCase):
         self.assertEqual(resolve_contig_name("chr1", ["1", "2"]), "1")
         self.assertIsNone(resolve_contig_name("chrZ", ["chr1", "chr2"]))
 
-        layout = select_layout(["chr1", "chrM"], [1000, 500], all_contigs=False)
-        self.assertEqual(len(layout), 1)
-        self.assertEqual(layout[0].name, "chr1")
+        layout = select_layout([("chr1", 1000), ("chrM", 500)], all_contigs=False)
+        self.assertEqual(layout, [("chr1", 1000)])
 
 
 class TestModelReExports(unittest.TestCase):
@@ -583,8 +549,7 @@ class TestModelReExports(unittest.TestCase):
             "DEFAULT_MIN_MAPPABILITY",
             "AnalysisMode",
             "parquet_path",
-            "Contig",
-            "GenomeProfile",
+            "ContigLookup",
             "SamplesheetEntry",
             "Cytoband",
             "select_layout",
@@ -616,6 +581,8 @@ class TestModelReExports(unittest.TestCase):
             "KNOWN_REFERENCE_BRANCHES",
             "CNV_REFERENCE_BRANCHES",
             "ArtifactKind",
+            "SampleBuffers",
+            "BranchFitArrays",
             "SampleMetadata",
             "ReferenceMetadata",
             "PrenatalModelMetadata",
@@ -631,7 +598,6 @@ class TestModelReExports(unittest.TestCase):
             "validate_schema",
             "validate_sample_table",
             "validate_reference_table",
-            "bin_coordinates",
             "CcnvError",
             "AlignmentError",
             "BinCompatibilityError",

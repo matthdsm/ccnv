@@ -12,14 +12,13 @@ import pysam
 from ccnv.models import (
     BinResult,
     SegmentResult,
+    natural_sort_key,
 )
 from ccnv.report import write_outputs
 from ccnv.report.bed import (
-    format_bed_float,
-    natural_sort_key,
     sort_bin_result,
     sort_segments,
-    write_compressed_bed,
+    write_bins_bed_streaming,
 )
 from ccnv.report.html import (
     PLOTLY_CDN_URL,
@@ -98,25 +97,32 @@ class TestBedReport(unittest.TestCase):
             [("chr1", 0), ("chr1", 50), ("chr2", 0)],
         )
 
-    def test_format_bed_float(self) -> None:
-        self.assertEqual(format_bed_float(float("nan")), "NaN")
-        self.assertEqual(format_bed_float(1.23456789), "1.2345679")
-
-    def test_write_compressed_bed(self) -> None:
+    def test_write_bins_bed_indexed_and_nan_format(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            bed_path = Path(tmpdir) / "test.bed.gz"
-            header = ("#contig", "start", "end", "val")
-            rows = [("chr1", 0, 100, 1.5), ("chr1", 100, 200, 2.5)]
-            out = write_compressed_bed(bed_path, header, rows)
+            bed_path = Path(tmpdir) / "test_bins.bed.gz"
+            bins = (
+                BinResult(
+                    branch="autosomal",
+                    contigs=("chr1", "chr1"),
+                    starts=np.array([0, 100], dtype=np.int64),
+                    ends=np.array([100, 200], dtype=np.int64),
+                    ratios=np.array([1.23456789, float("nan")], dtype=np.float64),
+                    zscores=np.array([2.5, float("nan")], dtype=np.float64),
+                    weights=np.array([1.0, 0.0], dtype=np.float64),
+                    reference_sizes=np.array([5, 0], dtype=np.int64),
+                    masked=np.array([False, True], dtype=np.bool_),
+                ),
+            )
+            out = write_bins_bed_streaming(bed_path, bins, contig_lengths={"chr1": 200})
             self.assertEqual(out, bed_path)
             self.assertTrue(bed_path.is_file())
             self.assertTrue(Path(f"{bed_path}.tbi").is_file())
 
-            # Read back using pysam.TabixFile
             with pysam.TabixFile(str(bed_path)) as tbx:
-                self.assertEqual(tbx.header, ["#contig\tstart\tend\tval"])
                 records = list(tbx.fetch("chr1", 0, 200))
                 self.assertEqual(len(records), 2)
+                self.assertIn("1.234568", records[0])
+                self.assertIn("NaN", records[1])
 
 
 class TestVcfReport(unittest.TestCase):

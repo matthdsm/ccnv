@@ -229,19 +229,13 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
         assert ("chrM", 16_000) not in selected
         assert ("chr0", 5_000) not in selected
 
-        legacy_contigs = select_layout(
-            [name for name, _ in header],
-            [length for _, length in header],
-            all_contigs=False,
-        )
-        assert len(legacy_contigs) == 39
-        assert legacy_contigs[-2].name == "chr38"
-
     def test_resolve_contig_name_handles_single_pass_generator_and_config_preserves_prefix(
         self,
     ) -> None:
         assert resolve_contig_name("CHR1", (c for c in ["chr1", "chr2"])) == "chr1"
-        cfg = ReferenceConfig(samples=Path("sheet.yaml"), prefix=Path("out/ref"))
+        cfg = ReferenceConfig(
+            samplesheet_path=Path("sheet.yaml"), prefix=Path("out/ref")
+        )
         assert cfg.prefix == Path("out/ref")
 
         p_cfg = PredictConfig(
@@ -722,7 +716,7 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
         for bad_field, bad_val in (
             ("pca_components", "five"),
             ("min_mappability", "high"),
-            ("nearest_bins", "many"),
+            ("max_batch_memory_mb", "many"),
         ):
             corrupt_ref_dict = {
                 **ref_dict,
@@ -741,7 +735,7 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
     def test_fixed_size_list_size_validation_sliced_rebinning_and_multichunk_null_dict(
         self,
     ) -> None:
-        from ccnv.models import bin_coordinates, fixed_size_list_to_numpy
+        from ccnv.models import decode_dictionary_contigs, fixed_size_list_to_numpy
 
         # Finding #6: fixed_size_list_to_numpy rejects list_size mismatch and non-FixedSizeList types
         arr_12 = pa.FixedSizeListArray.from_arrays(
@@ -832,7 +826,7 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
         with self.assertRaisesRegex(SchemaError, "dictionary"):
             validate_reference_table(multichunk_null_contig, check_rows=True)
         with self.assertRaisesRegex(SchemaError, "dictionary"):
-            bin_coordinates(multichunk_null_contig)
+            decode_dictionary_contigs(multichunk_null_contig.column("contig"))
 
 
 if __name__ == "__main__":

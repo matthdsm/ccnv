@@ -12,6 +12,7 @@ from ccnv.models import (
     ExtractConfig,
     PredictConfig,
     ReferenceConfig,
+    SamplesheetEntry,
     parquet_path,
 )
 from ccnv.models.schemas import SampleMetadata, decode_metadata, reconstruct_sample_grid
@@ -77,10 +78,9 @@ class TestInstalledPipelineContract(unittest.TestCase):
             reference_path = parquet_path(reference_prefix)
             reference(
                 ReferenceConfig(
-                    tuple(sample_paths),
-                    reference_prefix,
+                    prefix=reference_prefix,
+                    entries=tuple(SamplesheetEntry(filepath=p) for p in sample_paths),
                     pca_components=2,
-                    nearest_bins=12,
                     min_cohort_size=8,
                 )
             )
