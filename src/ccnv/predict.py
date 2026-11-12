@@ -9,11 +9,10 @@ from typing import Final, Literal, overload
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.parquet as pq
-from numpy.typing import ArrayLike, NDArray
+from numpy.typing import NDArray
 
 from ccnv.extract import extract_for_predict
+from ccnv.features.binning import align_sample_to_grid_indices
 from ccnv.features.covariates import validate_min_mappability
 from ccnv.features.fragmentomics import (
     apply_prenatal_fisher_weighting,
@@ -22,6 +21,7 @@ from ccnv.features.fragmentomics import (
 from ccnv.features.normalization import (
     BranchModel,
     BranchNormalizationResult,
+    align_reference_unmasked_bins,
     build_branch_model_from_tables,
     normalize_branch,
     normalize_sample_branch,
@@ -31,6 +31,7 @@ from ccnv.features.prenatal_origin import annotate_sample_prenatal_segments
 from ccnv.features.rebinning import rebin_sample_buffers
 from ccnv.features.sex import infer_single_sample_sex
 from ccnv.io.parquet import (
+    filter_reference_branches,
     read_reference_parquet,
     read_sample_buffers,
 )
@@ -45,24 +46,25 @@ from ccnv.models import (
     BRANCH_MALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
+    NUM_GC_QUANTILES,
     AnalysisMode,
-    ArtifactKind,
     BinCompatibilityError,
     BinResult,
+    CcnvError,
+    ContigLookup,
     CovariateError,
     FetalFractionResult,
+    InvalidInputError,
     PredictConfig,
     PredictError,
     PredictionOutputs,
     PrenatalModelMetadata,
     ReferenceMetadata,
     SampleBuffers,
+    SchemaError,
     SegmentResult,
-    decode_metadata,
-    normalize_chr,
     reconstruct_sample_grid,
     unique_dictionary_contigs,
-    validate_schema,
 )
 from ccnv.qc.predict import build_predict_qc_payload, write_predict_qc_json
 from ccnv.report import write_outputs
@@ -100,59 +102,131 @@ class PredictionInput:
     contig_lengths: dict[str, int]
     sex: Sex | None
     branches: tuple[str, ...]
+    ref_meta: ReferenceMetadata | None = None
+
+
+def _preload_sample_track_overrides(
+    sample: SampleBuffers,
+    reference: pa.Table,
+    branches: tuple[str, ...],
+    *,
+    gc_path: Path | None,
+    mappability_path: Path | None,
+    mode: AnalysisMode,
+) -> tuple[
+    NDArray[np.float64] | None,
+    NDArray[np.float32] | None,
+    NDArray[np.bool_] | None,
+    NDArray[np.float64] | None,
+]:
+    """Load optional --gc and --mappability tracks once onto the sample grid."""
+    if gc_path is None and mappability_path is None:
+        return None, None, None, None
+
+    track_branches = (
+        (*branches, BRANCH_PRENATAL_FFY) if mode == "prenatal" else branches
+    )
+    sub_ref = filter_reference_branches(reference, track_branches)
+    ref_contigs = unique_dictionary_contigs(sub_ref.column("contig"))
+    lookup = ContigLookup.from_names(sample.meta.contig_order)
+    target_contigs: set[str] = set()
+    for c_name in ref_contigs:
+        if c_name in sample.meta.contig_lengths:
+            target_contigs.add(c_name)
+        elif mode == "prenatal":
+            resolved = lookup.resolve(c_name)
+            if resolved is not None:
+                target_contigs.add(resolved)
+
+    codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(sample.meta)
+    keep_codes = [i for i, name in enumerate(names) if name in target_contigs]
+    q_mask = (
+        np.isin(codes, keep_codes)
+        if keep_codes
+        else np.zeros(sample.num_rows, dtype=np.bool_)
+    )
+    q_contigs = [names[int(c)] for c in codes[q_mask]]
+    q_starts = starts_u32[q_mask].astype(np.int64, copy=False)
+    q_ends = ends_u32[q_mask].astype(np.int64, copy=False)
+
+    n_rows = sample.num_rows
+    sample_gc: NDArray[np.float64] | None = None
+    sample_gc_q: NDArray[np.float32] | None = None
+    sample_n_mask: NDArray[np.bool_] | None = None
+    sample_map: NDArray[np.float64] | None = None
+    try:
+        if gc_path is not None:
+            gc_sub, n_sub, gc_q_sub = load_gc_track(
+                gc_path, q_contigs, q_starts, q_ends
+            )
+            sample_gc = np.full(n_rows, np.nan, dtype=np.float64)
+            sample_gc[q_mask] = gc_sub
+            sample_n_mask = np.ones(n_rows, dtype=np.bool_)
+            sample_n_mask[q_mask] = n_sub
+            if gc_q_sub is not None:
+                sample_gc_q = np.zeros((n_rows, NUM_GC_QUANTILES), dtype=np.float32)
+                sample_gc_q[q_mask] = gc_q_sub
+        if mappability_path is not None:
+            map_sub = load_mappability_track(
+                mappability_path, q_contigs, q_starts, q_ends
+            )
+            sample_map = np.zeros(n_rows, dtype=np.float64)
+            sample_map[q_mask] = map_sub
+    except CovariateError as err:
+        raise PredictError(str(err)) from err
+    return sample_gc, sample_gc_q, sample_n_mask, sample_map
 
 
 def _normalize_branches_once(
     inputs: PredictionInput,
     config: PredictConfig,
+    *,
+    sample_gc: NDArray[np.float64] | None = None,
+    sample_gc_q: NDArray[np.float32] | None = None,
+    sample_n_mask: NDArray[np.bool_] | None = None,
+    sample_map: NDArray[np.float64] | None = None,
+    tracks_loaded: bool = False,
 ) -> tuple[BinResult, ...]:
     models = tuple(build_branch_model(inputs, branch) for branch in inputs.branches)
-    if not models or (config.gc is None and config.mappability is None):
+    if not models:
+        return ()
+    if not tracks_loaded and (config.gc is not None or config.mappability is not None):
+        sample_gc, sample_gc_q, sample_n_mask, sample_map = (
+            _preload_sample_track_overrides(
+                inputs.sample,
+                inputs.reference,
+                inputs.branches,
+                gc_path=config.gc,
+                mappability_path=config.mappability,
+                mode=config.mode,
+            )
+        )
+    if sample_gc is None and sample_map is None:
         return tuple(normalize_branch(model, config) for model in models)
 
-    all_contigs: list[str] = []
-    offsets = [0]
-    for model in models:
-        all_contigs.extend(model.contigs)
-        offsets.append(len(all_contigs))
-    all_starts = (
-        np.concatenate([m.starts for m in models])
-        if all_contigs
-        else np.empty(0, dtype=np.int64)
-    )
-    all_ends = (
-        np.concatenate([m.ends for m in models])
-        if all_contigs
-        else np.empty(0, dtype=np.int64)
-    )
-
-    try:
-        gc_all, n_mask_all, gc_q_all = (
-            load_gc_track(config.gc, all_contigs, all_starts, all_ends)
-            if config.gc is not None
-            else (None, None, None)
-        )
-        map_all = (
-            load_mappability_track(
-                config.mappability, all_contigs, all_starts, all_ends
-            )
-            if config.mappability is not None
-            else None
-        )
-    except CovariateError as err:
-        raise PredictError(str(err)) from err
-
     results: list[BinResult] = []
-    for idx, model in enumerate(models):
-        sl = slice(offsets[idx], offsets[idx + 1])
+    for model in models:
+        s_idx = align_sample_to_grid_indices(
+            inputs.sample.meta,
+            model.contigs,
+            model.starts,
+            model.ends,
+            strict_branch=model.branch,
+        )
         results.append(
             normalize_branch(
                 model,
                 config,
-                gc_override=gc_all[sl] if gc_all is not None else None,
-                gc_quantiles_override=gc_q_all[sl] if gc_q_all is not None else None,
-                n_mask_override=n_mask_all[sl] if n_mask_all is not None else None,
-                mappability_override=map_all[sl] if map_all is not None else None,
+                gc_override=sample_gc[s_idx] if sample_gc is not None else None,
+                gc_quantiles_override=(
+                    sample_gc_q[s_idx] if sample_gc_q is not None else None
+                ),
+                n_mask_override=(
+                    sample_n_mask[s_idx] if sample_n_mask is not None else None
+                ),
+                mappability_override=(
+                    sample_map[s_idx] if sample_map is not None else None
+                ),
             )
         )
     return tuple(results)
@@ -164,34 +238,16 @@ def _sample_usable_from_bin_results(
 ) -> NDArray[np.bool_] | None:
     if raw_sample.num_rows == 0 or not bin_results:
         return None
-    codes, names, starts_u32, _ = reconstruct_sample_grid(raw_sample.meta)
-    usable_by_contig: dict[str, tuple[int, NDArray[np.bool_]]] = {}
+    usable = np.zeros(raw_sample.num_rows, dtype=np.bool_)
     for br in bin_results:
         if br.starts.size == 0:
             continue
-        c_arr = np.asarray(br.contigs, dtype=object)
-        for c_name in dict.fromkeys(br.contigs):
-            mask = c_arr == c_name
-            b_starts = br.starts[mask]
-            b_ends = br.ends[mask]
-            ref_bs = max(1, int(np.max(b_ends - b_starts)))
-            b_idx = b_starts // ref_bs
-            u_grid = np.zeros(int(np.max(b_idx)) + 1, dtype=np.bool_)
-            u_grid[b_idx] = ~br.masked[mask]
-            usable_by_contig[normalize_chr(str(c_name))] = (ref_bs, u_grid)
-
-    out = np.zeros(starts_u32.size, dtype=np.bool_)
-    starts_i64 = starts_u32.astype(np.int64, copy=False)
-    for c_code, c_name in enumerate(names):
-        entry = usable_by_contig.get(normalize_chr(c_name))
-        if entry is None:
-            continue
-        ref_bs, u_grid = entry
-        s_mask = codes == c_code
-        idx = starts_i64[s_mask] // ref_bs
-        in_bounds = (idx >= 0) & (idx < u_grid.size)
-        out[s_mask] = in_bounds & u_grid[np.clip(idx, 0, max(u_grid.size - 1, 0))]
-    return out
+        s_idx = align_sample_to_grid_indices(
+            raw_sample.meta, br.contigs, br.starts, br.ends, allow_alias=True
+        )
+        hit = (s_idx >= 0) & ~br.masked
+        usable[s_idx[hit]] = True
+    return usable
 
 
 def run(config: PredictConfig) -> PredictionOutputs:
@@ -208,25 +264,63 @@ def run(config: PredictConfig) -> PredictionOutputs:
         fasta=config.fasta,
         threads=config.threads,
     )
+    try:
+        cytobands_track = (
+            load_cytobands_track(config.cytobands, inputs.contig_lengths)
+            if (config.plot and config.cytobands is not None)
+            else None
+        )
+    except CovariateError as err:
+        raise PredictError(str(err)) from err
+
     raw_sample = inputs.sample
+    sample_gc, sample_gc_q, sample_n_mask, sample_map = _preload_sample_track_overrides(
+        raw_sample,
+        inputs.reference,
+        inputs.branches,
+        gc_path=config.gc,
+        mappability_path=config.mappability,
+        mode=config.mode,
+    )
+
     prenatal_meta: PrenatalModelMetadata | None = None
     prenatal_result: FetalFractionResult | None = None
     if config.mode == "prenatal":
-        prenatal_meta = PrenatalModelMetadata.from_table(inputs.reference)
-        if prenatal_meta is None:
-            raise PredictError("reference is missing prenatal metadata (ccnv.prenatal)")
-        prenatal_result = predict_prenatal(
-            raw_sample,
-            inputs.reference,
-            prenatal_meta,
-            min_ff_warning=config.min_fetal_fraction_warning,
-        )
-        weighted_sample = apply_prenatal_fisher_weighting(raw_sample, prenatal_meta)
+        try:
+            prenatal_meta = (
+                inputs.ref_meta.prenatal
+                if inputs.ref_meta is not None and inputs.ref_meta.prenatal is not None
+                else PrenatalModelMetadata.from_table(inputs.reference)
+            )
+            if prenatal_meta is None:
+                raise PredictError(
+                    "reference is missing prenatal metadata (ccnv.prenatal)"
+                )
+            prenatal_result = predict_prenatal(
+                raw_sample,
+                inputs.reference,
+                prenatal_meta,
+                min_ff_warning=config.min_fetal_fraction_warning,
+                sample_gc_override=sample_gc,
+                sample_mappability_override=sample_map,
+                sample_n_mask_override=sample_n_mask,
+                min_mappability=config.min_mappability,
+            )
+            weighted_sample = apply_prenatal_fisher_weighting(raw_sample, prenatal_meta)
+        except (SchemaError, ValueError) as err:
+            raise PredictError(str(err)) from err
         if weighted_sample is not raw_sample:
             inputs = replace(inputs, sample=weighted_sample)
 
-    bin_results = _normalize_branches_once(inputs, config)
-    _require_aligned_results(bin_results)
+    bin_results = _normalize_branches_once(
+        inputs,
+        config,
+        sample_gc=sample_gc,
+        sample_gc_q=sample_gc_q,
+        sample_n_mask=sample_n_mask,
+        sample_map=sample_map,
+        tracks_loaded=True,
+    )
     segments = segment_and_call(
         bin_results,
         inputs.contig_lengths,
@@ -239,47 +333,69 @@ def run(config: PredictConfig) -> PredictionOutputs:
     )
     if config.mode == "prenatal" and prenatal_result is not None:
         sample_usable = _sample_usable_from_bin_results(raw_sample, bin_results)
-        segments, lod_metrics = annotate_sample_prenatal_segments(
-            segments,
-            raw_sample,
-            bin_usable=sample_usable,
-            prenatal_meta=prenatal_meta,
-            prenatal_result=prenatal_result,
-            z_threshold=config.z_threshold,
-        )
+        try:
+            segments, lod_metrics = annotate_sample_prenatal_segments(
+                segments,
+                raw_sample,
+                bin_usable=sample_usable,
+                prenatal_meta=prenatal_meta,
+                prenatal_result=prenatal_result,
+                z_threshold=config.z_threshold,
+            )
+        except (SchemaError, ValueError) as err:
+            raise PredictError(str(err)) from err
         prenatal_result = replace(prenatal_result, lod_metrics=lod_metrics)
+
     qc_json_path = Path(f"{config.prefix}_qc.json")
-    write_predict_qc_json(
-        qc_json_path,
-        build_predict_qc_payload(
-            mode=config.mode,
-            sample_table=raw_sample,
+    try:
+        write_predict_qc_json(
+            qc_json_path,
+            build_predict_qc_payload(
+                mode=config.mode,
+                sample_table=raw_sample,
+                segments=segments,
+                prenatal_result=prenatal_result,
+                bin_results=bin_results,
+            ),
+        )
+        return write_outputs(
+            prefix=config.prefix,
+            bins=bin_results,
             segments=segments,
+            contig_lengths=inputs.contig_lengths,
+            plot=config.plot,
+            vcf=config.vcf,
+            bins_vcf=config.bins_vcf,
+            threads=config.threads,
+            cytobands=cytobands_track,
+            z_threshold=config.z_threshold,
+            ratio_threshold=config.ratio_threshold,
             prenatal_result=prenatal_result,
-            bin_results=bin_results,
-        ),
-    )
-    cytobands_track = (
-        load_cytobands_track(config.cytobands, inputs.contig_lengths)
-        if (config.plot and config.cytobands is not None)
-        else None
-    )
-    return write_outputs(
-        prefix=config.prefix,
-        bins=bin_results,
-        segments=segments,
-        contig_lengths=inputs.contig_lengths,
-        plot=config.plot,
-        vcf=config.vcf,
-        bins_vcf=config.bins_vcf,
-        threads=config.threads,
-        cytobands=cytobands_track,
-        z_threshold=config.z_threshold,
-        ratio_threshold=config.ratio_threshold,
-        prenatal_result=prenatal_result,
-        mode=config.mode,
-        qc_json_path=qc_json_path,
-    )
+            mode=config.mode,
+            qc_json_path=qc_json_path,
+        )
+    except OSError as err:
+        raise PredictError(
+            f"failed to write prediction outputs for {config.prefix}: {err}"
+        ) from err
+
+
+def _validate_branch_contigs(
+    reference: pa.Table,
+    branches: list[str],
+    sample_lens: dict[str, int],
+    ref_lens: dict[str, int],
+) -> None:
+    active_ref = filter_reference_branches(reference, branches)
+    active_contigs = unique_dictionary_contigs(active_ref.column("contig"))
+    missing_contigs = [c for c in active_contigs if c not in sample_lens]
+    if missing_contigs:
+        raise PredictError(
+            f"sample is missing reference bins on contig(s): {', '.join(missing_contigs)}"
+        )
+    for contig_name in active_contigs:
+        if sample_lens.get(contig_name) != ref_lens.get(contig_name):
+            raise PredictError(f"contig length mismatch for {contig_name!r}")
 
 
 def load_inputs(
@@ -293,11 +409,10 @@ def load_inputs(
 ) -> PredictionInput:
     """Load and validate sample buffers and selective reference branches."""
     try:
-        ref_schema = pq.read_schema(reference_path)
-        validate_schema(ref_schema, ArtifactKind.REFERENCE)
-        ref_meta_obj = ReferenceMetadata.from_schema(ref_schema)
-        raw_ref_meta = decode_metadata(ref_schema.metadata)
-    except Exception as err:
+        _, ref_meta_obj = read_reference_parquet(
+            reference_path, branches=(), check_rows=False
+        )
+    except (OSError, pa.ArrowException, CcnvError, ValueError) as err:
         raise PredictError(f"failed to read reference {reference_path}: {err}") from err
 
     if sample_path.suffix.lower() in {".bam", ".cram"}:
@@ -311,35 +426,21 @@ def load_inputs(
     else:
         try:
             sample = read_sample_buffers(sample_path)
-        except Exception as err:
+        except (OSError, pa.ArrowException, CcnvError, ValueError) as err:
             raise PredictError(f"failed to read sample {sample_path}: {err}") from err
 
     if mode == "prenatal" and ref_meta_obj.mode != "prenatal":
-        msg = (
+        raise PredictError(
             "reference was built in germline mode and lacks prenatal models; "
             "rebuild reference with --mode prenatal or run predict with --mode germline"
         )
-        raise PredictError(msg)
     if mode == "germline" and ref_meta_obj.mode == "prenatal":
         logger.warning(
             "reference was built in prenatal mode; "
             "prenatal models are ignored in germline mode"
         )
 
-    branch_vals: set[object] = set(ref_meta_obj.branches)
-    if not branch_vals:
-        try:
-            b_tbl = pq.read_table(reference_path, columns=["branch"])
-            branch_vals = {
-                str(v)
-                for v in pc.unique(b_tbl.column("branch")).to_pylist()
-                if v is not None
-            }
-        except Exception as err:
-            raise PredictError(
-                f"failed to read reference {reference_path}: {err}"
-            ) from err
-
+    branch_vals = set(ref_meta_obj.branches)
     if BRANCH_AUTOSOMAL not in branch_vals:
         raise PredictError("reference has no autosomal branch")
 
@@ -353,18 +454,21 @@ def load_inputs(
             for b in (*branches, BRANCH_PRENATAL_AUTOSOMAL, BRANCH_PRENATAL_FFY)
             if b in branch_vals
         ]
-    else:
-        chosen_sex = _resolve_sample_sex(sex, sample, raw_ref_meta, branch_vals)
-        branches = [BRANCH_AUTOSOMAL]
-        if chosen_sex is not None:
-            sex_branch = (
-                BRANCH_FEMALE_SEX if chosen_sex == "female" else BRANCH_MALE_SEX
-            )
-            if sex_branch not in branch_vals and sex != "autosomal":
-                raise PredictError(f"reference has no {sex_branch!r} branch")
-            if sex_branch in branch_vals:
-                branches.append(sex_branch)
+    elif sex != "autosomal":
+        chosen_sex = infer_single_sample_sex(sample, ref_meta_obj, sex=sex)
+        sex_branch = BRANCH_FEMALE_SEX if chosen_sex == "female" else BRANCH_MALE_SEX
+        if sex_branch not in branch_vals:
+            raise PredictError(f"reference has no {sex_branch!r} branch")
+        branches = [BRANCH_AUTOSOMAL, sex_branch]
         read_branches = list(branches)
+    else:
+        chosen_sex = None
+        branches = [BRANCH_AUTOSOMAL]
+        read_branches = [
+            b
+            for b in (BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX)
+            if b in branch_vals
+        ]
 
     if sample.meta.bin_size != ref_meta_obj.bin_size:
         logger.debug(
@@ -381,24 +485,37 @@ def load_inputs(
         reference, _ = read_reference_parquet(
             reference_path, branches=read_branches, check_rows=False
         )
-    except Exception as err:
+    except (OSError, pa.ArrowException, CcnvError, ValueError) as err:
         raise PredictError(f"failed to read reference {reference_path}: {err}") from err
 
-    resolve_fragmentomics_compatibility(sample, reference)
-    active_ref = reference.filter(
-        pc.is_in(reference.column("branch"), pa.array(branches, type=pa.string()))
-    )
-    active_contigs = unique_dictionary_contigs(active_ref.column("contig"))
-    sample_lens = sample.meta.contig_lengths
+    resolve_fragmentomics_compatibility(sample, ref_meta_obj)
+    sample_lens = dict(sample.meta.contig_lengths)
     ref_lens = dict(ref_meta_obj.contig_lengths)
-    missing_contigs = [c for c in active_contigs if c not in sample_lens]
-    if missing_contigs:
-        raise PredictError(
-            f"sample is missing reference bins on contig(s): {', '.join(missing_contigs)}"
+
+    if mode == "germline" and sex == "autosomal":
+        _validate_branch_contigs(reference, [BRANCH_AUTOSOMAL], sample_lens, ref_lens)
+        for c_name in unique_dictionary_contigs(reference.column("contig")):
+            if c_name in sample_lens and sample_lens[c_name] != ref_lens.get(c_name):
+                raise PredictError(f"contig length mismatch for {c_name!r}")
+
+        unmasked_sample_bins = align_reference_unmasked_bins(sample, reference)
+
+        chosen_sex = infer_single_sample_sex(
+            sample,
+            ref_meta_obj,
+            sex=None,
+            unmasked_sample_bins=unmasked_sample_bins,
         )
-    for contig_name in active_contigs:
-        if sample_lens.get(contig_name) != ref_lens.get(contig_name):
-            raise PredictError(f"contig length mismatch for {contig_name!r}")
+        if chosen_sex is not None:
+            sex_branch = (
+                BRANCH_FEMALE_SEX if chosen_sex == "female" else BRANCH_MALE_SEX
+            )
+            if sex_branch in branch_vals:
+                branches.append(sex_branch)
+        if set(branches) != set(read_branches):
+            reference = filter_reference_branches(reference, branches)
+
+    _validate_branch_contigs(reference, branches, sample_lens, ref_lens)
 
     return PredictionInput(
         sample=sample,
@@ -406,6 +523,7 @@ def load_inputs(
         contig_lengths=ref_lens,
         sex=chosen_sex,
         branches=tuple(branches),
+        ref_meta=ref_meta_obj,
     )
 
 
@@ -429,7 +547,10 @@ def build_branch_model(
     """Build dense NumPy arrays for one reference branch."""
     if isinstance(inputs, PredictionInput):
         return build_branch_model_from_tables(
-            inputs.reference, branch, sample_data=inputs.sample
+            inputs.reference,
+            branch,
+            sample=inputs.sample,
+            ref_meta=inputs.ref_meta,
         )
     return build_branch_model_from_tables(inputs, branch, ref_meta=ref_meta)
 
@@ -451,6 +572,7 @@ def segment_and_call(
 
     by_contig: dict[str, ContigSegmentationInput] = {}
     for result in bins:
+        ploidy = 1 if result.branch == BRANCH_MALE_SEX else 2
         contig_array = np.asarray(result.contigs, dtype=object)
         for contig_name in dict.fromkeys(result.contigs):
             selected = contig_array == contig_name
@@ -467,35 +589,22 @@ def segment_and_call(
                     if result.expected_counts is not None
                     else None
                 ),
+                baseline_ploidy=ploidy,
             )
 
-    scored_segments = segment_and_score_genome(
-        by_contig,
-        penalty=None,
-        sensitivity=penalty,
-        z_threshold=z_threshold,
-        ratio_threshold=ratio_threshold,
-        max_blacklist_gap=max_blacklist_gap,
-        threads=threads,
-        mode=mode,
-    )
-
-    output = tuple(
-        SegmentResult(
-            contig=s.contig,
-            start=s.start,
-            end=min(s.end, contig_lengths[s.contig]),
-            ratio=s.mean,
-            zscore=s.zscore,
-            weight=s.weight,
-            bin_count=s.bin_count,
-            call=s.call,
-            copy_number=s.copy_number,
-            log_bf=s.log_bf,
-            q_value=s.q_value,
+    try:
+        output = segment_and_score_genome(
+            by_contig,
+            penalty=None,
+            sensitivity=penalty,
+            z_threshold=z_threshold,
+            ratio_threshold=ratio_threshold,
+            max_blacklist_gap=max_blacklist_gap,
+            threads=threads,
+            mode=mode,
         )
-        for s in scored_segments
-    )
+    except InvalidInputError as err:
+        raise PredictError(str(err)) from err
 
     gains = sum(1 for s in output if s.call == "gain")
     losses = sum(1 for s in output if s.call == "loss")
@@ -508,18 +617,6 @@ def segment_and_call(
         neutral,
     )
     return output
-
-
-def _resolve_sample_sex(
-    requested: Literal["autosomal", "female", "male"],
-    sample: SampleBuffers | pa.Table,
-    metadata: dict[str, object],
-    branches: set[object],
-) -> Sex | None:
-    """Infer sample genetic sex from non-PAR sex-signal coverage against reference cutoff."""
-    if requested != "autosomal":
-        return requested
-    return infer_single_sample_sex(sample, metadata, branches)
 
 
 def _validate_config(config: PredictConfig) -> None:
@@ -540,31 +637,14 @@ def _validate_config(config: PredictConfig) -> None:
         or config.mask_repeats < 1
         or config.max_blacklist_gap < 0
     ):
-        msg = (
+        raise PredictError(
             "min_reference_bins and mask_repeats must be positive, "
             "max_blacklist_gap non-negative"
         )
-        raise PredictError(msg)
     try:
         validate_min_mappability(config.min_mappability)
     except CovariateError as err:
         raise PredictError(str(err)) from err
-
-
-def _require_aligned(length: int, *arrays: ArrayLike) -> None:
-    """Ensure all provided arrays have 1D shape matching expected length."""
-    if any(np.asarray(a).shape != (length,) for a in arrays):
-        raise PredictError(
-            "prediction result arrays must be aligned and one-dimensional"
-        )
-
-
-def _require_aligned_results(results: tuple[BinResult, ...]) -> None:
-    """Ensure all per-branch BinResult arrays are 1D aligned."""
-    for res in results:
-        _require_aligned(
-            res.starts.size, res.ratios, res.zscores, res.weights, res.reference_sizes
-        )
 
 
 run_predict: Final = run

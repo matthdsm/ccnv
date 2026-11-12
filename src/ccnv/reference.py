@@ -13,26 +13,27 @@ import numpy as np
 import pyarrow as pa
 from numpy.typing import NDArray
 
+from ccnv.features.binning import compute_bin_exposure
 from ccnv.features.cohort import (
     Cohort,
-    SexInference,
-    SexLabel,
+    alloc_cohort_counts,
     build_fisher_weighted_cohort,
     cohort_from_fasta,
-    compute_bin_exposure,
     estimate_size_factors,
-    infer_germline_sex_2d,
     load_and_assemble_cohort,
     mask_low_coverage_per_contig,
 )
 from ccnv.features.covariates import (
-    build_exogenous_covariate_basis,
     covariate_features,
-    fit_poisson_covariate_trends,
     mask_covariates,
     validate_min_mappability,
 )
 from ccnv.features.prenatal import fit_prenatal_models
+from ccnv.features.sex import (
+    SexInference,
+    SexLabel,
+    infer_germline_sex_2d,
+)
 from ccnv.io.parquet import write_reference_parquet
 from ccnv.io.samplesheet import load_samplesheet
 from ccnv.io.tracks import (
@@ -48,20 +49,28 @@ from ccnv.models import (
     AnalysisMode,
     BranchFitArrays,
     CovariateError,
+    InvalidInputError,
+    PrenatalModelMetadata,
     ReferenceConfig,
     ReferenceError,
     ReferenceMetadata,
+    ReferenceQCError,
     SamplesheetEntry,
+    SchemaError,
     assemble_reference_table,
+    normalize_chr,
     parquet_path,
 )
 from ccnv.qc.reference import run_reference_qc_on_table
-from ccnv.stats.neighbors import (
+from ccnv.stats import (
+    build_exogenous_covariate_basis,
     build_whitened_subspace_features,
     calibrate_prototype_dispersion,
+    fit_poisson_covariate_trends,
     fit_prototype_graph,
+    fit_whitened_pca,
+    reconstruct_whitened_pca_expected,
 )
-from ccnv.stats.pca import fit_whitened_pca, reconstruct_whitened_pca_expected
 
 DEFAULT_SEX_CONTIGS: Final[tuple[str, ...]] = ("X", "Y", "chrX", "chrY")
 DEFAULT_SEX_SIGNAL_CONTIGS: Final[tuple[str, ...]] = ("chrY", "Y")
@@ -78,49 +87,59 @@ __all__ = [
 ]
 
 
+def _load_cohort(config: ReferenceConfig) -> Cohort:
+    """Load a cohort matrix from a samplesheet/entries or build a flat FASTA grid."""
+    if config.fasta is not None:
+        if config.bin_size is None or config.bin_size <= 0:
+            raise ReferenceError(
+                "bin_size must be a positive integer when using a FASTA"
+            )
+        contigs = read_fasta_contigs(config.fasta, all_contigs=config.all_contigs)
+        return cohort_from_fasta(
+            contigs,
+            config.bin_size,
+            fasta_path=config.fasta,
+        )
+    return load_and_assemble_cohort(
+        config.entries,
+        target_bin_size=config.bin_size,
+        threads=config.threads,
+        max_batch_memory_mb=config.max_batch_memory_mb,
+    )
+
+
 def run(config: ReferenceConfig) -> Path:
     """Validate a cohort and write a versioned Schema v2.0.0 reference Parquet file."""
     _validate_config(config)
     if config.samplesheet_path is not None:
         config = replace(config, entries=load_samplesheet(config.samplesheet_path))
-    if config.fasta is not None:
-        if config.bin_size is None:
-            raise ReferenceError("--fasta requires --binsize")
-        contigs = read_fasta_contigs(config.fasta, all_contigs=config.all_contigs)
-        cohort = cohort_from_fasta(
-            contigs,
-            config.bin_size,
-            fasta_path=config.fasta,
-        )
-        config = (
-            replace(config, sex_contigs=())
-            if (config.sex_contigs is None or config.sex_contigs == DEFAULT_SEX_CONTIGS)
-            else config
-        )
-    else:
-        cohort = load_and_assemble_cohort(
-            config.entries,
-            target_bin_size=config.bin_size,
-            threads=config.threads,
-            max_batch_memory_mb=config.max_batch_memory_mb,
-        )
-    table, path = build_reference_table(cohort, config), parquet_path(config.prefix)
+    table = build_reference_table(_load_cohort(config), config)
+    path = parquet_path(config.prefix)
     logger.debug("writing reference parquet %s (%d rows)", path, table.num_rows)
-    write_reference_parquet(table, path)
+    try:
+        write_reference_parquet(table, path)
+        size_kb = path.stat().st_size / 1024
+    except (SchemaError, OSError, pa.ArrowException) as err:
+        raise ReferenceError(
+            f"failed to write reference parquet {path}: {err}"
+        ) from err
     logger.debug(
         "wrote reference parquet %s (%.1f KB, %d rows)",
         path,
-        path.stat().st_size / 1024,
+        size_kb,
         table.num_rows,
     )
     if config.qc_report:
-        run_reference_qc_on_table(
-            table,
-            prefix=config.prefix,
-            reference_path=path,
-            write_json=True,
-            emit_stderr=True,
-        )
+        try:
+            run_reference_qc_on_table(
+                table,
+                prefix=config.prefix,
+                reference_path=path,
+                write_json=True,
+                emit_stderr=True,
+            )
+        except (ReferenceQCError, OSError) as err:
+            raise ReferenceError(str(err)) from err
     return path
 
 
@@ -130,7 +149,8 @@ def build_reference_table(
 ) -> pa.Table:
     """Fit autosomal and optional sex-contig branches into one Schema v2.0.0 table."""
     is_flat = config.fasta is not None
-    if not is_flat and cohort.counts.shape[1] < config.min_cohort_size:
+    n_samples = int(cohort.counts.shape[1])
+    if not is_flat and n_samples < config.min_cohort_size:
         raise ReferenceError(
             f"provide at least {config.min_cohort_size} samples to build a reference"
         )
@@ -150,12 +170,10 @@ def build_reference_table(
                 gc_src, cohort.contigs, cohort.starts, cohort.ends
             )
             if config.gc is not None and config.fasta is not None:
-                _, fasta_n_mask, fasta_gc_q = load_gc_track(
+                _, fasta_n_mask, _ = load_gc_track(
                     config.fasta, cohort.contigs, cohort.starts, cohort.ends
                 )
                 cohort_n_mask = cohort_n_mask | fasta_n_mask
-                if cohort_gc_q is None:
-                    cohort_gc_q = fasta_gc_q
         if config.mappability is not None:
             cohort_map = load_mappability_track(
                 config.mappability, cohort.contigs, cohort.starts, cohort.ends
@@ -164,30 +182,51 @@ def build_reference_table(
         raise ReferenceError(str(err)) from err
 
     autosomes, sex_contigs = _resolve_contig_roles(cohort, config)
-    prenatal_meta = None
-    prenatal_auto_fit: BranchFitArrays | None = None
-    prenatal_ffy_fit: BranchFitArrays | None = None
+    signal = _resolve_sex_signal(cohort, config)
+
+    bin_size = cohort.bin_size
+    contig_lengths = dict(cohort.contig_lengths)
+    identities = cohort.identities
+    first_filters: dict[str, object] | None = None
+    if cohort.sample_metadata:
+        raw_f = cohort.sample_metadata[0].get("filters")
+        if isinstance(raw_f, Mapping):
+            first_filters = {str(k): v for k, v in raw_f.items()}
+
+    prenatal_meta: PrenatalModelMetadata | None = None
+    prenatal_branch_fits: tuple[BranchFitArrays, ...] = ()
 
     if config.mode == "prenatal":
-        eff_bs = config.bin_size if config.bin_size is not None else cohort.bin_size
+        if config.prenatal_bin_size < 1:
+            raise ReferenceError("prenatal_bin_size must be a positive integer")
+        if config.prenatal_bin_size < cohort.bin_size:
+            raise ReferenceError(
+                f"prenatal_bin_size ({config.prenatal_bin_size}) must be >= "
+                f"cohort bin_size ({cohort.bin_size})"
+            )
         entries = config.entries or tuple(
             SamplesheetEntry(filepath=Path(f"sample_{i}.ccnv"))
-            for i in range(cohort.counts.shape[1])
+            for i in range(n_samples)
         )
-        prenatal_auto_fit, prenatal_ffy_fit, prenatal_meta, is_m = fit_prenatal_models(
-            cohort,
-            entries,
-            bin_size=eff_bs,
-            prenatal_bin_size=config.prenatal_bin_size,
-            seed=config.seed,
-            cohort_gc=cohort_gc,
-            cohort_mappability=cohort_map,
-        )
-        sexes: tuple[SexLabel, ...] | None = tuple(
-            "male" if m else "female" for m in np.array(is_m, dtype=np.bool_)
-        )
-        sex_source, signal = "prenatal_model", _resolve_sex_signal(cohort, config)
-        quarantined = np.zeros(len(is_m), dtype=np.bool_)
+        try:
+            prenatal_meta, prenatal_branch_fits, sexes_tup = fit_prenatal_models(
+                cohort,
+                entries,
+                prenatal_bin_size=config.prenatal_bin_size,
+                cohort_gc=cohort_gc,
+                cohort_mappability=cohort_map,
+                cohort_n_mask=cohort_n_mask,
+                min_mappability=config.min_mappability,
+                autosomes=autosomes,
+                sex_contigs=sex_contigs,
+                sex_signal_contig=signal,
+                seed=config.seed,
+            )
+        except (InvalidInputError, ValueError) as err:
+            raise ReferenceError(str(err)) from err
+        sexes: tuple[SexLabel, ...] | None = sexes_tup
+        sex_source = "prenatal_model"
+        quarantined = np.zeros(len(sexes_tup), dtype=np.bool_)
         if prenatal_meta.quarantined_samples is not None:
             quarantined[prenatal_meta.quarantined_samples] = True
         inference: SexInference | None = SexInference(
@@ -199,12 +238,7 @@ def build_reference_table(
             quarantined_mask=quarantined,
         )
     elif is_flat:
-        sexes, sex_source, inference, signal = (
-            None,
-            "none",
-            None,
-            _resolve_sex_signal(cohort, config),
-        )
+        sexes, sex_source, inference = None, "none", None
     else:
         _, cohort_c_ids = np.unique(
             np.asarray(cohort.contigs, dtype=str), return_inverse=True
@@ -219,82 +253,58 @@ def build_reference_table(
             n_mask=cohort_n_mask,
             min_mappability=config.min_mappability,
         )
-        sexes, sex_source, inference, signal = _resolve_sexes(
-            cohort, config, sex_contigs, cohort_usable
+        sexes, sex_source, inference = _resolve_sexes(
+            cohort, config, sex_contigs, signal, cohort_usable
         )
 
-    cnv_cohort = (
-        build_fisher_weighted_cohort(
+    if (
+        config.mode == "prenatal"
+        and prenatal_meta is not None
+        and prenatal_meta.band_fisher_weights is not None
+    ):
+        cnv_cohort = build_fisher_weighted_cohort(
             cohort,
             prenatal_meta.band_fisher_weights,
             max_batch_memory_mb=config.max_batch_memory_mb,
             threads=config.threads,
         )
-        if (
-            config.mode == "prenatal"
-            and prenatal_meta is not None
-            and prenatal_meta.band_fisher_weights is not None
-        )
-        else cohort
+    else:
+        cnv_cohort = cohort
+    del cohort
+
+    frag_corrected = (cnv_cohort.ref_frag_len is not None) or (
+        cnv_cohort.ref_ep_rate is not None
     )
-
-    branch_fits: list[BranchFitArrays] = []
-
-    def _add_branch(
-        branch_name: str,
-        sample_indices: NDArray[np.integer],
-        contig_names: tuple[str, ...],
-    ) -> None:
-        branch_fits.append(
-            _fit_branch(
-                branch=branch_name,
-                cohort=cnv_cohort,
-                sample_index=sample_indices,
-                contig_names=contig_names,
-                config=config,
-                cohort_gc=cohort_gc,
-                cohort_mappability=cohort_map,
-                cohort_n_mask=cohort_n_mask,
-                cohort_gc_quantiles=cohort_gc_q,
-            )
-        )
-
-    _add_branch(BRANCH_AUTOSOMAL, np.arange(cohort.counts.shape[1]), autosomes)
-    if not is_flat and sex_contigs and sexes is not None:
-        labels = np.asarray(sexes)
-        clean = (
-            ~inference.quarantined_mask
-            if (
-                inference is not None
-                and inference.quarantined_mask.shape == (cohort.counts.shape[1],)
-            )
-            else np.ones(cohort.counts.shape[1], dtype=np.bool_)
-        )
-        if (
-            female_indices := np.flatnonzero((labels == "female") & clean)
-        ).size >= config.min_sex_group_size:
-            _add_branch(BRANCH_FEMALE_SEX, female_indices, sex_contigs)
-        if (
-            male_indices := np.flatnonzero((labels == "male") & clean)
-        ).size >= config.min_sex_group_size:
-            _add_branch(BRANCH_MALE_SEX, male_indices, sex_contigs)
+    branch_fits = _fit_cnv_branches(
+        cnv_cohort,
+        config=config,
+        is_flat=is_flat,
+        autosomes=autosomes,
+        sex_contigs=sex_contigs,
+        signal=signal,
+        sexes=sexes,
+        inference=inference,
+        cohort_gc=cohort_gc,
+        cohort_map=cohort_map,
+        cohort_n_mask=cohort_n_mask,
+        cohort_gc_q=cohort_gc_q,
+    )
+    del cnv_cohort
 
     if config.mode == "prenatal":
-        if prenatal_auto_fit is None or prenatal_ffy_fit is None:
+        if not prenatal_branch_fits:
             raise ReferenceError("prenatal branch models were not initialized")
-        for fit in (prenatal_auto_fit, prenatal_ffy_fit):
-            if fit.num_rows > 0:
-                branch_fits.append(fit)
+        for fit in prenatal_branch_fits:
+            if fit.num_rows == 0:
+                raise ReferenceError(
+                    f"prenatal reference branch {fit.branch!r} produced 0 bins "
+                    "(prenatal mode requires both autosomal and chrY/MSY contigs)"
+                )
+            branch_fits.append(fit)
 
     p_max = max((b.pca_rank for b in branch_fits), default=0)
     built_branches = tuple(b.branch for b in branch_fits)
     branch_pca_ranks = {b.branch: b.pca_rank for b in branch_fits}
-
-    first_filters: dict[str, object] | None = None
-    if cohort.sample_metadata:
-        raw_f = cohort.sample_metadata[0].get("filters")
-        if isinstance(raw_f, Mapping):
-            first_filters = {str(k): v for k, v in raw_f.items()}
 
     resolved_sex_cutoff = (
         config.sex_cutoff
@@ -302,8 +312,8 @@ def build_reference_table(
         else (inference.cutoff if inference is not None and inference.passed else None)
     )
     ref_meta = ReferenceMetadata(
-        bin_size=cohort.bin_size,
-        contig_lengths=cohort.contig_lengths,
+        bin_size=bin_size,
+        contig_lengths=contig_lengths,
         branches=built_branches,
         autosomal_contigs=autosomes,
         sex_contigs=sex_contigs,
@@ -314,7 +324,7 @@ def build_reference_table(
         prenatal_bin_size=(
             config.prenatal_bin_size if config.mode == "prenatal" else None
         ),
-        sample_identities=cohort.identities,
+        sample_identities=identities,
         sex_signal_contig=signal,
         sex_cutoff=resolved_sex_cutoff,
         sex_source=sex_source,
@@ -336,8 +346,7 @@ def build_reference_table(
         flat=is_flat,
         gc_corrected=(config.gc is not None) or is_flat,
         mappability_corrected=config.mappability is not None,
-        fragmentomics_corrected=(cohort.ref_frag_len is not None)
-        or (cohort.ref_ep_rate is not None),
+        fragmentomics_corrected=frag_corrected,
         min_mappability=config.min_mappability,
         branch_pca_ranks=branch_pca_ranks,
         filters=first_filters,
@@ -345,18 +354,89 @@ def build_reference_table(
     )
     return assemble_reference_table(
         branch_fits,
-        contig_order=tuple(cohort.contig_lengths.keys()),
+        contig_order=tuple(contig_lengths.keys()),
         metadata=ref_meta.build_arrow_metadata(),
     )
 
 
+def _fit_cnv_branches(
+    cohort: Cohort,
+    *,
+    config: ReferenceConfig,
+    is_flat: bool,
+    autosomes: tuple[str, ...],
+    sex_contigs: tuple[str, ...],
+    signal: str | None,
+    sexes: tuple[SexLabel, ...] | None,
+    inference: SexInference | None,
+    cohort_gc: NDArray[np.float64] | None,
+    cohort_map: NDArray[np.float64] | None,
+    cohort_n_mask: NDArray[np.bool_] | None,
+    cohort_gc_q: NDArray[np.float32] | None,
+) -> list[BranchFitArrays]:
+    """Fit autosomal and optional female/male sex CNV reference branches."""
+    n_samples = int(cohort.counts.shape[1])
+    specs: list[tuple[str, NDArray[np.integer], tuple[str, ...]]] = [
+        (BRANCH_AUTOSOMAL, np.arange(n_samples), autosomes)
+    ]
+    female_contigs = (
+        tuple(c for c in sex_contigs if c != signal and normalize_chr(c) != "Y")
+        or sex_contigs
+    )
+    if is_flat and sex_contigs:
+        empty_idx = np.empty(0, dtype=np.int64)
+        specs.append((BRANCH_FEMALE_SEX, empty_idx, female_contigs))
+        specs.append((BRANCH_MALE_SEX, empty_idx, sex_contigs))
+    elif not is_flat and sex_contigs and sexes is not None:
+        labels = np.asarray(sexes)
+        clean = (
+            ~inference.quarantined_mask
+            if (
+                inference is not None
+                and inference.quarantined_mask.shape == (n_samples,)
+            )
+            else np.ones(n_samples, dtype=np.bool_)
+        )
+        if (
+            female_indices := np.flatnonzero((labels == "female") & clean)
+        ).size >= config.min_sex_group_size:
+            specs.append((BRANCH_FEMALE_SEX, female_indices, female_contigs))
+        if (
+            male_indices := np.flatnonzero((labels == "male") & clean)
+        ).size >= config.min_sex_group_size:
+            specs.append((BRANCH_MALE_SEX, male_indices, sex_contigs))
+
+    return [
+        _fit_branch(
+            branch=b_name,
+            cohort=cohort,
+            sample_index=s_idx,
+            contig_names=c_names,
+            config=config,
+            cohort_gc=cohort_gc,
+            cohort_mappability=cohort_map,
+            cohort_n_mask=cohort_n_mask,
+            cohort_gc_quantiles=cohort_gc_q,
+        )
+        for b_name, s_idx, c_names in specs
+    ]
+
+
 def _validate_config(config: ReferenceConfig) -> None:
     """Validate reference build configuration parameters and input paths."""
-    if config.mode == "prenatal" and config.fasta is not None:
-        raise ReferenceError(
-            "Flat FASTA references are only supported in --mode germline; "
-            "--mode prenatal requires a cohort --samplesheet."
-        )
+    if config.mode == "prenatal":
+        if config.fasta is not None:
+            raise ReferenceError(
+                "Flat FASTA references are only supported in --mode germline; "
+                "--mode prenatal requires a cohort --samplesheet."
+            )
+        if config.prenatal_bin_size < 1:
+            raise ReferenceError("prenatal_bin_size must be a positive integer")
+        if config.bin_size is not None and config.prenatal_bin_size < config.bin_size:
+            raise ReferenceError(
+                f"prenatal_bin_size ({config.prenatal_bin_size}) must be >= "
+                f"bin_size ({config.bin_size})"
+            )
     has_samples, has_fasta = (
         bool(config.entries or config.samplesheet_path),
         config.fasta is not None,
@@ -369,6 +449,10 @@ def _validate_config(config: ReferenceConfig) -> None:
         raise ReferenceError(
             "provide either sample Parquet entries or a FASTA, not both"
         )
+    if config.all_contigs and not has_fasta:
+        logger.warning(
+            "--all-contigs applies only to --fasta flat references; cohort contigs follow sample headers"
+        )
     if has_fasta and (config.bin_size is None or config.bin_size <= 0):
         raise ReferenceError("bin_size must be a positive integer when using a FASTA")
     if config.pca_components is not None and config.pca_components < 1:
@@ -379,8 +463,8 @@ def _validate_config(config: ReferenceConfig) -> None:
     ]:
         if val < 1:
             raise ReferenceError(f"{name} must be a positive integer")
-    if config.max_batch_memory_mb < 0:
-        raise ReferenceError("max_batch_memory_mb must be a non-negative integer")
+    if config.max_batch_memory_mb < 1:
+        raise ReferenceError("max_batch_memory_mb must be a positive integer")
     try:
         validate_min_mappability(config.min_mappability)
     except CovariateError as err:
@@ -396,21 +480,17 @@ def _resolve_contig_roles(
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Partition cohort contigs into autosomal and sex-chromosome sets."""
     ordered, avail = tuple(dict.fromkeys(cohort.contigs)), set(cohort.contigs)
-    req_sex = (
-        None if config.sex_contigs is None else tuple(dict.fromkeys(config.sex_contigs))
-    )
-    sex_contigs = (
-        tuple(n for n in DEFAULT_SEX_CONTIGS if n in avail)
-        if (req_sex is None or req_sex == DEFAULT_SEX_CONTIGS)
-        else req_sex
-    )
-    if (
-        req_sex is not None
-        and req_sex != DEFAULT_SEX_CONTIGS
-        and any(n not in avail for n in sex_contigs)
-    ):
-        unknown = ", ".join(n for n in sex_contigs if n not in avail)
-        raise ReferenceError(f"unknown sex contig(s): {unknown}")
+    is_flat = config.fasta is not None
+    if config.sex_contigs is None:
+        sex_contigs = (
+            () if is_flat else tuple(n for n in DEFAULT_SEX_CONTIGS if n in avail)
+        )
+    else:
+        sex_contigs = tuple(dict.fromkeys(config.sex_contigs))
+        if any(n not in avail for n in sex_contigs):
+            unknown = ", ".join(n for n in sex_contigs if n not in avail)
+            raise ReferenceError(f"unknown sex contig(s): {unknown}")
+
     autosomes = (
         tuple(n for n in ordered if n not in set(sex_contigs))
         if config.autosomal_contigs is None
@@ -433,12 +513,12 @@ def _resolve_sexes(
     cohort: Cohort,
     config: ReferenceConfig,
     sex_contigs: tuple[str, ...],
+    signal: str | None,
     usable: NDArray[np.bool_],
-) -> tuple[tuple[SexLabel, ...] | None, str, SexInference | None, str | None]:
+) -> tuple[tuple[SexLabel, ...] | None, str, SexInference | None]:
     """Resolve sample sex assignments, 2D outlier quarantine, and signal cutoff."""
-    signal = _resolve_sex_signal(cohort, config)
-    if not sex_contigs or signal is None:
-        return None, "none", None, signal
+    if not sex_contigs:
+        return None, "none", None
     explicit: tuple[SexLabel | None, ...] | None = (
         tuple(
             "male" if e.sex == "M" else ("female" if e.sex == "F" else None)
@@ -448,6 +528,13 @@ def _resolve_sexes(
         else None
     )
     all_labeled = explicit is not None and all(x is not None for x in explicit)
+    if signal is None:
+        if all_labeled and explicit is not None:
+            lbls_only: tuple[SexLabel, ...] = tuple(
+                "male" if x == "male" else "female" for x in explicit
+            )
+            return lbls_only, "samplesheet", None
+        return None, "none", None
     inference = infer_germline_sex_2d(
         cohort,
         usable,
@@ -460,16 +547,16 @@ def _resolve_sexes(
         lbls: tuple[SexLabel, ...] = tuple(
             "male" if x == "male" else "female" for x in explicit
         )
-        return lbls, "samplesheet", inference, signal
+        return lbls, "samplesheet", inference
     if not inference.passed or inference.labels is None:
-        return None, "none", inference, signal
-    return inference.labels, "inferred", inference, signal
+        return None, "none", inference
+    return inference.labels, "inferred", inference
 
 
 def _resolve_sex_signal(cohort: Cohort, config: ReferenceConfig) -> str | None:
     """Identify the sex-signal contig available in the cohort."""
     avail, req = set(cohort.contigs), config.sex_signal_contig
-    if req is None or req == DEFAULT_SEX_SIGNAL_CONTIGS[0]:
+    if req is None:
         return next((n for n in DEFAULT_SEX_SIGNAL_CONTIGS if n in avail), None)
     if req not in avail:
         raise ReferenceError(f"unknown sex-signal contig {req!r}")
@@ -518,6 +605,9 @@ def _fit_branch(
     branch_ep_ratio = (
         cohort.ref_ep_rate[selected] if cohort.ref_ep_rate is not None else None
     )
+    branch_kappa = (
+        cohort.ref_kappa_frag[selected] if cohort.ref_kappa_frag is not None else None
+    )
 
     if is_flat:
         counts = np.empty((n_bins, 0), dtype=np.float32)
@@ -537,7 +627,7 @@ def _fit_branch(
             )
         else:
             sel_idx = np.flatnonzero(selected)
-            counts = np.empty((n_bins, n_sub), dtype=np.float32)
+            counts = alloc_cohort_counts(n_bins, n_sub, config.max_batch_memory_mb)
             for r0 in range(0, n_bins, 32_768):
                 r1 = min(n_bins, r0 + 32_768)
                 sub_rows = cohort.counts[sel_idx[r0:r1]]
@@ -586,7 +676,7 @@ def _fit_branch(
             0.0,
             covariate_mat=cov_mat,
         )
-        _, pids_u, pweights_u, mdist_u = fit_prototype_graph(
+        pids_u, pweights_u, mdist_u = fit_prototype_graph(
             profiles,
             max_prototypes=2048,
             top_r=NUM_PROTOTYPES_PER_BIN,
@@ -632,7 +722,7 @@ def _fit_branch(
             covariate_mat=cov_mat,
             fallback_rate=pca_res.mean_rate[usable],
         )
-        centers, pids_u, pweights_u, mdist_u = fit_prototype_graph(
+        pids_u, pweights_u, mdist_u = fit_prototype_graph(
             profiles,
             max_prototypes=2048,
             top_r=NUM_PROTOTYPES_PER_BIN,
@@ -646,7 +736,7 @@ def _fit_branch(
             pids_u,
             pweights_u,
             pca_rank=int(pca_loadings.shape[0]),
-            n_prototypes=int(centers.shape[0]),
+            kappa_frag=branch_kappa,
         )
 
     raw_rank = int(pca_loadings.shape[0])

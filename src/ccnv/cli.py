@@ -1,6 +1,7 @@
 """Thin command-line interface for ccnv pipeline stages."""
 
 import logging
+import math
 import os
 import sys
 from enum import StrEnum
@@ -10,12 +11,12 @@ from typing import Annotated, NoReturn
 
 import typer
 
-from ccnv.extract import ExtractError
 from ccnv.extract import run as run_extract
 from ccnv.models import (
     DEFAULT_BIN_SIZE,
     DEFAULT_MIN_MAPPABILITY,
     AnalysisMode,
+    CcnvError,
     ExtractConfig,
     PredictConfig,
     ReadFilters,
@@ -23,20 +24,9 @@ from ccnv.models import (
     ReferenceQCConfig,
     SexBranch,
 )
-from ccnv.predict import PredictError
 from ccnv.predict import run as run_predict
-from ccnv.ref_qc import (
-    ReferenceQCError,
-    run_reference_qc,
-)
-from ccnv.reference import (
-    DEFAULT_SEX_CONTIGS,
-    DEFAULT_SEX_SIGNAL_CONTIGS,
-    ReferenceError,
-)
-from ccnv.reference import (
-    run as run_reference,
-)
+from ccnv.ref_qc import run_reference_qc
+from ccnv.reference import run as run_reference
 
 app = typer.Typer(
     name="ccnv",
@@ -123,12 +113,26 @@ GcOption = Annotated[
     ),
 ]
 
+
+def _require_positive_float(value: float | None) -> float | None:
+    if value is not None and (not math.isfinite(value) or value <= 0.0):
+        raise typer.BadParameter("must be a finite positive number (> 0)")
+    return value
+
+
+def _require_finite_unit_float(value: float | None) -> float | None:
+    if value is not None and (not math.isfinite(value) or value < 0.0 or value > 1.0):
+        raise typer.BadParameter("must be a finite number in [0, 1]")
+    return value
+
+
 MinMappabilityOption = Annotated[
     float,
     typer.Option(
         "--min-mappability",
         min=0.0,
         max=1.0,
+        callback=_require_finite_unit_float,
         help="Minimum bin mappability in [0, 1] required to stay unmasked",
     ),
 ]
@@ -220,25 +224,25 @@ def extract(
         threads,
     )
     started = perf_counter()
-    config = ExtractConfig(
-        alignment,
-        prefix if prefix is not None else alignment.with_suffix(""),
-        bin_size,
-        fasta=fasta,
-        filters=ReadFilters(
-            min_mapping_quality=min_mapq,
-            exclude_duplicates=not keep_duplicates,
-            exclude_secondary=not keep_secondary,
-            exclude_supplementary=not keep_supplementary,
-            require_proper_pair=not allow_improper_pairs,
-        ),
-        threads=threads,
-        all_contigs=all_contigs,
-    )
     try:
+        config = ExtractConfig(
+            alignment,
+            prefix if prefix is not None else alignment.with_suffix(""),
+            bin_size,
+            fasta=fasta,
+            filters=ReadFilters(
+                min_mapping_quality=min_mapq,
+                exclude_duplicates=not keep_duplicates,
+                exclude_secondary=not keep_secondary,
+                exclude_supplementary=not keep_supplementary,
+                require_proper_pair=not allow_improper_pairs,
+            ),
+            threads=threads,
+            all_contigs=all_contigs,
+        )
         run_extract(config)
         cli_logger.debug("extract completed in %.3f s", perf_counter() - started)
-    except ExtractError as error:
+    except (CcnvError, ValueError, OSError) as error:
         _fail(error, 1)
 
 
@@ -302,15 +306,16 @@ def reference(
         typer.Option("--sex-contig", help="Sex contig name; repeat as needed"),
     ] = None,
     sex_signal_contig: Annotated[
-        str,
+        str | None,
         typer.Option(help="Contig used for inferred sex; higher fraction is male"),
-    ] = DEFAULT_SEX_SIGNAL_CONTIGS[0],
+    ] = None,
     sex_cutoff: Annotated[
         float | None,
         typer.Option(
             "--sex-cutoff",
             min=0.0,
             max=1.0,
+            callback=_require_finite_unit_float,
             help="Signal-contig coverage fraction cutoff; samples above it are male",
         ),
     ] = None,
@@ -392,16 +397,14 @@ def reference(
                 prenatal_bin_size=prenatal_binsize,
                 qc_report=qc_report,
                 samplesheet_path=samplesheet,
-                sex_contigs=(
-                    tuple(sex_contig) if sex_contig is not None else DEFAULT_SEX_CONTIGS
-                ),
+                sex_contigs=(tuple(sex_contig) if sex_contig is not None else None),
                 sex_cutoff=sex_cutoff,
                 sex_signal_contig=sex_signal_contig,
                 threads=threads,
             )
         )
         cli_logger.debug("reference completed in %.3f s", perf_counter() - started)
-    except ReferenceError as error:
+    except (CcnvError, ValueError, OSError) as error:
         _fail(error, 1)
 
 
@@ -437,7 +440,7 @@ def ref_qc(
     try:
         run_reference_qc(ReferenceQCConfig(reference=reference, prefix=prefix))
         cli_logger.debug("ref-qc completed in %.3f s", perf_counter() - started)
-    except ReferenceQCError as error:
+    except (CcnvError, ValueError, OSError) as error:
         _fail(error, 1)
 
 
@@ -478,19 +481,23 @@ def predict(
     penalty: Annotated[
         float,
         typer.Option(
-            min=0.0,
+            callback=_require_positive_float,
             help="Breakpoint penalty multiplier (gamma) for calibrated mBIC segmentation",
         ),
     ] = 1.0,
     z_threshold: Annotated[
         float,
-        typer.Option("--z-threshold", min=0.0, help="Absolute segment z call cutoff"),
+        typer.Option(
+            "--z-threshold",
+            callback=_require_positive_float,
+            help="Absolute segment z call cutoff",
+        ),
     ] = 3.0,
     ratio_threshold: Annotated[
         float | None,
         typer.Option(
             "--ratio-threshold",
-            min=0.0,
+            callback=_require_positive_float,
             help="Absolute log2-ratio call cutoff; overrides z-score calling",
         ),
     ] = None,
@@ -602,7 +609,7 @@ def predict(
         )
 
         cli_logger.debug("predict completed in %.3f s", perf_counter() - started)
-    except PredictError as error:
+    except (CcnvError, ValueError, OSError) as error:
         _fail(error, 1)
 
 

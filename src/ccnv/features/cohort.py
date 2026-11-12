@@ -1,4 +1,4 @@
-"""Cohort sample aggregation, streaming assembly, depth normalization, and sex inference."""
+"""Cohort sample aggregation, streaming assembly, and super-block depth scaling."""
 
 from __future__ import annotations
 
@@ -19,19 +19,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from numpy.typing import NDArray
 
+from ccnv._core import FRAG_BAND_EDGES
 from ccnv.features.binning import (
     build_coordinate_grid,
-    compute_bin_exposure,
     rebin_counts_matrix,
 )
+from ccnv.features.fragmentomics import has_paired_fragmentomics
 from ccnv.features.rebinning import rebin_sample_buffers
-from ccnv.features.sex import (
-    SexInference,
-    SexLabel,
-    infer_germline_sex_2d,
-    infer_sample_sexes,
-    nonpar_contig_mask,
-)
 from ccnv.models import (
     NUM_FRAG_BANDS,
     BinCompatibilityError,
@@ -44,27 +38,25 @@ from ccnv.models import (
     decode_metadata,
     reconstruct_sample_grid,
 )
-from ccnv.stats.fragmentomics import evaluate_band_weighted_counts
+from ccnv.stats import estimate_superblock_scales
 
 logger = logging.getLogger(__name__)
 _MASK_FRACTION: Final[float] = 0.05
 _DEFAULT_FRAG_LEN_BP: Final[float] = 167.0
+_FRAG_BAND_MIDPOINTS: Final[NDArray[np.float64]] = 0.5 * (
+    np.asarray(FRAG_BAND_EDGES[:-1], dtype=np.float64)
+    + np.asarray(FRAG_BAND_EDGES[1:], dtype=np.float64)
+    - 1.0
+)
 
 __all__ = [
     "Cohort",
-    "InvalidInputError",
-    "SexInference",
-    "SexLabel",
+    "alloc_cohort_counts",
     "build_fisher_weighted_cohort",
     "cohort_from_fasta",
-    "compute_bin_exposure",
     "estimate_size_factors",
-    "estimate_superblock_size_factors",
-    "infer_germline_sex_2d",
-    "infer_sample_sexes",
     "load_and_assemble_cohort",
     "mask_low_coverage_per_contig",
-    "nonpar_contig_mask",
     "rebin_cohort",
     "validate_cohort",
 ]
@@ -85,7 +77,8 @@ class Cohort:
     sample_metadata: tuple[dict[str, object], ...] = ()
     ref_frag_len: NDArray[np.float32] | None = None
     ref_ep_rate: NDArray[np.float32] | None = None
-    in_memory_tables: tuple[pa.Table, ...] = ()
+    in_memory_tables: tuple[SampleBuffers, ...] = ()
+    ref_kappa_frag: NDArray[np.float32] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +92,7 @@ class _StreamedSample:
     paired_count: NDArray[np.uint32]
     frag_len_sum: NDArray[np.uint64]
     endpoint_count: NDArray[np.uint32]
+    bufs: SampleBuffers | None = None
 
 
 def _encode_contig_ids(
@@ -121,162 +115,44 @@ def _encode_contig_ids(
     return c_ids
 
 
-def _size_factors_from_blocks(
-    block_sums: NDArray[np.float64], *, has_mask: bool
-) -> NDArray[np.float64]:
-    totals = block_sums.sum(axis=0)
-    if np.any(~np.isfinite(totals)) or np.any(totals <= 0):
-        suffix = " on usable bins" if has_mask else ""
-        raise InvalidInputError(
-            f"Total read count is zero for at least one sample{suffix}."
-        )
-    ref_block = block_sums.mean(axis=1, keepdims=True)
-    valid = ref_block[:, 0] > 0
-    raw_sf = np.median(block_sums[valid] / ref_block[valid], axis=0)
-    total_ref = float(np.sum(ref_block[valid]))
-    fallback = totals / total_ref if total_ref > 0 else np.ones_like(totals)
-    sparse_two = int(np.count_nonzero(valid)) <= 2 and bool(
-        np.any(block_sums[valid] == 0)
-    )
-    raw_sf = (
-        fallback
-        if sparse_two
-        else np.where(~np.isfinite(raw_sf) | (raw_sf <= 0), fallback, raw_sf)
-    )
-    med = float(np.median(raw_sf))
-    if not math.isfinite(med) or med <= 0.0:
-        raw_sf = fallback
-        med = float(np.median(raw_sf))
-    return raw_sf / med
-
-
-def estimate_superblock_size_factors(
+def estimate_size_factors(
     counts: NDArray[np.floating] | NDArray[np.integer],
+    mask: NDArray[np.bool_] | None = None,
+    *,
     contigs: NDArray[np.integer]
     | Sequence[str]
     | NDArray[np.str_]
-    | NDArray[np.object_],
-    starts: NDArray[np.integer],
-    ends: NDArray[np.integer],
-    usable: NDArray[np.bool_],
-    *,
+    | NDArray[np.object_]
+    | None = None,
+    starts: NDArray[np.integer] | None = None,
+    ends: NDArray[np.integer] | None = None,
     block_bp: int = 1_000_000,
 ) -> NDArray[np.float64]:
     """Estimate DESeq2 median-of-ratios size factors over per-contig 1 Mb super-blocks."""
-    if counts.ndim != 2 or 0 in counts.shape:
+    arr = counts if isinstance(counts, np.ndarray) else np.asarray(counts)
+    if arr.ndim != 2 or 0 in arr.shape:
         raise InvalidInputError("Counts matrix must be a non-empty 2D array.")
-    if not isinstance(block_bp, int) or isinstance(block_bp, bool) or block_bp <= 0:
-        raise InvalidInputError("block_bp must be a positive integer")
-    n_bins, n_samples = counts.shape
-    chunk_rows = max(1024, (64 * 1024 * 1024) // max(n_samples, 1))
-    for r0 in range(0, n_bins, chunk_rows):
-        if np.any(counts[r0 : r0 + chunk_rows] < 0):
-            raise InvalidInputError("Counts matrix cannot contain negative values.")
-
-    usable_arr = np.asarray(usable, dtype=np.bool_)
-    if usable_arr.shape != (n_bins,):
-        raise InvalidInputError("usable length must match counts row count")
-    u_idx = np.flatnonzero(usable_arr)
-    if u_idx.size == 0:
-        raise InvalidInputError("No usable bins remaining after mask.")
-
+    if contigs is None or starts is None or ends is None:
+        raise InvalidInputError(
+            "contigs, starts, and ends coordinates are required for super-block size factors"
+        )
+    n_bins = arr.shape[0]
     c_ids = _encode_contig_ids(contigs, n_bins)
-    s_arr, e_arr = np.asarray(starts, dtype=np.int64), np.asarray(ends, dtype=np.int64)
+    s_arr = np.asarray(starts, dtype=np.int64)
+    e_arr = np.asarray(ends, dtype=np.int64)
     if s_arr.shape != (n_bins,) or e_arr.shape != (n_bins,):
         raise InvalidInputError("starts and ends must match counts row count")
     widths = e_arr - s_arr
     if np.any(widths < 0):
         raise InvalidInputError("bin widths cannot be negative")
-
     bin_size = max(1, int(np.max(widths)))
-    bins_per_block = max(10, round(max(int(block_bp), 10 * bin_size) / bin_size))
-    half_k = max(1, bins_per_block // 2)
-    u_c = c_ids[u_idx]
-    run_cuts = np.concatenate(
-        ([0], np.flatnonzero(u_c[1:] != u_c[:-1]) + 1, [u_idx.size])
+    return estimate_superblock_scales(
+        arr,
+        c_ids,
+        usable=mask,
+        bin_size=bin_size,
+        block_bp=block_bp,
     )
-    starts_list: list[int] = []
-    for r_idx in range(run_cuts.size - 1):
-        r0, r1 = int(run_cuts[r_idx]), int(run_cuts[r_idx + 1])
-        cuts = (
-            [r0] if r1 - r0 <= bins_per_block else list(range(r0, r1, bins_per_block))
-        )
-        if len(cuts) > 1 and (r1 - cuts[-1]) < half_k:
-            cuts.pop()
-        starts_list.extend(cuts)
-
-    b_starts = np.asarray(starts_list, dtype=np.int64)
-    b_ends = np.concatenate((b_starts[1:], [u_idx.size]))
-    block_sums = np.empty((b_starts.size, n_samples), dtype=np.float64)
-    b0 = 0
-    while b0 < b_starts.size:
-        b1 = b0 + 1
-        while b1 < b_starts.size and int(b_ends[b1 - 1] - b_starts[b0]) < chunk_rows:
-            b1 += 1
-        u0, u1 = int(b_starts[b0]), int(b_ends[b1 - 1])
-        sub = np.asarray(counts[u_idx[u0:u1]], dtype=np.float64)
-        block_sums[b0:b1] = np.add.reduceat(sub, b_starts[b0:b1] - u0, axis=0)
-        b0 = b1
-    return _size_factors_from_blocks(block_sums, has_mask=True)
-
-
-def estimate_size_factors(
-    counts: NDArray[np.floating] | NDArray[np.integer],
-    mask: NDArray[np.bool_] | None = None,
-    *,
-    contigs: NDArray[np.integer] | Sequence[str] | None = None,
-    starts: NDArray[np.integer] | None = None,
-    ends: NDArray[np.integer] | None = None,
-    block_bp: int = 1_000_000,
-) -> NDArray[np.float64]:
-    """Estimate median-normalized DESeq2 size factors for each sample."""
-    arr = np.asarray(counts)
-    if arr.ndim != 2 or 0 in arr.shape:
-        raise InvalidInputError("Counts matrix must be a non-empty 2D array.")
-    if contigs is not None and starts is not None and ends is not None:
-        usable = (
-            np.ones(arr.shape[0], dtype=np.bool_)
-            if mask is None
-            else np.asarray(mask, dtype=np.bool_)
-        )
-        return estimate_superblock_size_factors(
-            arr, contigs, starts, ends, usable, block_bp=block_bp
-        )
-
-    matrix = np.asarray(arr, dtype=np.float64)
-    if np.any(matrix < 0):
-        raise InvalidInputError("Counts matrix cannot contain negative values.")
-    if mask is not None:
-        mask_arr = np.asarray(mask, dtype=np.bool_)
-        if mask_arr.shape != (matrix.shape[0],):
-            raise InvalidInputError("mask length must match counts row count")
-        sub = matrix[mask_arr]
-        if sub.shape[0] == 0:
-            raise InvalidInputError("No usable bins remaining after mask.")
-    else:
-        sub = matrix
-
-    if sub.shape[0] >= 1000:
-        cuts = np.arange(0, sub.shape[0], 1000, dtype=np.int64)
-        if cuts.size > 1 and (sub.shape[0] - int(cuts[-1])) < 500:
-            cuts = cuts[:-1]
-        return _size_factors_from_blocks(
-            np.add.reduceat(sub, cuts, axis=0), has_mask=mask is not None
-        )
-
-    totals = sub.sum(axis=0)
-    if np.any(totals <= 0):
-        suffix = " on usable bins" if mask is not None else ""
-        raise InvalidInputError(
-            f"Total read count is zero for at least one sample{suffix}."
-        )
-    pos_rows = np.all(sub > 0, axis=1)
-    if np.count_nonzero(pos_rows) >= 1:
-        log_gm = np.mean(np.log(sub[pos_rows]), axis=1, keepdims=True)
-        raw_sf = np.exp(np.median(np.log(sub[pos_rows]) - log_gm, axis=0))
-    else:
-        raw_sf = totals.astype(np.float64)
-    return raw_sf / float(np.median(raw_sf))
 
 
 def mask_low_coverage_per_contig(
@@ -321,57 +197,81 @@ def mask_low_coverage_per_contig(
     return keep
 
 
+def _finalize_frag_covariates(
+    sum_count: NDArray[np.float64],
+    sum_paired: NDArray[np.float64],
+    sum_flen: NDArray[np.float64],
+    sum_ep: NDArray[np.float64],
+    *,
+    is_paired: bool,
+) -> tuple[NDArray[np.float32] | None, NDArray[np.float32] | None]:
+    if not is_paired:
+        return None, None
+    pos = sum_paired > 0.0
+    fb = (
+        float(np.median(sum_flen[pos] / sum_paired[pos]))
+        if np.any(pos)
+        else _DEFAULT_FRAG_LEN_BP
+    )
+    ref_frag_len = np.where(pos, sum_flen / np.maximum(sum_paired, 1e-12), fb).astype(
+        np.float32
+    )
+    ref_ep_rate = (sum_ep / np.maximum(sum_count, 1e-12)).astype(np.float32)
+    return ref_frag_len, ref_ep_rate
+
+
 def _extract_streamed_sample(
     index: int,
-    table: pa.Table | SampleBuffers,
+    bufs: SampleBuffers,
+    raw_meta: dict[str, object],
     path: Path,
     target_bin_size: int | None,
+    *,
+    retain_buffers: bool = False,
 ) -> _StreamedSample:
-    try:
-        bufs = SampleBuffers.coerce(table, validate=True)
-    except SchemaError as err:
-        raise ReferenceError(f"{path}: {err}") from err
-    raw_meta = (
-        bufs.meta.to_metadata()
-        if isinstance(table, SampleBuffers)
-        else decode_metadata(table.schema.metadata)
-    )
     if target_bin_size is not None and bufs.meta.bin_size != target_bin_size:
         bufs = rebin_sample_buffers(bufs, target_bin_size)
         if bufs.meta.fragmentomics is None:
             raw_meta.pop("fragmentomics", None)
 
-    is_paired = (
-        bufs.meta.fragmentomics.paired_end
-        if bufs.meta.fragmentomics is not None
-        else (bufs.frag_bands is not None)
-    )
+    is_paired = has_paired_fragmentomics(bufs)
     return _StreamedSample(
-        index,
-        path,
-        raw_meta,
-        bufs.meta,
-        is_paired,
-        np.asarray(bufs.count, dtype=np.uint32),
-        bufs.paired_count,
-        bufs.frag_len_sum,
-        bufs.endpoint_count,
+        index=index,
+        path=path,
+        raw_meta=raw_meta,
+        sample_meta=bufs.meta,
+        is_paired=is_paired,
+        count=np.asarray(bufs.count, dtype=np.uint32),
+        paired_count=bufs.paired_count,
+        frag_len_sum=bufs.frag_len_sum,
+        endpoint_count=bufs.endpoint_count,
+        bufs=bufs if retain_buffers else None,
     )
+
+
+def _read_cohort_sample(path: Path) -> tuple[SampleBuffers, pa.Table]:
+    try:
+        table = pq.read_table(path)
+        bufs = SampleBuffers.from_table(table, validate=True)
+    except (FileNotFoundError, OSError, pa.ArrowInvalid, pa.ArrowException) as err:
+        raise ReferenceError(f"{path}: cannot read sample Parquet ({err})") from err
+    except SchemaError as err:
+        raise ReferenceError(f"{path}: {err}") from err
+    return bufs, table
 
 
 def _read_and_extract_sample(
     index: int, path: Path, target_bin_size: int | None
 ) -> _StreamedSample:
-    try:
-        table = pq.read_table(path)
-    except (FileNotFoundError, OSError, pa.ArrowInvalid, pa.ArrowException) as err:
-        raise ReferenceError(f"{path}: cannot read sample Parquet ({err})") from err
-    return _extract_streamed_sample(index, table, path, target_bin_size)
+    bufs, table = _read_cohort_sample(path)
+    raw_meta = decode_metadata(table.schema.metadata)
+    return _extract_streamed_sample(index, bufs, raw_meta, path, target_bin_size)
 
 
-def _alloc_cohort_counts(
+def alloc_cohort_counts(
     n_bins: int, n_samples: int, max_batch_memory_mb: int
 ) -> NDArray[np.float32]:
+    """Allocate a Fortran-contiguous float32 cohort matrix, spilling to memmap above budget."""
     if (
         n_bins > 0
         and n_samples > 0
@@ -381,9 +281,17 @@ def _alloc_cohort_counts(
             prefix="ccnv_cohort_", suffix=".mmap", delete=False
         ) as tmp:
             tmp_path = Path(tmp.name)
-        mmap_arr = np.memmap(
-            tmp_path, dtype=np.float32, mode="w+", shape=(n_bins, n_samples), order="F"
-        )
+        try:
+            mmap_arr = np.memmap(
+                tmp_path,
+                dtype=np.float32,
+                mode="w+",
+                shape=(n_bins, n_samples),
+                order="F",
+            )
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -403,7 +311,7 @@ class _CohortAccumulator:
     ) -> None:
         n_bins = first.count.size
         self.first, self.require_same_native_bin = first, require_same_native_bin
-        self.counts = _alloc_cohort_counts(n_bins, n_samples, max_batch_memory_mb)
+        self.counts = alloc_cohort_counts(n_bins, n_samples, max_batch_memory_mb)
         self.sum_count = np.zeros(n_bins, dtype=np.float64)
         self.sum_paired = np.zeros(n_bins, dtype=np.float64)
         self.sum_flen = np.zeros(n_bins, dtype=np.float64)
@@ -452,26 +360,18 @@ class _CohortAccumulator:
         self,
         paths: Sequence[Path],
         *,
-        in_memory_tables: Sequence[pa.Table] = (),
+        in_memory_tables: Sequence[SampleBuffers] = (),
     ) -> Cohort:
         codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(
             self.first.sample_meta
         )
-        if self.first.is_paired:
-            pos = self.sum_paired > 0
-            fb = (
-                float(np.median(self.sum_flen[pos] / self.sum_paired[pos]))
-                if np.any(pos)
-                else _DEFAULT_FRAG_LEN_BP
-            )
-            ref_frag_len = np.where(
-                pos, self.sum_flen / np.maximum(self.sum_paired, 1.0), fb
-            ).astype(np.float32)
-            ref_ep_rate = (self.sum_ep / np.maximum(self.sum_count, 1.0)).astype(
-                np.float32
-            )
-        else:
-            ref_frag_len = ref_ep_rate = None
+        ref_frag_len, ref_ep_rate = _finalize_frag_covariates(
+            self.sum_count,
+            self.sum_paired,
+            self.sum_flen,
+            self.sum_ep,
+            is_paired=self.first.is_paired,
+        )
         return Cohort(
             counts=self.counts,
             contigs=tuple(names[int(c)] for c in codes),
@@ -536,68 +436,185 @@ def load_and_assemble_cohort(
     return acc.finalize(paths)
 
 
-def _weighted_sample_column(
-    table: pa.Table | SampleBuffers,
+def _weighted_sample_summary(
+    bufs: SampleBuffers,
     target_bin_size: int,
     w_24: NDArray[np.float64],
-) -> NDArray[np.float32]:
-    bufs = SampleBuffers.coerce(table, validate=True)
+    w_sq_24: NDArray[np.float64],
+    w_mid_24: NDArray[np.float64],
+) -> tuple[
+    NDArray[np.float32],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
     if bufs.meta.bin_size != target_bin_size:
         bufs = rebin_sample_buffers(bufs, target_bin_size)
+    zeros = np.zeros(bufs.num_rows, dtype=np.float64)
     if (
         bufs.num_rows == 0
         or bufs.frag_bands is None
         or not np.any(bufs.paired_count > 0)
     ):
-        return np.asarray(bufs.count, dtype=np.float32)
-    w_counts, _ = evaluate_band_weighted_counts(
-        bufs.frag_bands, bufs.count, bufs.paired_count, w_24
+        w_counts = np.asarray(bufs.count, dtype=np.float64)
+        return (
+            w_counts.astype(np.float32),
+            np.asarray(bufs.paired_count, dtype=np.float64),
+            np.asarray(bufs.frag_len_sum, dtype=np.float64),
+            np.asarray(bufs.endpoint_count, dtype=np.float64),
+            zeros,
+            zeros,
+            zeros,
+        )
+    bands_f64 = np.asarray(bufs.frag_bands, dtype=np.float64)
+    raw_cnt = np.asarray(bufs.count, dtype=np.float64)
+    paired_f64 = np.asarray(bufs.paired_count, dtype=np.float64)
+    raw_unpaired = np.maximum(raw_cnt - paired_f64, 0.0)
+    w_paired = bands_f64 @ w_24
+    w_counts = raw_unpaired + w_paired
+    w_flen = bands_f64 @ w_mid_24
+    ep_scale = np.where(raw_cnt > 0.0, w_counts / np.maximum(raw_cnt, 1.0), 1.0)
+    w_ep = np.asarray(bufs.endpoint_count, dtype=np.float64) * ep_scale
+
+    has_p = paired_f64 > 0.0
+    n_tot_bin = np.where(has_p, raw_unpaired + paired_f64, 0.0)
+    w_tot_bin = np.where(has_p, w_counts, 0.0)
+    w_sq_bin = np.where(has_p, raw_unpaired + (bands_f64 @ w_sq_24), 0.0)
+    return (
+        w_counts.astype(np.float32),
+        w_paired,
+        w_flen,
+        w_ep,
+        n_tot_bin,
+        w_tot_bin,
+        w_sq_bin,
     )
-    return np.asarray(w_counts, dtype=np.float32)
 
 
 def build_fisher_weighted_cohort(
     cohort: Cohort,
-    band_weights_24: Sequence[float] | NDArray[np.floating],
+    band_weights_24: Sequence[float] | NDArray[np.floating] | None,
     *,
     max_batch_memory_mb: int = 256,
     threads: int = 1,
 ) -> Cohort:
-    """Return a Cohort whose counts matrix applies 24-band Fisher read weighting."""
-    n_bins, n_samples = cohort.counts.shape
+    """Return a Cohort whose counts and fragmentomic covariates apply 24-band Fisher read weighting."""
+    if band_weights_24 is None:
+        return cohort
     w_24 = np.asarray(band_weights_24, dtype=np.float64)
-    if n_bins == 0 or n_samples == 0 or w_24.size != NUM_FRAG_BANDS:
+    if (
+        w_24.ndim != 1
+        or w_24.size != NUM_FRAG_BANDS
+        or not np.all(np.isfinite(w_24) & (w_24 >= 0.0))
+    ):
+        raise ReferenceError(
+            f"band_weights_24 must contain {NUM_FRAG_BANDS} finite non-negative weights"
+        )
+
+    n_bins, n_samples = cohort.counts.shape
+    if n_bins == 0 or n_samples == 0:
         return cohort
 
-    if len(cohort.in_memory_tables) == n_samples:
-        weighted = _alloc_cohort_counts(n_bins, n_samples, max_batch_memory_mb)
-        for idx, tbl in enumerate(cohort.in_memory_tables):
-            weighted[:, idx] = _weighted_sample_column(tbl, cohort.bin_size, w_24)
-        return replace(cohort, counts=weighted)
+    has_inmem = len(cohort.in_memory_tables) == n_samples
+    has_paths = len(cohort.paths) == n_samples and all(
+        p.is_file() for p in cohort.paths
+    )
+    if not has_inmem and not has_paths:
+        raise ReferenceError(
+            "cannot apply Fisher fragment weighting: cohort lacks in-memory sample buffers and readable sample paths"
+        )
 
-    if len(cohort.paths) != n_samples or not all(p.is_file() for p in cohort.paths):
-        return cohort
+    w_sq_24 = np.square(w_24)
+    w_mid_24 = w_24 * _FRAG_BAND_MIDPOINTS
+    weighted = alloc_cohort_counts(n_bins, n_samples, max_batch_memory_mb)
+    sum_count = np.zeros(n_bins, dtype=np.float64)
+    sum_paired = np.zeros(n_bins, dtype=np.float64)
+    sum_flen = np.zeros(n_bins, dtype=np.float64)
+    sum_ep = np.zeros(n_bins, dtype=np.float64)
+    sum_n_tot = np.zeros(n_bins, dtype=np.float64)
+    sum_w_tot = np.zeros(n_bins, dtype=np.float64)
+    sum_w_sq = np.zeros(n_bins, dtype=np.float64)
 
-    weighted = _alloc_cohort_counts(n_bins, n_samples, max_batch_memory_mb)
+    def _accumulate(
+        idx: int,
+        col: NDArray[np.float32],
+        w_p: NDArray[np.float64],
+        w_fl: NDArray[np.float64],
+        w_e: NDArray[np.float64],
+        n_tot_b: NDArray[np.float64],
+        w_tot_b: NDArray[np.float64],
+        w_sq_b: NDArray[np.float64],
+    ) -> None:
+        nonlocal sum_count, sum_paired, sum_flen, sum_ep
+        nonlocal sum_n_tot, sum_w_tot, sum_w_sq
+        weighted[:, idx] = col
+        sum_count += col
+        sum_paired += w_p
+        sum_flen += w_fl
+        sum_ep += w_e
+        sum_n_tot += n_tot_b
+        sum_w_tot += w_tot_b
+        sum_w_sq += w_sq_b
 
-    def _load_col(idx: int) -> tuple[int, NDArray[np.float32]]:
-        path = cohort.paths[idx]
-        try:
-            tbl = pq.read_table(path)
-        except (FileNotFoundError, OSError, pa.ArrowInvalid, pa.ArrowException) as err:
-            raise ReferenceError(f"{path}: cannot read sample Parquet ({err})") from err
-        return idx, _weighted_sample_column(tbl, cohort.bin_size, w_24)
-
-    workers = max(1, min(threads, n_samples))
-    if workers == 1:
-        for idx in range(n_samples):
-            _, col = _load_col(idx)
-            weighted[:, idx] = col
+    if has_inmem:
+        for idx, bufs in enumerate(cohort.in_memory_tables):
+            summary = _weighted_sample_summary(
+                bufs, cohort.bin_size, w_24, w_sq_24, w_mid_24
+            )
+            _accumulate(idx, *summary)
     else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for idx, col in pool.map(_load_col, range(n_samples)):
-                weighted[:, idx] = col
-    return replace(cohort, counts=weighted)
+
+        def _load_col(
+            idx: int,
+        ) -> tuple[
+            int,
+            NDArray[np.float32],
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+        ]:
+            bufs, _ = _read_cohort_sample(cohort.paths[idx])
+            summary = _weighted_sample_summary(
+                bufs, cohort.bin_size, w_24, w_sq_24, w_mid_24
+            )
+            return idx, *summary
+
+        workers = max(1, min(threads, n_samples))
+        if workers == 1:
+            for idx in range(n_samples):
+                _accumulate(*_load_col(idx))
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for loaded in pool.map(_load_col, range(n_samples)):
+                    _accumulate(*loaded)
+
+    has_frag_covs = (cohort.ref_frag_len is not None) or (
+        cohort.ref_ep_rate is not None
+    )
+    ref_frag_len, ref_ep_rate = _finalize_frag_covariates(
+        sum_count, sum_paired, sum_flen, sum_ep, is_paired=has_frag_covs
+    )
+    has_paired = sum_n_tot > 0.0
+    ref_kappa = np.ones(n_bins, dtype=np.float32)
+    ref_kappa[has_paired] = np.maximum(
+        sum_n_tot[has_paired]
+        * sum_w_sq[has_paired]
+        / np.maximum(np.square(sum_w_tot[has_paired]), 1e-12),
+        1.0,
+    ).astype(np.float32)
+    return replace(
+        cohort,
+        counts=weighted,
+        ref_frag_len=ref_frag_len,
+        ref_ep_rate=ref_ep_rate,
+        ref_kappa_frag=ref_kappa,
+    )
 
 
 def validate_cohort(
@@ -605,7 +622,7 @@ def validate_cohort(
     paths: Sequence[Path] | None = None,
     target_bin_size: int | None = None,
 ) -> Cohort:
-    """Validate in-memory sample sketch tables into an aligned Cohort."""
+    """Validate in-memory sample sketch tables or buffers into an aligned Cohort."""
     if len(tables) < 1:
         raise ReferenceError("cohort must contain at least one sample")
     resolved = (
@@ -615,24 +632,43 @@ def validate_cohort(
     )
     if len(resolved) != len(tables):
         raise ReferenceError("paths must align with sample tables")
-    first = _extract_streamed_sample(0, tables[0], resolved[0], target_bin_size)
+
+    def _coerce_one(idx: int) -> _StreamedSample:
+        item = tables[idx]
+        path = resolved[idx]
+        try:
+            bufs = SampleBuffers.coerce(item, validate=True)
+        except SchemaError as err:
+            raise ReferenceError(f"{path}: {err}") from err
+        raw_meta = (
+            bufs.meta.to_metadata()
+            if isinstance(item, SampleBuffers)
+            else decode_metadata(item.schema.metadata)
+        )
+        return _extract_streamed_sample(
+            idx, bufs, raw_meta, path, target_bin_size, retain_buffers=True
+        )
+
+    first = _coerce_one(0)
     acc = _CohortAccumulator(
         first,
         len(tables),
         require_same_native_bin=target_bin_size is None,
         max_batch_memory_mb=65_536,
     )
+    retained: list[SampleBuffers] = [first.bufs] if first.bufs is not None else []
     for idx in range(1, len(tables)):
-        acc.record(
-            _extract_streamed_sample(idx, tables[idx], resolved[idx], target_bin_size)
-        )
-    return acc.finalize(resolved, in_memory_tables=tables)
+        sample = _coerce_one(idx)
+        acc.record(sample)
+        if sample.bufs is not None:
+            retained.append(sample.bufs)
+    return acc.finalize(resolved, in_memory_tables=retained)
 
 
 def rebin_cohort(cohort: Cohort, target_bin_size: int) -> Cohort:
     """Rescale 2D cohort count matrix to target_bin_size."""
     if target_bin_size <= 0:
-        raise ValueError("target_bin_size must be a positive integer")
+        raise InvalidInputError("target_bin_size must be a positive integer")
     if cohort.bin_size == target_bin_size:
         return cohort
     rebinned = rebin_counts_matrix(

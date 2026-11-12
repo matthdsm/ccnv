@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, Literal
 
 import numpy as np
-import pyarrow as pa
 from numpy.typing import NDArray
 
 from ccnv.features.binning import compute_bin_exposure
@@ -19,11 +18,13 @@ from ccnv.models import (
     InvalidInputError,
     PredictError,
     ReferenceError,
+    ReferenceMetadata,
     SampleBuffers,
     is_autosome_name,
     normalize_chr,
     reconstruct_sample_grid,
 )
+from ccnv.stats import mad_scale
 
 if TYPE_CHECKING:
     from ccnv.features.cohort import Cohort
@@ -31,11 +32,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 SexLabel = Literal["female", "male"]
 
-_SEPARATION_MAD_MULTIPLIER: Final[float] = 4.0
+_SEPARATION_SIGMA_MULTIPLIER: Final[float] = 4.0 / 1.4826
 _QUARANTINE_SIGMA_MULTIPLIER: Final[float] = 4.5
 _HUMAN_PAR_MIN_CONTIG_BP: Final[int] = 10_000_000
 _HUMAN_PAR1_END_BP: Final[int] = 3_000_000
 _HUMAN_PAR2_TAIL_BP: Final[int] = 1_000_000
+_HUMAN_Y_XTR_START_BP: Final[int] = 2_900_000
+_HUMAN_Y_XTR_END_BP: Final[int] = 6_600_000
+_HUMAN_X_XTR_MIN_CONTIG_BP: Final[int] = 100_000_000
+_HUMAN_X_XTR_START_BP: Final[int] = 88_400_000
+_HUMAN_X_XTR_END_BP: Final[int] = 93_300_000
 
 __all__ = [
     "SexInference",
@@ -43,13 +49,13 @@ __all__ = [
     "infer_germline_sex_2d",
     "infer_sample_sexes",
     "infer_single_sample_sex",
-    "nonpar_contig_mask",
+    "par_xtr_mask",
 ]
 
 
 @dataclass(frozen=True, slots=True)
 class SexInference:
-    """Deterministic sex assignments, 2D ploidy dosages, and outlier quarantine."""
+    """Deterministic sex assignments, signal cutoff, and outlier quarantine."""
 
     labels: tuple[SexLabel, ...] | None
     cutoff: float | None
@@ -59,39 +65,36 @@ class SexInference:
     quarantined_mask: NDArray[np.bool_] = field(
         default_factory=lambda: np.zeros(0, dtype=np.bool_)
     )
-    d_x: tuple[float, ...] = ()
-    d_y: tuple[float, ...] = ()
-
-    @property
-    def sample_sexes(self) -> tuple[SexLabel, ...] | None:
-        return self.labels
-
-    @property
-    def chry_cutoff(self) -> float | None:
-        return self.cutoff
 
 
-def nonpar_contig_mask(
+def par_xtr_mask(
     on_contig: NDArray[np.bool_],
     starts: NDArray[np.integer],
     ends: NDArray[np.integer],
     contig_length: int,
+    *,
+    contig_name: str | None = None,
 ) -> NDArray[np.bool_]:
-    """Exclude human-scale PAR1/PAR2 terminal intervals while preserving short contigs."""
+    """Exclude human-scale PAR1, PAR2, and X/Y XTR homology intervals while preserving short contigs."""
     if contig_length >= _HUMAN_PAR_MIN_CONTIG_BP:
         interior = (
             on_contig
             & (starts >= _HUMAN_PAR1_END_BP)
             & (ends <= contig_length - _HUMAN_PAR2_TAIL_BP)
         )
+        if contig_name is not None:
+            norm = normalize_chr(contig_name)
+            if norm == "Y":
+                interior = interior & ~(
+                    (starts < _HUMAN_Y_XTR_END_BP) & (ends > _HUMAN_Y_XTR_START_BP)
+                )
+            elif norm == "X" and contig_length >= _HUMAN_X_XTR_MIN_CONTIG_BP:
+                interior = interior & ~(
+                    (starts < _HUMAN_X_XTR_END_BP) & (ends > _HUMAN_X_XTR_START_BP)
+                )
         if np.any(interior):
             return interior
     return on_contig
-
-
-def _mad(values: NDArray[np.floating]) -> float:
-    arr = np.asarray(values, dtype=np.float64)
-    return float(np.median(np.abs(arr - np.median(arr)))) if arr.size > 0 else 0.0
 
 
 def _sum_counts_by_sample(
@@ -139,10 +142,10 @@ def _ellipse_quarantine_2d(
         mx = float(np.median(d_x[core]))
         my = float(np.median(d_y[core]))
         sx = _QUARANTINE_SIGMA_MULTIPLIER * float(
-            np.clip(1.4826 * _mad(d_x[core]), 0.02, 0.12)
+            np.clip(mad_scale(d_x[core]), 0.02, 0.12)
         )
         sy = _QUARANTINE_SIGMA_MULTIPLIER * float(
-            np.clip(1.4826 * _mad(d_y[core]), 0.02, 0.12)
+            np.clip(mad_scale(d_y[core]), 0.02, 0.12)
         )
         return ((d_x - mx) / sx) ** 2 + ((d_y - my) / sy) ** 2
 
@@ -181,10 +184,45 @@ def _merge_explicit_sexes(
     return tuple(base)
 
 
+def _calibrate_labeled_cutoff(
+    labels: tuple[SexLabel, ...],
+    q_mask: NDArray[np.bool_],
+    y_fracs: NDArray[np.float64],
+    exp_y: float,
+    denom_exp: float,
+) -> float:
+    lbl_arr = np.asarray(labels)
+    cf_clean = (lbl_arr == "female") & ~q_mask
+    cm_clean = (lbl_arr == "male") & ~q_mask
+    cf, cm = (
+        (cf_clean, cm_clean)
+        if (np.any(cf_clean) or np.any(cm_clean))
+        else (lbl_arr == "female", lbl_arr == "male")
+    )
+    if np.any(cf) and np.any(cm):
+        max_f = float(np.max(y_fracs[cf]))
+        min_m = float(np.min(y_fracs[cm]))
+        return (
+            0.5 * (max_f + min_m)
+            if max_f < min_m
+            else 0.5 * (float(np.median(y_fracs[cf])) + float(np.median(y_fracs[cm])))
+        )
+    if np.any(cf):
+        exp_hap = 0.5 * exp_y / max(denom_exp, 1.0)
+        max_f = float(np.max(y_fracs[cf]))
+        return float(
+            np.clip(
+                0.5 * (max_f + max(exp_hap, max_f * 4.0 + 1e-4)),
+                1e-6,
+                0.999999,
+            )
+        )
+    return float(np.clip(0.5 * float(np.min(y_fracs[cm])), 1e-6, 0.999999))
+
+
 def infer_sample_sexes(
     fractions: NDArray[np.floating],
     min_group_size: int,
-    min_separation: float = 0.0,
     cutoff: float | None = None,
 ) -> SexInference:
     """Split Y-like fractions into female/male groups when separation is clear."""
@@ -226,9 +264,9 @@ def infer_sample_sexes(
     best_split = min_group_size + best_rel
     low = sorted_vals[:best_split]
     high = sorted_vals[best_split:]
-    spread = max(_mad(low), _mad(high), 1e-12)
+    spread = max(mad_scale(low), mad_scale(high), 1e-12)
     cutoff_val = float((low[-1] + high[0]) / 2.0)
-    if float(gaps[best_rel]) < max(min_separation, _SEPARATION_MAD_MULTIPLIER * spread):
+    if float(gaps[best_rel]) < _SEPARATION_SIGMA_MULTIPLIER * spread:
         return SexInference(
             None,
             cutoff_val,
@@ -254,7 +292,7 @@ def infer_germline_sex_2d(
     cutoff: float | None = None,
     explicit_labels: Sequence[SexLabel | None] | None = None,
 ) -> SexInference:
-    """Infer germline sex in 2D non-PAR (d_X, d_Y) ploidy space with 4.5-sigma ellipse quarantine."""
+    """Infer germline sex in 2D non-PAR/XTR (d_X, d_Y) ploidy space with 4.5-sigma ellipse quarantine."""
     if min_group_size < 1:
         raise ReferenceError("min_sex_group_size must be a positive integer")
     n_bins, n_samples = cohort.counts.shape
@@ -292,30 +330,40 @@ def infer_germline_sex_2d(
         return SexInference(None, None, (), False, "zero autosomal depth", empty_q)
     rate_auto = sum_auto / exp_auto
 
-    y_nonpar = nonpar_contig_mask(
-        c_arr == y_name, cohort.starts, cohort.ends, cohort.contig_lengths[y_name]
+    y_clean = par_xtr_mask(
+        c_arr == y_name,
+        cohort.starts,
+        cohort.ends,
+        cohort.contig_lengths[y_name],
+        contig_name=y_name,
     )
-    y_fracs = _sum_counts_by_sample(cohort.counts, y_nonpar) / lib_totals
-    recorded = tuple(float(v) for v in y_fracs)
-    exp_y_nonpar = float(np.sum(exposure[y_nonpar]))
-    y_usable = y_nonpar & usable_arr
+    exp_y_clean = float(np.sum(exposure[y_clean]))
+    y_usable = y_clean & usable_arr
     y_mask = (
         y_usable
-        if exp_y_nonpar > 0.0
-        and float(np.sum(exposure[y_usable])) >= 0.20 * exp_y_nonpar
-        else y_nonpar
+        if exp_y_clean > 0.0 and float(np.sum(exposure[y_usable])) >= 0.20 * exp_y_clean
+        else y_clean
     )
+    denom_mask = usable_arr | y_mask
+    denom_totals = _sum_counts_by_sample(cohort.counts, denom_mask)
+    denom_safe = np.where(denom_totals > 0.0, denom_totals, lib_totals)
+    y_fracs = _sum_counts_by_sample(cohort.counts, y_mask) / denom_safe
+    recorded = tuple(float(v) for v in y_fracs)
     exp_y = max(float(np.sum(exposure[y_mask])), 1e-6)
     raw_dy = 2.0 * (_sum_counts_by_sample(cohort.counts, y_mask) / exp_y) / rate_auto
 
     has_x = len(x_names) > 0
     if has_x:
-        x_nonpar = np.zeros(n_bins, dtype=np.bool_)
+        x_clean = np.zeros(n_bins, dtype=np.bool_)
         for xn in x_names:
-            x_nonpar |= nonpar_contig_mask(
-                c_arr == xn, cohort.starts, cohort.ends, cohort.contig_lengths[xn]
+            x_clean |= par_xtr_mask(
+                c_arr == xn,
+                cohort.starts,
+                cohort.ends,
+                cohort.contig_lengths[xn],
+                contig_name=xn,
             )
-        x_mask = x_nonpar & usable_arr if np.any(x_nonpar & usable_arr) else x_nonpar
+        x_mask = x_clean & usable_arr if np.any(x_clean & usable_arr) else x_clean
         exp_x = max(float(np.sum(exposure[x_mask])), 1e-6)
         d_x = 2.0 * (_sum_counts_by_sample(cohort.counts, x_mask) / exp_x) / rate_auto
         cand_xy = (np.abs(d_x - 1.0) < 0.45) & (raw_dy > 0.20)
@@ -330,8 +378,6 @@ def infer_germline_sex_2d(
         d_y = raw_dy
         cand_xy = empty_q
 
-    dx_tup = tuple(float(v) for v in d_x)
-    dy_tup = tuple(float(v) for v in d_y)
     f_core = (np.abs(d_x - 2.0) < 0.45) & (d_y < 0.25) if has_x else empty_q
     m_init = (np.abs(d_x - 1.0) < 0.45) & (d_y > 0.25) if has_x else empty_q
     med_my0 = (
@@ -352,98 +398,55 @@ def infer_germline_sex_2d(
         else (empty_q, empty_q)
     )
 
-    if cutoff is not None:
-        if not math.isfinite(cutoff) or not (0.0 <= cutoff <= 1.0):
-            raise ReferenceError("sex_cutoff must be a finite number in [0, 1]")
-        base_lbls: list[SexLabel] = [
-            "male" if float(v) > cutoff else "female" for v in y_fracs
-        ]
-        merged_cut = _merge_explicit_sexes(base_lbls, explicit_labels)
-        q_mask = _quarantine_for_labels(
-            merged_cut,
-            in_f,
-            in_m,
-            f_core,
-            cand_xy,
-            has_x=has_x,
-            has_f=has_f,
-            has_m=has_m,
-        )
-        return SexInference(
-            merged_cut,
-            float(cutoff),
-            recorded,
-            True,
-            "cutoff",
-            q_mask,
-            dx_tup,
-            dy_tup,
-        )
-
-    if (
+    all_explicit = (
         explicit_labels is not None
         and len(explicit_labels) == n_samples
         and all(x in ("female", "male") for x in explicit_labels)
-    ):
-        lbl_tup: tuple[SexLabel, ...] = tuple(
-            "male" if x == "male" else "female" for x in explicit_labels
-        )
-        q_mask = _quarantine_for_labels(
-            lbl_tup,
-            in_f,
-            in_m,
-            f_core,
-            cand_xy,
-            has_x=has_x,
-            has_f=has_f,
-            has_m=has_m,
-        )
-        lbl_arr = np.asarray(lbl_tup)
-        cf_clean = (lbl_arr == "female") & ~q_mask
-        cm_clean = (lbl_arr == "male") & ~q_mask
-        if np.any(cf_clean) or np.any(cm_clean):
-            cf, cm = cf_clean, cm_clean
-        else:
-            cf, cm = lbl_arr == "female", lbl_arr == "male"
-        if np.any(cf) and np.any(cm):
-            max_f = float(np.max(y_fracs[cf]))
-            min_m = float(np.min(y_fracs[cm]))
-            cut_val = (
-                0.5 * (max_f + min_m)
-                if max_f < min_m
-                else 0.5
-                * (float(np.median(y_fracs[cf])) + float(np.median(y_fracs[cm])))
-            )
-        elif np.any(cf):
-            exp_hap = 0.5 * exp_y / max(float(np.sum(exposure[usable_arr])), 1.0)
-            max_f = float(np.max(y_fracs[cf]))
-            cut_val = float(
-                np.clip(
-                    0.5 * (max_f + max(exp_hap, max_f * 2.0 + 1e-4)), 1e-6, 0.999999
-                )
-            )
-        else:
-            cut_val = float(np.clip(0.5 * float(np.min(y_fracs[cm])), 1e-6, 0.999999))
-        return SexInference(
-            lbl_tup, cut_val, recorded, True, "samplesheet", q_mask, dx_tup, dy_tup
-        )
-
-    if (
+    )
+    if cutoff is not None:
+        if not math.isfinite(cutoff) or not (0.0 <= cutoff <= 1.0):
+            raise ReferenceError("sex_cutoff must be a finite number in [0, 1]")
+        raw_labels: Sequence[SexLabel] = [
+            "male" if float(v) > cutoff else "female" for v in y_fracs
+        ]
+        cut_val: float | None = float(cutoff)
+        reason = "cutoff"
+        apply_q = True
+    elif all_explicit and explicit_labels is not None:
+        raw_labels = ["male" if x == "male" else "female" for x in explicit_labels]
+        cut_val = None
+        reason = "samplesheet"
+        apply_q = True
+    elif (
         has_f
         and has_m
         and int(np.count_nonzero(in_f)) >= min_group_size
         and int(np.count_nonzero(in_m)) >= min_group_size
     ):
         cut_val = 0.5 * (float(np.max(y_fracs[in_f])) + float(np.min(y_fracs[in_m])))
-        inferred_2d: list[SexLabel] = [
+        raw_labels = [
             "female"
             if bool(in_f[i])
             else ("male" if bool(in_m[i]) or float(y_fracs[i]) > cut_val else "female")
             for i in range(n_samples)
         ]
-        merged_2d = _merge_explicit_sexes(inferred_2d, explicit_labels)
-        q_mask = _quarantine_for_labels(
-            merged_2d,
+        reason = "separated_2d"
+        apply_q = True
+    else:
+        base = infer_sample_sexes(y_fracs, min_group_size=min_group_size)
+        if not base.passed or base.labels is None:
+            return SexInference(
+                None, base.cutoff, recorded, False, base.reason, empty_q
+            )
+        raw_labels = base.labels
+        cut_val = base.cutoff
+        reason = base.reason
+        apply_q = False
+
+    merged = _merge_explicit_sexes(raw_labels, explicit_labels)
+    q_mask = (
+        _quarantine_for_labels(
+            merged,
             in_f,
             in_m,
             f_core,
@@ -452,87 +455,96 @@ def infer_germline_sex_2d(
             has_f=has_f,
             has_m=has_m,
         )
-        return SexInference(
-            merged_2d,
-            cut_val,
-            recorded,
-            True,
-            "separated_2d",
-            q_mask,
-            dx_tup,
-            dy_tup,
-        )
-
-    base = infer_sample_sexes(y_fracs, min_group_size=min_group_size)
-    if not base.passed or base.labels is None:
-        return SexInference(
-            None, base.cutoff, recorded, False, base.reason, empty_q, dx_tup, dy_tup
-        )
-    return SexInference(
-        _merge_explicit_sexes(base.labels, explicit_labels),
-        base.cutoff,
-        recorded,
-        True,
-        base.reason,
-        empty_q,
-        dx_tup,
-        dy_tup,
+        if apply_q
+        else empty_q
     )
+    if cut_val is None:
+        cut_val = _calibrate_labeled_cutoff(
+            merged,
+            q_mask,
+            y_fracs,
+            exp_y,
+            float(np.sum(exposure[denom_mask])),
+        )
+    return SexInference(merged, cut_val, recorded, True, reason, q_mask)
 
 
 def infer_single_sample_sex(
-    sample: pa.Table | SampleBuffers,
-    metadata: Mapping[str, object],
-    branches: set[object],
+    sample: SampleBuffers,
+    ref_meta: ReferenceMetadata,
+    sex: SexLabel | None = None,
+    unmasked_sample_bins: NDArray[np.bool_] | None = None,
 ) -> SexLabel | None:
-    """Infer single-sample sex from non-PAR signal coverage against persisted reference cutoff."""
-    if not ({BRANCH_FEMALE_SEX, BRANCH_MALE_SEX} & branches):
+    """Infer single-sample sex from non-PAR/XTR signal coverage over unmasked reference-aligned bins."""
+    if not isinstance(sample, SampleBuffers):
+        raise PredictError("sample must be a SampleBuffers instance")
+    if not isinstance(ref_meta, ReferenceMetadata):
+        raise PredictError("ref_meta must be a ReferenceMetadata instance")
+    if sex is not None:
+        if sex not in ("female", "male"):
+            raise PredictError(
+                f"invalid sex label {sex!r}; expected 'female' or 'male'"
+            )
+        return sex
+
+    if not ({BRANCH_FEMALE_SEX, BRANCH_MALE_SEX} & set(ref_meta.branches)):
         return None
-    model = metadata.get("model")
-    if not isinstance(model, Mapping) or not isinstance(
-        model.get("sex_signal_contig"), str
-    ):
+    signal = ref_meta.sex_signal_contig
+    cutoff = ref_meta.sex_cutoff
+    if not signal or cutoff is None or not math.isfinite(cutoff):
         raise PredictError("cannot infer sample sex; pass --sex female or --sex male")
-    raw_inf = model.get("sex_inference")
-    cutoff = model.get("sex_cutoff")
-    if cutoff is None and isinstance(raw_inf, Mapping):
-        cutoff = raw_inf.get("cutoff")
-    if (
-        isinstance(cutoff, bool)
-        or not isinstance(cutoff, int | float)
-        or not math.isfinite(float(cutoff))
-    ):
-        raise PredictError("cannot infer sample sex; pass --sex female or --sex male")
-    bufs = SampleBuffers.coerce(sample)
-    counts = np.asarray(bufs.count, dtype=np.float64)
+
+    counts = np.asarray(sample.count, dtype=np.float64)
     total = float(np.sum(counts))
-    if total <= 0:
+    if total <= 0.0:
         raise PredictError("sample has zero total coverage")
-    signal = str(model["sex_signal_contig"])
-    raw_clen = metadata.get("contig_lengths")
-    sig_len = (
-        int(raw_clen[signal])
-        if isinstance(raw_clen, Mapping) and isinstance(raw_clen.get(signal), int)
-        else 0
+
+    codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(sample.meta)
+    sig_len = sample.meta.contig_lengths.get(
+        signal, ref_meta.contig_lengths.get(signal, 0)
     )
-    codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(bufs.meta)
-    on_sig = (
-        nonpar_contig_mask(
+    y_clean = (
+        par_xtr_mask(
             codes == names.index(signal),
             starts_u32,
             ends_u32,
-            bufs.meta.contig_lengths.get(signal, sig_len),
+            sig_len,
+            contig_name=signal,
         )
         if signal in names
         else np.zeros(counts.size, dtype=np.bool_)
     )
-    fraction = float(np.sum(counts[on_sig])) / total
-    sex: SexLabel = "male" if fraction > float(cutoff) else "female"
+
+    if unmasked_sample_bins is not None:
+        unmasked_arr = np.asarray(unmasked_sample_bins, dtype=np.bool_)
+        if unmasked_arr.shape != (counts.size,):
+            raise PredictError(
+                "unmasked_sample_bins length must match sample bin count"
+            )
+        y_usable = y_clean & unmasked_arr
+        n_y_clean = int(np.count_nonzero(y_clean))
+        y_mask = (
+            y_usable
+            if (
+                n_y_clean > 0
+                and int(np.count_nonzero(y_usable)) >= max(1, int(0.20 * n_y_clean))
+            )
+            else y_clean
+        )
+        denom = float(np.sum(counts[unmasked_arr | y_mask]))
+        if denom <= 0.0:
+            raise PredictError("sample has zero coverage on unmasked reference bins")
+    else:
+        y_mask = y_clean
+        denom = total
+
+    fraction = float(np.sum(counts[y_mask])) / denom
+    resolved: SexLabel = "male" if fraction > float(cutoff) else "female"
     logger.debug(
         "inferred sample sex as %s (signal %s fraction=%.4f vs cutoff=%.4f)",
-        sex,
+        resolved,
         signal,
         fraction,
         float(cutoff),
     )
-    return sex
+    return resolved

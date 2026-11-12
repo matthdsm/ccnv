@@ -13,9 +13,9 @@ from numpy.typing import ArrayLike, NDArray
 from sklearn.decomposition import PCA
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import HuberRegressor
-from sklearn.utils.extmath import randomized_svd, svd_flip
+from sklearn.utils.extmath import svd_flip
 
-from ccnv.models.exceptions import ReferenceError
+from ccnv.models.exceptions import InvalidInputError
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ def _fit_chunk_mean_and_whitened(
         or not np.all(np.isfinite(e))
         or np.any(e <= 0.0)
     ):
-        raise ReferenceError(
+        raise InvalidInputError(
             "counts must be finite non-negative and expected must be finite positive on usable bins"
         )
 
@@ -129,8 +129,8 @@ def _svht_noise_cutoff(
 
 
 def fit_whitened_pca(
-    counts: NDArray[np.float32],
-    expected: NDArray[np.float32],
+    counts: NDArray[np.floating],
+    expected: NDArray[np.floating],
     usable: NDArray[np.bool_],
     *,
     max_components: int | None = None,
@@ -144,7 +144,7 @@ def fit_whitened_pca(
         or counts_arr.shape != exp_arr.shape
         or 0 in counts_arr.shape
     ):
-        raise ReferenceError(
+        raise InvalidInputError(
             "counts and expected must be non-empty 2D arrays with identical shape"
         )
     if max_components is not None and (
@@ -152,16 +152,16 @@ def fit_whitened_pca(
         or isinstance(max_components, bool)
         or max_components < 0
     ):
-        raise ReferenceError("max_components must be None or a non-negative integer")
+        raise InvalidInputError("max_components must be None or a non-negative integer")
 
     n_bins, n_samples = counts_arr.shape
     mask = np.asarray(usable, dtype=np.bool_)
     if mask.ndim != 1 or mask.shape[0] != n_bins:
-        raise ReferenceError("usable must be a 1D boolean mask aligned with counts")
+        raise InvalidInputError("usable must be a 1D boolean mask aligned with counts")
     u_idx = np.flatnonzero(mask)
     u_count = int(u_idx.size)
     if u_count == 0:
-        raise ReferenceError("fit_whitened_pca requires at least one usable bin")
+        raise InvalidInputError("fit_whitened_pca requires at least one usable bin")
 
     mean_rate = np.zeros(n_bins, dtype=np.float32)
     mu_u = np.empty(u_count, dtype=np.float32)
@@ -212,23 +212,22 @@ def fit_whitened_pca(
                 mp_sigma=0.0,
                 scores=empty_scores,
             )
-        u_bins_raw, s_raw, vt_raw = randomized_svd(
-            zc_full, n_components=m_nontrivial, random_state=0
-        )
-        s_all = np.asarray(s_raw, dtype=np.float64)
-        u_bins_all = np.asarray(u_bins_raw, dtype=np.float64)
-        u_samp_all = np.asarray(vt_raw, dtype=np.float64).T
+        u_bins_raw, s_raw, vt_raw = scipy.linalg.svd(zc_full, full_matrices=False)
+        s_all = np.asarray(s_raw[:m_nontrivial], dtype=np.float64)
+        u_bins_all = np.asarray(u_bins_raw[:, :m_nontrivial], dtype=np.float64)
+        u_samp_all = np.asarray(vt_raw[:m_nontrivial, :], dtype=np.float64).T
 
     mp_sigma = _svht_noise_cutoff(s_all, s_eff, u_count)
     if n_samples <= 2 or u_count <= 1:
         rank = 0
     else:
-        max_rank = (
-            min(60, max(5, n_samples // 5), max(0, n_samples - 2), max(0, u_count - 1))
+        cap = (
+            min(60, max(5, n_samples // 5))
             if max_components is None
-            else min(max_components, max(0, n_samples - 1), u_count)
+            else max_components
         )
-        rank = min(int(np.count_nonzero(s_all > mp_sigma)), max_rank)
+        max_rank = max(0, min(cap, n_samples - 2, u_count - 1))
+        rank = min(int(np.count_nonzero(s_all > max(mp_sigma, 1e-12))), max_rank)
 
     if rank == 0:
         logger.debug(
@@ -259,7 +258,7 @@ def fit_whitened_pca(
             v_bins[c0:c1] = zc @ u_top
 
     norms = np.linalg.norm(v_bins, axis=0)
-    keep = norms > 1e-12
+    keep = (norms > 1e-12) & (s_all[:rank] > 1e-12)
     if not np.any(keep):
         return WhitenedPCAResult(
             mean_rate=mean_rate,
@@ -296,31 +295,33 @@ def fit_whitened_pca(
 
 
 def reconstruct_whitened_pca_expected(
-    expected: NDArray[np.float32] | NDArray[np.float64],
+    expected: NDArray[np.floating],
     usable: NDArray[np.bool_],
     pca_result: WhitenedPCAResult,
 ) -> NDArray[np.float32]:
     """Reconstruct positive per-sample expected counts lambda_hat from whitened PCA."""
     exp_arr = expected if isinstance(expected, np.ndarray) else np.asarray(expected)
     if exp_arr.ndim != 2:
-        raise ValueError("expected must be a 2D array")
+        raise InvalidInputError("expected must be a 2D array")
     n_bins, n_samples = exp_arr.shape
     rank = int(pca_result.loadings.shape[0])
     if pca_result.scores.shape != (rank, n_samples):
-        raise ValueError(
+        raise InvalidInputError(
             f"pca_result.scores shape {pca_result.scores.shape} does not match ({rank}, {n_samples})"
         )
 
     mask = np.asarray(usable, dtype=np.bool_)
     if mask.ndim != 1 or mask.shape[0] != n_bins:
-        raise ValueError("usable must be a 1D boolean mask aligned with expected")
+        raise InvalidInputError(
+            "usable must be a 1D boolean mask aligned with expected"
+        )
     u_idx = np.flatnonzero(mask)
     u_count = int(u_idx.size)
     recon = np.zeros((n_bins, n_samples), dtype=np.float32)
     if u_count == 0:
         return recon
     if int(pca_result.loadings.shape[1]) != u_count:
-        raise ValueError(
+        raise InvalidInputError(
             f"pca_result.loadings width {pca_result.loadings.shape[1]} does not match usable bin count {u_count}"
         )
 
@@ -345,43 +346,74 @@ def reconstruct_whitened_pca_expected(
 
 
 def project_huber_pca_wave(
-    log_signal: NDArray[np.float64],
+    log_signal: NDArray[np.floating],
     loadings: NDArray[np.floating],
     *,
-    whitening_scale: NDArray[np.float64] | None = None,
+    whitening_scale: NDArray[np.floating] | None = None,
     eval_loadings: NDArray[np.floating] | None = None,
+    eval_whitening_scale: NDArray[np.floating] | None = None,
     epsilon: float = 1.35,
     alpha: float = 1e-4,
     clip: float | None = LOG_WAVE_CLIP,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Project 1D signal onto PCA loadings via rank-safe Huber M-estimation."""
+    """Project 1D signal onto whitened PCA loadings via rank-safe Huber M-estimation."""
     y = np.asarray(log_signal, dtype=np.float64).ravel()
     u_len = int(y.size)
     ld = np.asarray(loadings, dtype=np.float64)
     if ld.ndim != 2:
-        raise ValueError("loadings must be a 2D array of shape (K, U)")
+        raise InvalidInputError("loadings must be a 2D array of shape (K, U)")
     k_rank, u_cols = ld.shape
-    if k_rank > 0 and u_cols != u_len:
-        raise ValueError(
+    if (k_rank > 0 and u_cols != u_len) or (k_rank == 0 and u_cols not in (0, u_len)):
+        raise InvalidInputError(
             f"loadings width {u_cols} does not match log_signal length {u_len}"
         )
     ev_ld = ld if eval_loadings is None else np.asarray(eval_loadings, dtype=np.float64)
     if ev_ld.ndim != 2 or ev_ld.shape[0] != k_rank:
-        raise ValueError(
+        raise InvalidInputError(
             "eval_loadings must be a 2D array with matching component rank"
         )
-    eval_len = int(ev_ld.shape[1])
-    if k_rank == 0 or u_len == 0:
-        return np.zeros(k_rank, dtype=np.float64), np.zeros(eval_len, dtype=np.float64)
+    eval_len = u_len if eval_loadings is None else int(ev_ld.shape[1])
 
-    finite = np.isfinite(y) & np.all(np.isfinite(ld), axis=0)
+    if (
+        eval_loadings is None
+        and eval_whitening_scale is None
+        and whitening_scale is not None
+    ):
+        eval_whitening_scale = whitening_scale
+    elif eval_loadings is not None and (whitening_scale is None) != (
+        eval_whitening_scale is None
+    ):
+        raise InvalidInputError(
+            "whitening_scale and eval_whitening_scale must both be provided or both omitted when eval_loadings is set"
+        )
+
     w_arr: NDArray[np.float64] | None = None
     if whitening_scale is not None:
         w_arr = np.asarray(whitening_scale, dtype=np.float64).ravel()
         if w_arr.size != u_len:
-            raise ValueError(
+            raise InvalidInputError(
                 f"whitening_scale length {w_arr.size} does not match log_signal length {u_len}"
             )
+        if u_len > 0 and bool(np.any(np.isfinite(w_arr) & (w_arr < 0.0))):
+            raise InvalidInputError("whitening_scale cannot contain negative entries")
+
+    ew_arr: NDArray[np.float64] | None = None
+    if eval_whitening_scale is not None:
+        ew_arr = np.asarray(eval_whitening_scale, dtype=np.float64).ravel()
+        if ew_arr.size != eval_len:
+            raise InvalidInputError(
+                f"eval_whitening_scale length {ew_arr.size} does not match eval_loadings width {eval_len}"
+            )
+        if eval_len > 0 and bool(np.any(np.isfinite(ew_arr) & (ew_arr < 0.0))):
+            raise InvalidInputError(
+                "eval_whitening_scale cannot contain negative entries"
+            )
+
+    if k_rank == 0 or u_len == 0:
+        return np.zeros(k_rank, dtype=np.float64), np.zeros(eval_len, dtype=np.float64)
+
+    finite = np.isfinite(y) & np.all(np.isfinite(ld), axis=0)
+    if w_arr is not None:
         finite &= np.isfinite(w_arr) & (w_arr > 0.0)
 
     n_valid = int(np.count_nonzero(finite))
@@ -390,7 +422,8 @@ def project_huber_pca_wave(
 
     v_sub = ld[:, finite]
     y_sub = y[finite]
-    gram_v = 0.5 * (v_sub @ v_sub.T + (v_sub @ v_sub.T).T)
+    raw_gram = v_sub @ v_sub.T
+    gram_v = 0.5 * (raw_gram + raw_gram.T)
     evals_v, evecs_v = np.linalg.eigh(gram_v)
     tol_v = 1e-8 * max(float(np.max(evals_v)), 1.0)
     keep_v = evals_v > tol_v
@@ -400,13 +433,8 @@ def project_huber_pca_wave(
 
     proj_basis = evecs_v[:, keep_v].T
     v_red_fit = proj_basis @ v_sub
-    if w_arr is not None:
-        w_sub = w_arr[finite]
-        x_fit = (v_red_fit * w_sub[np.newaxis, :]).T
-        y_fit = y_sub * w_sub
-    else:
-        x_fit = v_red_fit.T
-        y_fit = y_sub
+    x_fit = v_red_fit.T
+    y_fit = y_sub * w_arr[finite] if w_arr is not None else y_sub
 
     coef_red: NDArray[np.float64] | None = None
     if n_valid >= max(rank_eff + 2, 4) and float(np.std(y_fit)) > 1e-12:
@@ -434,6 +462,9 @@ def project_huber_pca_wave(
     coef = np.asarray(proj_basis.T @ coef_red, dtype=np.float64)
     ev_safe = np.where(np.isfinite(ev_ld), ev_ld, 0.0)
     wave = ev_safe.T @ coef
+    if ew_arr is not None:
+        ew_pos = np.isfinite(ew_arr) & (ew_arr > 0.0)
+        wave = np.where(ew_pos, wave / np.where(ew_pos, ew_arr, 1.0), 0.0)
     if clip is not None:
         wave = np.clip(wave, -clip, clip)
     return coef, np.asarray(wave, dtype=np.float64)
@@ -449,6 +480,8 @@ def pca_irlba_numpy(
     Returns (scores, center, rotation) matching prcomp_irlba.
     """
     x_arr = np.asarray(X, dtype=np.float64)
+    if x_arr.ndim != 2:
+        raise InvalidInputError("X must be a 2D array")
     n_samples, n_features = x_arr.shape
     k = max(0, min(n_components, n_samples, n_features))
 

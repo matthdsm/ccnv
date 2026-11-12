@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -14,44 +16,32 @@ from ccnv.models import (
     ArtifactKind,
     ReferenceMetadata,
     SampleBuffers,
-    SchemaError,
     canonical_dictionary_array,
-    decode_metadata,
     validate_reference_table,
     validate_sample_table,
     validate_schema,
 )
 
 __all__ = [
-    "is_sample_parquet",
+    "filter_reference_branches",
     "read_reference_parquet",
     "read_sample_buffers",
-    "read_sample_parquet",
     "write_reference_parquet",
     "write_sample_parquet",
 ]
 
 
-def is_sample_parquet(path: Path | str) -> bool:
-    """Return True if path is a readable Parquet file with sample artifact metadata."""
-    try:
-        p = Path(path)
-        metadata = decode_metadata(pq.read_schema(p).metadata)
-    except OSError, TypeError, ValueError, SchemaError, pa.ArrowException:
-        return False
-    return metadata.get("artifact_kind") == ArtifactKind.SAMPLE.value
-
-
-def read_sample_parquet(path: Path | str) -> pa.Table:
-    """Read a sample Parquet table from disk and validate its schema contract."""
-    table = pq.read_table(Path(path))
-    validate_sample_table(table)
-    return table
-
-
 def read_sample_buffers(path: Path | str) -> SampleBuffers:
     """Read and validate a sample Parquet artifact directly into SampleBuffers."""
-    return SampleBuffers.from_table(pq.read_table(Path(path)), validate=True)
+    return SampleBuffers.from_table(
+        pq.read_table(Path(path).expanduser()), validate=True
+    )
+
+
+def _sibling_tmp_path(out_path: Path) -> Path:
+    return out_path.with_name(
+        f".{out_path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    )
 
 
 def write_sample_parquet(
@@ -60,16 +50,22 @@ def write_sample_parquet(
     *,
     compression_level: int = 3,
 ) -> Path:
-    """Validate sample table contract and persist as a zstd-compressed Parquet table."""
+    """Validate sample table contract and atomically persist as a zstd-compressed Parquet table."""
     validate_sample_table(table)
-    out_path = Path(path)
+    out_path = Path(path).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(
-        table,
-        out_path,
-        compression="zstd",
-        compression_level=compression_level,
-    )
+    tmp_path = _sibling_tmp_path(out_path)
+    try:
+        pq.write_table(
+            table,
+            tmp_path,
+            compression="zstd",
+            compression_level=compression_level,
+        )
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return out_path
 
 
@@ -124,6 +120,25 @@ def _select_matching_row_groups(
     return matching, needs_post_filter
 
 
+def _is_string_or_string_dict(dtype: pa.DataType) -> bool:
+    if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
+        return True
+    if pa.types.is_dictionary(dtype) and isinstance(dtype, pa.DictionaryType):
+        vt = dtype.value_type
+        return bool(pa.types.is_string(vt) or pa.types.is_large_string(vt))
+    return False
+
+
+def filter_reference_branches(table: pa.Table, branches: Sequence[str]) -> pa.Table:
+    """Filter an in-memory reference table to selected branches, preserving schema metadata."""
+    orig_meta = table.schema.metadata
+    mask = pc.is_in(
+        table.column("branch"),
+        pa.array(list(branches), type=pa.string()),
+    )
+    return table.filter(mask).replace_schema_metadata(orig_meta)
+
+
 def read_reference_parquet(
     path: Path | str,
     *,
@@ -131,7 +146,7 @@ def read_reference_parquet(
     check_rows: bool = False,
 ) -> tuple[pa.Table, ReferenceMetadata]:
     """Read a reference Parquet table (optionally branch-pruned) and return (table, metadata)."""
-    pf = pq.ParquetFile(Path(path))
+    pf = pq.ParquetFile(Path(path).expanduser())
     validate_schema(pf.schema_arrow, ArtifactKind.REFERENCE)
 
     if branches is None:
@@ -147,11 +162,7 @@ def read_reference_parquet(
             else:
                 table = pf.read_row_groups(matching_rgs)
                 if needs_filter:
-                    mask = pc.is_in(
-                        table.column("branch"),
-                        pa.array(list(target_set), type=pa.string()),
-                    )
-                    table = table.filter(mask)
+                    table = filter_reference_branches(table, tuple(target_set))
 
     meta = validate_reference_table(table, check_rows=check_rows)
     return table, meta
@@ -164,29 +175,33 @@ def write_reference_parquet(
     compression_level: int = 3,
 ) -> Path:
     """Validate reference table contract and write one ZSTD Parquet row group per branch."""
+    canon_branch: pa.DictionaryArray | None = None
     for col_name, idx_type in (("branch", pa.int8()), ("contig", pa.int16())):
-        if col_name in table.schema.names:
-            col_idx = table.schema.get_field_index(col_name)
-            col_field = table.schema.field(col_idx)
-            if (
-                pa.types.is_string(col_field.type)
-                or pa.types.is_large_string(col_field.type)
-            ) and table.column(col_idx).null_count == 0:
-                canon = canonical_dictionary_array(
-                    table.column(col_idx), col_name, index_type=idx_type
-                )
-                table = table.set_column(
-                    col_idx,
-                    pa.field(
-                        col_name,
-                        pa.dictionary(idx_type, pa.string()),
-                        nullable=False,
-                    ),
-                    canon,
-                )
+        if col_name not in table.schema.names:
+            continue
+        col_idx = table.schema.get_field_index(col_name)
+        col_field = table.schema.field(col_idx)
+        if (
+            _is_string_or_string_dict(col_field.type)
+            and table.column(col_idx).null_count == 0
+        ):
+            canon = canonical_dictionary_array(
+                table.column(col_idx), col_name, index_type=idx_type
+            )
+            table = table.set_column(
+                col_idx,
+                pa.field(
+                    col_name,
+                    pa.dictionary(idx_type, pa.string()),
+                    nullable=False,
+                ),
+                canon,
+            )
+            if col_name == "branch":
+                canon_branch = canon
 
     validate_reference_table(table, check_rows=True)
-    out_path = Path(path)
+    out_path = Path(path).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     writer_kwargs: dict[str, object] = {
@@ -198,25 +213,23 @@ def write_reference_parquet(
             "end": "DELTA_BINARY_PACKED",
         },
     }
-    if table.num_rows == 0:
-        pq.write_table(table, out_path, **writer_kwargs)
-        return out_path
-
-    branch_idx = table.schema.get_field_index("branch")
-    branch_dict = canonical_dictionary_array(
-        table.column(branch_idx), "branch", index_type=pa.int8()
-    )
-    table = table.set_column(branch_idx, table.schema.field(branch_idx), branch_dict)
-    b_codes = branch_dict.indices.to_numpy(zero_copy_only=False)
-    boundaries = (np.flatnonzero(b_codes[1:] != b_codes[:-1]) + 1).tolist()
-    slice_starts = [0, *boundaries]
-    slice_ends = [*boundaries, table.num_rows]
-
-    with pq.ParquetWriter(out_path, table.schema, **writer_kwargs) as writer:
-        for s_idx, e_idx in zip(slice_starts, slice_ends, strict=True):
-            branch_slice = table.slice(s_idx, e_idx - s_idx)
-            writer.write_table(
-                branch_slice, row_group_size=max(branch_slice.num_rows, 1)
-            )
-
+    tmp_path = _sibling_tmp_path(out_path)
+    try:
+        if table.num_rows == 0 or canon_branch is None:
+            pq.write_table(table, tmp_path, **writer_kwargs)
+        else:
+            b_codes = canon_branch.indices.to_numpy(zero_copy_only=False)
+            boundaries = (np.flatnonzero(b_codes[1:] != b_codes[:-1]) + 1).tolist()
+            slice_starts = [0, *boundaries]
+            slice_ends = [*boundaries, table.num_rows]
+            with pq.ParquetWriter(tmp_path, table.schema, **writer_kwargs) as writer:
+                for s_idx, e_idx in zip(slice_starts, slice_ends, strict=True):
+                    branch_slice = table.slice(s_idx, e_idx - s_idx)
+                    writer.write_table(
+                        branch_slice, row_group_size=max(branch_slice.num_rows, 1)
+                    )
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return out_path

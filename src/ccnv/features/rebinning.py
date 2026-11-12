@@ -6,20 +6,18 @@ import logging
 from dataclasses import replace
 
 import numpy as np
-import pyarrow as pa
 from numpy.typing import NDArray
 
 from ccnv.models import (
     BinCompatibilityError,
+    InvalidInputError,
     SampleBuffers,
-    validate_sample_table,
 )
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "rebin_sample_buffers",
-    "rebin_sample_sketch",
 ]
 
 
@@ -29,7 +27,7 @@ def _validate_target_bin_size(target_bin_size: int) -> None:
         or isinstance(target_bin_size, bool)
         or target_bin_size <= 0
     ):
-        raise ValueError(
+        raise InvalidInputError(
             f"target_bin_size must be a positive integer, got {target_bin_size!r}"
         )
 
@@ -46,6 +44,7 @@ def rebin_sample_buffers(bufs: SampleBuffers, target_bin_size: int) -> SampleBuf
     if target_bin_size == meta.bin_size:
         return bufs
 
+    is_float_count = bool(np.issubdtype(bufs.count.dtype, np.floating))
     if target_bin_size % meta.bin_size == 0:
         factor = target_bin_size // meta.bin_size
         parts: list[NDArray[np.int64]] = []
@@ -62,11 +61,16 @@ def rebin_sample_buffers(bufs: SampleBuffers, target_bin_size: int) -> SampleBuf
             if bufs.frag_bands is not None
             else None
         )
+        dst_count: NDArray[np.uint32] | NDArray[np.float64] = (
+            np.add.reduceat(np.asarray(bufs.count, dtype=np.float64), r_idx)
+            if is_float_count
+            else np.add.reduceat(np.asarray(bufs.count, dtype=np.uint64), r_idx).astype(
+                np.uint32
+            )
+        )
         return SampleBuffers(
             meta=replace(meta, bin_size=target_bin_size),
-            count=np.add.reduceat(
-                np.asarray(bufs.count, dtype=np.uint64), r_idx
-            ).astype(np.uint32),
+            count=dst_count,
             paired_count=np.add.reduceat(
                 bufs.paired_count.astype(np.uint64, copy=False), r_idx
             ).astype(np.uint32),
@@ -96,7 +100,7 @@ def rebin_sample_buffers(bufs: SampleBuffers, target_bin_size: int) -> SampleBuf
             meta.bin_size,
             target_bin_size,
         )
-    dst_parts: list[NDArray[np.uint32]] = []
+    dst_parts: list[NDArray[np.uint32] | NDArray[np.float64]] = []
     off = 0
     for name in meta.contig_order:
         length = meta.contig_lengths[name]
@@ -114,11 +118,20 @@ def rebin_sample_buffers(bufs: SampleBuffers, target_bin_size: int) -> SampleBuf
         knots_y = np.concatenate(
             (np.array([0.0]), np.cumsum(c_slice, dtype=np.float64))
         )
-        rounded_cum = np.rint(np.interp(dst_ends, knots_x, knots_y)).astype(np.int64)
-        dst_c = np.diff(np.concatenate((np.array([0], dtype=np.int64), rounded_cum)))
-        dst_parts.append(dst_c.astype(np.uint32))
+        interp_cum = np.interp(dst_ends, knots_x, knots_y)
+        if is_float_count:
+            dst_c_f = np.maximum(
+                0.0, np.diff(np.concatenate((np.array([0.0]), interp_cum)))
+            )
+            dst_parts.append(dst_c_f)
+        else:
+            rounded_cum = np.rint(interp_cum).astype(np.int64)
+            dst_c = np.diff(
+                np.concatenate((np.array([0], dtype=np.int64), rounded_cum))
+            )
+            dst_parts.append(dst_c.astype(np.uint32))
 
-    dst_counts = np.concatenate(dst_parts)
+    dst_counts: NDArray[np.uint32] | NDArray[np.float64] = np.concatenate(dst_parts)
     n_dst = int(dst_counts.size)
     return SampleBuffers(
         meta=replace(meta, bin_size=target_bin_size, fragmentomics=None),
@@ -130,18 +143,3 @@ def rebin_sample_buffers(bufs: SampleBuffers, target_bin_size: int) -> SampleBuf
         frag_gc_sum=np.zeros(n_dst, dtype=np.float32),
         frag_bands=None,
     )
-
-
-def rebin_sample_sketch(table: pa.Table, target_bin_size: int) -> pa.Table:
-    """Coarsen a Schema v2.0.0 sample sketch table to ``target_bin_size``.
-
-    Raises ``BinCompatibilityError`` when ``target_bin_size < source_bin_size``.
-    """
-    _validate_target_bin_size(target_bin_size)
-    meta = validate_sample_table(table)
-    if target_bin_size == meta.bin_size:
-        return table
-    rebinned = rebin_sample_buffers(
-        SampleBuffers.from_table(table, validate=False), target_bin_size
-    )
-    return rebinned.to_table(base_metadata=table.schema.metadata)

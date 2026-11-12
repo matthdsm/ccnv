@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Final
 
@@ -19,16 +18,17 @@ from ccnv.io.alignments import (
 )
 from ccnv.io.parquet import write_sample_parquet
 from ccnv.models import (
-    AlignmentError,
     BinCompatibilityError,
     ContigLookup,
     ExtractConfig,
     ExtractError,
+    FragmentomicsMetadata,
     PredictError,
     ReadFilters,
     ReferenceMetadata,
     SampleBuffers,
     SampleMetadata,
+    SchemaError,
     parquet_path,
     select_layout,
 )
@@ -66,12 +66,31 @@ def _scan_to_buffers(
     qc = build_sample_qc(
         {str(k): int(v) for k, v in scan["qc_counts"].items() if isinstance(v, int)}
     )
-    meta_frag = estimate_sample_landmarks(
-        hist_autosomal=np.asarray(scan["hist_autosomal"], dtype=np.int64),
-        hist_chry=np.asarray(scan["hist_chry"], dtype=np.int64),
-        hist_chrx=np.asarray(scan["hist_chrx"], dtype=np.int64),
-        end_motif_counts=np.asarray(scan["motif_counts"], dtype=np.int64),
+    hist_auto = np.asarray(scan["hist_autosomal"], dtype=np.int64)
+    hist_chry = np.asarray(scan["hist_chry"], dtype=np.int64)
+    hist_chrx = np.asarray(scan["hist_chrx"], dtype=np.int64)
+    motifs = np.asarray(scan["motif_counts"], dtype=np.int64)
+    landmarks = estimate_sample_landmarks(
+        hist_autosomal=hist_auto,
+        end_motif_counts=motifs,
         paired_end=paired_end,
+    )
+    meta_frag = FragmentomicsMetadata(
+        paired_end=landmarks.paired_end,
+        total_paired_fragments=landmarks.total_paired_fragments,
+        chromatosome_mode_bp=landmarks.chromatosome_mode_bp,
+        core_shoulder_bp=landmarks.core_shoulder_bp,
+        sizing_shift_bp=landmarks.sizing_shift_bp,
+        self_referenced_peak_ratio=landmarks.self_referenced_peak_ratio,
+        dinucleosome_fraction=landmarks.dinucleosome_fraction,
+        high_mw_fraction=landmarks.high_mw_fraction,
+        helical_10bp_amplitude=landmarks.helical_10bp_amplitude,
+        helical_10bp_phase=landmarks.helical_10bp_phase,
+        motif_diversity_score=landmarks.motif_diversity_score,
+        hist_autosomal=hist_auto.tolist(),
+        hist_chry=hist_chry.tolist(),
+        hist_chrx=hist_chrx.tolist(),
+        end_motif_counts=motifs.tolist(),
     )
     contig_order = [name for name, _ in selected]
     contig_lengths = dict(selected)
@@ -95,7 +114,7 @@ def _scan_to_buffers(
         source_identity=source_id,
         reference_identity=ref_id,
         qc=dict(qc),
-        filters=dict(asdict(filters)),
+        filters=filters.to_dict(),
         fragmentomics=meta_frag,
     )
     return SampleBuffers(
@@ -107,34 +126,6 @@ def _scan_to_buffers(
         endpoint_count=np.asarray(scan["endpoint_count"], dtype=np.uint32),
         frag_gc_sum=np.asarray(scan["frag_gc_sum"], dtype=np.float32),
         frag_bands=bands_arr,
-    )
-
-
-def _filters_from_ref_meta(ref_meta: ReferenceMetadata) -> ReadFilters:
-    defaults = ReadFilters()
-    raw = ref_meta.filters
-    if not isinstance(raw, Mapping):
-        return defaults
-
-    def _bool(key: str, default: bool) -> bool:
-        v = raw.get(key)
-        return v if isinstance(v, bool) else default
-
-    mq = raw.get("min_mapping_quality")
-    min_mq = (
-        int(mq)
-        if isinstance(mq, int) and not isinstance(mq, bool) and mq >= 0
-        else defaults.min_mapping_quality
-    )
-    return ReadFilters(
-        min_mapping_quality=min_mq,
-        exclude_duplicates=_bool("exclude_duplicates", defaults.exclude_duplicates),
-        exclude_secondary=_bool("exclude_secondary", defaults.exclude_secondary),
-        exclude_supplementary=_bool(
-            "exclude_supplementary", defaults.exclude_supplementary
-        ),
-        exclude_unmapped=_bool("exclude_unmapped", defaults.exclude_unmapped),
-        require_proper_pair=_bool("require_proper_pair", defaults.require_proper_pair),
     )
 
 
@@ -152,31 +143,36 @@ def extract_for_predict(
             alignment, fasta
         )
         header = read_alignment_header(resolved_alignment, resolved_fasta)
-    except (AlignmentError, ExtractError, ValueError, OSError) as err:
+    except (ExtractError, ValueError, OSError) as err:
         raise PredictError(f"failed to read sample {alignment}: {err}") from err
 
     if not header or any(length <= 0 for _, length in header):
         raise PredictError(f"{resolved_alignment} header declares invalid contigs")
-    header_map = dict(header)
-    if len(header_map) != len(header):
+    if len(dict(header)) != len(header):
         raise PredictError(f"{resolved_alignment} header declares duplicate contigs")
 
-    lookup = ContigLookup.from_names(header_map.keys())
+    lookup = ContigLookup.from_names(ref_meta.contig_lengths.keys())
+    seen_ref_contigs: set[str] = set()
     selected: list[tuple[str, int]] = []
-    for name, expected_len in ref_meta.contig_lengths.items():
-        resolved = lookup.resolve(name)
-        if resolved is None:
+    for header_name, actual_len in header:
+        ref_name = lookup.resolve(header_name)
+        if ref_name is None:
             continue
-        actual_len = header_map[resolved]
+        if ref_name in seen_ref_contigs:
+            raise PredictError(
+                f"{resolved_alignment} header maps multiple contigs to {ref_name!r}"
+            )
+        seen_ref_contigs.add(ref_name)
+        expected_len = ref_meta.contig_lengths[ref_name]
         if actual_len != expected_len:
-            raise BinCompatibilityError(f"contig length mismatch for {name!r}")
-        selected.append((name, expected_len))
+            raise BinCompatibilityError(f"contig length mismatch for {ref_name!r}")
+        selected.append((ref_name, expected_len))
     if not selected:
         raise PredictError(
             f"{resolved_alignment} declares none of the reference contigs"
         )
 
-    filters = _filters_from_ref_meta(ref_meta)
+    filters = ReadFilters.from_dict(ref_meta.filters or {}, strict=False)
     try:
         scan = scan_alignment_bins(
             resolved_alignment,
@@ -187,7 +183,7 @@ def extract_for_predict(
             fasta=resolved_fasta,
             collect_bands=collect_bands,
         )
-    except (AlignmentError, ExtractError, ValueError, OSError) as err:
+    except (ExtractError, ValueError, OSError) as err:
         raise PredictError(f"failed to stream alignment {alignment}: {err}") from err
 
     return _scan_to_buffers(
@@ -255,11 +251,15 @@ def run(config: ExtractConfig) -> None:
     table = extract_sample_table(config)
     output = parquet_path(config.prefix)
     logger.debug("writing sample parquet %s (%d bins)", output, table.num_rows)
-    write_sample_parquet(table, output)
+    try:
+        write_sample_parquet(table, output)
+        size_kb = output.stat().st_size / 1024
+    except (SchemaError, OSError, pa.ArrowException) as err:
+        raise ExtractError(f"failed to write sample parquet {output}: {err}") from err
     logger.debug(
         "wrote sample parquet %s (%.1f KB)",
         output,
-        output.stat().st_size / 1024,
+        size_kb,
     )
 
 

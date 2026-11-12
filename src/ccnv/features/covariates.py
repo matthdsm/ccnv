@@ -1,4 +1,4 @@
-"""Genomic covariate masking, exogenous basis assembly, and Poisson bias regression."""
+"""Genomic covariate masking and standardized exogenous feature extraction."""
 
 from __future__ import annotations
 
@@ -11,17 +11,10 @@ from ccnv.models import (
     DEFAULT_MIN_MAPPABILITY,
     CovariateError,
 )
-from ccnv.stats.regression import (
-    build_exogenous_covariate_basis,
-    fit_poisson_covariate_trends,
-    standardize_column,
-)
+from ccnv.stats import standardize_column
 
 __all__ = [
-    "DEFAULT_MIN_MAPPABILITY",
-    "build_exogenous_covariate_basis",
     "covariate_features",
-    "fit_poisson_covariate_trends",
     "mask_covariates",
     "validate_min_mappability",
 ]

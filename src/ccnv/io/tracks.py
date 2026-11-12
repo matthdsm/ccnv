@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 import gzip
 import logging
+import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Final
@@ -136,23 +138,52 @@ def _extract_contig_grid(
         return [], 1, []
 
     runs: list[tuple[str, int, int]] = []
+    seen_contigs: set[str] = set()
     run_start = 0
     prev = str(contigs[0])
     for idx in range(1, n):
         cur = str(contigs[idx])
         if cur != prev:
+            if prev in seen_contigs:
+                raise CovariateError(f"non-contiguous contig run on contig {prev}")
+            seen_contigs.add(prev)
             runs.append((prev, run_start, idx))
             prev = cur
             run_start = idx
+    if prev in seen_contigs:
+        raise CovariateError(f"non-contiguous contig run on contig {prev}")
     runs.append((prev, run_start, n))
+
+    for cname, s_idx, e_idx in runs:
+        c_starts = starts[s_idx:e_idx]
+        c_ends = ends[s_idx:e_idx]
+        if bool(np.any(c_starts < 0)) or bool(np.any(c_ends <= c_starts)):
+            raise CovariateError(
+                f"non-positive or inverted bin coordinates on contig {cname}"
+            )
+        if c_starts.size >= 2 and bool(np.any(c_starts[1:] < c_ends[:-1])):
+            raise CovariateError(
+                f"unsorted or overlapping bin coordinates on contig {cname}"
+            )
 
     bin_size = 0
     for _, s_idx, e_idx in runs:
         if e_idx - s_idx >= 2:
             bin_size = int(ends[s_idx] - starts[s_idx])
             break
+
     if bin_size <= 0:
-        bin_size = max(int(np.max(ends - starts)), 1)
+        max_width = max(int(np.max(ends - starts)), 1)
+        pos_starts = [int(s) for s in starts if int(s) > 0]
+        if pos_starts:
+            step = functools.reduce(math.gcd, pos_starts)
+            if step < max_width:
+                raise CovariateError(
+                    f"non-uniform bin coordinates on contig {runs[0][0]} are unsupported"
+                )
+            bin_size = step
+        else:
+            bin_size = max_width
 
     specs: list[tuple[str, int]] = []
     placements: list[tuple[slice, slice, NDArray[np.intp] | None]] = []
@@ -160,14 +191,11 @@ def _extract_contig_grid(
     for cname, s_idx, e_idx in runs:
         c_starts = starts[s_idx:e_idx]
         c_ends = ends[s_idx:e_idx]
-        contig_len = int(np.max(c_ends))
-        if contig_len <= 0:
-            raise CovariateError(f"non-positive bin end coordinate on contig {cname}")
+        contig_len = int(c_ends[-1])
         n_core = (contig_len + bin_size - 1) // bin_size
         is_full_grid = (
             c_starts.size == n_core
             and int(c_starts[0]) == 0
-            and int(c_ends[-1]) == contig_len
             and (
                 n_core == 1
                 or (
@@ -178,11 +206,8 @@ def _extract_contig_grid(
         )
         if is_full_grid:
             bin_idx = None
-        elif (
-            bool(np.all(c_starts >= 0))
-            and bool(np.all(c_starts % bin_size == 0))
-            and bool(np.all(c_ends > c_starts))
-            and bool(np.all(c_ends == np.minimum(c_starts + bin_size, contig_len)))
+        elif bool(np.all(c_starts % bin_size == 0)) and bool(
+            np.all(c_ends == np.minimum(c_starts + bin_size, contig_len))
         ):
             bin_idx = (c_starts // bin_size).astype(np.intp)
         else:
@@ -242,6 +267,16 @@ def load_mappability_track(
         label="mappability",
         full_bin_denominator=True,
     )
+    if np.any(np.isinf(values)):
+        raise CovariateError(f"mappability track {path} contains infinite values")
+    finite_vals = values[np.isfinite(values)]
+    if finite_vals.size > 0 and (
+        bool(np.any(finite_vals < -1e-5)) or bool(np.any(finite_vals > 1.0 + 1e-5))
+    ):
+        raise CovariateError(
+            f"mappability track {path} contains values outside [0.0, 1.0]: "
+            f"min={float(np.min(finite_vals)):.6g}, max={float(np.max(finite_vals)):.6g}"
+        )
     values = np.nan_to_num(values, nan=0.0)
     values = np.clip(values, 0.0, 1.0)
     logger.debug(
@@ -307,6 +342,10 @@ def _load_bed_gc(
     resolved = path.expanduser()
     if not resolved.is_file():
         raise CovariateError(f"GC track file not found: {resolved}")
+
+    _extract_contig_grid(contigs, starts, ends)
+    if starts.size == 0:
+        return np.empty(0, dtype=np.float64)
 
     try:
         df = pl.read_csv(
@@ -396,7 +435,7 @@ def _load_bed_gc(
             part["val"].to_numpy(),
         )
 
-    if not matched_any and starts.size > 0:
+    if not matched_any:
         raise CovariateError(f"GC track {resolved} contains none of the target contigs")
     return out
 
@@ -441,12 +480,12 @@ def load_gc_track(
 
     finite = np.isfinite(gc)
     if np.any(finite):
-        if (
-            1.0 < float(np.nanmedian(gc[finite]))
-            and float(np.nanmax(gc[finite])) <= 100.0
-        ):
-            gc[finite] /= 100.0
-        invalid_range = (gc < 0.0) | (gc > 1.0)
+        finite_vals = gc[finite]
+        if 1.0 < float(np.median(finite_vals)) and float(np.max(finite_vals)) <= 100.0:
+            gc[finite] = finite_vals / 100.0
+            finite_vals = gc[finite]
+        invalid_range = np.zeros(gc.shape, dtype=np.bool_)
+        invalid_range[finite] = (finite_vals < 0.0) | (finite_vals > 1.0)
         gc[invalid_range] = np.nan
         n_mask |= invalid_range
 
@@ -464,42 +503,49 @@ def load_cytobands_track(
     path: Path, contig_lengths: Mapping[str, int]
 ) -> tuple[Cytoband, ...]:
     """Parse a UCSC cytoband BED/TSV file (.txt, .bed, or .gz) aligned to contigs."""
-    lookup = ContigLookup.from_names(contig_lengths.keys())
+    resolved = Path(path).expanduser()
+    if not resolved.is_file():
+        raise CovariateError(f"cytobands file not found: {resolved}")
 
-    open_fn = gzip.open if path.suffix.lower() == ".gz" else open
+    lookup = ContigLookup.from_names(contig_lengths.keys())
+    open_fn = gzip.open if resolved.suffix.lower() == ".gz" else open
     bands: list[Cytoband] = []
-    with open_fn(path, "rt", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line or line.startswith(("#", "track")):
-                continue
-            fields = line.split("\t") if "\t" in line else line.split()
-            if len(fields) < 4:
-                continue
-            canonical = lookup.resolve(fields[0])
-            if canonical is None:
-                continue
-            try:
-                start = int(fields[1])
-                end = int(fields[2])
-            except ValueError:
-                continue
-            max_len = contig_lengths[canonical]
-            start = max(0, min(start, max_len))
-            end = max(0, min(end, max_len))
-            if end <= start:
-                continue
-            name = fields[3]
-            stain = fields[4] if len(fields) >= 5 else "gneg"
-            bands.append(
-                Cytoband(
-                    contig=canonical,
-                    start=start,
-                    end=end,
-                    name=name,
-                    stain=stain,
+    try:
+        with open_fn(resolved, "rt", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith(("#", "track", "browser")):
+                    continue
+                fields = line.split("\t") if "\t" in line else line.split()
+                if len(fields) < 4:
+                    continue
+                canonical = lookup.resolve(fields[0])
+                if canonical is None:
+                    continue
+                try:
+                    start = int(fields[1])
+                    end = int(fields[2])
+                except ValueError:
+                    continue
+                max_len = contig_lengths[canonical]
+                start = max(0, min(start, max_len))
+                end = max(0, min(end, max_len))
+                if end <= start:
+                    continue
+                name = fields[3]
+                stain = fields[4] if len(fields) >= 5 else "gneg"
+                bands.append(
+                    Cytoband(
+                        contig=canonical,
+                        start=start,
+                        end=end,
+                        name=name,
+                        stain=stain,
+                    )
                 )
-            )
+    except (OSError, EOFError, UnicodeDecodeError) as error:
+        raise CovariateError(f"failed to read cytobands {resolved}: {error}") from error
+
     return tuple(
         sorted(bands, key=lambda b: (natural_sort_key(b.contig), b.start, b.end))
     )

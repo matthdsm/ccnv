@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import importlib.resources
 import json
+import math
 from pathlib import Path
 
 import jsonschema
@@ -12,11 +13,7 @@ import yaml
 
 from ccnv.models import ReferenceError, SamplesheetEntry
 
-__all__ = [
-    "_get_samplesheet_schema",
-    "_validate_sample_file",
-    "load_samplesheet",
-]
+__all__ = ["load_samplesheet"]
 
 
 @functools.cache
@@ -32,15 +29,9 @@ def _get_samplesheet_schema() -> dict[str, object]:
     return loaded
 
 
-def _validate_sample_file(path: Path) -> None:
-    """Validate that a referenced sample file exists on disk."""
-    if not path.is_file():
-        raise ReferenceError(f"{path}: sample file not found")
-
-
 def load_samplesheet(path: Path | str) -> tuple[SamplesheetEntry, ...]:
     """Load, validate, and parse a cohort samplesheet from YAML or JSON."""
-    samplesheet_path = Path(path)
+    samplesheet_path = Path(path).expanduser()
     if not samplesheet_path.is_file():
         raise ReferenceError(f"samplesheet not found: {samplesheet_path}")
 
@@ -86,8 +77,7 @@ def load_samplesheet(path: Path | str) -> tuple[SamplesheetEntry, ...]:
     entries: list[SamplesheetEntry] = []
 
     for idx, item in enumerate(raw_data):
-        raw_filepath = item["filepath"]
-        entry_path = Path(raw_filepath)
+        entry_path = Path(item["filepath"]).expanduser()
         resolved_path = (
             entry_path.resolve()
             if entry_path.is_absolute()
@@ -101,18 +91,25 @@ def load_samplesheet(path: Path | str) -> tuple[SamplesheetEntry, ...]:
             )
         seen_paths.add(resolved_path)
 
-        _validate_sample_file(resolved_path)
+        if not resolved_path.is_file():
+            raise ReferenceError(f"{resolved_path}: sample file not found")
 
         raw_sex = item.get("sex")
         raw_ff = item.get("ff")
         ff_val = float(raw_ff) if raw_ff is not None else None
+        if ff_val is not None and not math.isfinite(ff_val):
+            raise ReferenceError(
+                f"{samplesheet_path}: entry {idx} fetal fraction ff must be finite, got {raw_ff!r}"
+            )
 
-        entries.append(
-            SamplesheetEntry(
+        try:
+            entry = SamplesheetEntry(
                 filepath=resolved_path,
                 sex=raw_sex,
                 ff=ff_val,
             )
-        )
+        except ValueError as error:
+            raise ReferenceError(f"{samplesheet_path}: entry {idx}: {error}") from error
+        entries.append(entry)
 
     return tuple(entries)

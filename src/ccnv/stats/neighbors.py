@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import tempfile
 import warnings
 from contextlib import ExitStack
@@ -17,6 +18,8 @@ from scipy.special import digamma, polygamma
 from scipy.stats import poisson
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.exceptions import ConvergenceWarning
+
+from ccnv.models.exceptions import InvalidInputError
 
 logger = logging.getLogger(__name__)
 
@@ -141,27 +144,25 @@ def fit_prototype_graph(
     max_prototypes: int = 2048,
     top_r: int = 4,
 ) -> tuple[
-    NDArray[np.float32],
     NDArray[np.uint16],
     NDArray[np.float16],
     NDArray[np.float32],
 ]:
     """Cluster signal-space features into M <= max_prototypes prototypes and query top_r."""
     if max_prototypes < 1 or max_prototypes > 65535:
-        raise ValueError("max_prototypes must be in [1, 65535]")
+        raise InvalidInputError("max_prototypes must be in [1, 65535]")
     if top_r < 1:
-        raise ValueError("top_r must be a positive integer")
+        raise InvalidInputError("top_r must be a positive integer")
 
     feats = np.asarray(features, dtype=np.float32)
     if feats.ndim == 1:
         feats = feats[:, np.newaxis]
     if feats.ndim != 2:
-        raise ValueError("features must be a 1D or 2D array")
+        raise InvalidInputError("features must be a 1D or 2D array")
 
     u_count, n_dim = feats.shape
     if u_count == 0:
         return (
-            np.empty((0, n_dim), dtype=np.float32),
             np.zeros((0, top_r), dtype=np.uint16),
             np.zeros((0, top_r), dtype=np.float16),
             np.empty(0, dtype=np.float32),
@@ -172,7 +173,6 @@ def fit_prototype_graph(
         proto_weights = np.zeros((u_count, top_r), dtype=np.float16)
         proto_weights[:, 0] = np.float16(1.0)
         return (
-            np.empty((1, 0), dtype=np.float32),
             proto_ids,
             proto_weights,
             np.zeros(u_count, dtype=np.float32),
@@ -216,7 +216,7 @@ def fit_prototype_graph(
     proto_weights = np.zeros((u_count, top_r), dtype=np.float16)
     proto_weights[:, :k_query] = w_f16
     mean_distance = np.mean(dists, axis=1).astype(np.float32)
-    return centers, proto_ids, proto_weights, mean_distance
+    return proto_ids, proto_weights, mean_distance
 
 
 def _resolve_prototype_weights(
@@ -224,15 +224,17 @@ def _resolve_prototype_weights(
     pw: NDArray[np.float64],
     valid_proto: NDArray[np.bool_],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
-    """Resolve effective prototype weights and deduplicated support mask per bin."""
+    """Resolve pooled prototype weights across unique prototype IDs and active support mask."""
     u_count, r_cols = pids.shape
+    eff_w = np.where(valid_proto & (pw > 0.0), pw, 0.0)
     first_occ = np.ones((u_count, r_cols), dtype=np.bool_)
     for col_j in range(1, r_cols):
-        first_occ[:, col_j] = np.all(
-            pids[:, :col_j] != pids[:, col_j : col_j + 1], axis=1
-        )
-    valid_w = valid_proto & (pw > 0.0)
-    eff_w = np.where(valid_w, pw, 0.0)
+        for prev_j in range(col_j):
+            same = pids[:, col_j] == pids[:, prev_j]
+            first_occ[:, col_j] &= ~same
+            active_dup = same & first_occ[:, prev_j]
+            eff_w[:, prev_j] += np.where(active_dup, eff_w[:, col_j], 0.0)
+        eff_w[:, col_j] = np.where(first_occ[:, col_j], eff_w[:, col_j], 0.0)
     w_sum = np.sum(eff_w, axis=1)
     fallback_proto = valid_proto & first_occ
     need_unif = (w_sum <= 0.0) & np.any(fallback_proto, axis=1)
@@ -241,8 +243,7 @@ def _resolve_prototype_weights(
             need_unif[:, np.newaxis], np.where(fallback_proto, 1.0, 0.0), eff_w
         )
         w_sum = np.sum(eff_w, axis=1)
-    used_mask = np.where(need_unif[:, np.newaxis], fallback_proto, valid_w & first_occ)
-    return eff_w, w_sum, used_mask
+    return eff_w, w_sum, eff_w > 0.0
 
 
 def compute_loco_prototype_support(
@@ -540,18 +541,17 @@ def _winsorized_anscombe_mean_and_var(
 
 
 def calibrate_prototype_dispersion(
-    counts: NDArray[np.float32],
-    recon_expected: NDArray[np.float32],
-    contigs: NDArray[np.int16],
+    counts: NDArray[np.floating],
+    recon_expected: NDArray[np.floating],
+    contigs: NDArray[np.integer],
     usable: NDArray[np.bool_],
     proto_ids: NDArray[np.uint16],
-    proto_weights: NDArray[np.float16],
+    proto_weights: NDArray[np.floating],
     *,
     pca_rank: int,
-    n_prototypes: int,
+    kappa_frag: NDArray[np.floating] | None = None,
 ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Calibrate full-cohort null_mean and depth-decomposed EB bio_dispersion across all samples."""
-    del n_prototypes
     counts_arr = counts if isinstance(counts, np.ndarray) else np.asarray(counts)
     exp_arr = (
         recon_expected
@@ -559,33 +559,53 @@ def calibrate_prototype_dispersion(
         else np.asarray(recon_expected)
     )
     if counts_arr.ndim != 2 or exp_arr.ndim != 2 or counts_arr.shape != exp_arr.shape:
-        raise ValueError(
+        raise InvalidInputError(
             "counts and recon_expected must be 2D arrays of matching shape"
         )
 
     n_bins, n_samples = counts_arr.shape
     mask = np.asarray(usable, dtype=np.bool_)
     if mask.ndim != 1 or mask.shape[0] != n_bins:
-        raise ValueError("usable must be a 1D boolean mask aligned with counts")
+        raise InvalidInputError("usable must be a 1D boolean mask aligned with counts")
+
+    contigs_arr = np.asarray(contigs, dtype=np.int64)
+    if contigs_arr.ndim != 1 or contigs_arr.shape[0] != n_bins:
+        raise InvalidInputError(
+            "contigs must be a 1D integer array aligned with counts"
+        )
 
     null_mean = np.zeros(n_bins, dtype=np.float32)
     bio_disp = np.zeros(n_bins, dtype=np.float32)
     u_idx = np.flatnonzero(mask)
     u_count = int(u_idx.size)
+    if (
+        proto_ids.ndim != 2
+        or proto_weights.ndim != 2
+        or proto_ids.shape != proto_weights.shape
+        or proto_ids.shape[0] != u_count
+    ):
+        raise InvalidInputError(
+            f"proto_ids and proto_weights must be 2D arrays with matching shape ({u_count}, top_r)"
+        )
     if u_count == 0 or n_samples == 0:
         return null_mean, bio_disp
 
-    c_ids_u = np.asarray(contigs, dtype=np.int64)[u_idx]
-    if proto_ids.shape[0] == u_count and proto_weights.shape[0] == u_count:
-        pids_u = proto_ids
-        pw_u = proto_weights
-    elif proto_ids.shape[0] == n_bins and proto_weights.shape[0] == n_bins:
-        pids_u = proto_ids[u_idx]
-        pw_u = proto_weights[u_idx]
-    else:
-        raise ValueError(
-            "proto_ids and proto_weights must align with usable or full bins"
+    c_ids_u = contigs_arr[u_idx]
+    pids_u = proto_ids
+    pw_u = proto_weights
+    if kappa_frag is not None:
+        kap_arr = np.asarray(kappa_frag, dtype=np.float64)
+        if kap_arr.ndim != 1 or kap_arr.shape[0] != n_bins:
+            raise InvalidInputError(
+                "kappa_frag must be a 1D float array aligned with counts"
+            )
+        kap_u = np.where(
+            np.isfinite(kap_arr[u_idx]) & (kap_arr[u_idx] > 0.0),
+            kap_arr[u_idx],
+            1.0,
         )
+    else:
+        kap_u = np.ones(u_count, dtype=np.float64)
 
     shot_sum = np.zeros(u_count, dtype=np.float64)
     lam_sum = np.zeros(u_count, dtype=np.float64)
@@ -616,11 +636,12 @@ def calibrate_prototype_dispersion(
             ) - exact_poisson_log2_jensen_bias(eff_lam[ok])
             r_col[ok] = r_unbiased.astype(np.float32)
             r_store[:, s_idx] = r_col
-            shot_sum[ok] += exact_poisson_log_variance(eff_lam[ok]) / LN2_SQ
+            shot_sum[ok] += kap_u[ok] * exact_poisson_log_variance(eff_lam[ok]) / LN2_SQ
             lam_sum[ok] += eff_lam[ok]
             shot_cnt[ok] += 1
 
-    ddof = 1.0 + float(max(0, pca_rank)) / float(max(n_samples, 1))
+    d_eb = float(max(1, n_samples - 1 - max(0, pca_rank)))
+    ddof = float(n_samples) - d_eb if n_samples > 1 else 1.0
     mean_u = np.zeros(u_count, dtype=np.float64)
     obs_var_u = np.zeros(u_count, dtype=np.float64)
 
@@ -647,7 +668,7 @@ def calibrate_prototype_dispersion(
                 m_c, v_c = _winsorized_anscombe_mean_and_var(
                     np.asarray(r_store[c0:c1], dtype=np.float64),
                     mean_lam_u[c0:c1],
-                    ddof,
+                    ddof=ddof,
                 )
                 mean_u[c0:c1] = m_c
                 obs_var_u[c0:c1] = v_c
@@ -656,25 +677,28 @@ def calibrate_prototype_dispersion(
 
     has_support = (shot_cnt > 0) & (last_sup > 0)
     null_mean[u_idx] = np.where(has_support, mean_u, 0.0).astype(np.float32)
-    if n_samples <= 1:
+    if n_samples <= 1 or not np.any(has_support):
         return null_mean, bio_disp
-
-    d_eb = float(max(1, n_samples - 1 - max(0, pca_rank)))
-    if n_samples > 1 and pca_rank > 0:
-        obs_var_u = obs_var_u * (float(n_samples) - ddof) / float(d_eb)
 
     f_loco = compute_kish_loco_inflation(c_ids_u, pids_u, pw_u, last_sup)
     v_shot = np.where(shot_cnt > 0, shot_sum / np.maximum(shot_cnt, 1), 0.0)
     v_tot = obs_var_u / f_loco
-    raw_phi = np.where(has_support, LN2_SQ * np.maximum(0.0, v_tot - v_shot), 0.0)
 
-    pos_bins = has_support & (raw_phi > 1e-12)
+    phi_0 = max(
+        0.0,
+        float(np.median(LN2_SQ * (v_tot[has_support] - v_shot[has_support]))),
+    )
+    s0_sq = np.maximum(v_shot[has_support] + phi_0 / LN2_SQ, 1e-12)
     disp_u = np.zeros(u_count, dtype=np.float64)
-    if u_count >= 10 and int(np.count_nonzero(pos_bins)) >= 2:
-        shrunk_pos, _, _ = squeeze_var(raw_phi[pos_bins], df=d_eb)
-        disp_u[pos_bins] = np.maximum(shrunk_pos, 0.0)
+    if int(np.count_nonzero(has_support)) >= 2:
+        w_post, _, _ = squeeze_var(v_tot[has_support] / s0_sq, df=d_eb)
+        disp_u[has_support] = LN2_SQ * np.maximum(
+            0.0, s0_sq * w_post - v_shot[has_support]
+        )
     else:
-        disp_u[pos_bins] = raw_phi[pos_bins]
+        disp_u[has_support] = LN2_SQ * np.maximum(
+            0.0, v_tot[has_support] - v_shot[has_support]
+        )
 
     disp_u[~np.isfinite(disp_u) | (disp_u <= 1e-16)] = 0.0
     bio_disp[u_idx] = disp_u.astype(np.float32)
@@ -690,10 +714,10 @@ def calibrate_prototype_dispersion(
 def squeeze_var(
     var: NDArray[np.floating],
     df: float,
-    winsor_tail_p: tuple[float, float] = (0.0, 0.0),
 ) -> tuple[NDArray[np.float64], float, float]:
     """Empirical Bayes variance moderation matching Smyth (2004) / limma::squeezeVar."""
-    del winsor_tail_p
+    if not math.isfinite(df) or df <= 0.0:
+        raise InvalidInputError("df must be finite and positive")
     var_arr = np.asarray(var, dtype=np.float64)
     valid = np.isfinite(var_arr) & (var_arr > 1e-16)
     if np.count_nonzero(valid) < 2:
@@ -717,6 +741,7 @@ def squeeze_var(
         d0_hat = float(brentq(func, 1e-8, 1e8))
         s0_sq_hat = float(np.exp(mean_z + digamma(d0_hat / 2.0) - np.log(d0_hat / 2.0)))
 
+    nonneg = np.isfinite(var_arr) & (var_arr >= 0.0)
     var_post = var_arr.copy()
-    var_post[valid] = (d0_hat * s0_sq_hat + df * v) / (d0_hat + df)
+    var_post[nonneg] = (d0_hat * s0_sq_hat + df * var_arr[nonneg]) / (d0_hat + df)
     return var_post, d0_hat, s0_sq_hat

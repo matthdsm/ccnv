@@ -1,15 +1,21 @@
-"""Shared coordinate sorting, contig chunking, and segment DataFrame builders for reports."""
+"""Shared coordinate sorting, contig chunking, DataFrame builders, and atomic BGZF writing."""
 
+from __future__ import annotations
+
+import os
+import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import groupby
 from operator import attrgetter
-from typing import Final
+from pathlib import Path
+from typing import Final, Literal
 
 import numpy as np
 import polars as pl
 from numpy.typing import NDArray
 
+from ccnv._core import write_bgzf_indexed
 from ccnv.models import BinResult, SegmentResult, natural_sort_key
 
 type BinResults = Sequence[BinResult]
@@ -68,15 +74,21 @@ __all__ = [
     "STREAM_CHUNK_ROWS",
     "BinResults",
     "ContigBinChunk",
+    "bin_chunk_to_dataframe",
     "iter_contig_bin_chunks",
+    "max_bin_end",
+    "max_df_end",
     "ordered_contig_names",
     "partition_contig_runs",
     "resolve_natural_contig_bounds",
+    "resolve_segments_dataframe",
     "segments_to_dataframe",
     "sort_bin_result",
     "sort_bin_results",
     "sort_segments",
+    "sort_segments_dataframe",
     "validate_threads",
+    "write_bgzf_atomic",
 ]
 
 
@@ -84,6 +96,46 @@ def validate_threads(threads: int) -> None:
     """Validate that threads is a positive integer."""
     if isinstance(threads, bool) or threads < 1:
         raise ValueError("threads must be a positive integer")
+
+
+def write_bgzf_atomic(
+    gz_path: Path,
+    preset: Literal["bed", "vcf"],
+    contig_names: Sequence[str],
+    max_contig_len: int,
+    chunks: Iterable[bytes],
+    threads: int,
+) -> Path:
+    """Atomically write BGZF archive and its Tabix/CSI index via sibling temp files."""
+    gz_path.parent.mkdir(parents=True, exist_ok=True)
+    token = f".{gz_path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+    tmp_gz = gz_path.parent / token
+    tmp_idx: Path | None = None
+    try:
+        tmp_idx_str = write_bgzf_indexed(
+            str(tmp_gz),
+            preset,
+            list(contig_names),
+            int(max_contig_len),
+            chunks,
+            threads,
+        )
+        tmp_idx = Path(tmp_idx_str)
+        idx_ext = ".csi" if tmp_idx_str.endswith(".csi") else ".tbi"
+        stale_ext = ".tbi" if idx_ext == ".csi" else ".csi"
+        final_idx = Path(f"{gz_path}{idx_ext}")
+        os.replace(tmp_gz, gz_path)
+        os.replace(tmp_idx, final_idx)
+        Path(f"{gz_path}{stale_ext}").unlink(missing_ok=True)
+    except BaseException:
+        tmp_gz.unlink(missing_ok=True)
+        if tmp_idx is not None:
+            tmp_idx.unlink(missing_ok=True)
+        else:
+            Path(f"{tmp_gz}.tbi").unlink(missing_ok=True)
+            Path(f"{tmp_gz}.csi").unlink(missing_ok=True)
+        raise
+    return gz_path
 
 
 def partition_contig_runs(contigs: Sequence[str]) -> list[tuple[str, int, int]]:
@@ -235,6 +287,28 @@ def iter_contig_bin_chunks(
             )
 
 
+def bin_chunk_to_dataframe(chunk: ContigBinChunk) -> pl.DataFrame:
+    """Build a Polars DataFrame from a ContigBinChunk with non-finite floats mapped to null."""
+    cols: dict[str, object] = {
+        "start": chunk.starts,
+        "end": chunk.ends,
+        "ratio": chunk.ratios,
+        "zscore": chunk.zscores,
+        "weight": chunk.weights,
+        "reference_size": chunk.reference_sizes,
+        "masked": chunk.masked,
+    }
+    if not isinstance(chunk.branch, str):
+        cols["branch"] = pl.Series("branch", chunk.branch, dtype=pl.String)
+    return pl.DataFrame(cols).with_columns(
+        pl.when(pl.col(col).is_not_null() & pl.col(col).is_finite())
+        .then(pl.col(col))
+        .otherwise(None)
+        .alias(col)
+        for col in _FINITE_BASE_FLOAT_COLS
+    )
+
+
 def sort_bin_result(result: BinResult) -> BinResult:
     """Sort BinResult bins in natural chromosome order, preserving coords."""
     if len(result.contigs) <= 1:
@@ -307,7 +381,7 @@ def segments_to_dataframe(
     *,
     is_prenatal: bool = False,
 ) -> pl.DataFrame:
-    """Unpack SegmentResult records once into a typed Polars DataFrame."""
+    """Unpack SegmentResult records once into a typed Polars DataFrame with null non-finite floats."""
     schema = _PRENATAL_SEGMENT_SCHEMA if is_prenatal else _GERMLINE_SEGMENT_SCHEMA
     if not segments:
         return pl.DataFrame(schema=schema)
@@ -316,21 +390,84 @@ def segments_to_dataframe(
     columns = list(zip(*map(getter, segments), strict=True))
     df = pl.DataFrame(columns, schema=schema, orient="col")
 
-    clean_exprs: list[pl.Expr] = [
-        pl.when(pl.col(col).is_finite())
+    float_cols = (
+        (*_FINITE_BASE_FLOAT_COLS, *_OPTIONAL_PRENATAL_FLOAT_COLS)
+        if is_prenatal
+        else _FINITE_BASE_FLOAT_COLS
+    )
+    return df.with_columns(
+        pl.when(pl.col(col).is_not_null() & pl.col(col).is_finite())
         .then(pl.col(col))
-        .otherwise(float("nan"))
+        .otherwise(None)
         .alias(col)
-        for col in _FINITE_BASE_FLOAT_COLS
-    ]
-    if is_prenatal:
-        clean_exprs.extend(
-            pl.when(pl.col(col).is_null())
-            .then(None)
-            .when(pl.col(col).is_finite())
-            .then(pl.col(col))
-            .otherwise(float("nan"))
-            .alias(col)
-            for col in _OPTIONAL_PRENATAL_FLOAT_COLS
+        for col in float_cols
+    )
+
+
+def max_bin_end(results: Sequence[BinResult]) -> int:
+    """Return the maximum bin end coordinate across a sequence of BinResult objects."""
+    return max(
+        (int(np.max(res.ends)) for res in results if res.ends.size > 0),
+        default=0,
+    )
+
+
+def max_df_end(df: pl.DataFrame) -> int:
+    """Return the maximum integer ``end`` coordinate in a segment Polars DataFrame."""
+    if df.height == 0:
+        return 0
+    end_max = df.get_column("end").max()
+    return (
+        int(end_max)
+        if isinstance(end_max, int) and not isinstance(end_max, bool)
+        else 0
+    )
+
+
+def sort_segments_dataframe(
+    df: pl.DataFrame,
+    contig_names: Sequence[str],
+) -> pl.DataFrame:
+    """Sort a segment Polars DataFrame by explicit contig rank, start, and end."""
+    if df.height <= 1:
+        return df
+    contig_rank = {c: idx for idx, c in enumerate(contig_names)}
+    return (
+        df.with_columns(
+            pl.col("contig")
+            .replace_strict(contig_rank, return_dtype=pl.Int32)
+            .alias("_contig_rank")
         )
-    return df.with_columns(clean_exprs)
+        .sort("_contig_rank", "start", "end", maintain_order=True)
+        .drop("_contig_rank")
+    )
+
+
+def resolve_segments_dataframe(
+    segments: Sequence[SegmentResult],
+    segments_df: pl.DataFrame | None,
+    *,
+    calls_only: bool,
+    is_prenatal: bool,
+    sort_natural: bool = False,
+) -> pl.DataFrame:
+    """Reuse or build a segment Polars DataFrame with optional call filtering and sorting."""
+    if segments_df is not None and (
+        not is_prenatal or "expected_ratio" in segments_df.columns
+    ):
+        filtered = (
+            segments_df.filter(pl.col("call").is_not_null())
+            if calls_only and segments_df.get_column("call").null_count() > 0
+            else segments_df
+        )
+        if sort_natural and filtered.height > 1:
+            c_names = ordered_contig_names(
+                filtered.get_column("contig").unique().to_list()
+            )
+            return sort_segments_dataframe(filtered, c_names)
+        return filtered
+    ordered: Iterable[SegmentResult] = (
+        sort_segments(segments) if sort_natural else segments
+    )
+    items = [s for s in ordered if not calls_only or s.call is not None]
+    return segments_to_dataframe(items, is_prenatal=is_prenatal)

@@ -2,24 +2,24 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pyarrow as pa
 from numpy.typing import NDArray
 
-from ccnv.models import SampleBuffers
-from ccnv.models.exceptions import PredictError, SchemaError
-from ccnv.models.schemas import (
+from ccnv.models import (
     FRAGMENTOMICS_METADATA_KEY,
     FragmentomicsMetadata,
+    PredictError,
     PrenatalModelMetadata,
+    ReferenceMetadata,
+    SampleBuffers,
+    SchemaError,
     decode_metadata,
 )
 from ccnv.stats.fragmentomics import (
-    CANONICAL_CHROMATOSOME_BP,
     FRAG_NUM_BINS,
     align_histogram,
     build_fragmentomic_feature_vector,
@@ -30,103 +30,88 @@ from ccnv.stats.fragmentomics import (
 )
 
 __all__ = [
+    "CohortFragmentomicsFit",
     "apply_prenatal_fisher_weighting",
-    "extract_bin_fragmentomic_covariates",
     "extract_sample_fragmentomics",
     "fit_cohort_fragmentomics_model",
-    "is_paired_sample_metadata",
+    "has_paired_fragmentomics",
+    "resolve_fisher_moment_weights",
     "resolve_fragmentomics_compatibility",
 ]
 
 
-def extract_bin_fragmentomic_covariates(
-    sample: SampleBuffers | pa.Table,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compute per-bin mean fragment length and cleavage endpoint protection ratio."""
-    bufs = SampleBuffers.coerce(sample)
-    counts = np.asarray(bufs.count, dtype=np.float64)
-    paired_cnt = np.asarray(bufs.paired_count, dtype=np.float64)
-    flen_sum = np.asarray(bufs.frag_len_sum, dtype=np.float64)
-    ep_counts = np.asarray(bufs.endpoint_count, dtype=np.float64)
+@dataclass(frozen=True, slots=True)
+class CohortFragmentomicsFit:
+    """Fitted cohort fetal/maternal fragment densities and FF_size logit ensemble."""
 
-    n_rows = int(counts.shape[0])
-    mean_lens = np.full(n_rows, CANONICAL_CHROMATOSOME_BP, dtype=np.float64)
-    if n_rows > 0:
-        has_reads = paired_cnt > 0.0
-        if np.any(has_reads):
-            computed = flen_sum[has_reads] / paired_cnt[has_reads]
-            mean_lens[has_reads] = computed
-            mean_lens[~has_reads] = float(np.median(computed))
-    ep_ratios = ep_counts / np.maximum(counts, 1.0)
-    return mean_lens, ep_ratios
-
-
-def _lookup_frag_entry(metadata: Mapping[object, object]) -> object:
-    for key in ("fragmentomics", "ccnv.fragmentomics", FRAGMENTOMICS_METADATA_KEY):
-        val = metadata.get(key)
-        if val is None and isinstance(key, str):
-            val = metadata.get(key.encode())
-        elif val is None and isinstance(key, bytes):
-            val = metadata.get(key.decode())
-        if val is not None:
-            return val
-    return None
+    p_fetal_density: list[float]
+    p_maternal_density: list[float]
+    ff_frag_weights: list[float] | None
+    ff_frag_bias: float | None
+    ff_frag_feature_mean: list[float] | None
+    ff_frag_feature_scale: list[float] | None
+    ff_size_std: float
 
 
 def extract_sample_fragmentomics(
-    metadata: Mapping[object, object] | None,
+    metadata: Mapping[str, object] | Mapping[bytes, bytes] | None,
 ) -> FragmentomicsMetadata | None:
-    """Extract FragmentomicsMetadata from decoded metadata mapping or schema metadata."""
+    """Parse validated FragmentomicsMetadata from decoded or Arrow schema metadata."""
     if not metadata:
         return None
-    val = _lookup_frag_entry(metadata)
+    if FRAGMENTOMICS_METADATA_KEY in metadata:
+        raw_bytes = {
+            k: v
+            for k, v in metadata.items()
+            if isinstance(k, bytes) and isinstance(v, bytes)
+        }
+        val: object = decode_metadata(raw_bytes).get("fragmentomics")
+    else:
+        val = metadata.get("fragmentomics")
     if val is None:
         return None
     if isinstance(val, FragmentomicsMetadata):
         return val
-    if isinstance(val, (bytes, str)):
-        try:
-            val = json.loads(val)
-        except json.JSONDecodeError, UnicodeDecodeError:
-            return None
-    if isinstance(val, Mapping):
-        try:
-            return FragmentomicsMetadata.from_dict(val)
-        except TypeError, ValueError, KeyError, SchemaError:
-            return None
-    return None
+    if not isinstance(val, Mapping):
+        raise SchemaError("ccnv.fragmentomics metadata must be a mapping")
+    return FragmentomicsMetadata.from_dict({str(k): v for k, v in val.items()})
 
 
 def fit_cohort_fragmentomics_model(
     frag_metas: Sequence[FragmentomicsMetadata | None],
     is_male_arr: NDArray[np.bool_],
-    final_ffy: NDArray[np.floating],
-    target_ffa: NDArray[np.floating],
-) -> (
-    tuple[
-        list[float],
-        list[float],
-        list[float] | None,
-        float | None,
-        list[float] | None,
-        list[float] | None,
-        float,
-    ]
-    | None
-):
+    ff_targets: NDArray[np.floating],
+    *,
+    quarantined: NDArray[np.bool_] | None = None,
+    seed: int = 42,
+) -> CohortFragmentomicsFit | None:
     """Deconvolve cohort fragment length densities and fit FF_size regularized ensemble."""
     n_samples = len(frag_metas)
     if n_samples == 0:
         return None
-    valid_metas = [m for m in frag_metas if m is not None and m.paired_end]
-    if len(valid_metas) != n_samples:
+
+    male_mask = np.asarray(is_male_arr, dtype=np.bool_)
+    targets = np.asarray(ff_targets, dtype=np.float64)
+    clean_mask = (
+        ~np.asarray(quarantined, dtype=np.bool_)
+        if quarantined is not None
+        else np.ones(n_samples, dtype=np.bool_)
+    )
+    clean_idx = np.flatnonzero(clean_mask)
+    if clean_idx.size == 0:
         return None
 
-    auto_aligned = np.zeros((n_samples, FRAG_NUM_BINS), dtype=np.float64)
-    chry_aligned = np.zeros((n_samples, FRAG_NUM_BINS), dtype=np.float64)
-    x_frag = np.zeros((n_samples, 36), dtype=np.float64)
+    clean_metas: list[FragmentomicsMetadata] = []
+    for idx in clean_idx:
+        meta = frag_metas[int(idx)]
+        if meta is None or not meta.paired_end:
+            return None
+        clean_metas.append(meta)
 
-    for i, meta in enumerate(valid_metas):
+    n_clean = len(clean_metas)
+    auto_aligned = np.zeros((n_clean, FRAG_NUM_BINS), dtype=np.float64)
+    chry_aligned = np.zeros((n_clean, FRAG_NUM_BINS), dtype=np.float64)
+    for i, meta in enumerate(clean_metas):
         auto_aligned[i] = align_histogram(
             np.asarray(meta.hist_autosomal, dtype=np.float64),
             meta.sizing_shift_bp,
@@ -135,129 +120,141 @@ def fit_cohort_fragmentomics_model(
             np.asarray(meta.hist_chry, dtype=np.float64),
             meta.sizing_shift_bp,
         )
-        x_frag[i] = build_fragmentomic_feature_vector(meta)
 
+    targets_clean = targets[clean_idx]
+    male_clean = male_mask[clean_idx]
     p_fetal, p_maternal = deconvolve_fetal_maternal_densities(
         auto_aligned,
         chry_aligned,
-        male_mask=is_male_arr,
-        ffy_values=final_ffy,
+        targets_clean,
+        male_clean,
     )
 
-    valid_mask = np.isfinite(target_ffa)
-    if int(np.sum(valid_mask)) < 5:
-        return (
-            [float(x) for x in p_fetal],
-            [float(x) for x in p_maternal],
-            None,
-            None,
-            None,
-            None,
-            0.018,
+    x_frag = np.zeros((n_clean, 36), dtype=np.float64)
+    for i, meta in enumerate(clean_metas):
+        x_frag[i] = build_fragmentomic_feature_vector(
+            auto_aligned[i],
+            meta.end_motif_counts,
+            chromatosome_mode_bp=meta.chromatosome_mode_bp,
+            sizing_shift_bp=0.0,
+            helical_10bp_amp=meta.helical_10bp_amplitude,
+            motif_mds=meta.motif_diversity_score,
+            reference_maternal_571=p_maternal,
         )
 
-    w_frag, b_frag, m_frag, s_frag, loocv_std = fit_ff_fragmentomics_ensemble(
-        x_frag[valid_mask],
-        target_ffa[valid_mask],
-    )
+    finite_mask = np.isfinite(targets_clean)
+    p_fet_list = [float(x) for x in p_fetal]
+    p_mat_list = [float(x) for x in p_maternal]
+    if int(np.count_nonzero(finite_mask)) < 5:
+        return CohortFragmentomicsFit(
+            p_fetal_density=p_fet_list,
+            p_maternal_density=p_mat_list,
+            ff_frag_weights=None,
+            ff_frag_bias=None,
+            ff_frag_feature_mean=None,
+            ff_frag_feature_scale=None,
+            ff_size_std=0.018,
+        )
 
-    return (
-        [float(x) for x in p_fetal],
-        [float(x) for x in p_maternal],
-        [float(x) for x in w_frag],
-        float(b_frag),
-        [float(x) for x in m_frag],
-        [float(x) for x in s_frag],
-        float(loocv_std),
+    ens = fit_ff_fragmentomics_ensemble(
+        x_frag[finite_mask],
+        targets_clean[finite_mask],
+        seed=seed,
+    )
+    return CohortFragmentomicsFit(
+        p_fetal_density=p_fet_list,
+        p_maternal_density=p_mat_list,
+        ff_frag_weights=[float(x) for x in ens.weights],
+        ff_frag_bias=float(ens.intercept),
+        ff_frag_feature_mean=[float(x) for x in ens.feat_mean],
+        ff_frag_feature_scale=[float(x) for x in ens.feat_std],
+        ff_size_std=float(ens.oof_rmse),
     )
 
 
 def apply_prenatal_fisher_weighting(
-    sample: SampleBuffers | pa.Table,
+    sample: SampleBuffers,
     prenatal_meta: PrenatalModelMetadata | None,
 ) -> SampleBuffers:
     """Evaluate 24-band Fisher-optimal weighted coverage and attach per-bin Kish factor."""
     bufs = SampleBuffers.coerce(sample)
-    if prenatal_meta is None or bufs.num_rows == 0 or bufs.frag_bands is None:
-        return bufs
-    if not np.any(bufs.paired_count > 0):
-        return bufs
-
-    if prenatal_meta.band_fisher_weights is not None:
-        w_24 = np.asarray(prenatal_meta.band_fisher_weights, dtype=np.float64)
-    elif (
-        prenatal_meta.p_fetal_density is not None
-        and prenatal_meta.p_maternal_density is not None
+    if (
+        prenatal_meta is None
+        or prenatal_meta.band_fisher_weights is None
+        or bufs.num_rows == 0
+        or bufs.frag_bands is None
+        or not np.any(bufs.paired_count > 0)
     ):
-        w_24, _, _ = compute_band_fisher_weights(
-            np.asarray(prenatal_meta.p_fetal_density, dtype=np.float64),
-            np.asarray(prenatal_meta.p_maternal_density, dtype=np.float64),
-        )
-    else:
         return bufs
 
+    w_24 = np.asarray(prenatal_meta.band_fisher_weights, dtype=np.float64)
     w_counts, kappa = evaluate_band_weighted_counts(
         bufs.frag_bands, bufs.count, bufs.paired_count, w_24
     )
     return replace(bufs, count=w_counts, kappa_frag=kappa)
 
 
-def is_paired_sample_metadata(metadata: Mapping[object, object] | None) -> bool:
-    """Return whether decoded or raw Arrow sample metadata indicates paired-end reads."""
-    if not metadata:
-        return False
-    frag_meta = extract_sample_fragmentomics(metadata)
-    if frag_meta is not None:
-        return bool(frag_meta.paired_end)
-    val = _lookup_frag_entry(metadata)
-    if isinstance(val, (bytes, str)):
-        try:
-            val = json.loads(val)
-        except json.JSONDecodeError, UnicodeDecodeError:
-            return False
-    if isinstance(val, Mapping):
-        return bool(val.get("paired_end", False))
-    return False
+def resolve_fisher_moment_weights(
+    sample: SampleBuffers,
+    prenatal_meta: PrenatalModelMetadata | None,
+) -> tuple[float, float]:
+    """Resolve (mu_fetal_w, mu_maternal_w) matching apply_prenatal_fisher_weighting eligibility."""
+    bufs = SampleBuffers.coerce(sample)
+    if (
+        prenatal_meta is None
+        or prenatal_meta.band_fisher_weights is None
+        or bufs.num_rows == 0
+        or bufs.frag_bands is None
+        or not np.any(bufs.paired_count > 0)
+    ):
+        return 1.0, 1.0
+    if prenatal_meta.mu_fetal_w is not None and prenatal_meta.mu_maternal_w is not None:
+        return (
+            max(float(prenatal_meta.mu_fetal_w), 1e-6),
+            max(float(prenatal_meta.mu_maternal_w), 1e-6),
+        )
+    p_fet = prenatal_meta.p_fetal_density
+    p_mat = prenatal_meta.p_maternal_density
+    if (
+        p_fet is not None
+        and p_mat is not None
+        and len(p_fet) == FRAG_NUM_BINS == len(p_mat)
+    ):
+        _, mf, mm = compute_band_fisher_weights(p_fet, p_mat)
+        return max(float(mf), 1e-6), max(float(mm), 1e-6)
+    return 1.0, 1.0
+
+
+def has_paired_fragmentomics(sample: SampleBuffers) -> bool:
+    """Return whether a sample sketch carries paired-end fragmentomic observations."""
+    bufs = SampleBuffers.coerce(sample)
+    if bufs.meta.fragmentomics is not None:
+        return bool(bufs.meta.fragmentomics.paired_end)
+    return bufs.frag_bands is not None and (
+        bool(np.any(bufs.paired_count > 0)) or bool(np.any(bufs.frag_bands > 0))
+    )
 
 
 def resolve_fragmentomics_compatibility(
-    sample: SampleBuffers | pa.Table,
-    reference: pa.Table,
+    sample: SampleBuffers,
+    reference: ReferenceMetadata | pa.Table,
 ) -> bool:
     """Validate sample vs reference fragmentomic correction settings."""
     bufs = SampleBuffers.coerce(sample)
-    sample_has_frag = (
-        bool(bufs.meta.fragmentomics.paired_end)
-        if bufs.meta.fragmentomics is not None
-        else (
-            bufs.frag_bands is not None
-            and (
-                bool(np.any(bufs.paired_count > 0)) or bool(np.any(bufs.frag_bands > 0))
-            )
-        )
+    sample_has_frag = has_paired_fragmentomics(bufs)
+
+    ref_meta = (
+        reference
+        if isinstance(reference, ReferenceMetadata)
+        else ReferenceMetadata.from_table(reference)
     )
-
-    ref_meta = decode_metadata(reference.schema.metadata)
-    ref_model = ref_meta.get("model", {})
-    if not isinstance(ref_model, Mapping):
-        ref_model = {}
-
-    if bool(ref_model.get("flat", False)):
+    if ref_meta.flat:
         return sample_has_frag
-
-    if "fragmentomics_corrected" in ref_model:
-        ref_frag = bool(ref_model["fragmentomics_corrected"])
-        if ref_frag != sample_has_frag:
-            raise PredictError(
-                f"sample fragmentomics ({'paired-end' if sample_has_frag else 'single-end'}) "
-                f"does not match cohort reference fragmentomics_corrected={ref_frag}; "
-                "use matching library types or rebuild the reference"
-            )
-        return ref_frag
-
-    if sample_has_frag:
+    if ref_meta.fragmentomics_corrected != sample_has_frag:
         raise PredictError(
-            "reference lacks fragmentomics_corrected metadata (uncorrected legacy cohort reference) "
-            "and cannot be projected against a paired-end sample; rebuild the reference"
+            f"sample fragmentomics ({'paired-end' if sample_has_frag else 'single-end'}) "
+            f"does not match cohort reference fragmentomics_corrected="
+            f"{ref_meta.fragmentomics_corrected}; "
+            "use matching library types or rebuild the reference"
         )
-    return False
+    return ref_meta.fragmentomics_corrected

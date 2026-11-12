@@ -200,7 +200,12 @@
     binY[i] = clampY(binR[i]);
   }
 
-  const escHtml = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const escHtml = s => String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
   const formatBinHover = i => {
     const ci = binC[i];
     return `${escHtml(D.contigs[ci])}:${binS[i].toLocaleString()}-${binE[i].toLocaleString()}<br>Log2R: ${binR[i].toFixed(3)} | Z: ${binZ[i].toFixed(2)}`;
@@ -222,15 +227,15 @@
     } else {
       badgeEl.className = "badge";
     }
-    const ffPct = (p.active_ff * 100).toFixed(1);
+    const ffPct = p.active_ff !== null && p.active_ff !== undefined ? `${(p.active_ff * 100).toFixed(1)}%` : "N/A";
     const ffyStr = p.ffy !== null && p.ffy !== undefined ? `${(p.ffy * 100).toFixed(1)}%` : "N/A";
     const ffaStr = p.ffa !== null && p.ffa !== undefined ? `${(p.ffa * 100).toFixed(1)}%` : "N/A";
     const ffxStr = p.ffx !== null && p.ffx !== undefined ? `${(p.ffx * 100).toFixed(1)}%` : "N/A";
     const ffSizeStr = p.ff_size !== null && p.ff_size !== undefined ? `${(p.ff_size * 100).toFixed(1)}%` : "N/A";
-    badgeEl.innerHTML = `<span><strong>Fetal Sex:</strong> ${p.fetal_sex}</span>` +
-      `<span>|</span><span><strong>Active FF:</strong> ${ffPct}% (${p.active_ff_source})</span>` +
+    badgeEl.innerHTML = `<span><strong>Fetal Sex:</strong> ${escHtml(p.fetal_sex)}</span>` +
+      `<span>|</span><span><strong>Active FF:</strong> ${ffPct} (${escHtml(p.active_ff_source)})</span>` +
       `<span>|</span><span><strong>FF (Y/A/X/Size):</strong> ${ffyStr} / ${ffaStr} / ${ffxStr} / ${ffSizeStr}</span>` +
-      `<span>|</span><span><strong>SCA:</strong> ${p.sca_call}</span>`;
+      `<span>|</span><span><strong>SCA:</strong> ${escHtml(p.sca_call)}</span>`;
     badgeEl.style.display = "inline-flex";
     if (discLegend) discLegend.style.display = "inline";
   }
@@ -294,10 +299,10 @@
     }
   }
 
-  if (D.prenatal && typeof D.prenatal.active_ff === "number" && D.prenatal.active_ff > 0) {
-    const aff = D.prenatal.active_ff;
-    const posRef = Math.log2(1 + 0.5 * aff);
-    const negRef = Math.log2(Math.max(1e-4, 1 - 0.5 * aff));
+  const effFF = D.prenatal ? (D.prenatal.effective_ff ?? D.prenatal.active_ff) : 0;
+  if (typeof effFF === "number" && effFF > 0) {
+    const posRef = Math.log2(1 + 0.5 * effFF);
+    const negRef = Math.log2(Math.max(1e-4, 1 - 0.5 * effFF));
     for (const yVal of [posRef, negRef]) {
       baseShapes.push({
         type: "line",
@@ -334,7 +339,7 @@
       });
       cytoX.push(0.5 * (x0 + x1));
       cytoY.push(0.5);
-      cytoText.push(`${D.contigs[ci]}${name} (${s.toLocaleString()}-${e.toLocaleString()}, ${stain})`);
+      cytoText.push(`${escHtml(D.contigs[ci])}${escHtml(name)} (${s.toLocaleString()}-${e.toLocaleString()}, ${escHtml(stain)})`);
     }
   }
 
@@ -422,7 +427,13 @@
       b.t.push(h, h, "");
     };
 
-    for (const seg of D.segments) {
+    const useInitialCalls = Array.isArray(D.segment_calls)
+      && D.segment_calls.length === D.segments.length
+      && Math.abs(zT - D.z_thresh) < 1e-9
+      && Math.abs(rT - D.r_thresh) < 1e-9;
+
+    for (let idx = 0; idx < D.segments.length; idx++) {
+      const seg = D.segments[idx];
       const ci = seg[0];
       const s = seg[1];
       const e = seg[2];
@@ -437,17 +448,29 @@
       const fragLLR = seg[11];
       const originCall = seg[12];
 
-      const c = classify(r, z, zT, rT);
+      let c;
+      if (useInitialCalls) {
+        const sc = D.segment_calls[idx];
+        c = sc === "gain" ? 1 : (sc === "loss" ? -1 : 0);
+      } else {
+        c = classify(r, z, zT, rT);
+      }
       const x0 = offsets[ci] + s;
       const x1 = offsets[ci] + e;
       const yClip = clampY(r);
-      let h = `${D.contigs[ci]}:${s.toLocaleString()}-${e.toLocaleString()} (${bc} bins)<br>Segment Log2R: ${r.toFixed(3)} | Z: ${z.toFixed(2)}`;
+      let h = `${escHtml(D.contigs[ci])}:${s.toLocaleString()}-${e.toLocaleString()} (${bc} bins)<br>Segment Log2R: ${r.toFixed(3)} | Z: ${z.toFixed(2)}`;
+      const fragParts = [];
       if (fragShortRatio !== null && fragShortRatio !== undefined) {
-        h += `<br>Short Frag: ${(Number(fragShortRatio) * 100).toFixed(1)}% | LLR_size: ${Number(fragLLR).toFixed(2)}`;
-        if (originCall) h += ` (${originCall})`;
+        fragParts.push(`Short Frag: ${(Number(fragShortRatio) * 100).toFixed(1)}%`);
+      }
+      if (fragLLR !== null && fragLLR !== undefined) {
+        fragParts.push(`LLR_size: ${Number(fragLLR).toFixed(2)}`);
+      }
+      if (fragParts.length > 0 || originCall) {
+        h += `<br>${fragParts.join(" | ")}${originCall ? (fragParts.length > 0 ? ` (${escHtml(originCall)})` : `Origin: ${escHtml(originCall)}`) : ""}`;
       }
       if (isDisc) {
-        h += `<br>Discordant: ${discReason || "YES"}`;
+        h += `<br>Discordant: ${escHtml(discReason || "YES")}`;
         if (expR !== null && expR !== undefined) h += ` | Expected: ${Number(expR).toFixed(3)}`;
         if (impliedFF !== null && impliedFF !== undefined) h += ` | Implied FF: ${(Number(impliedFF) * 100).toFixed(1)}%`;
         pushSeg(segBuckets.disc, x0, x1, yClip, h);

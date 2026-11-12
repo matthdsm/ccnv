@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -17,7 +16,7 @@ from ccnv.models import (
     SampleBuffers,
     SegmentResult,
 )
-from ccnv.qc.sample import sanitize_qc_payload
+from ccnv.qc.sample import write_qc_json
 
 __all__ = [
     "build_predict_qc_payload",
@@ -31,10 +30,12 @@ def _int_metric(
     *,
     fallback_key: str | None = None,
 ) -> int:
-    val = mapping.get(key)
+    val = mapping.get(key) if key in mapping else None
     if val is None and fallback_key is not None:
         val = mapping.get(fallback_key)
-    if isinstance(val, int | float) and not isinstance(val, bool):
+    if isinstance(val, (int, float, np.integer, np.floating)) and not isinstance(
+        val, bool
+    ):
         return int(val)
     return 0
 
@@ -74,8 +75,8 @@ def build_predict_qc_payload(
         masked_bins = total_bins - usable_bins
         lambda_gc = None
 
-    mean_bin_count = float(np.mean(counts)) if total_bins > 0 else 0.0
-    median_bin_count = float(np.median(counts)) if total_bins > 0 else 0.0
+    mean_bin_count = float(np.mean(counts)) if counts.size > 0 else 0.0
+    median_bin_count = float(np.median(counts)) if counts.size > 0 else 0.0
 
     effective_reads_examined = _int_metric(
         qc_meta, "effective_reads_examined", fallback_key="reads_seen"
@@ -137,9 +138,15 @@ def build_predict_qc_payload(
             if s.origin_call:
                 origin_counts[s.origin_call] = origin_counts.get(s.origin_call, 0) + 1
 
+        eff_ff = (
+            float(prenatal_result.effective_ff)
+            if prenatal_result.effective_ff is not None
+            else float(prenatal_result.active_ff)
+        )
         prenatal_data = {
             "fetal_sex": prenatal_result.fetal_sex,
             "active_ff": float(prenatal_result.active_ff),
+            "effective_ff": eff_ff,
             "active_ff_se": (
                 float(prenatal_result.active_ff_se)
                 if prenatal_result.active_ff_se is not None
@@ -215,10 +222,5 @@ def build_predict_qc_payload(
 
 
 def write_predict_qc_json(path: Path | str, payload: Mapping[str, object]) -> Path:
-    """Write formatted predict QC metrics to a JSON file."""
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    sanitized = sanitize_qc_payload(dict(payload))
-    with open(target, "w", encoding="utf-8") as handle:
-        json.dump(sanitized, handle, indent=2)
-    return target
+    """Atomically write formatted predict QC metrics to a JSON file."""
+    return write_qc_json(path, payload)

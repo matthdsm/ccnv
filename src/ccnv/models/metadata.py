@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from enum import StrEnum
@@ -20,6 +21,8 @@ METADATA_PREFIX: Final[str] = "ccnv."
 
 PRENATAL_METADATA_KEY: Final[bytes] = b"ccnv.prenatal"
 FRAGMENTOMICS_METADATA_KEY: Final[bytes] = b"ccnv.fragmentomics"
+
+_MISSING: Final[object] = object()
 
 
 class ArtifactKind(StrEnum):
@@ -44,91 +47,168 @@ __all__ = [
 ]
 
 
-def _req_bool(raw: object, name: str) -> bool:
+def _as_bool(raw: object, name: str) -> bool:
     if not isinstance(raw, bool):
         raise TypeError(f"{name} must be a boolean, got {raw!r}")
     return raw
 
 
-def _req_int(raw: object, name: str) -> int:
+def _as_int(raw: object, name: str) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int):
         raise TypeError(f"{name} must be an integer, got {raw!r}")
     return int(raw)
 
 
-def _req_float(raw: object, name: str) -> float:
+def _as_float(raw: object, name: str, *, finite: bool = False) -> float:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         raise TypeError(f"{name} must be numeric, got {raw!r}")
-    return float(raw)
+    val = float(raw)
+    if finite and not math.isfinite(val):
+        raise ValueError(f"{name} must be finite, got {raw!r}")
+    return val
 
 
-def _req_float_list(raw: object, name: str) -> list[float]:
+def _req_bool(data: Mapping[str, object], key: str, default: object = _MISSING) -> bool:
+    raw = data[key] if default is _MISSING else data.get(key, default)
+    return _as_bool(raw, key)
+
+
+def _req_int(data: Mapping[str, object], key: str, default: object = _MISSING) -> int:
+    raw = data[key] if default is _MISSING else data.get(key, default)
+    return _as_int(raw, key)
+
+
+def _opt_int(data: Mapping[str, object], key: str) -> int | None:
+    raw = data.get(key)
+    return None if raw is None else _as_int(raw, key)
+
+
+def _req_float(
+    data: Mapping[str, object],
+    key: str,
+    default: object = _MISSING,
+    *,
+    finite: bool = False,
+) -> float:
+    raw = data[key] if default is _MISSING else data.get(key, default)
+    return _as_float(raw, key, finite=finite)
+
+
+def _opt_float(data: Mapping[str, object], key: str) -> float | None:
+    raw = data.get(key)
+    return None if raw is None else _as_float(raw, key)
+
+
+def _opt_str(data: Mapping[str, object], key: str) -> str | None:
+    raw = data.get(key)
+    return None if raw is None else str(raw)
+
+
+def _req_float_list(data: Mapping[str, object], key: str) -> list[float]:
+    raw = data[key]
     if not isinstance(raw, (list, tuple)):
-        raise TypeError(f"{name} must be a sequence of floats, got {raw!r}")
-    return [_req_float(item, name) for item in raw]
+        raise TypeError(f"{key} must be a sequence of floats, got {raw!r}")
+    return [_as_float(item, key) for item in raw]
 
 
 def _opt_float_list(data: Mapping[str, object], key: str) -> list[float] | None:
-    raw = data.get(key)
-    return None if raw is None else _req_float_list(raw, key)
+    if data.get(key) is None:
+        return None
+    return _req_float_list(data, key)
 
 
 def _req_int_list(data: Mapping[str, object], key: str) -> list[int]:
     raw = data[key]
     if not isinstance(raw, (list, tuple)):
         raise TypeError(f"{key} must be a sequence of integers, got {raw!r}")
-    return [_req_int(item, key) for item in raw]
+    return [_as_int(item, key) for item in raw]
 
 
 def _opt_int_list(data: Mapping[str, object], key: str) -> list[int] | None:
-    raw = data.get(key)
-    if raw is None:
+    if data.get(key) is None:
         return None
-    if not isinstance(raw, (list, tuple)):
-        raise TypeError(f"{key} must be a sequence of integers, got {raw!r}")
-    return [_req_int(item, key) for item in raw]
+    return _req_int_list(data, key)
 
 
-def _req_str_tuple(raw: object, name: str) -> tuple[str, ...]:
+def _as_str_tuple(raw: object, name: str) -> tuple[str, ...]:
     if not isinstance(raw, (list, tuple)) or any(not isinstance(x, str) for x in raw):
         raise TypeError(f"{name} must be a sequence of strings, got {raw!r}")
     return tuple(raw)
 
 
-def _opt_str_tuple(raw: object, name: str) -> tuple[str, ...]:
-    return () if raw is None else _req_str_tuple(raw, name)
+def _opt_str_tuple(data: Mapping[str, object], key: str) -> tuple[str, ...]:
+    raw = data.get(key)
+    return () if raw is None else _as_str_tuple(raw, key)
 
 
-def _opt_obj_dict(raw: object, name: str) -> dict[str, object]:
+def _opt_nullable_str_tuple(
+    data: Mapping[str, object], key: str
+) -> tuple[str, ...] | None:
+    raw = data.get(key)
+    return None if raw is None else _as_str_tuple(raw, key)
+
+
+def _opt_obj_dict(data: Mapping[str, object], key: str) -> dict[str, object]:
+    raw = data.get(key)
     if raw is None:
         return {}
     if not isinstance(raw, Mapping):
-        raise TypeError(f"{name} must be a mapping, got {raw!r}")
+        raise TypeError(f"{key} must be a mapping, got {raw!r}")
     return {str(k): v for k, v in raw.items()}
 
 
-def _check_pos_int(val: object, name: str) -> None:
-    if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {val!r}")
+def _opt_nullable_obj_dict(
+    data: Mapping[str, object], key: str
+) -> dict[str, object] | None:
+    return None if data.get(key) is None else _opt_obj_dict(data, key)
 
 
-def _check_nonneg_int(val: object, name: str) -> None:
+def _is_pos_int(val: object) -> bool:
+    return isinstance(val, int) and not isinstance(val, bool) and val > 0
+
+
+def _schema_pos_int(val: object, name: str) -> None:
+    if not _is_pos_int(val):
+        raise SchemaError(f"{name} must be a positive integer, got {val!r}")
+
+
+def _schema_nonneg_int(val: object, name: str) -> None:
     if not isinstance(val, int) or isinstance(val, bool) or val < 0:
-        raise ValueError(f"{name} must be a non-negative integer, got {val!r}")
+        raise SchemaError(f"{name} must be a non-negative integer, got {val!r}")
+
+
+def _validate_contig_lengths(contig_lengths: object) -> None:
+    if not isinstance(contig_lengths, Mapping) or not contig_lengths:
+        raise SchemaError("contig_lengths must be a non-empty object")
+    if any(
+        not isinstance(k, str) or not k or not _is_pos_int(v)
+        for k, v in contig_lengths.items()
+    ):
+        raise SchemaError(
+            "contig_lengths must map non-empty names to positive integers"
+        )
+
+
+def _reject_json_constant(token: str) -> object:
+    raise ValueError(f"non-RFC-8259 JSON constant {token!r}")
 
 
 def encode_metadata(values: Mapping[str, object]) -> dict[bytes, bytes]:
-    """Encode namespaced metadata values as deterministic JSON."""
-    return {
-        f"{METADATA_PREFIX}{key}".encode(): json.dumps(
-            value, sort_keys=True, separators=(",", ":")
-        ).encode()
-        for key, value in values.items()
-    }
+    """Encode namespaced metadata values as deterministic RFC-8259 JSON."""
+    encoded: dict[bytes, bytes] = {}
+    for key, value in values.items():
+        try:
+            payload = json.dumps(
+                value, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode()
+        except (TypeError, ValueError) as error:
+            raise SchemaError(f"invalid metadata value for {key!r}: {error}") from error
+        encoded[f"{METADATA_PREFIX}{key}".encode()] = payload
+    return encoded
 
 
 def decode_metadata(metadata: Mapping[bytes, bytes] | None) -> dict[str, object]:
-    """Decode ccnv metadata and reject malformed JSON."""
+    """Decode ccnv metadata and reject malformed or non-finite JSON."""
     if metadata is None:
         return {}
     decoded: dict[str, object] = {}
@@ -138,8 +218,8 @@ def decode_metadata(metadata: Mapping[bytes, bytes] | None) -> dict[str, object]
             continue
         key = raw_key[len(prefix) :].decode()
         try:
-            decoded[key] = json.loads(raw_value)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            decoded[key] = json.loads(raw_value, parse_constant=_reject_json_constant)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
             raise SchemaError(f"invalid metadata value for {key!r}") from error
     return decoded
 
@@ -202,31 +282,17 @@ class FragmentomicsMetadata:
     def from_dict(cls, data: Mapping[str, object]) -> FragmentomicsMetadata:
         """Construct FragmentomicsMetadata from a decoded JSON dictionary."""
         return cls(
-            paired_end=_req_bool(data["paired_end"], "paired_end"),
-            total_paired_fragments=_req_int(
-                data["total_paired_fragments"], "total_paired_fragments"
-            ),
-            chromatosome_mode_bp=_req_float(
-                data["chromatosome_mode_bp"], "chromatosome_mode_bp"
-            ),
-            core_shoulder_bp=_req_float(data["core_shoulder_bp"], "core_shoulder_bp"),
-            sizing_shift_bp=_req_float(data["sizing_shift_bp"], "sizing_shift_bp"),
-            self_referenced_peak_ratio=_req_float(
-                data["self_referenced_peak_ratio"], "self_referenced_peak_ratio"
-            ),
-            dinucleosome_fraction=_req_float(
-                data["dinucleosome_fraction"], "dinucleosome_fraction"
-            ),
-            high_mw_fraction=_req_float(data["high_mw_fraction"], "high_mw_fraction"),
-            helical_10bp_amplitude=_req_float(
-                data["helical_10bp_amplitude"], "helical_10bp_amplitude"
-            ),
-            helical_10bp_phase=_req_float(
-                data["helical_10bp_phase"], "helical_10bp_phase"
-            ),
-            motif_diversity_score=_req_float(
-                data["motif_diversity_score"], "motif_diversity_score"
-            ),
+            paired_end=_req_bool(data, "paired_end"),
+            total_paired_fragments=_req_int(data, "total_paired_fragments"),
+            chromatosome_mode_bp=_req_float(data, "chromatosome_mode_bp"),
+            core_shoulder_bp=_req_float(data, "core_shoulder_bp"),
+            sizing_shift_bp=_req_float(data, "sizing_shift_bp"),
+            self_referenced_peak_ratio=_req_float(data, "self_referenced_peak_ratio"),
+            dinucleosome_fraction=_req_float(data, "dinucleosome_fraction"),
+            high_mw_fraction=_req_float(data, "high_mw_fraction"),
+            helical_10bp_amplitude=_req_float(data, "helical_10bp_amplitude"),
+            helical_10bp_phase=_req_float(data, "helical_10bp_phase"),
+            motif_diversity_score=_req_float(data, "motif_diversity_score"),
             hist_autosomal=_req_int_list(data, "hist_autosomal"),
             hist_chry=_req_int_list(data, "hist_chry"),
             hist_chrx=_req_int_list(data, "hist_chrx"),
@@ -240,17 +306,14 @@ class PrenatalModelMetadata:
 
     prenatal_bin_size: int
     yfrac_threshold: float
-    ffy_intercept: float
     ffy_slope: float
     olm_weights: list[float]
     olm_bias: float
-    ffx_intercept: float
-    ffx_slope: float
     female_chrx_ratio_mean: float
     female_chrx_ratio_std: float
+    alpha_1: float = -0.5
     ffy_std: float = 0.01
     ffa_std: float = 0.02
-    ffx_std: float = 0.025
     ffa_logit_mode: bool = True
     p_fetal_density: list[float] | None = None
     p_maternal_density: list[float] | None = None
@@ -261,17 +324,25 @@ class PrenatalModelMetadata:
     ff_size_std: float = 0.018
     msy_bg_rate: float | None = None
     clean_msy_bins: list[int] | None = None
-    alpha_0: float | None = None
-    alpha_1: float | None = None
-    sigma_x_sys: float | None = None
     quarantined_samples: list[int] | None = None
     band_fisher_weights: list[float] | None = None
     mu_fetal_w: float | None = None
     mu_maternal_w: float | None = None
 
     def __post_init__(self) -> None:
-        """Validate prenatal model metadata dimensions and types."""
-        _check_pos_int(self.prenatal_bin_size, "prenatal_bin_size")
+        """Validate prenatal model metadata invariants and forward-model parameters."""
+        if not _is_pos_int(self.prenatal_bin_size):
+            raise ValueError(
+                f"prenatal_bin_size must be a positive integer, got {self.prenatal_bin_size!r}"
+            )
+        for attr in ("female_chrx_ratio_mean", "female_chrx_ratio_std", "alpha_1"):
+            _as_float(getattr(self, attr), attr, finite=True)
+        if self.female_chrx_ratio_std < 0.0:
+            raise ValueError(
+                f"female_chrx_ratio_std must be non-negative, got {self.female_chrx_ratio_std!r}"
+            )
+        if self.alpha_1 >= 0.0:
+            raise ValueError(f"alpha_1 must be negative, got {self.alpha_1!r}")
 
     def to_dict(self) -> dict[str, object]:
         """Convert metadata container to a JSON-serializable dictionary."""
@@ -295,86 +366,60 @@ class PrenatalModelMetadata:
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> PrenatalModelMetadata:
         """Construct prenatal model metadata from a parsed dictionary."""
-        raw_bias = data.get("ff_frag_bias")
         return cls(
-            prenatal_bin_size=_req_int(data["prenatal_bin_size"], "prenatal_bin_size"),
-            yfrac_threshold=_req_float(data["yfrac_threshold"], "yfrac_threshold"),
-            ffy_intercept=_req_float(data["ffy_intercept"], "ffy_intercept"),
-            ffy_slope=_req_float(data["ffy_slope"], "ffy_slope"),
-            olm_weights=_req_float_list(data["olm_weights"], "olm_weights"),
-            olm_bias=_req_float(data["olm_bias"], "olm_bias"),
-            ffx_intercept=_req_float(data["ffx_intercept"], "ffx_intercept"),
-            ffx_slope=_req_float(data["ffx_slope"], "ffx_slope"),
+            prenatal_bin_size=_req_int(data, "prenatal_bin_size"),
+            yfrac_threshold=_req_float(data, "yfrac_threshold"),
+            ffy_slope=_req_float(data, "ffy_slope"),
+            olm_weights=_req_float_list(data, "olm_weights"),
+            olm_bias=_req_float(data, "olm_bias"),
             female_chrx_ratio_mean=_req_float(
-                data["female_chrx_ratio_mean"], "female_chrx_ratio_mean"
+                data, "female_chrx_ratio_mean", finite=True
             ),
             female_chrx_ratio_std=_req_float(
-                data["female_chrx_ratio_std"], "female_chrx_ratio_std"
+                data, "female_chrx_ratio_std", finite=True
             ),
-            ffy_std=_req_float(data.get("ffy_std", 0.01), "ffy_std"),
-            ffa_std=_req_float(data.get("ffa_std", 0.02), "ffa_std"),
-            ffx_std=_req_float(data.get("ffx_std", 0.025), "ffx_std"),
-            ffa_logit_mode=_req_bool(
-                data.get("ffa_logit_mode", True), "ffa_logit_mode"
-            ),
+            alpha_1=_req_float(data, "alpha_1", -0.5, finite=True),
+            ffy_std=_req_float(data, "ffy_std", 0.01),
+            ffa_std=_req_float(data, "ffa_std", 0.02),
+            ffa_logit_mode=_req_bool(data, "ffa_logit_mode", True),
             p_fetal_density=_opt_float_list(data, "p_fetal_density"),
             p_maternal_density=_opt_float_list(data, "p_maternal_density"),
             ff_frag_weights=_opt_float_list(data, "ff_frag_weights"),
-            ff_frag_bias=(
-                None if raw_bias is None else _req_float(raw_bias, "ff_frag_bias")
-            ),
+            ff_frag_bias=_opt_float(data, "ff_frag_bias"),
             ff_frag_feature_mean=_opt_float_list(data, "ff_frag_feature_mean"),
             ff_frag_feature_scale=_opt_float_list(data, "ff_frag_feature_scale"),
-            ff_size_std=_req_float(data.get("ff_size_std", 0.018), "ff_size_std"),
-            msy_bg_rate=(
-                None
-                if data.get("msy_bg_rate") is None
-                else _req_float(data["msy_bg_rate"], "msy_bg_rate")
-            ),
+            ff_size_std=_req_float(data, "ff_size_std", 0.018),
+            msy_bg_rate=_opt_float(data, "msy_bg_rate"),
             clean_msy_bins=_opt_int_list(data, "clean_msy_bins"),
-            alpha_0=(
-                None
-                if data.get("alpha_0") is None
-                else _req_float(data["alpha_0"], "alpha_0")
-            ),
-            alpha_1=(
-                None
-                if data.get("alpha_1") is None
-                else _req_float(data["alpha_1"], "alpha_1")
-            ),
-            sigma_x_sys=(
-                None
-                if data.get("sigma_x_sys") is None
-                else _req_float(data["sigma_x_sys"], "sigma_x_sys")
-            ),
             quarantined_samples=_opt_int_list(data, "quarantined_samples"),
             band_fisher_weights=_opt_float_list(data, "band_fisher_weights"),
-            mu_fetal_w=(
-                None
-                if data.get("mu_fetal_w") is None
-                else _req_float(data["mu_fetal_w"], "mu_fetal_w")
-            ),
-            mu_maternal_w=(
-                None
-                if data.get("mu_maternal_w") is None
-                else _req_float(data["mu_maternal_w"], "mu_maternal_w")
-            ),
+            mu_fetal_w=_opt_float(data, "mu_fetal_w"),
+            mu_maternal_w=_opt_float(data, "mu_maternal_w"),
         )
 
     def encode(self) -> bytes:
-        """Serialize metadata container to canonical JSON UTF-8 bytes."""
-        return json.dumps(
-            self.to_dict(), sort_keys=True, separators=(",", ":")
-        ).encode()
+        """Serialize metadata container to canonical RFC-8259 JSON UTF-8 bytes."""
+        try:
+            return json.dumps(
+                self.to_dict(),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        except (TypeError, ValueError) as error:
+            raise SchemaError(f"invalid prenatal metadata: {error}") from error
 
     @classmethod
     def decode(cls, raw: bytes | str | Mapping[str, object]) -> PrenatalModelMetadata:
         """Decode prenatal model metadata from JSON bytes, string, or mapping."""
-        parsed: object = (
-            raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
-        )
-        if isinstance(parsed, str):
-            parsed = json.loads(parsed)
+        try:
+            parsed: object = (
+                raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+            )
+            if isinstance(parsed, str):
+                parsed = json.loads(parsed, parse_constant=_reject_json_constant)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise SchemaError(f"invalid prenatal metadata JSON: {error}") from error
         if not isinstance(parsed, Mapping):
             raise SchemaError(
                 f"invalid prenatal metadata payload: expected mapping, got {type(parsed)}"
@@ -398,6 +443,47 @@ class PrenatalModelMetadata:
         return cls.from_metadata(table.schema.metadata)
 
 
+def _check_envelope_invariants(
+    schema_version: object, coordinate_system: object
+) -> None:
+    if (
+        not isinstance(schema_version, str)
+        or schema_version not in SUPPORTED_SCHEMA_VERSIONS
+    ):
+        raise SchemaVersionError(
+            f"unsupported schema version {schema_version!r}; expected {SCHEMA_VERSION!r}"
+        )
+    if not isinstance(coordinate_system, str) or coordinate_system != COORDINATE_SYSTEM:
+        raise SchemaError(f"coordinates must be {COORDINATE_SYSTEM}")
+
+
+def _parse_schema_version(data: Mapping[str, object]) -> str:
+    version = data.get("schema_version", SCHEMA_VERSION)
+    if not isinstance(version, str) or version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise SchemaVersionError(
+            f"unsupported schema version {version!r}; expected {SCHEMA_VERSION!r}"
+        )
+    return version
+
+
+def _parse_coordinate_system(data: Mapping[str, object]) -> str:
+    coord = data.get("coordinate_system", COORDINATE_SYSTEM)
+    if not isinstance(coord, str) or coord != COORDINATE_SYSTEM:
+        raise SchemaError(f"coordinates must be {COORDINATE_SYSTEM}")
+    return coord
+
+
+def _parse_contig_lengths(raw_lengths: object) -> dict[str, int]:
+    _validate_contig_lengths(raw_lengths)
+    if not isinstance(raw_lengths, Mapping):
+        raise SchemaError("contig_lengths must be a non-empty object")
+    return {
+        k: int(v)
+        for k, v in raw_lengths.items()
+        if isinstance(k, str) and isinstance(v, int)
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class SampleMetadata:
     """Strongly-typed metadata container for Schema v2.0.0 sample sketch artifacts."""
@@ -415,27 +501,9 @@ class SampleMetadata:
 
     def __post_init__(self) -> None:
         """Validate sample metadata invariants."""
-        if (
-            not isinstance(self.bin_size, int)
-            or isinstance(self.bin_size, bool)
-            or self.bin_size <= 0
-        ):
-            raise SchemaError(
-                f"bin_size must be a positive integer, got {self.bin_size!r}"
-            )
-        if not isinstance(self.contig_lengths, Mapping) or not self.contig_lengths:
-            raise SchemaError("contig_lengths must be a non-empty object")
-        if any(
-            not isinstance(k, str)
-            or not k
-            or not isinstance(v, int)
-            or isinstance(v, bool)
-            or v <= 0
-            for k, v in self.contig_lengths.items()
-        ):
-            raise SchemaError(
-                "contig_lengths must map non-empty names to positive integers"
-            )
+        _check_envelope_invariants(self.schema_version, self.coordinate_system)
+        _schema_pos_int(self.bin_size, "bin_size")
+        _validate_contig_lengths(self.contig_lengths)
         if not isinstance(self.contig_order, tuple) or any(
             not isinstance(c, str) or not c for c in self.contig_order
         ):
@@ -493,22 +561,13 @@ class SampleMetadata:
     def from_dict(cls, data: Mapping[str, object]) -> SampleMetadata:
         """Construct sample metadata from a decoded Arrow metadata dictionary."""
         try:
-            schema_version = str(data.get("schema_version", SCHEMA_VERSION))
-            if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
-                raise SchemaVersionError(
-                    f"unsupported schema version {schema_version!r}; "
-                    f"expected {SCHEMA_VERSION!r}"
-                )
-            raw_lengths = data.get("contig_lengths")
-            if not isinstance(raw_lengths, Mapping) or not raw_lengths:
-                raise SchemaError("contig_lengths must be a non-empty object")
-            contig_lengths = {
-                str(k): _req_int(v, "contig_length") for k, v in raw_lengths.items()
-            }
-            ref_id = _opt_obj_dict(data.get("reference_identity"), "reference_identity")
+            schema_version = _parse_schema_version(data)
+            coordinate_system = _parse_coordinate_system(data)
+            contig_lengths = _parse_contig_lengths(data.get("contig_lengths"))
+            ref_id = _opt_obj_dict(data, "reference_identity")
             raw_order = data.get("contig_order", ref_id.get("contig_order"))
             contig_order = (
-                _req_str_tuple(raw_order, "contig_order")
+                _as_str_tuple(raw_order, "contig_order")
                 if raw_order is not None
                 else tuple(contig_lengths.keys())
             )
@@ -520,17 +579,15 @@ class SampleMetadata:
                 frag_meta = FragmentomicsMetadata.from_dict(frag_obj)
 
             return cls(
-                bin_size=_req_int(data["bin_size"], "bin_size"),
+                bin_size=_req_int(data, "bin_size"),
                 contig_lengths=contig_lengths,
                 contig_order=contig_order,
-                source_identity=_opt_obj_dict(
-                    data.get("source_identity"), "source_identity"
-                ),
+                source_identity=_opt_obj_dict(data, "source_identity"),
                 reference_identity=ref_id,
-                qc=_opt_obj_dict(data.get("qc"), "qc"),
-                filters=_opt_obj_dict(data.get("filters"), "filters"),
+                qc=_opt_obj_dict(data, "qc"),
+                filters=_opt_obj_dict(data, "filters"),
                 schema_version=schema_version,
-                coordinate_system=str(data.get("coordinate_system", COORDINATE_SYSTEM)),
+                coordinate_system=coordinate_system,
                 fragmentomics=frag_meta,
             )
         except SchemaError:
@@ -592,24 +649,33 @@ class ReferenceMetadata:
 
     def __post_init__(self) -> None:
         """Validate reference metadata configuration and contig lengths."""
-        _check_pos_int(self.bin_size, "bin_size")
+        _check_envelope_invariants(self.schema_version, self.coordinate_system)
+        _schema_pos_int(self.bin_size, "bin_size")
         if self.prenatal_bin_size is not None:
-            _check_pos_int(self.prenatal_bin_size, "prenatal_bin_size")
-        _check_nonneg_int(self.pca_components, "pca_components")
-        _check_nonneg_int(self.max_batch_memory_mb, "max_batch_memory_mb")
+            _schema_pos_int(self.prenatal_bin_size, "prenatal_bin_size")
+        _schema_nonneg_int(self.pca_components, "pca_components")
+        _schema_pos_int(self.max_batch_memory_mb, "max_batch_memory_mb")
         if self.branch_pca_ranks is not None:
             for b_name, b_rank in self.branch_pca_ranks.items():
-                _check_nonneg_int(b_rank, f"branch_pca_ranks[{b_name!r}]")
+                _schema_nonneg_int(b_rank, f"branch_pca_ranks[{b_name!r}]")
         if not (0.0 <= self.min_mappability <= 1.0):
-            raise ValueError(
+            raise SchemaError(
                 f"min_mappability must be within [0.0, 1.0], got {self.min_mappability!r}"
             )
         if self.mode not in ("germline", "prenatal"):
-            raise ValueError(
+            raise SchemaError(
                 f"mode must be 'germline' or 'prenatal', got {self.mode!r}"
             )
-        if not self.contig_lengths:
-            raise ValueError("contig_lengths must be a non-empty mapping")
+        _validate_contig_lengths(self.contig_lengths)
+        if (
+            self.prenatal_bin_size is not None
+            and self.prenatal is not None
+            and self.prenatal_bin_size != self.prenatal.prenatal_bin_size
+        ):
+            raise SchemaError(
+                f"prenatal_bin_size ({self.prenatal_bin_size}) must match "
+                f"prenatal.prenatal_bin_size ({self.prenatal.prenatal_bin_size})"
+            )
 
     def to_metadata(self) -> dict[str, object]:
         """Convert reference metadata to a dictionary for Arrow table persistence."""
@@ -648,19 +714,10 @@ class ReferenceMetadata:
     def from_dict(cls, data: Mapping[str, object]) -> ReferenceMetadata:
         """Construct reference metadata from a decoded metadata dictionary."""
         try:
-            schema_version = str(data.get("schema_version", SCHEMA_VERSION))
-            if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
-                raise SchemaVersionError(
-                    f"unsupported schema version {schema_version!r}; "
-                    f"expected {SCHEMA_VERSION!r}"
-                )
-            model = _opt_obj_dict(data.get("model"), "model")
-            raw_clen = data.get("contig_lengths", {})
-            if not isinstance(raw_clen, Mapping):
-                raise TypeError("contig_lengths must be a mapping")
-            contig_lengths = {
-                str(k): _req_int(v, "contig_length") for k, v in raw_clen.items()
-            }
+            schema_version = _parse_schema_version(data)
+            coordinate_system = _parse_coordinate_system(data)
+            model = _opt_obj_dict(data, "model")
+            contig_lengths = _parse_contig_lengths(data.get("contig_lengths"))
             raw_ids = data.get("sample_identities", ())
             if not isinstance(raw_ids, (list, tuple)):
                 raise TypeError("sample_identities must be a list or tuple")
@@ -675,96 +732,59 @@ class ReferenceMetadata:
                 if prenatal_obj is not None
                 else None
             )
-            raw_mode = str(model.get("mode", "germline"))
-            if raw_mode not in ("germline", "prenatal"):
-                raise ValueError(
-                    f"mode must be 'germline' or 'prenatal', got {raw_mode!r}"
+            raw_mode = model.get("mode", "germline")
+            if not isinstance(raw_mode, str) or raw_mode not in (
+                "germline",
+                "prenatal",
+            ):
+                raise SchemaError(
+                    f"model.mode must be 'germline' or 'prenatal', got {raw_mode!r}"
                 )
-            mode = AnalysisMode(raw_mode)
-            raw_pbs = model.get("prenatal_bin_size")
-            prenatal_bs = (
-                _req_int(raw_pbs, "prenatal_bin_size")
-                if raw_pbs is not None
-                else (
-                    prenatal_meta.prenatal_bin_size
-                    if prenatal_meta is not None
-                    else None
-                )
-            )
-            raw_sexes = model.get("sample_sexes")
-            raw_cutoff = model.get("sex_cutoff")
+            prenatal_bs = _opt_int(model, "prenatal_bin_size")
+            if prenatal_bs is None and prenatal_meta is not None:
+                prenatal_bs = prenatal_meta.prenatal_bin_size
+
             raw_ranks = model.get("branch_pca_ranks")
             branch_pca_ranks: dict[str, int] | None = None
             if raw_ranks is not None:
-                if not isinstance(raw_ranks, Mapping):
-                    raise TypeError("branch_pca_ranks must be a mapping")
+                if not isinstance(raw_ranks, Mapping) or any(
+                    not isinstance(k, str) or not k for k in raw_ranks
+                ):
+                    raise TypeError("branch_pca_ranks must map non-empty names to ints")
                 branch_pca_ranks = {
-                    str(k): _req_int(v, "branch_pca_rank") for k, v in raw_ranks.items()
+                    k: _as_int(v, "branch_pca_rank")
+                    for k, v in raw_ranks.items()
+                    if isinstance(k, str)
                 }
-            raw_filters = model.get("filters")
-            filters = (
-                None if raw_filters is None else _opt_obj_dict(raw_filters, "filters")
-            )
             return cls(
-                bin_size=_req_int(model.get("bin_size", DEFAULT_BIN_SIZE), "bin_size"),
+                bin_size=_req_int(model, "bin_size", DEFAULT_BIN_SIZE),
                 contig_lengths=contig_lengths,
-                branches=_opt_str_tuple(model.get("branches"), "branches"),
-                autosomal_contigs=_opt_str_tuple(
-                    model.get("autosomal_contigs"), "autosomal_contigs"
-                ),
-                sex_contigs=_opt_str_tuple(model.get("sex_contigs"), "sex_contigs"),
-                pca_components=_req_int(
-                    model.get("pca_components", 0), "pca_components"
-                ),
-                mode=mode,
+                branches=_opt_str_tuple(model, "branches"),
+                autosomal_contigs=_opt_str_tuple(model, "autosomal_contigs"),
+                sex_contigs=_opt_str_tuple(model, "sex_contigs"),
+                pca_components=_req_int(model, "pca_components", 0),
+                mode=AnalysisMode(raw_mode),
                 prenatal_bin_size=prenatal_bs,
                 sample_identities=sample_identities,
-                sex_signal_contig=(
-                    None
-                    if model.get("sex_signal_contig") is None
-                    else str(model["sex_signal_contig"])
-                ),
-                sex_cutoff=(
-                    None if raw_cutoff is None else _req_float(raw_cutoff, "sex_cutoff")
-                ),
-                sex_source=(
-                    None
-                    if model.get("sex_source") is None
-                    else str(model["sex_source"])
-                ),
-                sample_sexes=(
-                    None
-                    if raw_sexes is None
-                    else _req_str_tuple(raw_sexes, "sample_sexes")
-                ),
-                sex_inference=(
-                    None
-                    if model.get("sex_inference") is None
-                    else _opt_obj_dict(model.get("sex_inference"), "sex_inference")
-                ),
-                max_batch_memory_mb=_req_int(
-                    model.get("max_batch_memory_mb", 256), "max_batch_memory_mb"
-                ),
-                flat=_req_bool(model.get("flat", False), "flat"),
-                gc_corrected=_req_bool(
-                    model.get("gc_corrected", False), "gc_corrected"
-                ),
-                mappability_corrected=_req_bool(
-                    model.get("mappability_corrected", False),
-                    "mappability_corrected",
-                ),
+                sex_signal_contig=_opt_str(model, "sex_signal_contig"),
+                sex_cutoff=_opt_float(model, "sex_cutoff"),
+                sex_source=_opt_str(model, "sex_source"),
+                sample_sexes=_opt_nullable_str_tuple(model, "sample_sexes"),
+                sex_inference=_opt_nullable_obj_dict(model, "sex_inference"),
+                max_batch_memory_mb=_req_int(model, "max_batch_memory_mb", 256),
+                flat=_req_bool(model, "flat", False),
+                gc_corrected=_req_bool(model, "gc_corrected", False),
+                mappability_corrected=_req_bool(model, "mappability_corrected", False),
                 fragmentomics_corrected=_req_bool(
-                    model.get("fragmentomics_corrected", False),
-                    "fragmentomics_corrected",
+                    model, "fragmentomics_corrected", False
                 ),
                 min_mappability=_req_float(
-                    model.get("min_mappability", DEFAULT_MIN_MAPPABILITY),
-                    "min_mappability",
+                    model, "min_mappability", DEFAULT_MIN_MAPPABILITY
                 ),
                 branch_pca_ranks=branch_pca_ranks,
-                filters=filters,
+                filters=_opt_nullable_obj_dict(model, "filters"),
                 schema_version=schema_version,
-                coordinate_system=str(data.get("coordinate_system", COORDINATE_SYSTEM)),
+                coordinate_system=coordinate_system,
                 prenatal=prenatal_meta,
             )
         except SchemaError:

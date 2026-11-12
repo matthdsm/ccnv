@@ -1,5 +1,10 @@
-"""Base domain models, configurations, results, schemas, and exceptions for ccnv."""
+"""Base domain models, configurations, results, schemas, buffers, and exceptions for ccnv."""
 
+from ccnv.models.buffers import (
+    BranchFitArrays,
+    SampleBuffers,
+    assemble_reference_table,
+)
 from ccnv.models.config import (
     DEFAULT_BIN_SIZE,
     DEFAULT_MIN_MAPPABILITY,
@@ -20,7 +25,6 @@ from ccnv.models.domain import (
     is_canonical_contig,
     natural_sort_key,
     normalize_chr,
-    resolve_contig_name,
     select_layout,
 )
 from ccnv.models.exceptions import (
@@ -58,7 +62,6 @@ from ccnv.models.schemas import (
     BRANCH_MALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
-    CNV_REFERENCE_BRANCHES,
     COORDINATE_SYSTEM,
     FRAGMENTOMICS_METADATA_KEY,
     KNOWN_REFERENCE_BRANCHES,
@@ -72,20 +75,16 @@ from ccnv.models.schemas import (
     SCHEMA_VERSION,
     SUPPORTED_SCHEMA_VERSIONS,
     ArtifactKind,
-    BranchFitArrays,
     FragmentomicsMetadata,
     PrenatalModelMetadata,
     ReferenceMetadata,
-    SampleBuffers,
     SampleMetadata,
-    assemble_reference_table,
     build_reference_schema,
     canonical_dictionary_array,
     decode_dictionary_contigs,
     decode_metadata,
     encode_metadata,
     fixed_size_list_to_numpy,
-    metadata_for,
     reconstruct_sample_grid,
     unique_dictionary_contigs,
 )
@@ -94,7 +93,6 @@ from ccnv.models.validation import (
     validate_reference_table,
     validate_sample_table,
     validate_schema,
-    validate_table,
 )
 
 __all__ = [
@@ -103,7 +101,6 @@ __all__ = [
     "BRANCH_MALE_SEX",
     "BRANCH_PRENATAL_AUTOSOMAL",
     "BRANCH_PRENATAL_FFY",
-    "CNV_REFERENCE_BRANCHES",
     "COORDINATE_SYSTEM",
     "DEFAULT_BIN_SIZE",
     "DEFAULT_MIN_MAPPABILITY",
@@ -169,17 +166,14 @@ __all__ = [
     "fixed_size_list_to_numpy",
     "is_autosome_name",
     "is_canonical_contig",
-    "metadata_for",
     "natural_sort_key",
     "normalize_chr",
     "parquet_path",
     "reconstruct_sample_grid",
-    "resolve_contig_name",
     "select_layout",
     "unique_dictionary_contigs",
     "validate_metadata",
     "validate_reference_table",
     "validate_sample_table",
     "validate_schema",
-    "validate_table",
 ]

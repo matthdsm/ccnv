@@ -63,7 +63,8 @@ def read_alignment_header(
     fasta: Path | str | None = None,
 ) -> list[tuple[str, int]]:
     """Return ordered `(contig, length)` pairs declared in a BAM/CRAM header."""
-    _, resolved, resolved_fasta = validate_alignment_inputs(path, fasta)
+    resolved = Path(path).expanduser()
+    resolved_fasta = Path(fasta).expanduser() if fasta is not None else None
     return _read_alignment_header_core(
         str(resolved),
         str(resolved_fasta) if resolved_fasta is not None else None,
@@ -82,7 +83,8 @@ def scan_alignment_bins(
     se_fragment_length: int = 0,
 ) -> ScanAlignmentResult:
     """Scan BAM or CRAM alignments into per-bin summary arrays via `ccnv._core`."""
-    _, resolved, resolved_fasta = validate_alignment_inputs(path, fasta)
+    resolved = Path(path).expanduser()
+    resolved_fasta = Path(fasta).expanduser() if fasta is not None else None
     active_filters = filters if filters is not None else ReadFilters()
     return _scan_alignment_bins_core(
         str(resolved),

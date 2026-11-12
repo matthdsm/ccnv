@@ -3,24 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Final
+from typing import Final, Literal, overload
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from ccnv.models.config import ReadFilters
 from ccnv.models.exceptions import SchemaError, SchemaVersionError
 from ccnv.models.metadata import (
-    COORDINATE_SYSTEM,
     SCHEMA_VERSION,
     SUPPORTED_SCHEMA_VERSIONS,
     ArtifactKind,
-    FragmentomicsMetadata,
-    PrenatalModelMetadata,
     ReferenceMetadata,
     SampleMetadata,
     decode_metadata,
-    encode_metadata,
 )
 from ccnv.models.schemas import (
     BRANCH_PRENATAL_AUTOSOMAL,
@@ -57,139 +54,66 @@ _KIND_METADATA: Final[Mapping[ArtifactKind, frozenset[str]]] = {
 }
 
 __all__ = [
-    "metadata_for",
     "validate_metadata",
     "validate_reference_table",
     "validate_sample_table",
     "validate_schema",
-    "validate_table",
 ]
 
 
-def metadata_for(
-    kind: ArtifactKind,
-    *,
-    contig_lengths: Mapping[str, int],
-    values: Mapping[str, object],
-) -> dict[bytes, bytes]:
-    """Build complete metadata for an artifact, preserving sample contig order."""
-    extra: dict[str, object] = {}
-    if kind is ArtifactKind.SAMPLE and "contig_order" not in values:
-        extra["contig_order"] = list(contig_lengths.keys())
-    metadata: dict[str, object] = {
-        "artifact_kind": kind.value,
-        "schema_version": SCHEMA_VERSION,
-        "coordinate_system": COORDINATE_SYSTEM,
-        "contig_lengths": dict(contig_lengths),
-        **extra,
-        **values,
-    }
-    validate_metadata(metadata, kind)
-    return encode_metadata(metadata)
-
-
-def _is_pos_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-
-def _check_version_header(
-    metadata: Mapping[str, object], kind: ArtifactKind | None = None
-) -> None:
+def _check_version_header(metadata: Mapping[str, object], kind: ArtifactKind) -> None:
     """Fail fast with SchemaVersionError or wrong artifact_kind before field checks."""
     if "schema_version" in metadata:
         version = metadata["schema_version"]
-        if version not in SUPPORTED_SCHEMA_VERSIONS:
+        if not isinstance(version, str) or version not in SUPPORTED_SCHEMA_VERSIONS:
             raise SchemaVersionError(
                 f"unsupported schema version {version!r}; expected {SCHEMA_VERSION!r}"
             )
-    if (
-        kind is not None
-        and "artifact_kind" in metadata
-        and metadata["artifact_kind"] != kind.value
-    ):
+    if "artifact_kind" in metadata and metadata["artifact_kind"] != kind.value:
         raise SchemaError(
             f"expected artifact_kind {kind.value!r}, got {metadata['artifact_kind']!r}"
         )
 
 
-def validate_metadata(metadata: Mapping[str, object], kind: ArtifactKind) -> None:
-    """Validate required keys and cross-artifact coordinate invariants."""
+@overload
+def validate_metadata(
+    metadata: Mapping[str, object], kind: Literal[ArtifactKind.SAMPLE]
+) -> SampleMetadata: ...
+
+
+@overload
+def validate_metadata(
+    metadata: Mapping[str, object], kind: Literal[ArtifactKind.REFERENCE]
+) -> ReferenceMetadata: ...
+
+
+@overload
+def validate_metadata(
+    metadata: Mapping[str, object], kind: ArtifactKind
+) -> SampleMetadata | ReferenceMetadata: ...
+
+
+def validate_metadata(
+    metadata: Mapping[str, object], kind: ArtifactKind
+) -> SampleMetadata | ReferenceMetadata:
+    """Validate required envelope keys, coordinate invariants, and typed metadata."""
     _check_version_header(metadata, kind)
     required = _COMMON_METADATA | _KIND_METADATA[kind]
     missing = sorted(required - metadata.keys())
     if missing:
         raise SchemaError(f"missing {kind.value} metadata: {', '.join(missing)}")
-    if metadata["artifact_kind"] != kind.value:
-        raise SchemaError(f"expected artifact_kind {kind.value!r}")
-    if metadata["coordinate_system"] != COORDINATE_SYSTEM:
-        raise SchemaError(f"coordinates must be {COORDINATE_SYSTEM}")
-
-    contig_lengths = metadata["contig_lengths"]
-    if not isinstance(contig_lengths, dict) or not contig_lengths:
-        raise SchemaError("contig_lengths must be a non-empty object")
-    if any(
-        not isinstance(name, str) or not name or not _is_pos_int(length)
-        for name, length in contig_lengths.items()
-    ):
-        raise SchemaError(
-            "contig_lengths must map non-empty names to positive integers"
-        )
 
     if kind is ArtifactKind.SAMPLE:
-        if not _is_pos_int(metadata["bin_size"]):
-            raise SchemaError("bin_size must be a positive integer")
         filters = metadata["filters"]
-        if not isinstance(filters, dict):
+        if not isinstance(filters, Mapping):
             raise SchemaError("filters must be an object")
-        min_mapq = filters.get("min_mapping_quality")
-        if not isinstance(min_mapq, int) or isinstance(min_mapq, bool) or min_mapq < 0:
-            raise SchemaError(
-                "filters.min_mapping_quality must be a non-negative integer"
-            )
-        contig_order = metadata.get("contig_order")
-        if contig_order is not None:
-            if not isinstance(contig_order, (list, tuple)) or any(
-                not isinstance(c, str) for c in contig_order
-            ):
-                raise SchemaError("contig_order must be a list of contig names")
-            if len(contig_order) != len(contig_lengths) or set(contig_order) != set(
-                contig_lengths.keys()
-            ):
-                raise SchemaError("contig_order must match contig_lengths keys")
-        frag_obj = metadata.get("fragmentomics")
-        if frag_obj is not None:
-            if not isinstance(frag_obj, Mapping):
-                raise SchemaError("ccnv.fragmentomics metadata must be an object")
-            try:
-                FragmentomicsMetadata.from_dict(frag_obj)
-            except (KeyError, TypeError, ValueError) as err:
-                raise SchemaError(
-                    f"invalid ccnv.fragmentomics metadata: {err}"
-                ) from err
+        ReadFilters.from_dict(filters, strict=True)
+        return SampleMetadata.from_dict(metadata)
 
-    if kind is ArtifactKind.REFERENCE:
-        model = metadata.get("model")
-        if not isinstance(model, dict):
-            raise SchemaError("model must be an object")
-        bin_size = model.get("bin_size")
-        if bin_size is not None and not _is_pos_int(bin_size):
-            raise SchemaError("model.bin_size must be a positive integer")
-        prenatal_bin_size = model.get("prenatal_bin_size")
-        if prenatal_bin_size is not None and not _is_pos_int(prenatal_bin_size):
-            raise SchemaError("model.prenatal_bin_size must be a positive integer")
-        mode = model.get("mode")
-        if mode is not None and mode not in ("germline", "prenatal"):
-            raise SchemaError(
-                f"model.mode must be 'germline' or 'prenatal', got {mode!r}"
-            )
-        prenatal_obj = metadata.get("prenatal")
-        if prenatal_obj is not None:
-            if not isinstance(prenatal_obj, Mapping):
-                raise SchemaError("ccnv.prenatal metadata must be an object")
-            try:
-                PrenatalModelMetadata.from_dict(prenatal_obj)
-            except (ValueError, TypeError, KeyError) as err:
-                raise SchemaError(f"invalid ccnv.prenatal metadata: {err}") from err
+    model = metadata.get("model")
+    if not isinstance(model, Mapping):
+        raise SchemaError("model must be an object")
+    return ReferenceMetadata.from_dict(metadata)
 
 
 def _expected_reference_schema(schema: pa.Schema) -> pa.Schema:
@@ -256,9 +180,8 @@ def validate_sample_table(table: pa.Table) -> SampleMetadata:
     _check_version_header(metadata, ArtifactKind.SAMPLE)
     _validate_arrow_fields(table.schema, SAMPLE_SCHEMA, ArtifactKind.SAMPLE)
     _validate_non_null_columns(table, SAMPLE_SCHEMA)
-    validate_metadata(metadata, ArtifactKind.SAMPLE)
+    sample_meta = validate_metadata(metadata, ArtifactKind.SAMPLE)
 
-    sample_meta = SampleMetadata.from_dict(metadata)
     expected_rows = sample_meta.expected_num_bins
     if table.num_rows != expected_rows:
         raise SchemaError(
@@ -268,25 +191,13 @@ def validate_sample_table(table: pa.Table) -> SampleMetadata:
     return sample_meta
 
 
-def _resolve_target_bin_sizes(
-    metadata: Mapping[str, object],
-) -> tuple[int | None, int | None]:
-    model_obj = metadata.get("model")
-    model = model_obj if isinstance(model_obj, Mapping) else {}
-    raw_bin = model.get("bin_size")
-    bin_size = (
-        int(raw_bin) if isinstance(raw_bin, int) and _is_pos_int(raw_bin) else None
-    )
-
-    raw_p = model.get("prenatal_bin_size")
-    if raw_p is None and isinstance(metadata.get("prenatal"), Mapping):
-        prenatal_map = metadata["prenatal"]
-        if isinstance(prenatal_map, Mapping):
-            raw_p = prenatal_map.get("prenatal_bin_size")
-    prenatal_bin_size = (
-        int(raw_p) if isinstance(raw_p, int) and _is_pos_int(raw_p) else None
-    )
-    return bin_size, prenatal_bin_size
+def _explicit_bin_size(
+    metadata: Mapping[str, object], ref_meta: ReferenceMetadata
+) -> int | None:
+    model = metadata.get("model")
+    if isinstance(model, Mapping) and model.get("bin_size") is not None:
+        return ref_meta.bin_size
+    return None
 
 
 def _validate_reference_rows(
@@ -298,10 +209,13 @@ def _validate_reference_rows(
     if table.num_rows == 0:
         return
 
-    bin_size, prenatal_bin_size = _resolve_target_bin_sizes(metadata)
+    bin_size = _explicit_bin_size(metadata, ref_meta)
+    prenatal_bin_size = ref_meta.prenatal_bin_size
 
     branch_dict = canonical_dictionary_array(table.column("branch"), "branch")
     contig_dict = canonical_dictionary_array(table.column("contig"), "contig")
+    b_vocab = [str(v) for v in branch_dict.dictionary.to_pylist()]
+    c_vocab = [str(v) for v in contig_dict.dictionary.to_pylist()]
 
     b_codes = branch_dict.indices.to_numpy(zero_copy_only=False).astype(
         np.int32, copy=False
@@ -322,53 +236,32 @@ def _validate_reference_rows(
         .astype(np.int64, copy=False)
     )
 
-    branch_to_canon: dict[str, int] = {}
-    canon_b = np.zeros(len(branch_dict.dictionary), dtype=np.int32)
-    target_sizes: list[int] = []
+    target_size_by_bcode = np.zeros(len(b_vocab), dtype=np.int64)
     for b_code_raw in np.unique(b_codes):
-        raw_b = int(b_code_raw)
-        b_name = str(branch_dict.dictionary[raw_b].as_py())
-        canon_b_id = branch_to_canon.get(b_name)
-        if canon_b_id is None:
-            if b_name not in KNOWN_REFERENCE_BRANCHES:
-                raise SchemaError(
-                    f"unknown branch {b_name!r}; "
-                    f"expected one of {sorted(KNOWN_REFERENCE_BRANCHES)}"
-                )
-            if b_name == BRANCH_PRENATAL_AUTOSOMAL and prenatal_bin_size is None:
-                raise SchemaError(
-                    "table contains 'prenatal_autosomal' branch but prenatal_bin_size "
-                    "is not specified in metadata"
-                )
-            canon_b_id = len(branch_to_canon)
-            branch_to_canon[b_name] = canon_b_id
-            ts = prenatal_bin_size if b_name == BRANCH_PRENATAL_AUTOSOMAL else bin_size
-            target_sizes.append(ts if ts is not None else 0)
-        canon_b[raw_b] = canon_b_id
-    b_codes = canon_b[b_codes]
-    target_size_by_bcode = np.asarray(target_sizes, dtype=np.int64)
+        b_idx = int(b_code_raw)
+        b_name = b_vocab[b_idx]
+        if b_name not in KNOWN_REFERENCE_BRANCHES:
+            raise SchemaError(
+                f"unknown branch {b_name!r}; "
+                f"expected one of {sorted(KNOWN_REFERENCE_BRANCHES)}"
+            )
+        if b_name == BRANCH_PRENATAL_AUTOSOMAL and prenatal_bin_size is None:
+            raise SchemaError(
+                "table contains 'prenatal_autosomal' branch but prenatal_bin_size "
+                "is not specified in metadata"
+            )
+        ts = prenatal_bin_size if b_name == BRANCH_PRENATAL_AUTOSOMAL else bin_size
+        target_size_by_bcode[b_idx] = ts if ts is not None else 0
 
-    contig_to_canon: dict[str, int] = {}
-    canon_c = np.zeros(len(contig_dict.dictionary), dtype=np.int32)
-    contig_lens_canon: list[int] = []
-    contig_names_canon: list[str] = []
+    contig_len_by_code = np.zeros(len(c_vocab), dtype=np.int64)
     for c_code_raw in np.unique(c_codes):
-        raw_c = int(c_code_raw)
-        c_name = str(contig_dict.dictionary[raw_c].as_py())
-        canon_c_id = contig_to_canon.get(c_name)
-        if canon_c_id is None:
-            c_len = ref_meta.contig_lengths.get(c_name)
-            if c_len is None:
-                raise SchemaError(f"undeclared contig {c_name!r}")
-            canon_c_id = len(contig_to_canon)
-            contig_to_canon[c_name] = canon_c_id
-            contig_lens_canon.append(c_len)
-            contig_names_canon.append(c_name)
-        canon_c[raw_c] = canon_c_id
-    c_codes = canon_c[c_codes]
-    contig_len_by_code = np.asarray(contig_lens_canon, dtype=np.int64)
+        c_idx = int(c_code_raw)
+        c_name = c_vocab[c_idx]
+        c_len = ref_meta.contig_lengths.get(c_name)
+        if c_len is None:
+            raise SchemaError(f"undeclared contig {c_name!r}")
+        contig_len_by_code[c_idx] = c_len
 
-    # Enforce contiguous branch blocks and unique contiguous (branch, contig) runs
     branch_run_starts = np.concatenate(
         (np.array([0], dtype=np.int64), np.flatnonzero(b_codes[1:] != b_codes[:-1]) + 1)
     )
@@ -391,7 +284,7 @@ def _validate_reference_rows(
     bad_bounds = (starts < 0) | (ends <= starts) | (ends > row_contig_lens)
     if np.any(bad_bounds):
         idx = int(np.flatnonzero(bad_bounds)[0])
-        c_name = contig_names_canon[int(c_codes[idx])]
+        c_name = c_vocab[int(c_codes[idx])]
         raise SchemaError(
             f"row {idx} interval [{int(starts[idx])}, {int(ends[idx])}) is outside "
             f"{c_name!r} length {int(row_contig_lens[idx])}"
@@ -447,17 +340,7 @@ def validate_reference_table(
     expected = _expected_reference_schema(table.schema)
     _validate_arrow_fields(table.schema, expected, ArtifactKind.REFERENCE)
     _validate_non_null_columns(table, expected)
-    validate_metadata(metadata, ArtifactKind.REFERENCE)
-
-    ref_meta = ReferenceMetadata.from_dict(metadata)
+    ref_meta = validate_metadata(metadata, ArtifactKind.REFERENCE)
     if check_rows:
         _validate_reference_rows(table, metadata, ref_meta)
     return ref_meta
-
-
-def validate_table(table: pa.Table, kind: ArtifactKind) -> None:
-    """Validate schema plus canonical coordinate bounds and row identity."""
-    if kind is ArtifactKind.SAMPLE:
-        validate_sample_table(table)
-    else:
-        validate_reference_table(table, check_rows=True)

@@ -134,6 +134,7 @@ class FetalFractionResult:
     low_ff_warning: bool = False
     warnings: tuple[str, ...] = ()
     active_ff_se: float | None = None
+    effective_ff: float | None = None
     lod_metrics: PrenatalLoDMetrics | None = None
 
     def __post_init__(self) -> None:
@@ -168,18 +169,13 @@ class PredictionOutputs:
 
 @dataclass(frozen=True, slots=True)
 class BranchQCStatus:
-    """Wrapper around branch QC metrics dictionary providing status and verdict attributes."""
+    """Wrapper around branch QC metrics dictionary providing status attribute."""
 
     data: dict[str, object]
 
     @property
     def status(self) -> str:
         """Branch quality verdict string (PASS, WARN, or FAIL)."""
-        return str(self.data.get("verdict", ""))
-
-    @property
-    def verdict(self) -> str:
-        """Alias for status."""
         return str(self.data.get("verdict", ""))
 
     def __getitem__(self, key: str) -> object:

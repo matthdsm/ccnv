@@ -1,4 +1,4 @@
-"""Exogenous log-link Poisson covariate regression, logit ensembles, and robust location estimators."""
+"""Exogenous log-link Poisson covariate regression, super-block scaling, logit ensembles, and robust location estimators."""
 
 from __future__ import annotations
 
@@ -8,30 +8,28 @@ import warnings
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
-from numpy.typing import NDArray
+import scipy.special
+from numpy.typing import ArrayLike, NDArray
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import ElasticNetCV, PoissonRegressor, RidgeCV
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import SplineTransformer
 
+from ccnv._core import GC_QUANTILE_EDGES
 from ccnv.models.exceptions import InvalidInputError
 
 _MIN_VARIANCE_STD: Final[float] = 1e-6
 _MIN_DISTINCT_VALUES: Final[int] = 5
 _DISTINCT_CHUNK_SIZE: Final[int] = 65_536
 _GC_QUANTILE_MIN_BIN_SIZE: Final[int] = 25_000
-_GC_QUANTILE_NUM_BANDS: Final[int] = 8
-_GC_BAND_MIDPOINTS: Final[tuple[float, ...]] = (
-    0.15,
-    0.325,
-    0.375,
-    0.425,
-    0.475,
-    0.525,
-    0.60,
-    0.825,
+_GC_QUANTILE_NUM_BANDS: Final[int] = len(GC_QUANTILE_EDGES) - 1
+_GC_BAND_MIDPOINTS: Final[tuple[float, ...]] = tuple(
+    0.5 * (float(GC_QUANTILE_EDGES[i]) + float(GC_QUANTILE_EDGES[i + 1]))
+    for i in range(_GC_QUANTILE_NUM_BANDS)
 )
 _POISSON_ALPHA: Final[float] = 1e-4
 _POISSON_MAX_ITER: Final[int] = 100
@@ -43,13 +41,26 @@ _GEMM_ROW_CHUNK: Final[int] = 65_536
 _GEMM_SAMPLE_BATCH: Final[int] = 128
 
 __all__ = [
+    "LogitEnsembleFit",
     "build_exogenous_covariate_basis",
     "fit_logit_linear_ensemble",
     "fit_poisson_covariate_trends",
     "half_sample_mode",
     "hsm_biweight_mode",
+    "mad_scale",
     "standardize_column",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class LogitEnsembleFit:
+    """Fitted K-fold logit-link convex RidgeCV + ElasticNetCV ensemble."""
+
+    weights: NDArray[np.float64]
+    intercept: float
+    feat_mean: NDArray[np.float64]
+    feat_std: NDArray[np.float64]
+    oof_rmse: float
 
 
 def _count_distinct_up_to(
@@ -86,16 +97,6 @@ def _count_distinct_up_to(
     return len(seen)
 
 
-def _has_min_distinct(
-    arr: NDArray[np.floating],
-    min_distinct: int = _MIN_DISTINCT_VALUES,
-) -> bool:
-    """Return True if arr is all-finite and contains at least min_distinct distinct values."""
-    if min_distinct <= 0:
-        return True
-    return _count_distinct_up_to(arr, min_distinct) >= min_distinct
-
-
 def standardize_column(arr: NDArray[np.float64]) -> NDArray[np.float64] | None:
     """Center and scale a 1D float64 vector when population std exceeds threshold."""
     if arr.size < 2 or not np.all(np.isfinite(arr)):
@@ -107,7 +108,17 @@ def standardize_column(arr: NDArray[np.float64]) -> NDArray[np.float64] | None:
     return centered / std
 
 
-def half_sample_mode(values: NDArray[np.floating]) -> float:
+def mad_scale(values: ArrayLike) -> float:
+    """Compute Gaussian-consistent Median Absolute Deviation (1.4826 * MAD)."""
+    arr = np.asarray(values, dtype=np.float64)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 0.0
+    med = float(np.median(finite))
+    return 1.4826 * float(np.median(np.abs(finite - med)))
+
+
+def half_sample_mode(values: ArrayLike) -> float:
     """Compute Robertson-Cryer O(N log N) iterative Half-Sample Mode."""
     arr = np.asarray(values, dtype=np.float64)
     finite = arr[np.isfinite(arr)]
@@ -136,17 +147,24 @@ def half_sample_mode(values: NDArray[np.floating]) -> float:
 
 
 def hsm_biweight_mode(
-    values: NDArray[np.float64],
-    weights: NDArray[np.float64] | None = None,
+    values: ArrayLike,
+    weights: ArrayLike | None = None,
 ) -> float:
     """Refine Half-Sample Mode with 2-step precision-weighted Tukey biweight."""
     vals = np.asarray(values, dtype=np.float64)
-    finite_mask = np.isfinite(vals)
     if weights is not None:
         w_arr = np.asarray(weights, dtype=np.float64)
-        if w_arr.shape == finite_mask.shape:
-            weights = w_arr[finite_mask]
-    vals = vals[finite_mask]
+        if w_arr.shape != vals.shape:
+            raise InvalidInputError(
+                f"weights shape {w_arr.shape} must match values shape {vals.shape}"
+            )
+        valid = np.isfinite(vals) & np.isfinite(w_arr) & (w_arr > 0.0)
+        vals = vals[valid]
+        base_w: NDArray[np.float64] | None = w_arr[valid]
+    else:
+        vals = vals[np.isfinite(vals)]
+        base_w = None
+
     if vals.size == 0:
         return 0.0
     m = half_sample_mode(vals)
@@ -156,13 +174,13 @@ def hsm_biweight_mode(
     if mad <= 1e-8:
         return m
     c = 3.5 * mad
-    base_w = np.ones_like(vals) if weights is None else np.maximum(weights, 0.0)
+    eff_w = np.ones_like(vals) if base_w is None else base_w
     for _ in range(2):
         u = (vals - m) / c
         inlier = np.abs(u) < 1.0
         if not np.any(inlier):
             return m
-        w = np.where(inlier, base_w * np.square(1.0 - np.square(u)), 0.0)
+        w = np.where(inlier, eff_w * np.square(1.0 - np.square(u)), 0.0)
         w_sum = float(np.sum(w))
         if w_sum <= 0.0:
             return m
@@ -170,21 +188,21 @@ def hsm_biweight_mode(
     return m
 
 
-def fit_logit_linear_ensemble(
-    X: NDArray[np.float64],
-    u: NDArray[np.float64],
+def _fit_convex_logit_pair(
+    x_mat: NDArray[np.float64],
+    u_vec: NDArray[np.float64],
     *,
     ridge_alphas: NDArray[np.float64],
-    l1_ratio: Sequence[float] = (0.1, 0.5),
-    enet_alphas: NDArray[np.float64] | None = None,
-    seed: int = 42,
-    max_iter: int = 3000,
+    l1_ratios: Sequence[float],
+    enet_alphas: NDArray[np.float64] | None,
+    seed: int,
+    max_iter: int,
 ) -> tuple[NDArray[np.float64], float]:
-    """Fit a 50/50 convex RidgeCV + ElasticNetCV linear model in logit space."""
-    cv_folds = min(5, max(2, int(X.shape[0])))
+    """Fit one 50/50 RidgeCV + ElasticNetCV linear pair in logit space."""
+    cv_folds = min(5, max(2, int(x_mat.shape[0])))
     ridge = RidgeCV(alphas=ridge_alphas)
     enet = ElasticNetCV(
-        l1_ratio=list(l1_ratio),
+        l1_ratio=list(l1_ratios),
         alphas=100 if enet_alphas is None else enet_alphas,
         cv=cv_folds,
         random_state=seed,
@@ -192,14 +210,133 @@ def fit_logit_linear_ensemble(
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", (ConvergenceWarning, UserWarning))
-        ridge.fit(X, u)
-        enet.fit(X, u)
+        ridge.fit(x_mat, u_vec)
+        enet.fit(x_mat, u_vec)
     w_ens = 0.5 * (
         np.asarray(ridge.coef_, dtype=np.float64)
         + np.asarray(enet.coef_, dtype=np.float64)
     )
     b_ens = 0.5 * (float(ridge.intercept_) + float(enet.intercept_))
     return w_ens, b_ens
+
+
+def fit_logit_linear_ensemble(
+    X: ArrayLike,
+    y: ArrayLike,
+    *,
+    standardize: bool = False,
+    l1_ratios: Sequence[float] = (0.1, 0.5),
+    ridge_alphas: ArrayLike | None = None,
+    enet_alphas: ArrayLike | None = None,
+    seed: int = 42,
+    max_iter: int = 3000,
+) -> LogitEnsembleFit:
+    """Fit a K-fold OOF convex logit-link RidgeCV + ElasticNetCV ensemble."""
+    x_arr = np.asarray(X, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.float64).ravel()
+    if x_arr.ndim != 2:
+        raise InvalidInputError("X must be a 2D feature matrix")
+    n_samples, n_features = x_arr.shape
+    if y_arr.size != n_samples:
+        raise InvalidInputError(
+            f"y length {y_arr.size} must match X row count {n_samples}"
+        )
+
+    valid_x = (
+        np.all(np.isfinite(x_arr), axis=1)
+        if n_features > 0
+        else np.ones(n_samples, dtype=np.bool_)
+    )
+    valid = valid_x & np.isfinite(y_arr)
+    x_stat = x_arr[valid] if np.any(valid) else x_arr[valid_x]
+    if standardize and x_stat.shape[0] > 0 and n_features > 0:
+        feat_mean = np.mean(x_stat, axis=0)
+        feat_std = np.std(x_stat, axis=0)
+        feat_std = np.where(feat_std < _MIN_VARIANCE_STD, 1.0, feat_std)
+    else:
+        feat_mean = np.zeros(n_features, dtype=np.float64)
+        feat_std = np.ones(n_features, dtype=np.float64)
+
+    n_valid = int(np.count_nonzero(valid))
+    if n_valid == 0:
+        return LogitEnsembleFit(
+            weights=np.zeros(n_features, dtype=np.float64),
+            intercept=float(scipy.special.logit(0.10)),
+            feat_mean=feat_mean,
+            feat_std=feat_std,
+            oof_rmse=0.25,
+        )
+
+    x_sub = x_arr[valid]
+    y_clip = np.clip(y_arr[valid], 0.005, 0.85)
+    if n_valid < 3 or n_features == 0 or float(np.ptp(y_clip)) < 1e-4:
+        mean_y = float(np.clip(np.mean(y_clip), 0.005, 0.85))
+        return LogitEnsembleFit(
+            weights=np.zeros(n_features, dtype=np.float64),
+            intercept=float(scipy.special.logit(mean_y)),
+            feat_mean=feat_mean,
+            feat_std=feat_std,
+            oof_rmse=0.25,
+        )
+
+    r_alphas = (
+        np.logspace(-2, 4, 40)
+        if ridge_alphas is None
+        else np.asarray(ridge_alphas, dtype=np.float64)
+    )
+    e_alphas = (
+        None if enet_alphas is None else np.asarray(enet_alphas, dtype=np.float64)
+    )
+    u = np.asarray(scipy.special.logit(y_clip), dtype=np.float64)
+    z_full = (x_sub - feat_mean) / feat_std if standardize else x_sub
+
+    weights, intercept = _fit_convex_logit_pair(
+        z_full,
+        u,
+        ridge_alphas=r_alphas,
+        l1_ratios=l1_ratios,
+        enet_alphas=e_alphas,
+        seed=seed,
+        max_iter=max_iter,
+    )
+
+    cv_outer = min(5, n_valid)
+    oof_u = np.empty(n_valid, dtype=np.float64)
+    kfold = KFold(n_splits=cv_outer, shuffle=True, random_state=seed)
+    for tr_idx, va_idx in kfold.split(x_sub):
+        u_tr = u[tr_idx]
+        if tr_idx.size < 2 or float(np.ptp(u_tr)) < 1e-6:
+            oof_u[va_idx] = float(np.mean(u_tr)) if tr_idx.size > 0 else intercept
+            continue
+        if standardize:
+            f_mean = np.mean(x_sub[tr_idx], axis=0)
+            f_std = np.std(x_sub[tr_idx], axis=0)
+            f_std = np.where(f_std < _MIN_VARIANCE_STD, 1.0, f_std)
+            x_tr = (x_sub[tr_idx] - f_mean) / f_std
+            x_va = (x_sub[va_idx] - f_mean) / f_std
+        else:
+            x_tr = x_sub[tr_idx]
+            x_va = x_sub[va_idx]
+        w_fold, b_fold = _fit_convex_logit_pair(
+            x_tr,
+            u_tr,
+            ridge_alphas=r_alphas,
+            l1_ratios=l1_ratios,
+            enet_alphas=e_alphas,
+            seed=seed,
+            max_iter=max_iter,
+        )
+        oof_u[va_idx] = x_va @ w_fold + b_fold
+
+    oof_pred = np.asarray(scipy.special.expit(oof_u), dtype=np.float64)
+    oof_rmse = max(float(np.sqrt(np.mean(np.square(oof_pred - y_clip)))), 0.005)
+    return LogitEnsembleFit(
+        weights=weights,
+        intercept=intercept,
+        feat_mean=feat_mean,
+        feat_std=feat_std,
+        oof_rmse=oof_rmse,
+    )
 
 
 def _clamped_quantile_splines(
@@ -254,7 +391,7 @@ def _usable_spline_covariate(
     if track is None:
         return None
     sub = np.asarray(track[mask], dtype=np.float64)
-    if not _has_min_distinct(sub, _MIN_DISTINCT_VALUES):
+    if _count_distinct_up_to(sub, _MIN_DISTINCT_VALUES) < _MIN_DISTINCT_VALUES:
         return None
     z_col = standardize_column(sub)
     if z_col is None:
@@ -305,7 +442,9 @@ def build_exogenous_covariate_basis(
         q_usable = np.asarray(q_arr[mask], dtype=np.float64)
         if np.all(np.isfinite(q_usable)):
             q_std_cols: list[NDArray[np.float64]] = []
-            _append_standardized_columns(q_std_cols, q_usable[:, :7])
+            _append_standardized_columns(
+                q_std_cols, q_usable[:, : _GC_QUANTILE_NUM_BANDS - 1]
+            )
             if q_std_cols:
                 cols.extend(q_std_cols)
                 used_gc_quantiles = True
@@ -383,9 +522,7 @@ def _winsorize_poisson_counts(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64] | None, bool]:
     """Clip outlier counts and compute inverse-square deviance damping weights."""
     dev = _poisson_deviance_residuals(counts, mu)
-    med = float(np.median(dev))
-    mad = float(np.median(np.abs(dev - med)))
-    tau = z_threshold * max(1.0, 1.4826 * mad)
+    tau = z_threshold * max(1.0, mad_scale(dev))
 
     hi = dev > tau
     lo = (dev < -tau) if not upper_only else np.zeros_like(hi)
@@ -450,27 +587,20 @@ def _fit_single_sample_poisson(
     w_eff = w_fit * w_scale0 if w_scale0 is not None else w_fit
 
     if n_features == 0:
-        rate = max(
-            float(np.sum(c_prev * w_scale0) / np.sum(w_eff))
-            if w_scale0 is not None
-            else float(np.sum(c_prev)) / w_sum,
-            1e-12,
-        )
+        rate = max(float(np.sum((c_prev / w_fit) * w_eff) / np.sum(w_eff)), 1e-12)
         for _ in range(_POISSON_WINSOR_PASSES):
             c_next, w_scale, changed = _winsorize_poisson_counts(
                 c_fit, w_fit * rate, _POISSON_WINSOR_Z
             )
-            rate = max(
-                float(np.sum(c_next * w_scale) / np.sum(w_fit * w_scale))
-                if w_scale is not None
-                else float(np.sum(c_next)) / w_sum,
-                1e-12,
-            )
+            w_step = w_fit * w_scale if w_scale is not None else w_fit
+            rate = max(float(np.sum((c_next / w_fit) * w_step) / np.sum(w_step)), 1e-12)
             if not changed or np.allclose(c_next, c_prev, rtol=1e-4, atol=1e-4):
                 break
             c_prev = c_next
-        log_rate = float(np.clip(math.log(rate), -_POISSON_EXP_CLIP, _POISSON_EXP_CLIP))
-        return log_rate, zero_coef
+        return (
+            float(np.clip(math.log(rate), -_POISSON_EXP_CLIP, _POISSON_EXP_CLIP)),
+            zero_coef,
+        )
 
     warn_ctx = warnings.catch_warnings() if suppress_warnings else nullcontext()
     with warn_ctx:
@@ -529,10 +659,10 @@ def fit_poisson_covariate_trends(
     if (
         not isinstance(max_fit_bins, int)
         or isinstance(max_fit_bins, bool)
-        or max_fit_bins < 1
+        or max_fit_bins <= 0
     ):
         raise InvalidInputError("max_fit_bins must be a positive integer")
-    if not isinstance(threads, int) or isinstance(threads, bool) or threads < 1:
+    if not isinstance(threads, int) or isinstance(threads, bool) or threads <= 0:
         raise InvalidInputError("threads must be a positive integer")
 
     counts_arr = counts if isinstance(counts, np.ndarray) else np.asarray(counts)

@@ -84,12 +84,6 @@ class ContigLookup:
         return self.lower_normalized.get(stripped.lower())
 
 
-def resolve_contig_name(contig: str, available: Iterable[str]) -> str | None:
-    """Resolve contig name against available keys with chr-prefix and case fallback."""
-
-    return ContigLookup.from_names(available).resolve(contig)
-
-
 def is_canonical_contig(name: str) -> bool:
     """Report whether a contig is a canonical autosome or sex chromosome.
 
@@ -144,6 +138,5 @@ __all__ = [
     "is_canonical_contig",
     "natural_sort_key",
     "normalize_chr",
-    "resolve_contig_name",
     "select_layout",
 ]

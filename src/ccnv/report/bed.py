@@ -1,25 +1,29 @@
 """Formatted BED generation with single-pass Rust BGZF compression and Tabix/CSI indexing."""
 
+from __future__ import annotations
+
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Final
 
-import numpy as np
 import polars as pl
 
-from ccnv._core import write_bgzf_indexed
 from ccnv.models import SegmentResult, natural_sort_key
 from ccnv.report._common import (
     STREAM_CHUNK_ROWS,
     BinResults,
     ContigBinChunk,
+    bin_chunk_to_dataframe,
     iter_contig_bin_chunks,
+    max_bin_end,
+    max_df_end,
     resolve_natural_contig_bounds,
-    segments_to_dataframe,
+    resolve_segments_dataframe,
     sort_bin_result,
     sort_bin_results,
     sort_segments,
     validate_threads,
+    write_bgzf_atomic,
 )
 
 BED_CHUNK_ROWS: Final[int] = STREAM_CHUNK_ROWS
@@ -115,10 +119,7 @@ def write_bins_bed_streaming(
 ) -> Path:
     """Stream bin evidence in 65,536-row Polars TSV slices to Rust BGZF+Tabix/CSI."""
     validate_threads(threads)
-    record_max = max(
-        (int(np.max(res.ends)) for res in bin_results if res.ends.size > 0),
-        default=0,
-    )
+    record_max = max_bin_end(bin_results)
     contig_names, max_end = resolve_natural_contig_bounds(
         (c for res in bin_results for c in dict.fromkeys(res.contigs)),
         record_max,
@@ -130,27 +131,12 @@ def write_bins_bed_streaming(
         for chunk in iter_contig_bin_chunks(
             bin_results, contig_names, chunk_rows=BED_CHUNK_ROWS
         ):
-            cols: dict[str, object] = {
-                "start": chunk.starts,
-                "end": chunk.ends,
-                "ratio": np.where(
-                    np.isfinite(chunk.ratios), chunk.ratios, np.nan
-                ).astype(np.float64, copy=False),
-                "zscore": np.where(
-                    np.isfinite(chunk.zscores), chunk.zscores, np.nan
-                ).astype(np.float64, copy=False),
-                "weight": np.where(
-                    np.isfinite(chunk.weights), chunk.weights, np.nan
-                ).astype(np.float64, copy=False),
-                "reference_size": chunk.reference_sizes,
-                "masked": chunk.masked,
-            }
-            if isinstance(chunk.branch, str):
-                branch_expr = pl.lit(chunk.branch, dtype=pl.String)
-            else:
-                cols["branch"] = pl.Series("branch", chunk.branch, dtype=pl.String)
-                branch_expr = pl.col("branch")
-            df = pl.DataFrame(cols).select(
+            branch_expr = (
+                pl.lit(chunk.branch, dtype=pl.String)
+                if isinstance(chunk.branch, str)
+                else pl.col("branch")
+            )
+            df = bin_chunk_to_dataframe(chunk).select(
                 pl.lit(chunk.contig, dtype=pl.String).alias("contig"),
                 pl.col("start"),
                 pl.col("end"),
@@ -179,15 +165,14 @@ def write_bins_bed_streaming(
             )
             yield csv_str.encode("utf-8")
 
-    write_bgzf_indexed(
-        str(gz_path),
+    return write_bgzf_atomic(
+        gz_path,
         "bed",
         contig_names,
         max_end,
         _chunks(),
         threads,
     )
-    return gz_path
 
 
 def write_segments_bed_streaming(
@@ -202,19 +187,13 @@ def write_segments_bed_streaming(
 ) -> Path:
     """Stream segment or call records in 65,536-row Polars TSV slices to Rust BGZF+Tabix/CSI."""
     validate_threads(threads)
-    if segments_df is not None and (
-        not is_prenatal or "expected_ratio" in segments_df.columns
-    ):
-        df = (
-            segments_df.filter(pl.col("call").is_not_null())
-            if calls_only and segments_df.get_column("call").null_count() > 0
-            else segments_df
-        )
-    else:
-        items = [
-            s for s in sort_segments(segments) if not calls_only or s.call is not None
-        ]
-        df = segments_to_dataframe(items, is_prenatal=is_prenatal)
+    df = resolve_segments_dataframe(
+        segments,
+        segments_df,
+        calls_only=calls_only,
+        is_prenatal=is_prenatal,
+        sort_natural=True,
+    )
 
     if calls_only:
         header = PRENATAL_CALLS_BED_HEADER if is_prenatal else CALLS_BED_HEADER
@@ -253,12 +232,7 @@ def write_segments_bed_streaming(
         )
 
     out_df = df.select(select_exprs)
-    end_max = out_df.get_column("end").max()
-    record_max = (
-        int(end_max)
-        if isinstance(end_max, int) and not isinstance(end_max, bool)
-        else 0
-    )
+    record_max = max_df_end(out_df)
     contig_names, max_end = resolve_natural_contig_bounds(
         out_df.get_column("contig").unique(maintain_order=True).to_list(),
         record_max,
@@ -278,12 +252,11 @@ def write_segments_bed_streaming(
             )
             yield csv_str.encode("utf-8")
 
-    write_bgzf_indexed(
-        str(gz_path),
+    return write_bgzf_atomic(
+        gz_path,
         "bed",
         contig_names,
         max_end,
         _chunks(),
         threads,
     )
-    return gz_path

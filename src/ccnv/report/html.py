@@ -1,8 +1,13 @@
 """Interactive Plotly WebGL HTML generator with M4 min/max bin decimation."""
 
+from __future__ import annotations
+
 import base64
+import functools
 import json
 import logging
+import os
+import tempfile
 from collections.abc import Sequence
 from importlib.resources import files
 from pathlib import Path
@@ -26,7 +31,7 @@ logger = logging.getLogger(__name__)
 PLOTLY_CDN_URL: Final[str] = "https://cdn.plot.ly/plotly-2.35.2.min.js"
 DEFAULT_MAX_PLOT_BINS: Final[int] = 48_000
 _JINJA_ENV: Final[jinja2.Environment] = jinja2.Environment(
-    autoescape=jinja2.select_autoescape(["html", "j2"]),
+    autoescape=True,
     keep_trailing_newline=True,
 )
 
@@ -36,19 +41,19 @@ __all__ = [
     "decimate_bins_m4",
     "encode_b64",
     "render_genome_plot",
-    "write_genome_plot",
 ]
 
 
 def encode_b64(array: NDArray[np.generic]) -> str:
-    """Encode a contiguous numpy array as base64 ascii string."""
+    """Encode a contiguous NumPy array as a base64 ASCII string."""
     return base64.b64encode(np.ascontiguousarray(array).tobytes()).decode("ascii")
 
 
-def _load_template_source() -> str:
-    """Load the genome plot Jinja2 template."""
+@functools.lru_cache(maxsize=1)
+def _get_template() -> jinja2.Template:
+    """Load and compile the genome plot Jinja2 template once per process."""
     res = files("ccnv.report.templates").joinpath("genome_plot.html.j2")
-    return res.read_text(encoding="utf-8")
+    return _JINJA_ENV.from_string(res.read_text(encoding="utf-8"))
 
 
 def _first_per_bucket(
@@ -158,6 +163,43 @@ def _map_contigs_to_indices(
     return lut[indices_np]
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(text)
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _finite_or_none(val: float | None, ndigits: int | None = None) -> float | None:
+    if val is None:
+        return None
+    f_val = float(val)
+    if not np.isfinite(f_val):
+        return None
+    return round(f_val, ndigits) if ndigits is not None else f_val
+
+
+def _finite_or_zero(val: float | None) -> float:
+    if val is None:
+        return 0.0
+    f_val = float(val)
+    return f_val if np.isfinite(f_val) else 0.0
+
+
 def render_genome_plot(
     path: Path,
     bins: tuple[BinResult, ...],
@@ -246,6 +288,7 @@ def render_genome_plot(
         z_arr = z_arr[keep].astype("<f4", copy=False)
 
     seg_rows: list[list[object]] = []
+    segment_calls: list[str | None] = []
     for s in segments:
         if s.contig not in contig_to_idx or not np.isfinite(s.ratio):
             continue
@@ -294,6 +337,7 @@ def render_genome_plot(
                 ]
             )
         seg_rows.append(row)
+        segment_calls.append(s.call)
 
     band_rows = [
         [contig_to_idx[b.contig], int(b.start), int(b.end), b.name, b.stain]
@@ -306,8 +350,8 @@ def render_genome_plot(
         "sample": title,
         "contigs": list(ordered),
         "lengths": [int(contig_lengths[c]) for c in ordered],
-        "z_thresh": float(z_threshold),
-        "r_thresh": float(ratio_threshold) if ratio_threshold is not None else 0.2,
+        "z_thresh": _finite_or_zero(z_threshold),
+        "r_thresh": _finite_or_zero(ratio_threshold),
         "n_bins": int(c_arr.size),
         "total_bins": total_valid_bins,
         "bins": {
@@ -318,38 +362,41 @@ def render_genome_plot(
             "z": encode_b64(z_arr),
         },
         "segments": seg_rows,
+        "segment_calls": segment_calls,
         "cytobands": band_rows,
     }
     if prenatal_result is not None:
+        raw_eff_ff = (
+            prenatal_result.effective_ff
+            if prenatal_result.effective_ff is not None
+            else prenatal_result.active_ff
+        )
         payload["prenatal"] = {
             "fetal_sex": prenatal_result.fetal_sex,
-            "active_ff": float(prenatal_result.active_ff),
+            "active_ff": _finite_or_none(prenatal_result.active_ff),
+            "effective_ff": _finite_or_none(raw_eff_ff, 6),
             "active_ff_source": prenatal_result.active_ff_source,
-            "ffy": (
-                float(prenatal_result.ffy) if prenatal_result.ffy is not None else None
-            ),
-            "ffx": float(prenatal_result.ffx),
-            "ffa": float(prenatal_result.ffa),
-            "ff_size": (
-                float(prenatal_result.ff_size)
-                if prenatal_result.ff_size is not None
-                else None
-            ),
+            "ffy": _finite_or_none(prenatal_result.ffy),
+            "ffx": _finite_or_none(prenatal_result.ffx),
+            "ffa": _finite_or_none(prenatal_result.ffa),
+            "ff_size": _finite_or_none(prenatal_result.ff_size),
             "sca_call": prenatal_result.sca.call,
             "is_aneuploid": bool(prenatal_result.sca.is_aneuploid),
             "low_ff_warning": bool(prenatal_result.low_ff_warning),
             "warnings": list(prenatal_result.warnings),
         }
-    payload_json = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
-    template_source = _load_template_source()
-    template = _JINJA_ENV.from_string(template_source)
-    html = template.render(
+    payload_json = (
+        json.dumps(payload, separators=(",", ":"), allow_nan=False)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+    html = _get_template().render(
         title=title,
         plotly_cdn_url=PLOTLY_CDN_URL,
         payload_json=payload_json,
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(html, encoding="utf-8")
+    _write_text_atomic(path, html)
     logger.debug(
         "wrote interactive genome HTML plot %s "
         "(%.1f KB, %d/%d bins, %d segments, %d cytobands)",
@@ -360,6 +407,3 @@ def render_genome_plot(
         len(seg_rows),
         len(band_rows),
     )
-
-
-write_genome_plot = render_genome_plot
