@@ -28,26 +28,27 @@ PUBLISHED_BIN_SIZE = 100_000
 
 
 def ensure_published_file(path: Path, url: str) -> Path:
-    """Download ``url`` to ``path`` unless a non-empty file is already cached."""
+    """Download ``url`` to ``path`` unless cached, indexing ``.cram`` files when needed."""
 
-    if path.is_file() and path.stat().st_size > 0:
-        return path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp")
-    try:
-        with (
-            urllib.request.urlopen(url, timeout=120) as response,
-            tmp.open("wb") as handle,
-        ):
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                handle.write(chunk)
-    except urllib.error.URLError as error:
-        tmp.unlink(missing_ok=True)
-        raise unittest.SkipTest(f"could not download {url}: {error}") from error
-    tmp.replace(path)
+    if not (path.is_file() and path.stat().st_size > 0):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.tmp")
+        try:
+            with (
+                urllib.request.urlopen(url, timeout=120) as response,
+                tmp.open("wb") as handle,
+            ):
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+        except urllib.error.URLError as error:
+            tmp.unlink(missing_ok=True)
+            raise unittest.SkipTest(f"could not download {url}: {error}") from error
+        tmp.replace(path)
+    if path.suffix == ".cram" and not Path(f"{path}.crai").is_file():
+        pysam.index(str(path))
     return path
 
 
