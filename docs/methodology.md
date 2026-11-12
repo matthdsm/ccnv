@@ -14,7 +14,7 @@ Every constant, threshold, and model hyperparameter in `ccnv` is classified into
 ```mermaid
 flowchart TD
     S1["1. Spatial Discretization, 24-Band Fragmentomics & Mass-Conserving Rebinning"] --> S2["2. 1 Mb Super-Block DESeq2 Depth Scaling & PoissonRegressor Covariate Correction"]
-    S2 --> S3["3. Cohort Sex Inference (Non-PAR Dosage & MSY Poisson-Beta EM)"]
+    S2 --> S3["3. Cohort Sex Inference (Non-PAR Dosage & MSY Poisson EM)"]
     S3 --> S4["4. Whitened Gavish-Donoho SVHT PCA & Robust HuberRegressor Projection"]
     S4 --> S5["5. Prototype Graph (M <= 2,048) & Smyth Empirical Bayes squeeze_var Nulls"]
     S5 --> S6["6. Vectorized 2D Prototype Normalization & Depth-Decomposed Precision Weighting"]
@@ -47,12 +47,12 @@ $$
 c_j^{\text{tgt}} = \sum_{i=0}^{N-1} w_{ij} c_i^{\text{src}}, \quad w_{ij} = \frac{\max\left(0, \min(e_i^{\text{src}}, e_j^{\text{tgt}}) - \max(s_i^{\text{src}}, s_j^{\text{tgt}})\right)}{e_i^{\text{src}} - s_i^{\text{src}}}
 $$
 
-`ccnv` implements a dual-path rebinning architecture in `src/ccnv/features/cohort.py:rebin_sample_table`:
+`ccnv` implements a dual-path rebinning architecture in `src/ccnv/features/rebinning.py:rebin_sample_buffers` and `src/ccnv/features/binning.py:rebin_counts`:
 
-1. **Exact Contained-Interval Coarsening Fast Path (e.g., $5\text{ kb} \to 100\text{ kb}$)**: When $w_{\text{target}} \gt w_{\text{source}}$, $w_{\text{target}} \equiv 0 \pmod{w_{\text{source}}}$, and every source interval lies inside a single target interval ($\lfloor s_i^{\text{src}} / B_{\text{tgt}} \rfloor = \lfloor (e_i^{\text{src}} - 1) / B_{\text{tgt}} \rfloor$), rebinning executes via a Rust-parallelized Polars `group_by(["contig", (pl.col("start") // target_bin_size) * target_bin_size], maintain_order=True)` expression that aggregates all channels (`count`, `paired_count`, `frag_len_sum`, `short_frag_count`, `endpoint_count`, `frag_gc_sum`, and element-wise summed `frag_bands`).
-2. **General Non-Nested Interval Rebinning**: For non-nested bin grids over contiguous source partitions, `src/ccnv/features/binning.py:rebin_counts` evaluates count redistribution in $O(N + M)$ time by constructing the piecewise-linear cumulative count function $F^{\text{src}}(x) = \sum_{j: e_j \le x} c_j + c_k \frac{x - s_k}{e_k - s_k}$ at knots $\mathbf{x}^{\text{src}} = (s_0^{\text{src}}, e_0^{\text{src}}, \dots, e_{N-1}^{\text{src}})$, interpolating $F^{\text{src}}$ at target knots $\mathbf{x}^{\text{tgt}}$ via `np.interp`, and taking non-negative first differences $c_j^{\text{tgt}} = \max(0, F^{\text{src}}(e_j^{\text{tgt}}) - F^{\text{src}}(s_j^{\text{tgt}}))$ (falling back to two-pointer interval overlap scanning `_redistribute_by_overlap` if source bins contain gaps). Because individual fragment coordinates cannot be recovered across split source intervals, non-nested rebinning zeroes fragmentomic channels, strips `ccnv.fragmentomics` schema metadata, and emits a warning when fragmentomic data was present.
+1. **Exact Contained-Interval Coarsening Fast Path (e.g., $5\text{ kb} \to 100\text{ kb}$)**: When $w_{\text{target}} \gt w_{\text{source}}$ and $w_{\text{target}} \equiv 0 \pmod{w_{\text{source}}}$, `rebin_sample_buffers` coarsens `SampleBuffers` directly via vectorized `np.add.reduceat` slices across contig boundaries, aggregating all 7 channels (`count`, `paired_count`, `frag_len_sum`, `short_frag_count`, `endpoint_count`, `frag_gc_sum`, and element-wise summed `frag_bands`) without constructing intermediate Arrow or DataFrame objects.
+2. **General Non-Nested Interval Rebinning**: For non-nested coarser grids over `SampleBuffers` (`rebin_sample_buffers`) or arbitrary interval partitions (`src/ccnv/features/binning.py:rebin_counts`), count redistribution executes in $O(N + M)$ time by constructing the piecewise-linear cumulative count function $F^{\text{src}}(x) = \sum_{j: e_j \le x} c_j + c_k \frac{x - s_k}{e_k - s_k}$ at knots $\mathbf{x}^{\text{src}} = (s_0^{\text{src}}, e_0^{\text{src}}, \dots, e_{N-1}^{\text{src}})$, interpolating $F^{\text{src}}$ at target knots $\mathbf{x}^{\text{tgt}}$ via `np.interp`, and taking non-negative first differences (falling back to two-pointer interval overlap scanning `_redistribute_by_overlap` in `rebin_counts` if source bins contain gaps). Upsampling a sample sketch to a finer bin width raises `BinCompatibilityError`. Because individual fragment coordinates cannot be recovered across split source intervals, non-nested sample rebinning zeroes fragmentomic channels, clears `ccnv.fragmentomics` metadata, and emits a warning when fragmentomic data was present.
 
-In-memory rebinned sample tables store `count` as `float64` to preserve fractional mass conservation ($\sum_m c_m^{\text{tgt}} = \sum_j c_j^{\text{src}}$), whereas canonical extracted `.ccnv` Parquet files persist raw `count` as `uint32` (`SAMPLE_SCHEMA 2.0.0`).
+General interval count redistribution (`rebin_counts`, `rebin_counts_matrix`) preserves fractional `float64` mass conservation ($\sum_m c_m^{\text{tgt}} = \sum_j c_j^{\text{src}}$), whereas canonical `.ccnv` Parquet files and `SampleBuffers` persist raw `count` as `uint32` (`SAMPLE_SCHEMA 2.0.0`).
 
 ### 1.2 Statistical Assumptions & Failure Modes
 
@@ -78,7 +78,7 @@ In-memory rebinned sample tables store `count` as `float64` to preserve fraction
 
 #### 2.1.1 1 Mb Super-Block DESeq2 Compositional Depth Scaling
 
-Given a raw counts matrix $\mathbf{C} \in \mathbb{R}_{\ge 0}^{B \times S}$ across $B$ bins and $S$ cohort samples (`src/ccnv/features/cohort.py:estimate_size_factors`, `src/ccnv/features/cohort.py:normalize_depth`), naive total-sum division projects sample depths onto the simplex $\Delta^{B-1}$, giving it a 0% breakdown point: any whole-chromosome aneuploidy or focal amplification shifts the total sum denominator and distorts diploid bins (Aitchison, 1982; Robinson & Oshlack, 2010).
+Given a raw counts matrix $\mathbf{C} \in \mathbb{R}_{\ge 0}^{B \times S}$ across $B$ bins and $S$ cohort samples (`src/ccnv/features/cohort.py:estimate_size_factors`, `src/ccnv/stats/superblocks.py:estimate_superblock_scales`), naive total-sum division projects sample depths onto the simplex $\Delta^{B-1}$, giving it a 0% breakdown point: any whole-chromosome aneuploidy or focal amplification shifts the total sum denominator and distorts diploid bins (Aitchison, 1982; Robinson & Oshlack, 2010).
 
 `ccnv` v2 partitions unmasked bins into contiguous $1\text{ Mb}$ ($\max(1{,}000{,}000, 10 B)$) super-blocks ($G \approx 3{,}000$). Cohort super-block sums $B_{g,s}$ are accumulated via `np.add.reduceat`, producing reference block means $\bar{B}_g = \mathrm{mean}_s(B_{g,s})$. DESeq2 median-of-ratios normalization (Anders & Huber, 2010; Love et al., 2014) is evaluated across positive super-blocks:
 
@@ -86,13 +86,13 @@ $$
 s_s = \mathrm{median}_{g: \bar{B}_g \gt 0}\left(\frac{B_{g,s}}{\bar{B}_g}\right)
 $$
 
-Factors are centered to unit median $\mathrm{median}(s_s) = 1.0$ while preserving median library depth. During single-sample prediction (`src/ccnv/predict.py:project_coverage`), test sample counts are scaled over super-blocks against the reference expected baseline:
+Factors are centered to unit median $\mathrm{median}(s_s) = 1.0$ while preserving median library depth. During single-sample prediction (`src/ccnv/features/normalization.py:normalize_sample_branch`), test sample counts are scaled over super-blocks against the reference expected baseline:
 
 $$
 s_{\text{test}} = \mathrm{median}_{g: \bar{\mu}_g \gt 0}\left(\frac{\sum_{i \in g} C_i}{\sum_{i \in g} \hat{\mu}_{0,i}}\right)
 $$
 
-Cohort-level low-coverage masking (`src/ccnv/features/cohort.py:mask_low_coverage`) evaluates normalized coverage per contig: for each contig $c$, bins with normalized rate $T_i / a_i \le 0.05 \cdot \mathrm{median}_{j \in c: T_j \gt 0}(T_j / a_j)$ are masked, ensuring haploid or prenatal sex chromosomes (`chrY`) are never inadvertently masked by autosomal medians.
+Cohort-level low-coverage masking (`src/ccnv/features/cohort.py:mask_low_coverage_per_contig`) evaluates normalized coverage per contig: for each contig $c$, bins with normalized rate $T_i / a_i \le 0.05 \cdot \mathrm{median}_{j \in c: T_j \gt 0}(T_j / a_j)$ are masked, ensuring haploid or prenatal sex chromosomes (`chrY`) are never inadvertently masked by autosomal medians.
 
 #### 2.1.2 Covariate Masking
 
@@ -109,7 +109,7 @@ $$
 
 #### 2.1.3 Zero-Inclusive PoissonRegressor Covariate Bias Correction
 
-`ccnv` models non-linear GC, mappability, and paired-end fragmentomic biases using log-link Poisson generalized linear models (`sklearn.linear_model.PoissonRegressor(alpha=1e-4, max_iter=100)`) in `src/ccnv/stats/regression.py:fit_sample_trend`. When $B \ge 25{,}000$ and $200\text{ bp}$ GC quantile histograms $\mathbf{Q} \in \mathbb{R}^{B \times 8}$ are available from FASTA scanning (`ccnv._core:scan_fasta_gc_quantiles`), $\mathbf{Q}$ forms the GC basis directly; otherwise, quantile B-splines $\mathcal{B}_{\text{GC}}^{(k=5, d=3)}(\mathbf{g})$ are fitted. Together with mappability splines $\mathcal{B}_{\text{map}}^{(k=4, d=2)}(\mathbf{m})$ and cohort reference fragmentomics (`ref_frag_len`, `ref_ep_rate`), the exogenous basis $\mathbf{X}_{\text{cov}}$ avoids endogenous single-sample count feedback.
+`ccnv` models non-linear GC, mappability, and paired-end fragmentomic biases using log-link Poisson generalized linear models (`sklearn.linear_model.PoissonRegressor(alpha=1e-4, max_iter=100)`) in `src/ccnv/stats/regression.py:fit_poisson_covariate_trends`. When $B \ge 25{,}000$ and $200\text{ bp}$ GC quantile histograms $\mathbf{Q} \in \mathbb{R}^{B \times 8}$ are available from FASTA scanning (`ccnv._core:scan_fasta_gc_quantiles`), $\mathbf{Q}$ forms the GC basis directly; otherwise, quantile B-splines $\mathcal{B}_{\text{GC}}^{(k=5, d=3)}(\mathbf{g})$ are fitted. Together with mappability splines $\mathcal{B}_{\text{map}}^{(k=4, d=2)}(\mathbf{m})$ and cohort reference fragmentomics (`ref_frag_len`, `ref_ep_rate`), the exogenous basis $\mathbf{X}_{\text{cov}}$ avoids endogenous single-sample count feedback.
 
 The model is fitted over a deterministic strided grid of up to $65{,}536$ usable bins **including zero-count bins**, winsorizing CNV-amplified outliers above $\mathrm{median} + 3.5 \times \text{MAD}$ across 2 passes:
 
@@ -140,17 +140,17 @@ Multiplicative trend $\hat{t}_i = a_i \exp(\mathbf{x}_i^{\top}\hat{\boldsymbol{\
 
 ---
 
-## 3. Cohort Sex Inference: 2D Non-PAR Dosage & MSY Poisson-Beta EM
+## 3. Cohort Sex Inference: 2D Non-PAR Dosage & MSY Poisson EM
 
 ### 3.1 Mathematical Formulation
 
-#### Germline Mode: 2D Non-PAR Mappable Dosage Separation (`src/ccnv/features/cohort.py:infer_sample_sexes`)
+#### Germline Mode: 2D Non-PAR/XTR Mappable Dosage Separation (`src/ccnv/features/sex.py:infer_germline_sex_2d`)
 
-For each cohort sample, normalized dosage across unmasked non-PAR `chrX` ($d_X$) and `chrY` ($d_Y$) bins is evaluated. The optimal separation hyperplane separates diploid females ($d_X \approx 1.0, d_Y \approx 0.0$) from males ($d_X \approx 0.5, d_Y \approx 0.5$). When samplesheet labels are provided, the inferred cutoff is verified and stored for subsequent prediction.
+For each cohort sample, normalized dosage across unmasked PAR1/PAR2/XTR-excluded `chrX` ($d_X$) and `chrY` ($d_Y$) bins (`par_xtr_mask`) is evaluated against autosomal exposure-adjusted depth. Core female ($d_X \approx 2.0, d_Y \approx 0.0$) and male ($d_X \approx 1.0, d_Y \approx 1.0$) clusters are separated in 2D ploidy space with a $4.5\sigma$ MAD ellipse quarantine gating sex-chromosome aneuploid outliers (`XO`, `XXY`, `XXX`, `XYY`). When samplesheet labels are provided, the inferred cutoff is calibrated on non-quarantined controls and stored for subsequent prediction.
 
-#### Prenatal Mode: MSY Poisson-Beta EM Mixture (`src/ccnv/stats/prenatal_math.py:fit_msy_sex_mixture`)
+#### Prenatal Mode: MSY Poisson EM Mixture (`src/ccnv/stats/prenatal_math.py:fit_msy_sex_mixture`)
 
-In maternal plasma, cell-free `chrY` dosage scales with fetal fraction ($f \in [0.02, 0.30]$). Bins in the male-specific region of the Y chromosome (MSY) with mappability $\ge 0.80$ and female background rate $\le 0.05$ are selected. A 2-component depth-aware Poisson-Beta mixture model is fitted via EM, gated by $\Delta\mathrm{BIC}_{2 \text{ vs } 1} \gt 6.0$, with a quarantine region $p_{\text{male}} \in [0.02, 0.98]$ identifying ambiguous samples.
+In maternal plasma, cell-free `chrY` dosage scales with fetal fraction ($f \in [0.02, 0.30]$). Bins in the male-specific region of the Y chromosome (MSY) with mappability $\ge 0.80$ and female background rate $\le 0.05$ are selected. A 2-component depth-aware Poisson mixture model is fitted via EM, gated by $\Delta\mathrm{BIC}_{2 \text{ vs } 1} \gt 6.0$, with a quarantine region $p_{\text{male}} \in [0.02, 0.98]$ identifying ambiguous samples.
 
 ---
 
@@ -180,7 +180,7 @@ with $P_{\max}(S) = \min(60, \max(5, \lfloor S / 5 \rfloor))$.
 
 #### 4.1.2 Single-Sample Robust PCA Projection via HuberRegressor
 
-During single-sample prediction (`src/ccnv/predict.py:project_coverage`), variance-weighted log residuals are projected onto reference loadings $\mathbf{V}_P$ via unpenalized Huber M-estimation (`HuberRegressor(fit_intercept=False, alpha=0.0, epsilon=1.35)`), reconstructing expected baseline $\hat{\lambda}_i = s_{\text{test}} \hat{t}_i \mu_i \exp(\mathbf{V}_{P, i}^{\top} \hat{\mathbf{c}}) \gt 0$.
+During single-sample prediction (`src/ccnv/stats/pca.py:project_huber_pca_wave`, `src/ccnv/features/normalization.py:normalize_sample_branch`), variance-weighted log residuals are projected onto reference loadings $\mathbf{V}_P$ via unpenalized Huber M-estimation (`HuberRegressor(fit_intercept=False, alpha=0.0, epsilon=1.35)`), reconstructing expected baseline $\hat{\lambda}_i = s_{\text{test}} \hat{t}_i \mu_i \exp(\mathbf{V}_{P, i}^{\top} \hat{\mathbf{c}}) \gt 0$.
 
 ---
 
@@ -192,7 +192,7 @@ During single-sample prediction (`src/ccnv/predict.py:project_coverage`), varian
 
 Rather than storing all pairwise nearest neighbors across hundreds of thousands of bins, `ccnv` builds a compact Prototype Graph (`src/ccnv/stats/neighbors.py:fit_prototype_graph`). Usable bins are embedded into standardized signal-subspace coordinates weighting each principal component by excess signal $\sqrt{\max(0, \sigma_p^2 - \hat{\sigma}_{\text{MP}}^2)/\sigma_1^2}$ alongside standardized GC and mappability.
 
-Bins are partitioned into $M = \min(2048, \max(32, \lfloor U_u / 64 \rfloor))$ prototypes using `sklearn.cluster.MiniBatchKMeans(n_clusters=M, random_state=0, batch_size=8192)`. For each bin $i$, $k=4$ nearest off-contig prototypes $\lbrace \pi_{i,1}, \dots, \pi_{i,4} \rbrace$ are queried via `scipy.spatial.KDTree` with soft inverse-distance weights:
+Bins are partitioned into $M = \min(2048, U_u, \max(8, \lfloor U_u / 64 \rfloor))$ prototypes using `sklearn.cluster.MiniBatchKMeans(n_clusters=M, random_state=0, batch_size=min(8192, max(256, U_u)))`. For each bin $i$, $k=4$ nearest off-contig prototypes $\lbrace \pi_{i,1}, \dots, \pi_{i,4} \rbrace$ are queried via `scipy.spatial.KDTree` with soft inverse-distance weights:
 
 $$
 w_{i,r} = \frac{(d_{i,r} + 10^{-6})^{-1}}{\sum_{m=1}^4 (d_{i,m} + 10^{-6})^{-1}}
@@ -250,13 +250,13 @@ $$
 
 #### 7.1.3 Discrete Integer Copy-Number Bayes Factors
 
-In germline mode, event calling requires $|Z_{\text{BLUE}}| \ge z_{\text{threshold}}$, BH-FDR $q \le 0.05$, and discrete integer copy-state log-Bayes factor $\ln \mathrm{BF}_{CN \ne 2} \gt 2.0$ over $CN \in \{0, 1, 2, 3, 4+\}$ combining segment-level Negative-Binomial count deviance and Anscombe-regularized Gaussian $\log_2$ ratio likelihood against $\mu_{\log_2}(CN; \bar{\lambda}_S) = \log_2((0.5 \cdot CN \cdot \bar{\lambda}_S + 0.5) / (\bar{\lambda}_S + 0.5))$:
+In germline mode, event calling requires $|Z_{\text{BLUE}}| \ge z_{\text{threshold}}$, BH-FDR $q \le 0.05$, and discrete integer copy-state log-Bayes factor $\ln \mathrm{BF}_{CN \ne CN_0} \gt 2.0$ over diploid states $CN \in \{0, 1, 2, 3, 4+\}$ ($CN_0 = 2$) or haploid male sex-chromosome states $CN \in \{0, 1, 2, 3+\}$ ($CN_0 = 1$). When segment observed counts $C_S$ and expected neutral baseline $\hat{\lambda}_S$ are available, $\ln \mathrm{BF}_{CN}$ evaluates the Negative-Binomial count log-likelihood ratio with segment overdispersion $\alpha_S = \max(0, (\ln 2)^2 \sigma_S^2 - \hat{\lambda}_S^{-1})$ (reducing smoothly to the exact Poisson log-likelihood ratio when $\alpha_S = 0$, and falling back to a Gaussian $\log_2$-ratio log-likelihood ratio only when raw counts are absent):
 
 $$
-\ln \mathrm{BF}_{CN} = \left[\ln P_{\text{NB}}\left(C_S \mid \mu = \tfrac{CN}{2}\hat{\lambda}_S, \alpha_S\right) - \ln P_{\text{NB}}\left(C_S \mid \mu = \hat{\lambda}_S, \alpha_S\right)\right] + \left[\ln \mathcal{N}\left(\hat{r}_S \mid \mu_{\log_2}(CN; \bar{\lambda}_S), \sigma_S^2\right) - \ln \mathcal{N}\left(\hat{r}_S \mid 0, \sigma_S^2\right)\right]
+\ln \mathrm{BF}_{CN} = \ln P_{\text{NB}}\left(C_S \mid \mu_k = \frac{CN}{CN_0}\hat{\lambda}_S, \alpha_S\right) - \ln P_{\text{NB}}\left(C_S \mid \mu_0 = \hat{\lambda}_S, \alpha_S\right)
 $$
 
-For homozygous deletions ($CN=0$), counts drop toward zero over the segment ($C_S \approx 0$), yielding decisive log-Bayes factors that detect focal and broad homozygous deletions down to $0.1\times$ sequencing depth.
+Evaluating a single discrete count likelihood avoids double-counting evidence between $C_S$ and $\hat{r}_S$. For homozygous deletions ($CN=0$), counts drop toward zero over the segment ($C_S \approx 0$), yielding decisive log-Bayes factors ($\ln \mathrm{BF}_0 \approx \hat{\lambda}_S$ in the Poisson limit) that detect focal and broad homozygous deletions down to $0.1\times$ sequencing depth.
 
 ---
 
@@ -298,7 +298,7 @@ $$
 
 Sex chromosome aneuploidies (`XX`, `XY`, `XO`, `XXX`, `XXY`, `XYY`, `DISCORDANT_MIXED`) are classified via closed-form erfc Gaussian mixture ray marginalization across the 4D feature vector $(\Delta_X^{\text{trimmed}}, \hat{f}_{\text{FFY}}, \hat{f}_{\text{FFA}}, \hat{f}_{\text{size}})$ paired with a `chrX` fragment-origin likelihood gate.
 
-### 9.2 Correlated Student-$t_4$ IRLS Active FF Fusion
+### 9.2 Precision-Weighted Student-$t_4$ IRLS Active FF Fusion
 
 Concordant estimators are fused into $(\hat{f}_{\text{active}}, \sigma_{f_{\text{active}}})$ via iterative reweighted least squares (IRLS) under a Student-$t_4$ heavy-tailed likelihood, bounding outlier contamination while achieving optimal precision.
 
@@ -346,7 +346,7 @@ Verdict escalation follows severity ordering $\texttt{PASS} (0) \lt \texttt{WARN
 | SVHT coefficients | `(0.56, -0.95, 1.82, 1.43)` | `src/ccnv/stats/pca.py` | Tier 2 | Gavish-Donoho optimal singular value hard threshold polynomial |
 | `pca_components` | `None` (cap `60`) | `src/ccnv/models/config.py` | Tier 2 / Tier 4 | Optional hard cap on principal components per branch (dynamic SVHT when `None`) |
 | `NUM_PROTOTYPES_PER_BIN` ($k$) | `4` | `src/ccnv/models/schemas.py` | Tier 2 / Tier 4 | Nearest off-contig reference prototypes stored per bin in Prototype Graph |
-| `prototype_count` ($M$) | `min(2048, max(32, U // 64))` | `src/ccnv/stats/neighbors.py` | Tier 4 | MiniBatch K-Means prototype count bounding reference graph memory |
+| `prototype_count` ($M$) | `min(2048, U, max(8, U // 64))` | `src/ccnv/stats/neighbors.py` | Tier 4 | MiniBatch K-Means prototype count bounding reference graph memory |
 | `squeeze_var` `d0` bounds | `[1e-8, 1e8]`, cap `1e6` | `src/ccnv/stats/neighbors.py` | Tier 4 | Root-finding bounds for Smyth Empirical Bayes log-variance shrinkage |
 | Flat-FASTA distance weight clamp | `[0.05, 20.0]` | `src/ccnv/features/normalization.py` | Tier 4 | Clamps flat-FASTA inverse-distance weights to bounded dynamic range |
 | `penalty` ($\gamma$) | `1.0` | `src/ccnv/models/config.py` | Tier 2 / Tier 4 | Breakpoint penalty multiplier for mBIC in `ruptures.Pelt` |
@@ -411,8 +411,8 @@ Verdict escalation follows severity ordering $\texttt{PASS} (0) \lt \texttt{WARN
 
 ### 12.2 Python Library & Algorithmic Documentation
 
-- **Polars DataFrames & Expressions**: [Polars Official Documentation](https://docs.pola.rs/), covering [`DataFrame.group_by`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.group_by.html) and [`from_arrow`](https://docs.pola.rs/api/python/stable/reference/api/polars.from_arrow.html).
-- **SciPy Spatial, Signal, & Image Kernels**: [`scipy.spatial.KDTree`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.KDTree.html) (multi-threaded spatial nearest neighbor queries), [`scipy.ndimage.gaussian_filter1d`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.ndimage.gaussian_filter1d.html), and [`scipy.signal.detrend`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.detrend.html).
-- **SciPy Special, Optimization, & Statistical Functions**: [`scipy.special.digamma`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.digamma.html), [`scipy.special.polygamma`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.polygamma.html), [`scipy.special.logit`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.logit.html), [`scipy.special.expit`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.expit.html), [`scipy.special.logsumexp`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.logsumexp.html), [`scipy.optimize.brentq`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.brentq.html), [`scipy.stats.zscore`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.zscore.html), and [`scipy.stats.chi2`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.chi2.html).
-- **Scikit-Learn Estimators & Model Selection**: [`sklearn.linear_model.HuberRegressor`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.HuberRegressor.html), [`sklearn.linear_model.PoissonRegressor`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.PoissonRegressor.html), [`sklearn.linear_model.ElasticNetCV`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.ElasticNetCV.html), [`sklearn.linear_model.RidgeCV`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.RidgeCV.html), [`sklearn.mixture.GaussianMixture`](https://scikit-learn.org/stable/modules/generated/sklearn.mixture.GaussianMixture.html), [`sklearn.preprocessing.SplineTransformer`](https://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.SplineTransformer.html), [`sklearn.decomposition.PCA`](https://scikit-learn.org/stable/modules/generated/sklearn.decomposition.PCA.html), [`sklearn.cluster.MiniBatchKMeans`](https://scikit-learn.org/stable/modules/generated/sklearn.cluster.MiniBatchKMeans.html), [`sklearn.model_selection.KFold`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.KFold.html), and [`sklearn.model_selection.cross_val_predict`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.cross_val_predict.html).
+- **Polars DataFrames & Expressions**: [Polars Official Documentation](https://docs.pola.rs/), covering [`read_csv`](https://docs.pola.rs/api/python/stable/reference/api/polars.read_csv.html), [`DataFrame.with_columns`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.with_columns.html), and [`DataFrame.write_csv`](https://docs.pola.rs/api/python/stable/reference/dataframe/api/polars.DataFrame.write_csv.html).
+- **SciPy Linear Algebra, Spatial, Signal, & Image Kernels**: [`scipy.linalg.svd`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.linalg.svd.html), [`scipy.linalg.eigh`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.linalg.eigh.html), [`scipy.spatial.KDTree`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.KDTree.html) (multi-threaded spatial nearest neighbor queries), [`scipy.ndimage.gaussian_filter1d`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.ndimage.gaussian_filter1d.html), and [`scipy.signal.detrend`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.detrend.html).
+- **SciPy Special, Optimization, & Statistical Functions**: [`scipy.special.digamma`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.digamma.html), [`scipy.special.polygamma`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.polygamma.html), [`scipy.special.gammaln`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.gammaln.html), [`scipy.special.erf`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.erf.html), [`scipy.special.erfc`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.erfc.html), [`scipy.special.log_ndtr`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.log_ndtr.html), [`scipy.special.logit`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.logit.html), [`scipy.special.expit`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.special.expit.html), [`scipy.optimize.brentq`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.brentq.html), [`scipy.optimize.minimize_scalar`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.optimize.minimize_scalar.html), [`scipy.stats.poisson`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.poisson.html), and [`scipy.stats.chi2`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.chi2.html).
+- **Scikit-Learn Estimators & Model Selection**: [`sklearn.linear_model.HuberRegressor`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.HuberRegressor.html), [`sklearn.linear_model.PoissonRegressor`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.PoissonRegressor.html), [`sklearn.linear_model.ElasticNetCV`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.ElasticNetCV.html), [`sklearn.linear_model.RidgeCV`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.RidgeCV.html), [`sklearn.preprocessing.SplineTransformer`](https://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.SplineTransformer.html), [`sklearn.decomposition.PCA`](https://scikit-learn.org/stable/modules/generated/sklearn.decomposition.PCA.html), [`sklearn.cluster.MiniBatchKMeans`](https://scikit-learn.org/stable/modules/generated/sklearn.cluster.MiniBatchKMeans.html), [`sklearn.model_selection.KFold`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.KFold.html), and [`sklearn.utils.extmath.svd_flip`](https://scikit-learn.org/stable/modules/generated/sklearn.utils.extmath.svd_flip.html).
 - **Ruptures Change-Point Solvers**: [`ruptures.Pelt`](https://centre-borelli.github.io/ruptures-docs/user-guide/detection/pelt/) and [`ruptures.KernelCPD`](https://centre-borelli.github.io/ruptures-docs/user-guide/detection/kernelcpd/).

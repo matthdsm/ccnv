@@ -17,12 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Depth-decomposed biological overdispersion (`bio_dispersion`) separating Poisson shot noise from technical dispersion using Smyth Empirical Bayes shrinkage (`squeeze_var`).
 - Calibrated `ruptures.Pelt` change-point segmentation with modified BIC (mBIC) penalty $`\beta_c = \gamma \cdot 2 \hat{\kappa}_c \ln(\max(U_{\text{block}}, 3))`$.
 - Multi-scale dyadic BLUE segment Z-scores ($`Z_{\text{BLUE}}`$) with spatial variance inflation $`\hat{\kappa}_c(L)`$ across dyadic block scales $`L \in \lbrace 1, 4, 16, 64, 256, 1024 \rbrace`$.
-- Discrete integer copy-number Bayes factors ($`\ln \mathrm{BF}_{CN \ne 2} \gt 2.0`$) over $`CN \in \lbrace 0, 1, 2, 3, 4+\rbrace`$ combining segment Negative-Binomial count deviance and Anscombe-regularized Gaussian log-ratio likelihood, detecting homozygous deletions ($`CN=0`$) down to $`0.1\times`$ sequencing depth.
+- Discrete integer copy-number Bayes factors ($`\ln \mathrm{BF}_{CN \ne CN_0} \gt 2.0`$) over diploid ($`CN \in \lbrace 0, 1, 2, 3, 4+\rbrace`$) and haploid sex-chromosome ($`CN \in \lbrace 0, 1, 2, 3+\rbrace`$) states using segment Negative-Binomial/Poisson count log-likelihood ratios (with Gaussian log-ratio fallback when counts are absent), detecting homozygous deletions ($`CN=0`$) down to $`0.1\times`$ sequencing depth.
 - Closed-form Poisson MLE for MSY fetal fraction (`FFY`) with analytical standard error propagation.
 - Forward-calibrated $`R_X`$ baseline regression across euploid `XX` ($`f=0`$) and `XY` ($`f=\hat{f}_{\text{FFY}}`$) control cohorts.
 - Reference-side 24-band Fisher read weighting ($`w^{\ast}_{0.08}`$) pre-applied during reference construction, eliminating test-time baseline distortions.
 - 4D closed-form erfc Gaussian mixture ray-marginalized sex chromosome aneuploidy (SCA) classifier with `chrX` fragment-origin likelihood gating.
-- Correlated Student-$`t_4`$ IRLS multi-modal active fetal fraction fusion (`active_ff`).
+- Precision-weighted Student-$`t_4`$ IRLS multi-modal active fetal fraction fusion (`active_ff`).
 - 5-state self-referenced coupled depth + Dirichlet-Multinomial origin engine (`FETAL_CONSTITUTIONAL`, `PLACENTAL_MOSAIC`, `MATERNAL_UNINHERITED`, `MATERNAL_AND_FETAL_INHERITED`, `MATERNAL_MOSAIC`, with `INDETERMINATE` when max posterior $`\lt 0.80`$).
 - Multi-architecture `abi3` release wheel matrix in GitHub Actions across `ubuntu-latest` (`x86_64`), `ubuntu-24.04-arm` (`aarch64`), and `macos-latest` (`arm64`), plus `sdist`.
 - Slim production Dockerfile copying compiled Rust crates and stripping build artifacts (`rustlib`, `rustc`, `cargo`) before production image packaging.

@@ -106,7 +106,7 @@ jobs:
           cache: true
           frozen: true
       - name: Build wheel
-        run: pixi run maturin build --release --out dist
+        run: pixi run maturin build --release --target ${{ matrix.target }} --out dist
       - name: Build sdist
         if: matrix.sdist
         run: pixi run maturin sdist --out dist

@@ -28,7 +28,7 @@ dependencies = [
     "polars-runtime-compat",
     "pyarrow",
     "pyyaml>=6.0",
-    "ruptures",
+    "ruptures>=1.1.10",
     "scikit-learn",
     "scipy",
     "typer",
@@ -58,7 +58,6 @@ polars = ">=2,<3"
 polars-runtime-compat = "*"
 pyarrow = "*"
 python = "3.14.*"
-ruptures = "*"
 scikit-learn = "*"
 scipy = "*"
 typer = "*"

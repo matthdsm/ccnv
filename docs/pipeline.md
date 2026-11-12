@@ -59,11 +59,11 @@ flowchart TD
     InputArg["Input: --samplesheet or --fasta"] --> ModeDecision{"Single FASTA provided?"}
     ModeDecision -- Yes --> FlatMode["Flat Mode: uniform depth + FASTA GC & N-masking"]
     ModeDecision -- No --> CohortMode["Cohort Mode: load & validate sample Parquets from samplesheet"]
-    CohortMode --> RebinCheck["Rebin in memory via Polars integer fast-path or cumulative knots"]
+    CohortMode --> RebinCheck["Rebin in memory via vectorized NumPy reduceat or cumulative knots"]
     FlatMode --> CovTrack["Load optional --gc & --mappability tracks via noodles/bigtools"]
     RebinCheck --> CovTrack
     CovTrack --> DepthNorm["1 Mb super-block DESeq2 size factors, per-contig coverage masking & 200 bp PoissonRegressor GC correction"]
-    DepthNorm --> SexInference["Infer sex from non-PAR dosage or prenatal MSY Poisson-Beta EM"]
+    DepthNorm --> SexInference["Infer sex from non-PAR dosage or prenatal MSY Poisson EM"]
     SexInference --> BranchPartition["Build autosomal, female_sex, and male_sex branches"]
     BranchPartition --> FitPCA["Fit whitened Gavish-Donoho SVHT PCA & subtract systemic bias"]
     FitPCA --> FitPrototypes["Build compact Prototype Graph (M <= 2,048) & query k=4 nearest prototypes"]

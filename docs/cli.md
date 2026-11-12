@@ -74,7 +74,7 @@ ccnv reference --fasta GENOME.fa --prefix PREFIX [--bin-size N]
 
 ```mermaid
 flowchart LR
-    A["Samplesheet (.yaml/.json) or FASTA"] --> B["Validation & Polars Rebinning"]
+    A["Samplesheet (.yaml/.json) or FASTA"] --> B["Validation & In-Memory Rebinning"]
     B --> C["DESeq2 Depth Scaling & Poisson Covariate Normalization"]
     C --> D["Sex Inference & Branching"]
     D --> E["Gavish-Donoho SVHT PCA Decomposition"]
@@ -109,7 +109,7 @@ ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
 | `SAMPLE` | required | Input BAM, CRAM (requires `--fasta`), or sample `.ccnv` Parquet file. |
 | `REFERENCE` | required | Reference `.ccnv` file from `reference`. |
 | `--mode` | `germline` | Prediction mode: `germline` (standard diploid CNV analysis) or `prenatal` (joint CNV, Student-$t_4$ IRLS precision-fused fetal fraction, reference-side 24-band Fisher read weighting, 4D erfc ray-marginalized SCA, ratio-based segment discordance, and 5-state self-referenced origin calling). |
-| `--prefix` | sample stem | Output path prefix. |
+| `-o`, `--prefix` | sample stem | Output path prefix. |
 | `-t`, `--threads` | CPU count | Total CPU budget for alignment streaming, projection, and segmentation. |
 | `--sex` | `autosomal` | Branch selection: `autosomal` (infers sex when sex branches exist), `female`, or `male`. (In `prenatal` mode, `chrX` is always normalized against the diploid `XX` female branch). |
 | `--penalty` | `1.0` | Breakpoint penalty multiplier $\gamma$ for mBIC segmentation over euchromatic arm blocks. |
@@ -133,7 +133,7 @@ Prediction outputs:
 - `<prefix>_bins.bed.gz` (`.tbi` or `.csi`) and optional `<prefix>_bins.vcf.gz` (`.tbi` or `.csi`): Per-bin $\log_2$ ratio, z-score, precision weight, reference bin count, mask status, and branch (`.csi` index emitted automatically when any contig exceeds $512\text{ Mb}$).
 - `<prefix>_segments.bed.gz` (`.tbi` or `.csi`) and `<prefix>_segments.vcf.gz` (`.tbi` or `.csi`): Segmented intervals with weighted mean $\log_2$ ratio, BLUE z-score, weight, bin count, and call. In `prenatal` mode, BED tables append `expected_ratio`, `implied_ff`, `discordant`, `discordance_reason`, `frag_short_ratio`, `frag_llr_size`, and `origin_call`, and VCF files add `INFO` tags (`DISCORDANT`, `DISC_REASON`, `FRAG_SHORT_R`, `FRAG_LLR`, `ORIGIN`, `MOSAIC_FRAC`), `FORMAT` fields (`EXP_LOG2R`, `IMPLIED_FF`), and header metadata (`##fetalSex`, `##fetalFraction`, `##scaCall`).
 - `<prefix>_calls.bed.gz` (`.tbi` or `.csi`) and `<prefix>_calls.vcf.gz` (`.tbi` or `.csi`): Called `gain` and `loss` segments only (encoded as `<DUP>` and `<DEL>` in VCFv4.2, including prenatal columns and tags in `prenatal` mode).
-- `<prefix>_qc.json`: Prediction quality metrics covering effective target contig reads and `lambda_gc`, CNV summary, sample `fragmentomics` metrics (`paired_end`, `total_paired_fragments`, `chromatosome_mode_bp`, `core_shoulder_bp`, `sizing_shift_bp`, `self_referenced_peak_ratio`, `dinucleosome_fraction`, `high_mw_fraction`, `helical_10bp_amplitude`, `motif_diversity_score`, and warnings such as `WARN_HIGH_LEUKOCYTE_DNA`), and, in `prenatal` mode, `fetal_sex`, `active_ff`, `active_ff_se`, `active_ff_source`, `sca`, `ffy`, `ffa`, `ffx`, `ff_size`, `chrx_ratio`, `chry_score`, `yfrac_threshold`, `low_ff_warning`, `origin_summary`, `lod_ff_35mb`, `lod_ff_3mb`, and `warnings`.
+- `<prefix>_qc.json`: Prediction quality metrics covering effective target contig reads and `lambda_gc`, CNV summary, sample `fragmentomics` metrics (`paired_end`, `total_paired_fragments`, `chromatosome_mode_bp`, `core_shoulder_bp`, `sizing_shift_bp`, `self_referenced_peak_ratio`, `dinucleosome_fraction`, `high_mw_fraction`, `helical_10bp_amplitude`, `motif_diversity_score`, and warnings such as `WARN_HIGH_LEUKOCYTE_DNA`), and, in `prenatal` mode, `fetal_sex`, `active_ff`, `effective_ff`, `active_ff_se`, `active_ff_source`, `sca`, `ffy`, `ffa`, `ffx`, `ff_size`, `chrx_ratio`, `chry_score`, `yfrac_threshold`, `low_ff_warning`, `origin_summary`, `lod_ff_35mb`, `lod_ff_3mb`, and `warnings`.
 - `<prefix>_plot.html`: Interactive Plotly WebGL genome-wide copy-number profile with pan/zoom, coordinate/cytoband search, configurable Z-score and $\log_2$ ratio threshold color-coding, optional cytoband ideogram track, and, in `prenatal` mode, prenatal status banner (`FF (Y/A/X/Size)`), fetal fraction reference lines, fragmentomic origin hover fields, and high-contrast purple `#9333ea` discordant segment overlays.
 
 ```mermaid
