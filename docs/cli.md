@@ -61,9 +61,8 @@ ccnv reference --fasta GENOME.fa --prefix PREFIX [--bin-size N]
 | `--sex-contig` | `X,Y,chrX,chrY` | Sex contig name (repeatable). Intersected with sample contigs in cohort mode; cleared into `autosomal` in flat `--fasta` mode unless explicitly passed. |
 | `--sex-signal-contig` | `chrY` | Contig coverage fraction used to infer male vs. female samples (falls back to `Y`). |
 | `--sex-cutoff` | inferred | Coverage fraction threshold on `--sex-signal-contig` above which samples are classified as male. |
-| `--pca-components` | `5` | Maximum number of principal components per branch (optimal rank selected dynamically via Gavish-Donoho SVHT). |
-| `--nearest-bins` | `300` | Target neighbor pool scale for QC and reference scaling; the Prototype Graph ($M \le 2{,}048$) persists a fixed $k=4$ nearest off-contig prototypes per bin (`NUM_PROTOTYPES_PER_BIN = 4`). |
-| `--max-batch-memory-mb` | `256` | Memory cap (MiB) for batched pairwise distance calculation. |
+| `--pca-components` | unset | Optional maximum number of principal components per branch (when omitted, optimal rank up to `60` is selected dynamically via Gavish-Donoho SVHT). |
+| `--max-batch-memory-mb` | `256` | Memory cap (MiB) before cohort count matrices spill to temporary memory-mapped files. |
 | `--min-cohort-size` | `10` | Minimum control samples required for the autosomal branch. |
 | `--min-sex-group-size` | `5` | Minimum samples per sex required to build a sex-specific branch. |
 | `--mappability` | unset | Mappability BigWig track (`.bw`/`.bigWig`) for masking and per-sample bias normalization. |

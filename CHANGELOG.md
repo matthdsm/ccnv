@@ -32,12 +32,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Replaced Python/pysam alignment streaming with compiled Rust multi-threaded tile scanner.
 - Replaced $`k=300`$ `KDTree` all-bin nearest neighbor search with compact Prototype Graph ($`M \le 2{,}048`$, $`k=4`$).
 - Replaced greedy `Binseg` default with calibrated `ruptures.Pelt` + mBIC.
-- Replaced single-sample runtime Fisher weight scaling with reference-side 24-band weighting.
+- Replaced single-sample runtime Fisher weight scaling with reference-side 24-band weighting ($`w^{\ast}_{0.08}`$) applied consistently across prenatal cohort CNV reference branches and sample prediction.
+- Updated `--pca-components` (`ReferenceConfig.pca_components`) to default to `None` (dynamic Gavish-Donoho SVHT rank selection up to `60`) while treating explicit integer values as hard upper caps.
+- Canonicalized in-memory sample representation on `SampleBuffers`, unified 17-column reference branch assembly on `BranchFitArrays` and `assemble_reference_table`, and consolidated single-pass FASTA GC and 200 bp GC quantile scanning in `load_gc_track`.
 - Updated prenatal sex chromosome aneuploidy classification from 2D Mahalanobis $`\chi^2`$ gate to 4D erfc ray marginalization.
 - Upgraded sample and reference storage contract from `1.0.0` to `2.0.0`.
 
 ### Removed
 
 - Removed runtime dependencies on `pysam`, `pybigwig`, and `samtools` from production environment.
-- Removed legacy `align_reference_to_weighted_sample` function.
+- Removed deprecated `--nearest-bins` CLI flag and positional `ccnv reference` sample arguments in favor of `--samplesheet` and `--fasta`.
+- Removed legacy `align_reference_to_weighted_sample` function and unused v1 kNN, `Binseg`, Stouffer, and B-spline helpers.
 - Removed legacy `fragment_lengths: list<uint16>` and `nearest_ref_indices: list<int32>` schema columns.

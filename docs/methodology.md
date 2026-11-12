@@ -339,14 +339,13 @@ Verdict escalation follows severity ordering $\texttt{PASS} (0) \lt \texttt{WARN
 | `_MAX_N_FRACTION` | `0.5` | `src/ccnv/io/tracks.py` | Tier 3 / Tier 4 | Masks bins with $\gt 50$% ambiguous reference bases (`N`) |
 | `_MASK_FRACTION` | `0.05` | `src/ccnv/features/cohort.py` | Tier 2 / Tier 4 | Masks bins with $\le 5$% of positive median contig coverage |
 | `PoissonRegressor` `alpha` | `1e-4` | `src/ccnv/stats/regression.py` | Tier 1 | L2 penalty for zero-inclusive log-link Poisson covariate regression |
-| `HuberRegressor` `epsilon` | `1.35` | `src/ccnv/stats/regression.py`, `predict.py` | Tier 1 | 95% Gaussian asymptotic efficiency in M-estimation |
+| `HuberRegressor` `epsilon` | `1.35` | `src/ccnv/stats/pca.py` | Tier 1 | 95% Gaussian asymptotic efficiency in M-estimation |
 | Trend clamp | `[0.20, 5.0]` | `src/ccnv/stats/regression.py` | Tier 4 | Bounds multiplicative covariate correction to at most $5\times$ |
 | `min_cohort_size` | `10` | `src/ccnv/models/config.py` | Tier 2 / Tier 4 | Minimum control samples required to fit reference PCA and prototype graphs |
 | `min_sex_group_size` | `5` | `src/ccnv/models/config.py` | Tier 2 / Tier 4 | Minimum samples per sex required to build `female_sex` / `male_sex` branches |
 | SVHT coefficients | `(0.56, -0.95, 1.82, 1.43)` | `src/ccnv/stats/pca.py` | Tier 2 | Gavish-Donoho optimal singular value hard threshold polynomial |
-| `pca_components` | `5` | `src/ccnv/models/config.py` | Tier 2 / Tier 4 | Maximum principal components per branch |
+| `pca_components` | `None` (cap `60`) | `src/ccnv/models/config.py` | Tier 2 / Tier 4 | Optional hard cap on principal components per branch (dynamic SVHT when `None`) |
 | `NUM_PROTOTYPES_PER_BIN` ($k$) | `4` | `src/ccnv/models/schemas.py` | Tier 2 / Tier 4 | Nearest off-contig reference prototypes stored per bin in Prototype Graph |
-| `nearest_bins` | `300` | `src/ccnv/models/config.py` | Tier 2 / Tier 4 | Reference neighbor scaling parameter |
 | `prototype_count` ($M$) | `min(2048, max(32, U // 64))` | `src/ccnv/stats/neighbors.py` | Tier 4 | MiniBatch K-Means prototype count bounding reference graph memory |
 | `squeeze_var` `d0` bounds | `[1e-8, 1e8]`, cap `1e6` | `src/ccnv/stats/neighbors.py` | Tier 4 | Root-finding bounds for Smyth Empirical Bayes log-variance shrinkage |
 | Flat-FASTA distance weight clamp | `[0.05, 20.0]` | `src/ccnv/features/normalization.py` | Tier 4 | Clamps flat-FASTA inverse-distance weights to bounded dynamic range |

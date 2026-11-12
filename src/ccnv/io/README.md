@@ -9,12 +9,11 @@ The `ccnv.io` package manages external format ingestion, genomic track loading, 
 - [`alignments.py:alignment_format`](./alignments.py): Maps `.bam` / `.cram` file suffixes to lowercase `"bam"` or `"cram"` (raising `ValueError` otherwise).
 - [`alignments.py:read_alignment_header`](./alignments.py): Extracts `(contig_names, contig_lengths)` tuples from an alignment header via `ccnv._core`.
 - [`alignments.py:scan_alignment_bins`](./alignments.py): Streams filtered 1D read starts or full paired-end/single-end fragmentomic channels (dyad midpoints, clamped insert lengths, 24-band distributions, endpoints, GC fractions, $`5'`$ 4-mer motifs, and 1-bp histograms) across contigs.
-- [`parquet.py:write_sample_parquet`](./parquet.py) & [`read_sample_parquet`](./parquet.py): Persist and validate 7-column coordinate-free `SAMPLE_SCHEMA` `.ccnv` Parquet files (`count`, `paired_count`, `frag_len_sum`, `short_frag_count`, `endpoint_count`, `frag_gc_sum`, `frag_bands`, plus `ccnv.*` metadata).
-- [`parquet.py:read_sample_tables`](./parquet.py), [`extract_sample_meta_and_counts`](./parquet.py), & [`load_cohort`](./parquet.py): Load and validate sample Parquet metadata (`ccnv.artifact_kind == "sample"`) and assemble synchronized `Cohort` buffers (parallelized across worker threads when `threads > 1`).
+- [`parquet.py:write_sample_parquet`](./parquet.py), [`read_sample_parquet`](./parquet.py), & [`read_sample_buffers`](./parquet.py): Persist and validate 7-column coordinate-free `SAMPLE_SCHEMA` `.ccnv` Parquet files (`count`, `paired_count`, `frag_len_sum`, `short_frag_count`, `endpoint_count`, `frag_gc_sum`, `frag_bands`, plus `ccnv.*` metadata) and decode zero-copy `SampleBuffers`.
 - [`parquet.py:write_reference_parquet`](./parquet.py) & [`read_reference_parquet`](./parquet.py): Persist and validate 17-column multi-branch `REFERENCE_SCHEMA` `.ccnv` Parquet files with per-branch row groups.
 - [`samplesheet.py:load_samplesheet`](./samplesheet.py): Parses root-list YAML/JSON samplesheets and validates entries (`filepath`, optional `sex` in `{"F", "M"}`, optional `ff` in `(0.0, 1.0]`) against `samplesheet.schema.json`.
 - [`tracks.py:read_fasta_contigs`](./tracks.py): Reads ordered `(name, length)` pairs from an indexed FASTA file via `noodles-fasta` (`ccnv._core`).
-- [`tracks.py:load_gc_track`](./tracks.py): Loads per-bin GC proportions and high-N masks from FASTA (`ccnv._core`), BigWig (`bigtools`), or tabular tracks.
+- [`tracks.py:load_gc_track`](./tracks.py): Loads per-bin GC proportions, high-N masks, and 200 bp GC quantiles in a single pass from FASTA (`ccnv._core`), BigWig (`bigtools`), or tabular tracks.
 - [`tracks.py:load_mappability_track`](./tracks.py): Loads per-bin mappability scores from BigWig tracks via `bigtools` in `ccnv._core` (validating finite values lie in `[0.0, 1.0]`).
 - [`tracks.py:load_cytobands_track`](./tracks.py): Loads UCSC cytoband intervals and Giemsa stain labels from `.txt`/`.bed`/`.tsv` (plain or `.gz`) files.
 
@@ -28,7 +27,6 @@ The `ccnv.io` package manages external format ingestion, genomic track loading, 
 ## Side Effects
 
 - [`parquet.py:write_sample_parquet`](./parquet.py) & [`write_reference_parquet`](./parquet.py): Create parent directories and write Zstandard-compressed Parquet files.
-- [`parquet.py:load_cohort`](./parquet.py): Spawns worker threads during parallel sample loading.
 
 ## Verification
 

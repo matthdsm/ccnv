@@ -11,7 +11,7 @@ flowchart TD
         B --> C["ccnv.models.schemas: SAMPLE_SCHEMA Parquet (.ccnv)"]
     end
     subgraph ReferenceModeling["Cohort & Reference Modeling"]
-        C --> D["ccnv.io.parquet: load_cohort & ccnv.features.cohort: estimate_superblock_size_factors"]
+        C --> D["ccnv.features.cohort: load_and_assemble_cohort & estimate_superblock_size_factors"]
         D --> E["ccnv.features.covariates: fit_poisson_covariate_trends"]
         E --> F["ccnv.stats.pca: fit_whitened_pca (Whitened SVHT PCA)"]
         F --> G["ccnv.stats.neighbors: fit_prototype_graph (M <= 2,048)"]
@@ -27,7 +27,7 @@ flowchart TD
     end
     subgraph Reporting["Artifact Generation"]
         L --> M["ccnv.report: write_outputs (BED.gz / VCF.gz / Tabix via ccnv._core)"]
-        L --> N["ccnv.report.html: write_genome_plot (_plot.html) & ccnv.qc.predict: write_predict_qc_json"]
+        L --> N["ccnv.report.html: write_genome_plot_streaming (_plot.html) & ccnv.qc.predict: write_predict_qc_json"]
     end
 ```
 
@@ -87,9 +87,9 @@ Contigs are pre-split at masked gaps $`\gt 2\text{ Mb}`$ into contiguous euchrom
 ## Side Effects
 
 - [`extract.py`](./extract.py) & [`io/alignments.py`](./io/alignments.py): Streams BAM/CRAM handles via compiled Rust `ccnv._core`.
-- [`io/parquet.py`](./io/parquet.py): Spawns worker threads during parallel `load_cohort` and writes Zstandard-compressed Parquet files.
+- [`features/cohort.py:load_and_assemble_cohort`](./features/cohort.py) & [`io/parquet.py`](./io/parquet.py): Spawn worker threads during parallel cohort streaming and write Zstandard-compressed Parquet files.
 - [`reference.py`](./reference.py), [`ref_qc.py`](./ref_qc.py), & [`predict.py`](./predict.py): Write `<prefix>_qc.json` payloads and emit reference QC usability verdicts to `sys.stderr`.
-- [`report/__init__.py:write_outputs`](./report/__init__.py) & [`report/html.py:write_genome_plot`](./report/html.py): Write single-pass bgzipped/tabix-indexed BED and VCF deliverables via `ccnv._core` and standalone HTML viewer `<prefix>_plot.html`.
+- [`report/__init__.py:write_outputs`](./report/__init__.py) & [`report/html.py:write_genome_plot_streaming`](./report/html.py): Write single-pass bgzipped/tabix-indexed BED and VCF deliverables via `ccnv._core` and standalone HTML viewer `<prefix>_plot.html`.
 
 ## Verification
 
