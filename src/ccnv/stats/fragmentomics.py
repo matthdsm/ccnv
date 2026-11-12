@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import math
-import warnings
 from typing import Final
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy import ndimage, optimize, signal
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.linear_model import ElasticNetCV, RidgeCV
 from sklearn.model_selection import KFold
 
 from ccnv._core import FRAG_BAND_EDGES
 from ccnv.models.schemas import FragmentomicsMetadata, PrenatalModelMetadata
+from ccnv.stats.regression import fit_logit_linear_ensemble
 
 FRAG_MIN_LEN: Final[int] = 30
 FRAG_MAX_LEN: Final[int] = 600
@@ -33,13 +31,13 @@ _BASE_MAP: Final[dict[int, int]] = {
 }
 
 _COMP_BASE_MAP: Final[dict[int, int]] = {
-    ord("A"): 3,  # comp is T
+    ord("A"): 3,
     ord("a"): 3,
-    ord("C"): 2,  # comp is G
+    ord("C"): 2,
     ord("c"): 2,
-    ord("G"): 1,  # comp is C
+    ord("G"): 1,
     ord("g"): 1,
-    ord("T"): 0,  # comp is A
+    ord("T"): 0,
     ord("t"): 0,
 }
 
@@ -53,7 +51,6 @@ def encode_kmer_4(seq: str | bytes, reverse_complement: bool = False) -> int | N
     mapping = _COMP_BASE_MAP if reverse_complement else _BASE_MAP
 
     if reverse_complement:
-        # Reverse complement of s[0]s[1]s[2]s[3] is comp(s[3]) comp(s[2]) comp(s[1]) comp(s[0])
         b0 = mapping.get(raw_bytes[3])
         b1 = mapping.get(raw_bytes[2])
         b2 = mapping.get(raw_bytes[1])
@@ -90,7 +87,6 @@ def compute_motif_diversity_score(motif_counts: NDArray[np.number]) -> float:
 def compute_helical_periodicity(hist: NDArray[np.number]) -> tuple[float, float]:
     """Evaluate 10.4 bp helical cleavage periodicity via DFT in the sub-nucleosomal band."""
     h = np.asarray(hist, dtype=np.float64)
-    # Band [80, 155] bp corresponds to indices [80 - 30, 155 - 30] = [50, 125]
     idx_start = 80 - FRAG_MIN_LEN
     idx_end = 155 - FRAG_MIN_LEN
     if len(h) < idx_end + 1:
@@ -103,12 +99,10 @@ def compute_helical_periodicity(hist: NDArray[np.number]) -> tuple[float, float]
     p = h / total
     sub_p = p[idx_start : idx_end + 1]
 
-    # Detrend linear background
     detrended = signal.detrend(sub_p)
     lengths = np.arange(80, 156, dtype=np.float64)
     f_helix = 1.0 / 10.4
 
-    # Discrete Fourier component at f_helix
     fourier_comp = np.sum(detrended * np.exp(-2.0j * np.pi * f_helix * lengths))
     amp = float(np.abs(fourier_comp) * (2.0 / len(sub_p)))
     phase = float(np.angle(fourier_comp))
@@ -123,7 +117,6 @@ def align_histogram(hist: NDArray[np.number], shift_bp: float) -> NDArray[np.flo
 
     n = len(h)
     x = np.arange(n, dtype=np.float64)
-    # Target index x samples from source index x + shift_bp (shifting by +shift_bp moves peak to lower index)
     aligned = np.interp(x + shift_bp, x, h, left=0.0, right=0.0)
 
     total_orig = np.sum(h)
@@ -167,16 +160,13 @@ def estimate_sample_landmarks(
             end_motif_counts=motifs.tolist(),
         )
 
-    # Gaussian smoothing with sigma=2.0 bins
     smoothed = ndimage.gaussian_filter1d(auto.astype(np.float64), sigma=2.0)
 
-    # Chromatosome mode search in [155, 180] bp -> indices [125, 150]
     idx_155 = 155 - FRAG_MIN_LEN
     idx_180 = 180 - FRAG_MIN_LEN
     local_argmax = int(np.argmax(smoothed[idx_155 : idx_180 + 1]))
     peak_idx = idx_155 + local_argmax
 
-    # Parabolic sub-bin interpolation
     if 0 < peak_idx < len(smoothed) - 1:
         y0 = smoothed[peak_idx - 1]
         y1 = smoothed[peak_idx]
@@ -193,24 +183,20 @@ def estimate_sample_landmarks(
     chrom_mode = float(np.clip(FRAG_MIN_LEN + sub_bin, 155.0, 180.0))
     sizing_shift = float(chrom_mode - CANONICAL_CHROMATOSOME_BP)
 
-    # Core shoulder search in [135, 150] bp -> indices [105, 120]
     idx_135 = 135 - FRAG_MIN_LEN
     idx_150 = 150 - FRAG_MIN_LEN
     core_argmax = int(np.argmax(smoothed[idx_135 : idx_150 + 1]))
     core_shoulder = float(FRAG_MIN_LEN + idx_135 + core_argmax)
 
-    # Self-referenced peak ratio: sum[135..150] / sum[160..175]
     idx_160 = 160 - FRAG_MIN_LEN
     idx_175 = 175 - FRAG_MIN_LEN
     sum_core = float(np.sum(auto[idx_135 : idx_150 + 1]))
     sum_chrom = float(np.sum(auto[idx_160 : idx_175 + 1]))
     self_ref_ratio = float(sum_core / max(sum_chrom, 1.0))
 
-    # High MW fraction: sum[250..600] / total
     idx_250 = 250 - FRAG_MIN_LEN
     high_mw = float(np.sum(auto[idx_250:]) / max(total_paired, 1))
 
-    # Dinucleosome fraction: sum[280..380] / total
     idx_280 = 280 - FRAG_MIN_LEN
     idx_380 = 380 - FRAG_MIN_LEN
     dinucl = float(np.sum(auto[idx_280 : idx_380 + 1]) / max(total_paired, 1))
@@ -247,11 +233,7 @@ def deconvolve_fetal_maternal_em(
     smooth_sigma: float = 1.2,
     em_steps: int = 8,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Cohort deconvolution of pure fetal and maternal cfDNA fragment length densities.
-
-    Employs exposure-scaled female background subtraction on chrY, pure maternal baseline
-    recovery via male algebraic subtraction, and coupled Poisson-EM iterations.
-    """
+    """Cohort deconvolution of pure fetal and maternal cfDNA fragment length densities."""
     lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
     auto = np.asarray(hist_auto, dtype=np.float64)
     chry = np.asarray(hist_chry, dtype=np.float64)
@@ -265,7 +247,6 @@ def deconvolve_fetal_maternal_em(
         param_m = np.exp(-0.5 * ((lengths - 166.0) / 12.0) ** 2)
         return param_f / np.sum(param_f), param_m / np.sum(param_m)
 
-    # 1. Initial pure fetal density p_F^(0) from chrY
     n_reads = np.sum(auto, axis=1)
     eligible_males = male_arr & np.isfinite(ff) & (ff >= 0.02)
     if np.any(eligible_males) and np.sum(chry[eligible_males]) > 0.0:
@@ -293,7 +274,6 @@ def deconvolve_fetal_maternal_em(
         param_f = np.exp(-0.5 * ((lengths - 143.0) / 10.0) ** 2)
         p_f0 = param_f / np.sum(param_f)
 
-    # 2. Initial pure maternal density p_M^(0) via male-only algebraic subtraction
     h_m0 = np.zeros(FRAG_NUM_BINS, dtype=np.float64)
     for i in np.flatnonzero(eligible_males):
         f_s = float(np.clip(ff[i], 0.002, 0.55))
@@ -309,7 +289,6 @@ def deconvolve_fetal_maternal_em(
         param_m = np.exp(-0.5 * ((lengths - 166.0) / 12.0) ** 2)
         p_m0 = param_m / np.sum(param_m)
 
-    # Regularize initial densities
     p_f = ndimage.gaussian_filter1d(p_f0, sigma=1.0)
     p_f = np.maximum(p_f, 0.0)
     p_f /= np.sum(p_f)
@@ -318,7 +297,6 @@ def deconvolve_fetal_maternal_em(
     p_m = np.maximum(p_m, 0.0)
     p_m /= np.sum(p_m)
 
-    # 3. Coupled Poisson-EM iterations across all autosomal histograms
     f_curr = np.zeros(n_samples, dtype=np.float64)
     for i in range(n_samples):
         if eligible_males[i]:
@@ -327,7 +305,6 @@ def deconvolve_fetal_maternal_em(
             f_curr[i] = 0.05
 
     for _ in range(max(1, em_steps)):
-        # E-step: update fetal fraction estimates on female (unanchored) samples
         for i in range(n_samples):
             if eligible_males[i] or n_reads[i] <= 0.0:
                 continue
@@ -347,7 +324,6 @@ def deconvolve_fetal_maternal_em(
             )
             f_curr[i] = float(np.clip(res.x, 0.002, 0.55))
 
-        # Responsibilities gamma_{s, F}(L)
         mix = (
             f_curr[:, np.newaxis] * p_f[np.newaxis, :]
             + (1.0 - f_curr[:, np.newaxis]) * p_m[np.newaxis, :]
@@ -356,7 +332,6 @@ def deconvolve_fetal_maternal_em(
         h_f_acc = np.sum(auto * gamma_f, axis=0)
         h_m_acc = np.sum(auto * (1.0 - gamma_f), axis=0)
 
-        # M-step: regularized update with Gaussian smoothing
         if np.sum(h_f_acc) > 0.0:
             s_f = ndimage.gaussian_filter1d(h_f_acc, sigma=1.0)
             p_f = np.maximum(s_f, 0.0)
@@ -391,11 +366,7 @@ def predict_ff_kl_deconvolution(
     p_fetal: NDArray[np.float64],
     p_maternal: NDArray[np.float64],
 ) -> tuple[float, float]:
-    """Zero-parameter maximum likelihood estimation of fetal fraction via KL deconvolution.
-
-    Returns (hat_f, sigma_kl) where sigma_kl is the analytical standard error from
-    observed Fisher information.
-    """
+    """Zero-parameter maximum likelihood estimation of fetal fraction via KL deconvolution."""
     h = np.asarray(hist_sample, dtype=np.float64)
     pf = np.asarray(p_fetal, dtype=np.float64)
     pm = np.asarray(p_maternal, dtype=np.float64)
@@ -426,11 +397,7 @@ def compute_band_fisher_weights(
     *,
     f0: float = 0.08,
 ) -> tuple[NDArray[np.float64], float, float]:
-    """Derive Fisher-optimal read weights mapped to 24 discrete fragmentomic bands.
-
-    Returns (w_24, mu_fetal_w, mu_maternal_w) normalized such that expected diploid
-    baseline coverage is 1.0.
-    """
+    """Derive Fisher-optimal read weights mapped to 24 discrete fragmentomic bands."""
     pf = np.asarray(p_fetal_571, dtype=np.float64)
     pm = np.asarray(p_maternal_571, dtype=np.float64)
     edges = np.asarray(FRAG_BAND_EDGES, dtype=np.int64)
@@ -455,7 +422,6 @@ def compute_band_fisher_weights(
     p_mix = eff_f0 * pf_24 + (1.0 - eff_f0) * pm_24
     raw_weights = pf_24 / np.maximum(p_mix, 1e-12)
 
-    # Solve for scale alpha such that sum_b pm_24[b] * clip(alpha * raw_weights[b], 0.25, 3.0) == 1.0
     low, high = 0.05, 20.0
     for _ in range(30):
         mid = 0.5 * (low + high)
@@ -489,7 +455,6 @@ def evaluate_band_weighted_counts(
     raw_unpaired = np.maximum(raw_f64 - paired_f64, 0.0)
     w_counts = raw_unpaired + w_paired
 
-    # Per-bin Kish design factor: kappa = paired_c * sum(k_b * w_b^2) / max((sum k_b * w_b)^2, 1e-12)
     sum_w_sq = bands_f64 @ (w_24**2)
     w_paired_sq = np.maximum(w_paired**2, 1e-12)
     has_paired = paired_f64 > 0.0
@@ -501,38 +466,6 @@ def evaluate_band_weighted_counts(
     ).astype(np.float32)
 
     return w_counts, kappa
-
-
-def fisher_optimal_weights(
-    p_fetal: NDArray[np.number],
-    p_maternal: NDArray[np.number],
-    target_ff: float = 0.10,
-    *,
-    f0: float | None = None,
-    clip_bounds: tuple[float, float] = (0.25, 3.0),
-) -> NDArray[np.float64]:
-    """Calculate parameter-free Fisher-score optimal coverage weights w*(L; f0)."""
-    effective_f0 = f0 if f0 is not None else target_ff
-    pf = np.asarray(p_fetal, dtype=np.float64)
-    pm = np.asarray(p_maternal, dtype=np.float64)
-
-    p_mix = effective_f0 * pf + (1.0 - effective_f0) * pm
-    p_mix_safe = np.maximum(p_mix, 1e-12)
-
-    raw_weights = pf / p_mix_safe
-    c_min, c_max = clip_bounds
-
-    low, high = 0.05, 20.0
-    for _ in range(25):
-        mid = 0.5 * (low + high)
-        val = float(np.sum(p_mix * np.clip(mid * raw_weights, c_min, c_max)))
-        if val < 1.0:
-            low = mid
-        else:
-            high = mid
-
-    alpha = 0.5 * (low + high)
-    return np.clip(alpha * raw_weights, c_min, c_max)
 
 
 def build_fragmentomic_feature_vector(
@@ -547,37 +480,28 @@ def build_fragmentomic_feature_vector(
     p = auto / total
     features: list[float] = []
 
-    # 1. Feature 0: scalar chromatosome mode landmark
     features.append(float(meta.chromatosome_mode_bp))
 
-    # Reference density around 166 bp ([164, 168] bp)
     idx_164 = 164 - FRAG_MIN_LEN
     idx_168 = 168 - FRAG_MIN_LEN
     ref_density = float(np.mean(p[idx_164 : idx_168 + 1]))
     ref_safe = max(ref_density, 1e-8)
 
-    # 2. 27 5-bp log-density bands in [85, 220) bp
     for start_bp in range(85, 220, 5):
         i_s = start_bp - FRAG_MIN_LEN
         i_e = i_s + 5
         band_density = float(np.mean(p[i_s:i_e]))
         features.append(math.log(max(band_density, 1e-8) / ref_safe))
 
-    # 3. Self-referenced peak ratio (1 feature)
     features.append(float(meta.self_referenced_peak_ratio))
 
-    # 4. Sub-nucleosomal peak ratios at 112, 122, 133, 143 vs 166 bp (4 features)
     for bp in (112, 122, 133, 143):
         idx = bp - FRAG_MIN_LEN
         features.append(float(p[idx] / ref_safe))
 
-    # 5. Helical periodicity amplitude (1 feature)
     features.append(float(meta.helical_10bp_amplitude))
-
-    # 6. Motif Diversity Score (1 feature)
     features.append(float(meta.motif_diversity_score))
 
-    # 7. Top cleavage 4-mer motif frequencies (CCCA, CCAG, CCTG) (1 feature)
     motifs = np.asarray(meta.end_motif_counts, dtype=np.float64)
     sum_motifs = max(float(np.sum(motifs)), 1.0)
     top_indices = [
@@ -609,49 +533,40 @@ def fit_ff_fragmentomics_ensemble(
     scale[scale < 1e-6] = 1.0
     Z = (X - mean) / scale
 
-    # Logit transform of target
     y_clipped = np.clip(y, 0.005, 0.85)
     u = np.log(y_clipped / (1.0 - y_clipped))
     ridge_alphas = np.logspace(-2, 4, 20)
     enet_alphas = np.logspace(-3, 2, 20)
 
-    def _fit_ensemble_pair(
-        z_mat: NDArray[np.float64], u_vec: NDArray[np.float64]
-    ) -> tuple[NDArray[np.float64], float]:
-        """Fit 50/50 RidgeCV + ElasticNetCV logit ensemble on standardized features."""
-        r_est = RidgeCV(alphas=ridge_alphas)
-        r_est.fit(z_mat, u_vec)
-        e_est = ElasticNetCV(
-            l1_ratio=[0.1, 0.5, 0.9],
-            alphas=enet_alphas,
-            cv=min(5, z_mat.shape[0]),
-            random_state=42,
+    weights, bias = fit_logit_linear_ensemble(
+        Z,
+        u,
+        ridge_alphas=ridge_alphas,
+        l1_ratio=(0.1, 0.5, 0.9),
+        enet_alphas=enet_alphas,
+        seed=42,
+        max_iter=2000,
+    )
+    oof_pred = np.empty(n_samples, dtype=np.float64)
+    kfold = KFold(n_splits=min(5, n_samples), shuffle=True, random_state=42)
+    for train_idx, val_idx in kfold.split(X):
+        f_mean = np.mean(X[train_idx], axis=0)
+        f_scale = np.std(X[train_idx], axis=0)
+        f_scale[f_scale < 1e-6] = 1.0
+        Z_tr = (X[train_idx] - f_mean) / f_scale
+        Z_va = (X[val_idx] - f_mean) / f_scale
+        w_fold, b_fold = fit_logit_linear_ensemble(
+            Z_tr,
+            u[train_idx],
+            ridge_alphas=ridge_alphas,
+            l1_ratio=(0.1, 0.5, 0.9),
+            enet_alphas=enet_alphas,
+            seed=42,
             max_iter=2000,
         )
-        e_est.fit(z_mat, u_vec)
-        return (
-            0.5 * r_est.coef_ + 0.5 * e_est.coef_,
-            float(0.5 * r_est.intercept_ + 0.5 * e_est.intercept_),
-        )
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
-        warnings.simplefilter("ignore", UserWarning)
-
-        weights, bias = _fit_ensemble_pair(Z, u)
-        oof_pred = np.empty(n_samples, dtype=np.float64)
-        kfold = KFold(n_splits=min(5, n_samples), shuffle=True, random_state=42)
-        for train_idx, val_idx in kfold.split(X):
-            f_mean = np.mean(X[train_idx], axis=0)
-            f_scale = np.std(X[train_idx], axis=0)
-            f_scale[f_scale < 1e-6] = 1.0
-            Z_tr = (X[train_idx] - f_mean) / f_scale
-            Z_va = (X[val_idx] - f_mean) / f_scale
-            w_fold, b_fold = _fit_ensemble_pair(Z_tr, u[train_idx])
-            oof_pred[val_idx] = 1.0 / (1.0 + np.exp(-(Z_va @ w_fold + b_fold)))
+        oof_pred[val_idx] = 1.0 / (1.0 + np.exp(-(Z_va @ w_fold + b_fold)))
 
     loocv_std = float(max(np.std(y - oof_pred), 0.015))
-
     return weights, bias, mean, scale, loocv_std
 
 
@@ -704,50 +619,6 @@ def predict_ff_fragmentomics(
     return float(np.clip(f_final, 0.005, 0.50))
 
 
-def segment_fragment_llr(
-    lengths: NDArray[np.number],
-    shift_bp: float,
-    p_fetal: NDArray[np.number],
-    p_maternal: NDArray[np.number],
-    active_ff: float,
-    is_gain: bool,
-) -> tuple[float, float]:
-    """Calculate segment short-fragment ratio and exact per-fragment log-likelihood ratio."""
-    if len(lengths) == 0:
-        return 0.0, 0.0
-
-    lens = np.asarray(lengths, dtype=np.float64)
-    lens = lens[lens > 0.0]
-    if lens.size == 0:
-        return 0.0, 0.0
-    short_ratio = float(np.mean(lens <= 150.0))
-
-    # Shift fragment lengths onto canonical frame
-    shifted_lens = np.clip(
-        np.round(lens - shift_bp), FRAG_MIN_LEN, FRAG_MAX_LEN
-    ).astype(int)
-    indices = shifted_lens - FRAG_MIN_LEN
-
-    pf = np.asarray(p_fetal, dtype=np.float64)
-    pm = np.asarray(p_maternal, dtype=np.float64)
-
-    f = float(np.clip(active_ff, 0.01, 0.40))
-    if is_gain:
-        f_fetal_cnv = (1.5 * f) / (1.0 + 0.5 * f)
-        f_mat_cnv = f / (1.0 + 0.5 * (1.0 - f))
-    else:
-        f_fetal_cnv = (0.5 * f) / (1.0 - 0.5 * f)
-        f_mat_cnv = f / (1.0 - 0.5 * (1.0 - f))
-
-    p_f_eval = f_fetal_cnv * pf[indices] + (1.0 - f_fetal_cnv) * pm[indices]
-    p_m_eval = f_mat_cnv * pf[indices] + (1.0 - f_mat_cnv) * pm[indices]
-
-    llr = float(
-        np.sum(np.log(np.maximum(p_f_eval, 1e-12) / np.maximum(p_m_eval, 1e-12)))
-    )
-    return short_ratio, llr
-
-
 __all__ = [
     "CANONICAL_CHROMATOSOME_BP",
     "FRAG_MAX_LEN",
@@ -763,9 +634,7 @@ __all__ = [
     "encode_kmer_4",
     "estimate_sample_landmarks",
     "evaluate_band_weighted_counts",
-    "fisher_optimal_weights",
     "fit_ff_fragmentomics_ensemble",
     "predict_ff_fragmentomics",
     "predict_ff_kl_deconvolution",
-    "segment_fragment_llr",
 ]

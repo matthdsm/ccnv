@@ -10,11 +10,8 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from ccnv.models.exceptions import SchemaError, SchemaVersionError
-from ccnv.models.schemas import (
-    BRANCH_PRENATAL_AUTOSOMAL,
+from ccnv.models.metadata import (
     COORDINATE_SYSTEM,
-    KNOWN_REFERENCE_BRANCHES,
-    SAMPLE_SCHEMA,
     SCHEMA_VERSION,
     SUPPORTED_SCHEMA_VERSIONS,
     ArtifactKind,
@@ -22,9 +19,15 @@ from ccnv.models.schemas import (
     PrenatalModelMetadata,
     ReferenceMetadata,
     SampleMetadata,
+    decode_metadata,
+    encode_metadata,
+)
+from ccnv.models.schemas import (
+    BRANCH_PRENATAL_AUTOSOMAL,
+    KNOWN_REFERENCE_BRANCHES,
+    SAMPLE_SCHEMA,
     build_reference_schema,
     canonical_dictionary_array,
-    decode_metadata,
 )
 
 _COMMON_METADATA: Final[frozenset[str]] = frozenset(
@@ -54,12 +57,35 @@ _KIND_METADATA: Final[Mapping[ArtifactKind, frozenset[str]]] = {
 }
 
 __all__ = [
+    "metadata_for",
     "validate_metadata",
     "validate_reference_table",
     "validate_sample_table",
     "validate_schema",
     "validate_table",
 ]
+
+
+def metadata_for(
+    kind: ArtifactKind,
+    *,
+    contig_lengths: Mapping[str, int],
+    values: Mapping[str, object],
+) -> dict[bytes, bytes]:
+    """Build complete metadata for an artifact, preserving sample contig order."""
+    extra: dict[str, object] = {}
+    if kind is ArtifactKind.SAMPLE and "contig_order" not in values:
+        extra["contig_order"] = list(contig_lengths.keys())
+    metadata: dict[str, object] = {
+        "artifact_kind": kind.value,
+        "schema_version": SCHEMA_VERSION,
+        "coordinate_system": COORDINATE_SYSTEM,
+        "contig_lengths": dict(contig_lengths),
+        **extra,
+        **values,
+    }
+    validate_metadata(metadata, kind)
+    return encode_metadata(metadata)
 
 
 def _is_pos_int(value: object) -> bool:

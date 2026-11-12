@@ -9,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 
-from ccnv.features.fragmentomics import extract_sample_fragmentomics
 from ccnv.models import (
     SCHEMA_VERSION,
     AnalysisMode,
@@ -17,7 +16,6 @@ from ccnv.models import (
     FetalFractionResult,
     SampleBuffers,
     SegmentResult,
-    decode_metadata,
 )
 from ccnv.qc.sample import sanitize_qc_payload
 
@@ -43,28 +41,17 @@ def _int_metric(
 
 def build_predict_qc_payload(
     mode: AnalysisMode,
-    sample_table: pa.Table | SampleBuffers,
+    sample_table: SampleBuffers | pa.Table,
     segments: Sequence[SegmentResult],
     prenatal_result: FetalFractionResult | None = None,
     bin_results: Sequence[BinResult] | None = None,
 ) -> dict[str, object]:
     """Construct structured QC metrics for a prediction invocation."""
-    if isinstance(sample_table, SampleBuffers):
-        qc_meta: Mapping[str, object] = sample_table.meta.qc or {}
-        counts = np.asarray(sample_table.count, dtype=np.float64)
-        source_identity: object = sample_table.meta.source_identity
-        frag_meta = sample_table.meta.fragmentomics
-    else:
-        sample_meta = decode_metadata(sample_table.schema.metadata)
-        qc_meta_raw = sample_meta.get("qc")
-        qc_meta = qc_meta_raw if isinstance(qc_meta_raw, Mapping) else {}
-        counts = (
-            sample_table.column("count")
-            .to_numpy(zero_copy_only=False)
-            .astype(np.float64)
-        )
-        source_identity = sample_meta.get("source_identity")
-        frag_meta = extract_sample_fragmentomics(sample_meta)
+    bufs = SampleBuffers.coerce(sample_table)
+    qc_meta: Mapping[str, object] = bufs.meta.qc or {}
+    counts = np.asarray(bufs.count, dtype=np.float64)
+    source_identity: object = bufs.meta.source_identity
+    frag_meta = bufs.meta.fragmentomics
 
     if bin_results is not None and len(bin_results) > 0:
         total_bins = sum(int(b.masked.size) for b in bin_results)
@@ -132,8 +119,8 @@ def build_predict_qc_payload(
             sample_name = str(source_identity["sample_name"])
 
     total_segments = len(segments)
-    gain_calls = sum(1 for s in segments if s.call in ("gain", "GAIN"))
-    loss_calls = sum(1 for s in segments if s.call in ("loss", "LOSS"))
+    gain_calls = sum(1 for s in segments if s.call == "gain")
+    loss_calls = sum(1 for s in segments if s.call == "loss")
     discordant_segments = sum(1 for s in segments if s.discordant)
 
     cnv_summary: dict[str, object] = {

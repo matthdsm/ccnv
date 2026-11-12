@@ -15,9 +15,14 @@ from ccnv.models import (
     SegmentResult,
     natural_sort_key,
 )
-from ccnv.report.bed import iter_contig_bin_chunks
+from ccnv.report._common import (
+    STREAM_CHUNK_ROWS,
+    iter_contig_bin_chunks,
+    segments_to_dataframe,
+    validate_threads,
+)
 
-VCF_CHUNK_ROWS: Final[int] = 65_536
+VCF_CHUNK_ROWS: Final[int] = STREAM_CHUNK_ROWS
 _CONTIG_HEADER_RE: Final[re.Pattern[str]] = re.compile(
     r"^##contig=<ID=([^,>]+)(?:,.*?length=(\d+))?.*>$"
 )
@@ -30,11 +35,6 @@ __all__ = [
     "write_segments_vcf",
     "write_vcf_streaming",
 ]
-
-
-def _validate_threads(threads: int) -> None:
-    if isinstance(threads, bool) or threads < 1:
-        raise ValueError("threads must be a positive integer")
 
 
 def _fmt_vcf_float_expr(col_name: str) -> pl.Expr:
@@ -181,7 +181,7 @@ def write_vcf_streaming(
     threads: int = 1,
 ) -> Path:
     """Stream VCFv4.2 header and UTF-8 body byte chunks into Rust BGZF+Tabix/CSI."""
-    _validate_threads(threads)
+    validate_threads(threads)
     if isinstance(max_contig_len, bool) or max_contig_len < 0:
         raise ValueError("max_contig_len must be a non-negative integer")
 
@@ -333,86 +333,12 @@ def write_segments_vcf(
     def _body_chunks() -> Iterator[bytes]:
         for offset in range(0, len(items), VCF_CHUNK_ROWS):
             batch = items[offset : offset + VCF_CHUNK_ROWS]
-            cols: dict[str, pl.Series] = {
-                "chrom": pl.Series("chrom", [s.contig for s in batch], dtype=pl.String),
-                "pos": pl.Series(
-                    "pos", [int(s.start) + 1 for s in batch], dtype=pl.Int64
-                ),
-                "end": pl.Series("end", [int(s.end) for s in batch], dtype=pl.Int64),
-                "call": pl.Series("call", [s.call for s in batch], dtype=pl.String),
-                "ratio": pl.Series(
-                    "ratio", [float(s.ratio) for s in batch], dtype=pl.Float64
-                ),
-                "zscore": pl.Series(
-                    "zscore", [float(s.zscore) for s in batch], dtype=pl.Float64
-                ),
-                "weight": pl.Series(
-                    "weight", [float(s.weight) for s in batch], dtype=pl.Float64
-                ),
-                "bin_count": pl.Series(
-                    "bin_count", [int(s.bin_count) for s in batch], dtype=pl.Int64
-                ),
-            }
-            if is_prenatal:
-                cols["discordant"] = pl.Series(
-                    "discordant", [bool(s.discordant) for s in batch], dtype=pl.Boolean
-                )
-                cols["disc_reason"] = pl.Series(
-                    "disc_reason",
-                    [s.discordance_reason for s in batch],
-                    dtype=pl.String,
-                )
-                cols["frag_short_ratio"] = pl.Series(
-                    "frag_short_ratio",
-                    [
-                        vcf_float(s.frag_short_ratio)
-                        if s.frag_short_ratio is not None
-                        else None
-                        for s in batch
-                    ],
-                    dtype=pl.Float64,
-                )
-                cols["frag_llr_size"] = pl.Series(
-                    "frag_llr_size",
-                    [
-                        vcf_float(s.frag_llr_size)
-                        if s.frag_llr_size is not None
-                        else None
-                        for s in batch
-                    ],
-                    dtype=pl.Float64,
-                )
-                cols["origin_call"] = pl.Series(
-                    "origin_call", [s.origin_call for s in batch], dtype=pl.String
-                )
-                cols["expected_ratio"] = pl.Series(
-                    "expected_ratio",
-                    [
-                        vcf_float(s.expected_ratio)
-                        if s.expected_ratio is not None
-                        else None
-                        for s in batch
-                    ],
-                    dtype=pl.Float64,
-                )
-                cols["implied_ff"] = pl.Series(
-                    "implied_ff",
-                    [
-                        vcf_float(s.implied_ff) if s.implied_ff is not None else None
-                        for s in batch
-                    ],
-                    dtype=pl.Float64,
-                )
-                cols["mosaic_fraction"] = pl.Series(
-                    "mosaic_fraction",
-                    [
-                        vcf_float(s.mosaic_fraction)
-                        if s.mosaic_fraction is not None
-                        else None
-                        for s in batch
-                    ],
-                    dtype=pl.Float64,
-                )
+            base_df = segments_to_dataframe(
+                batch, is_prenatal=is_prenatal
+            ).with_columns(
+                pl.col("contig").alias("chrom"),
+                (pl.col("start") + 1).alias("pos"),
+            )
 
             svtype_expr = (
                 pl.when(pl.col("call") == "gain")
@@ -436,12 +362,12 @@ def write_segments_vcf(
                         .otherwise(pl.lit("")),
                         pl.when(
                             pl.col("discordant")
-                            & pl.col("disc_reason").is_not_null()
-                            & (pl.col("disc_reason") != "")
+                            & pl.col("discordance_reason").is_not_null()
+                            & (pl.col("discordance_reason") != "")
                         )
                         .then(
                             pl.concat_str(
-                                [pl.lit(";DISC_REASON="), pl.col("disc_reason")]
+                                [pl.lit(";DISC_REASON="), pl.col("discordance_reason")]
                             )
                         )
                         .otherwise(pl.lit("")),
@@ -503,7 +429,7 @@ def write_segments_vcf(
                     pl.col("bin_count").cast(pl.String),
                 ]
 
-            df = pl.DataFrame(cols).select(
+            df = base_df.select(
                 pl.col("chrom"),
                 pl.col("pos"),
                 pl.lit(None, dtype=pl.String).alias("id"),

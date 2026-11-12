@@ -1,10 +1,11 @@
-"""Exogenous log-link Poisson covariate regression and legacy Huber spline kernels."""
+"""Exogenous log-link Poisson covariate regression, logit ensembles, and robust location estimators."""
 
 from __future__ import annotations
 
 import math
 import sys
 import warnings
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import Final
@@ -12,7 +13,7 @@ from typing import Final
 import numpy as np
 from numpy.typing import NDArray
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.linear_model import HuberRegressor, PoissonRegressor
+from sklearn.linear_model import ElasticNetCV, PoissonRegressor, RidgeCV
 from sklearn.preprocessing import SplineTransformer
 
 from ccnv.models.exceptions import InvalidInputError
@@ -40,17 +41,14 @@ _POISSON_WINSOR_PASSES: Final[int] = 2
 _POISSON_EXP_CLIP: Final[float] = 20.0
 _GEMM_ROW_CHUNK: Final[int] = 65_536
 _GEMM_SAMPLE_BATCH: Final[int] = 128
-_HUBER_ALPHA: Final[float] = 1e-4
-_HUBER_EPSILON: Final[float] = 1.35
-_HUBER_MAX_ITER: Final[int] = 100
 
 __all__ = [
-    "apply_1d_correction",
-    "build_1d_basis",
     "build_exogenous_covariate_basis",
-    "build_joint_covariate_basis",
+    "fit_logit_linear_ensemble",
     "fit_poisson_covariate_trends",
-    "fit_sample_trend",
+    "half_sample_mode",
+    "hsm_biweight_mode",
+    "standardize_column",
 ]
 
 
@@ -98,7 +96,7 @@ def _has_min_distinct(
     return _count_distinct_up_to(arr, min_distinct) >= min_distinct
 
 
-def _standardize_column(arr: NDArray[np.float64]) -> NDArray[np.float64] | None:
+def standardize_column(arr: NDArray[np.float64]) -> NDArray[np.float64] | None:
     """Center and scale a 1D float64 vector when population std exceeds threshold."""
     if arr.size < 2 or not np.all(np.isfinite(arr)):
         return None
@@ -109,16 +107,99 @@ def _standardize_column(arr: NDArray[np.float64]) -> NDArray[np.float64] | None:
     return centered / std
 
 
-def _prepare_covariate(arr: NDArray[np.floating] | None) -> NDArray[np.float64] | None:
-    """Convert optional 1D covariate to float64 when finite and non-constant."""
-    if arr is None:
-        return None
-    val_arr = np.asarray(arr, dtype=np.float64)
-    if val_arr.ndim != 1 or val_arr.size < 2 or not np.all(np.isfinite(val_arr)):
-        return None
-    if float(np.std(val_arr)) <= _MIN_VARIANCE_STD:
-        return None
-    return val_arr
+def half_sample_mode(values: NDArray[np.floating]) -> float:
+    """Compute Robertson-Cryer O(N log N) iterative Half-Sample Mode."""
+    arr = np.asarray(values, dtype=np.float64)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return 0.0
+    s = np.sort(finite)
+    while s.size > 3:
+        n = int(s.size)
+        half = (n + 1) // 2
+        widths = s[half - 1 :] - s[: n - half + 1]
+        min_w = float(np.min(widths))
+        ties = np.flatnonzero(widths <= min_w + 1e-15)
+        best = int(ties[ties.size // 2])
+        s = s[best : best + half]
+    if s.size == 1:
+        return float(s[0])
+    if s.size == 2:
+        return 0.5 * float(s[0] + s[1])
+    d0 = float(s[1] - s[0])
+    d1 = float(s[2] - s[1])
+    if d0 < d1:
+        return 0.5 * float(s[0] + s[1])
+    if d1 < d0:
+        return 0.5 * float(s[1] + s[2])
+    return float(s[1])
+
+
+def hsm_biweight_mode(
+    values: NDArray[np.float64],
+    weights: NDArray[np.float64] | None = None,
+) -> float:
+    """Refine Half-Sample Mode with 2-step precision-weighted Tukey biweight."""
+    vals = np.asarray(values, dtype=np.float64)
+    finite_mask = np.isfinite(vals)
+    if weights is not None:
+        w_arr = np.asarray(weights, dtype=np.float64)
+        if w_arr.shape == finite_mask.shape:
+            weights = w_arr[finite_mask]
+    vals = vals[finite_mask]
+    if vals.size == 0:
+        return 0.0
+    m = half_sample_mode(vals)
+    if vals.size < 6:
+        return m
+    mad = 1.4826 * float(np.median(np.abs(vals - m)))
+    if mad <= 1e-8:
+        return m
+    c = 3.5 * mad
+    base_w = np.ones_like(vals) if weights is None else np.maximum(weights, 0.0)
+    for _ in range(2):
+        u = (vals - m) / c
+        inlier = np.abs(u) < 1.0
+        if not np.any(inlier):
+            return m
+        w = np.where(inlier, base_w * np.square(1.0 - np.square(u)), 0.0)
+        w_sum = float(np.sum(w))
+        if w_sum <= 0.0:
+            return m
+        m = float(np.sum(w * vals)) / w_sum
+    return m
+
+
+def fit_logit_linear_ensemble(
+    X: NDArray[np.float64],
+    u: NDArray[np.float64],
+    *,
+    ridge_alphas: NDArray[np.float64],
+    l1_ratio: Sequence[float] = (0.1, 0.5),
+    enet_alphas: NDArray[np.float64] | None = None,
+    seed: int = 42,
+    max_iter: int = 3000,
+) -> tuple[NDArray[np.float64], float]:
+    """Fit a 50/50 convex RidgeCV + ElasticNetCV linear model in logit space."""
+    cv_folds = min(5, max(2, int(X.shape[0])))
+    ridge = RidgeCV(alphas=ridge_alphas)
+    enet = ElasticNetCV(
+        l1_ratio=list(l1_ratio),
+        alphas=100 if enet_alphas is None else enet_alphas,
+        cv=cv_folds,
+        random_state=seed,
+        max_iter=max_iter,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", (ConvergenceWarning, UserWarning))
+        ridge.fit(X, u)
+        enet.fit(X, u)
+    w_ens = 0.5 * (
+        np.asarray(ridge.coef_, dtype=np.float64)
+        + np.asarray(enet.coef_, dtype=np.float64)
+    )
+    b_ens = 0.5 * (float(ridge.intercept_) + float(enet.intercept_))
+    return w_ens, b_ens
 
 
 def _clamped_quantile_splines(
@@ -144,7 +225,7 @@ def _append_standardized_columns(
 ) -> None:
     """Append standardized columns of matrix whose population std exceeds threshold."""
     for col_idx in range(matrix.shape[1]):
-        sc = _standardize_column(matrix[:, col_idx])
+        sc = standardize_column(matrix[:, col_idx])
         if sc is not None:
             dest.append(sc)
 
@@ -175,7 +256,7 @@ def _usable_spline_covariate(
     sub = np.asarray(track[mask], dtype=np.float64)
     if not _has_min_distinct(sub, _MIN_DISTINCT_VALUES):
         return None
-    z_col = _standardize_column(sub)
+    z_col = standardize_column(sub)
     if z_col is None:
         return None
     return sub, z_col
@@ -229,12 +310,12 @@ def build_exogenous_covariate_basis(
                 cols.extend(q_std_cols)
                 used_gc_quantiles = True
                 if gc_arr is not None:
-                    z_gc = _standardize_column(
+                    z_gc = standardize_column(
                         np.asarray(gc_arr[mask], dtype=np.float64)
                     )
                 if z_gc is None:
                     midpoints = np.asarray(_GC_BAND_MIDPOINTS, dtype=np.float64)
-                    z_gc = _standardize_column(q_usable @ midpoints)
+                    z_gc = standardize_column(q_usable @ midpoints)
 
     if not used_gc_quantiles:
         gc_pair = _usable_spline_covariate(gc_arr, mask)
@@ -251,7 +332,7 @@ def build_exogenous_covariate_basis(
             cols, _clamped_quantile_splines(map_sub, degree=2, n_knots=4)
         )
         if z_gc is not None:
-            inter_gm = _standardize_column(z_gc * z_map)
+            inter_gm = standardize_column(z_gc * z_map)
             if inter_gm is not None:
                 cols.append(inter_gm)
 
@@ -262,7 +343,7 @@ def build_exogenous_covariate_basis(
             cols, _clamped_quantile_splines(len_sub, degree=3, n_knots=4)
         )
         if z_gc is not None:
-            inter_gl = _standardize_column(z_gc * z_len)
+            inter_gl = standardize_column(z_gc * z_len)
             if inter_gl is not None:
                 cols.append(inter_gl)
 
@@ -570,175 +651,3 @@ def fit_poisson_covariate_trends(
                 lin_block.astype(np.float32), np.float32(1e-30)
             )
     return trends
-
-
-def build_1d_basis(
-    values: NDArray[np.floating],
-    degree: int,
-    n_knots: int = 2,
-) -> NDArray[np.float64] | None:
-    """Build a natural cubic or polynomial B-spline design matrix."""
-    val_arr = _prepare_covariate(values)
-    if val_arr is None:
-        return None
-    k = min(n_knots, max(2, _count_distinct_up_to(val_arr, max(2, n_knots))))
-    spline = SplineTransformer(
-        n_knots=k,
-        degree=degree,
-        knots="quantile",
-        extrapolation="linear",
-        include_bias=True,
-    )
-    return np.asarray(spline.fit_transform(val_arr.reshape(-1, 1)), dtype=np.float64)
-
-
-def _fit_spline_terms(
-    values: NDArray[np.float64],
-    degree: int,
-    max_knots: int,
-) -> NDArray[np.float64]:
-    """Fit quantile B-spline terms without intercept."""
-    k = min(max_knots, max(2, _count_distinct_up_to(values, max(2, max_knots))))
-    spline = SplineTransformer(
-        n_knots=k,
-        degree=degree,
-        knots="quantile",
-        extrapolation="linear",
-        include_bias=False,
-    )
-    return np.asarray(spline.fit_transform(values.reshape(-1, 1)), dtype=np.float64)
-
-
-def build_joint_covariate_basis(
-    gc: NDArray[np.floating] | None,
-    mappability: NDArray[np.floating] | None,
-    *,
-    ref_frag_len: NDArray[np.floating] | None = None,
-    ref_ep_rate: NDArray[np.floating] | None = None,
-    mean_frag_len: NDArray[np.floating] | None = None,
-    endpoint_ratio: NDArray[np.floating] | None = None,
-) -> NDArray[np.float64] | None:
-    """Build legacy Huber B-spline covariate basis with single-pass standardization."""
-    gc_arr = _prepare_covariate(gc)
-    map_arr = _prepare_covariate(mappability)
-    len_arr = _prepare_covariate(
-        ref_frag_len if ref_frag_len is not None else mean_frag_len
-    )
-    ep_arr = _prepare_covariate(
-        ref_ep_rate if ref_ep_rate is not None else endpoint_ratio
-    )
-
-    if gc_arr is None and map_arr is None and len_arr is None and ep_arr is None:
-        return None
-
-    z_gc = _standardize_column(gc_arr) if gc_arr is not None else None
-    z_map = _standardize_column(map_arr) if map_arr is not None else None
-
-    base_design: NDArray[np.float64] | None
-    if gc_arr is not None and map_arr is None:
-        base_design = build_1d_basis(gc_arr, degree=3, n_knots=5)
-    elif map_arr is not None and gc_arr is None:
-        base_design = build_1d_basis(map_arr, degree=2, n_knots=4)
-    elif (
-        gc_arr is not None
-        and map_arr is not None
-        and z_gc is not None
-        and z_map is not None
-    ):
-        if gc_arr.size != map_arr.size:
-            return None
-        n_rows = gc_arr.size
-        b_gc = _fit_spline_terms(gc_arr, degree=3, max_knots=5)
-        b_map = _fit_spline_terms(map_arr, degree=2, max_knots=4)
-        interaction = (z_gc * z_map)[:, np.newaxis]
-        ones = np.ones((n_rows, 1), dtype=np.float64)
-        base_design = np.hstack([ones, b_gc, b_map, interaction], dtype=np.float64)
-    else:
-        first_valid = len_arr if len_arr is not None else ep_arr
-        if first_valid is None:
-            return None
-        base_design = np.ones((first_valid.size, 1), dtype=np.float64)
-
-    if base_design is None or (len_arr is None and ep_arr is None):
-        return base_design
-
-    extra_cols: list[NDArray[np.float64]] = [base_design]
-    n_rows = base_design.shape[0]
-
-    if len_arr is not None and len_arr.size == n_rows:
-        z_len = _standardize_column(len_arr)
-        extra_cols.append(_fit_spline_terms(len_arr, degree=3, max_knots=4))
-        if z_gc is not None and z_len is not None and z_gc.size == n_rows:
-            extra_cols.append((z_gc * z_len)[:, np.newaxis])
-
-    if ep_arr is not None and ep_arr.size == n_rows:
-        extra_cols.append(_fit_spline_terms(ep_arr, degree=3, max_knots=4))
-
-    return np.hstack(extra_cols, dtype=np.float64)
-
-
-def fit_sample_trend(
-    design: NDArray[np.float64],
-    y: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Fit a Huber-weighted spline coverage trend centered at unit median."""
-    valid = np.isfinite(y) & (y > 0)
-    n_valid = int(np.count_nonzero(valid))
-    n_cols = design.shape[1]
-    if n_valid <= n_cols or n_valid == 0:
-        return np.ones(y.size, dtype=np.float64)
-
-    med_y = float(np.median(y[valid]))
-    if not math.isfinite(med_y) or med_y <= 0:
-        return np.ones(y.size, dtype=np.float64)
-    scaled_y = y / med_y
-
-    if n_valid < 4:
-        beta = np.linalg.lstsq(design[valid], scaled_y[valid], rcond=None)[0]
-    else:
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", ConvergenceWarning)
-                reg = HuberRegressor(
-                    fit_intercept=False,
-                    alpha=_HUBER_ALPHA,
-                    epsilon=_HUBER_EPSILON,
-                    max_iter=_HUBER_MAX_ITER,
-                )
-                reg.fit(design[valid], scaled_y[valid])
-                beta = reg.coef_
-        except ValueError:
-            beta = np.linalg.lstsq(design[valid], scaled_y[valid], rcond=None)[0]
-
-    if not np.all(np.isfinite(beta)):
-        return np.ones(y.size, dtype=np.float64)
-
-    trend = design @ beta
-    pos_trend = trend[valid & (trend > 0)]
-    if pos_trend.size == 0:
-        return np.ones(y.size, dtype=np.float64)
-    median_trend = float(np.median(pos_trend))
-    if not math.isfinite(median_trend) or median_trend <= 0:
-        return np.ones(y.size, dtype=np.float64)
-    return np.clip(trend / median_trend, 0.20, 5.0)
-
-
-def apply_1d_correction(
-    sub: NDArray[np.float64],
-    design: NDArray[np.float64] | None,
-) -> NDArray[np.float64]:
-    """Divide 1D or 2D usable coverage array by fitted trend."""
-    if design is None:
-        return sub
-    out = sub.copy()
-    arr2d = out[:, np.newaxis] if out.ndim == 1 else out
-    for s_idx in range(arr2d.shape[1]):
-        col = arr2d[:, s_idx]
-        orig_sum = float(np.sum(col))
-        trend = fit_sample_trend(design, col)
-        corrected = col / trend
-        new_sum = float(np.sum(corrected))
-        if orig_sum > 0 and new_sum > 0:
-            corrected *= orig_sum / new_sum
-        arr2d[:, s_idx] = corrected
-    return out

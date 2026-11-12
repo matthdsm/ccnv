@@ -224,8 +224,7 @@
     }
     const ffPct = (p.active_ff * 100).toFixed(1);
     const ffyStr = p.ffy !== null && p.ffy !== undefined ? `${(p.ffy * 100).toFixed(1)}%` : "N/A";
-    const ffaVal = (p.ffa !== null && p.ffa !== undefined) ? p.ffa : p.preface;
-    const ffaStr = ffaVal !== null && ffaVal !== undefined ? `${(ffaVal * 100).toFixed(1)}%` : "N/A";
+    const ffaStr = p.ffa !== null && p.ffa !== undefined ? `${(p.ffa * 100).toFixed(1)}%` : "N/A";
     const ffxStr = p.ffx !== null && p.ffx !== undefined ? `${(p.ffx * 100).toFixed(1)}%` : "N/A";
     const ffSizeStr = p.ff_size !== null && p.ff_size !== undefined ? `${(p.ff_size * 100).toFixed(1)}%` : "N/A";
     badgeEl.innerHTML = `<span><strong>Fetal Sex:</strong> ${p.fetal_sex}</span>` +

@@ -1,9 +1,7 @@
-"""Python-native weighted copy-number segmentation.
+"""Python-native weighted copy-number segmentation and segment scoring.
 
 The ``penalty`` is measured in weighted squared-error units. PELT minimizes
-``sum(weighted squared error) + penalty * number of breakpoints``; Binseg
-greedily accepts a breakpoint only when its weighted-error reduction exceeds
-the penalty.
+``sum(weighted squared error) + penalty * number of breakpoints``.
 """
 
 from __future__ import annotations
@@ -14,47 +12,59 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Literal
 
 import numpy as np
-import polars as pl
 import ruptures as rpt
 from numpy.typing import ArrayLike, NDArray
 from ruptures.base import BaseCost
 from scipy.special import erfc
 
-from ccnv.models import AnalysisMode
+from ccnv.models import AnalysisMode, CallType
 
 logger = logging.getLogger(__name__)
 
-Algorithm = Literal["pelt", "binseg"]
 DEFAULT_MAX_BLACKLIST_GAP = 2_000_000
-
-ContigDataTuple = tuple[
-    NDArray[np.int64],
-    NDArray[np.int64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64] | None,
-    NDArray[np.float64] | None,
-    NDArray[np.bool_],
-]
 
 __all__ = [
     "DEFAULT_MAX_BLACKLIST_GAP",
-    "Algorithm",
+    "ContigSegmentationInput",
+    "PreparedContigData",
     "Segment",
     "WeightedL2Cost",
-    "compute_contig_rho1",
     "estimate_dyadic_inflation",
     "evaluate_blue_scores_and_bayes_factors",
-    "evaluate_stouffer_segment_scores",
     "interpolate_dyadic_inflation",
     "segment_and_score_genome",
     "segment_contig",
-    "segment_genome",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class ContigSegmentationInput:
+    """Typed per-contig array inputs for genome segmentation and BLUE scoring."""
+
+    starts: ArrayLike
+    ends: ArrayLike
+    ratios: ArrayLike
+    weights: ArrayLike
+    contig_length: int
+    zscores: ArrayLike | None = None
+    counts: ArrayLike | None = None
+    expected: ArrayLike | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedContigData:
+    """Validated per-contig arrays and usability mask for segment scoring."""
+
+    starts: NDArray[np.int64]
+    ends: NDArray[np.int64]
+    ratios: NDArray[np.float64]
+    weights: NDArray[np.float64]
+    zscores: NDArray[np.float64]
+    counts: NDArray[np.float64] | None
+    expected: NDArray[np.float64] | None
+    usable: NDArray[np.bool_]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +78,7 @@ class Segment:
     weight: float
     bin_count: int
     zscore: float = 0.0
-    call: str = "NEUTRAL"
+    call: CallType | None = None
     copy_number: int | None = None
     log_bf: float | None = None
     q_value: float = 1.0
@@ -93,7 +103,6 @@ class WeightedL2Cost(BaseCost):
         self, signal: ArrayLike, weights: ArrayLike | None = None
     ) -> WeightedL2Cost:
         """Fit cumulative sums from values and optional non-negative weights."""
-
         array = np.asarray(signal, dtype=np.float64)
         if weights is None:
             if array.ndim == 2 and array.shape[1] == 2:
@@ -133,7 +142,6 @@ class WeightedL2Cost(BaseCost):
 
     def error(self, start: int, end: int) -> float:
         """Return weighted residual sum of squares for ``[start, end)``."""
-
         if start < 0 or end > self._n or start >= end:
             raise ValueError("cost interval must be a non-empty in-bounds slice")
         weight = self._weight_sum[end] - self._weight_sum[start]
@@ -223,14 +231,13 @@ def segment_contig(
     weights: ArrayLike,
     contig_length: int,
     penalty: float | None = None,
-    algorithm: Algorithm = "pelt",
     sensitivity: float = 1.0,
     kappa_local: float = 1.0,
     min_size: int = 2,
     jump: int = 1,
     max_blacklist_gap: int = DEFAULT_MAX_BLACKLIST_GAP,
 ) -> tuple[Segment, ...]:
-    """Segment one contig using weighted L2 loss with usable-bin compaction."""
+    """Segment one contig using weighted L2 PELT with usable-bin compaction."""
     start_array, end_array, ratio_array, weight_array = _validate_inputs(
         contig=contig,
         starts=starts,
@@ -286,7 +293,6 @@ def segment_contig(
             signal=c_signal,
             block_usable=np.ones(valid_global.size, dtype=bool),
             penalty=block_penalty,
-            algorithm=algorithm,
             min_size=min_size,
             jump=jump,
         )
@@ -319,7 +325,7 @@ def segment_contig(
 
 def evaluate_blue_scores_and_bayes_factors(
     segments: Sequence[Segment],
-    contigs_data: Mapping[str, ContigDataTuple],
+    contigs_data: Mapping[str, PreparedContigData],
     dyadic_inflations: Mapping[str, NDArray[np.float64]],
     *,
     mode: AnalysisMode = "germline",
@@ -331,23 +337,21 @@ def evaluate_blue_scores_and_bayes_factors(
         return ()
 
     prefix_map: dict[str, dict[str, NDArray[np.float64]]] = {}
-    for c_name, data_tuple in contigs_data.items():
-        _, _, _, c_weights, c_zscores, c_counts, c_expected, c_usable = data_tuple
-
-        clean_w = np.where(c_usable, c_weights, 0.0)
-        clean_z = np.where(c_usable, c_zscores, 0.0)
+    for c_name, data in contigs_data.items():
+        clean_w = np.where(data.usable, data.weights, 0.0)
+        clean_z = np.where(data.usable, data.zscores, 0.0)
         sqrt_w = np.sqrt(np.maximum(clean_w, 0.0))
         w_z = sqrt_w * clean_z
 
         acc: dict[str, NDArray[np.float64]] = {
             "cumsum_w_z": _cumulative(w_z),
-            "cumsum_usable": _cumulative(c_usable.astype(np.float64)),
+            "cumsum_usable": _cumulative(data.usable.astype(np.float64)),
             "cumsum_w": _cumulative(clean_w),
         }
-        if c_counts is not None:
-            acc["cumsum_c"] = _cumulative(np.where(c_usable, c_counts, 0.0))
-        if c_expected is not None:
-            acc["cumsum_e"] = _cumulative(np.where(c_usable, c_expected, 0.0))
+        if data.counts is not None:
+            acc["cumsum_c"] = _cumulative(np.where(data.usable, data.counts, 0.0))
+        if data.expected is not None:
+            acc["cumsum_e"] = _cumulative(np.where(data.usable, data.expected, 0.0))
 
         prefix_map[c_name] = acc
 
@@ -364,12 +368,11 @@ def evaluate_blue_scores_and_bayes_factors(
         c_name = seg.contig
         if c_name not in contigs_data or c_name not in prefix_map:
             continue
-        c_starts = contigs_data[c_name][0]
-        c_ends = contigs_data[c_name][1]
+        c_data = contigs_data[c_name]
         acc = prefix_map[c_name]
 
-        s_bin = int(np.searchsorted(c_starts, seg.start, side="left"))
-        e_bin = int(np.searchsorted(c_ends, seg.end, side="right"))
+        s_bin = int(np.searchsorted(c_data.starts, seg.start, side="left"))
+        e_bin = int(np.searchsorted(c_data.ends, seg.end, side="right"))
 
         w_z = float(acc["cumsum_w_z"][e_bin] - acc["cumsum_w_z"][s_bin])
         n_u = int(acc["cumsum_usable"][e_bin] - acc["cumsum_usable"][s_bin])
@@ -455,18 +458,17 @@ def evaluate_blue_scores_and_bayes_factors(
 
     scored_segments: list[Segment] = []
     for i, seg in enumerate(segments):
-        n_u = usable_counts[i]
-        z_blue = blue_zscores[i]
+        n_u = int(usable_counts[i])
+        z_blue = float(blue_zscores[i])
         q_val = float(q_vals[i])
 
+        call: CallType | None
         if n_u == 0:
-            call, final_cn, final_bf, z_blue, q_val = (
-                "NEUTRAL",
-                2 if mode == "germline" else None,
-                None,
-                0.0,
-                1.0,
-            )
+            call = None
+            final_cn = 2 if mode == "germline" else None
+            final_bf = None
+            z_blue = 0.0
+            q_val = 1.0
         else:
             passes_thresh = (
                 abs(seg.mean) >= ratio_threshold
@@ -476,16 +478,16 @@ def evaluate_blue_scores_and_bayes_factors(
             if mode == "germline":
                 bf, k_cand = log_bfs[i], copy_numbers[i]
                 if passes_thresh and q_val <= 0.05 and bf is not None and bf > 2.0:
-                    call = "LOSS" if (k_cand is not None and k_cand < 2) else "GAIN"
+                    call = "loss" if (k_cand is not None and k_cand < 2) else "gain"
                     final_cn = k_cand
                 else:
-                    call, final_cn = "NEUTRAL", 2
+                    call, final_cn = None, 2
                 final_bf = bf
             else:
                 call = (
-                    ("LOSS" if z_blue < 0.0 else "GAIN")
+                    ("loss" if z_blue < 0.0 else "gain")
                     if (passes_thresh and q_val <= 0.05)
-                    else "NEUTRAL"
+                    else None
                 )
                 final_cn, final_bf = None, None
 
@@ -509,67 +511,14 @@ def evaluate_blue_scores_and_bayes_factors(
     return tuple(scored_segments)
 
 
-def segment_genome(
-    contigs: Mapping[str, tuple[ArrayLike, ArrayLike, ArrayLike, ArrayLike, int]],
-    *,
-    penalty: float = 0.5,
-    algorithm: Algorithm = "pelt",
-    min_size: int = 2,
-    jump: int = 1,
-    max_blacklist_gap: int = DEFAULT_MAX_BLACKLIST_GAP,
-) -> tuple[Segment, ...]:
-    """Segment ordered contig inputs without assumptions about contig names."""
-
-    started = perf_counter()
-    logger.debug(
-        "segmenting %d contigs with %s (penalty=%.2f, max_blacklist_gap=%d bp)",
-        len(contigs),
-        algorithm,
-        penalty,
-        max_blacklist_gap,
-    )
-    all_segments: list[Segment] = []
-    for contig, (starts, ends, ratios, weights, contig_length) in contigs.items():
-        segments = segment_contig(
-            contig=contig,
-            starts=starts,
-            ends=ends,
-            ratios=ratios,
-            weights=weights,
-            contig_length=contig_length,
-            penalty=penalty,
-            algorithm=algorithm,
-            min_size=min_size,
-            jump=jump,
-            max_blacklist_gap=max_blacklist_gap,
-        )
-        if segments:
-            logger.debug(
-                "contig %s: %d segments found across %d bp",
-                contig,
-                len(segments),
-                contig_length,
-            )
-        all_segments.extend(segments)
-
-    elapsed = perf_counter() - started
-    logger.debug(
-        "segmentation finished: %d segments across %d contigs in %.3f s",
-        len(all_segments),
-        len(contigs),
-        elapsed,
-    )
-    return tuple(all_segments)
+def _as_optional_f64(val: ArrayLike | None) -> NDArray[np.float64] | None:
+    return np.ravel(np.asarray(val, dtype=np.float64)) if val is not None else None
 
 
 def segment_and_score_genome(
-    contigs: Mapping[
-        str,
-        tuple[ArrayLike, ...] | Mapping[str, ArrayLike],
-    ],
+    contigs: Mapping[str, ContigSegmentationInput],
     *,
     penalty: float | None = None,
-    algorithm: Algorithm = "pelt",
     sensitivity: float = 1.0,
     mode: AnalysisMode = "germline",
     z_threshold: float = 3.0,
@@ -582,57 +531,60 @@ def segment_and_score_genome(
     """Segment genome and score with dyadic Gauss-Markov BLUE Z and integer CN Bayes factors."""
     started = perf_counter()
     logger.debug(
-        "segmenting and scoring %d contigs with %s (mode=%s, z_thresh=%.1f, threads=%d)",
+        "segmenting and scoring %d contigs with PELT (mode=%s, z_thresh=%.1f, threads=%d)",
         len(contigs),
-        algorithm,
         mode,
         z_threshold,
         threads,
     )
 
-    contigs_data: dict[str, ContigDataTuple] = {}
+    contigs_data: dict[str, PreparedContigData] = {}
     contig_lengths: dict[str, int] = {}
     dyadic_inflations: dict[str, NDArray[np.float64]] = {}
 
-    for c_name, payload in contigs.items():
-        c_starts, c_ends, c_ratios, c_weights, c_len, c_z, c_counts, c_exp = (
-            _unpack_contig_payload(payload)
-        )
+    for c_name, item in contigs.items():
+        c_starts = np.ravel(np.asarray(item.starts, dtype=np.int64))
+        c_ends = np.ravel(np.asarray(item.ends, dtype=np.int64))
+        c_ratios = np.ravel(np.asarray(item.ratios, dtype=np.float64))
+        c_weights = np.ravel(np.asarray(item.weights, dtype=np.float64))
+        c_len = int(item.contig_length)
+        c_z_raw = _as_optional_f64(item.zscores)
+        c_counts = _as_optional_f64(item.counts)
+        c_exp = _as_optional_f64(item.expected)
 
         u = np.isfinite(c_ratios) & np.isfinite(c_weights) & (c_weights > 0)
-        if c_z is None:
+        if c_z_raw is None:
             c_z = np.where(u, c_ratios * np.sqrt(c_weights), 0.0)
         else:
-            u = u & np.isfinite(c_z)
-            c_z = np.where(u, c_z, 0.0)
+            u = u & np.isfinite(c_z_raw)
+            c_z = np.where(u, c_z_raw, 0.0)
 
         infl = estimate_dyadic_inflation(c_z, u)
         dyadic_inflations[c_name] = infl
         contig_lengths[c_name] = c_len
-        contigs_data[c_name] = (
-            c_starts,
-            c_ends,
-            c_ratios,
-            c_weights,
-            c_z,
-            c_counts,
-            c_exp,
-            u,
+        contigs_data[c_name] = PreparedContigData(
+            starts=c_starts,
+            ends=c_ends,
+            ratios=c_ratios,
+            weights=c_weights,
+            zscores=c_z,
+            counts=c_counts,
+            expected=c_exp,
+            usable=u,
         )
 
     def _segment_one(contig_name: str) -> tuple[Segment, ...]:
-        c_tuple = contigs_data[contig_name]
+        c_data = contigs_data[contig_name]
         c_len = contig_lengths[contig_name]
         k_local = float(dyadic_inflations[contig_name][0])
         return segment_contig(
             contig=contig_name,
-            starts=c_tuple[0],
-            ends=c_tuple[1],
-            ratios=c_tuple[2],
-            weights=c_tuple[3],
+            starts=c_data.starts,
+            ends=c_data.ends,
+            ratios=c_data.ratios,
+            weights=c_data.weights,
             contig_length=c_len,
             penalty=penalty,
-            algorithm=algorithm,
             sensitivity=sensitivity,
             kappa_local=k_local,
             min_size=min_size,
@@ -668,47 +620,6 @@ def segment_and_score_genome(
     return final_segments
 
 
-def _unpack_contig_payload(
-    payload: tuple[ArrayLike, ...] | Mapping[str, ArrayLike],
-) -> tuple[
-    NDArray[np.int64],
-    NDArray[np.int64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    int,
-    NDArray[np.float64] | None,
-    NDArray[np.float64] | None,
-    NDArray[np.float64] | None,
-]:
-    """Unpack mapping or tuple into typed numpy arrays for segmentation."""
-
-    def _arr_f(val: ArrayLike | None) -> NDArray[np.float64] | None:
-        return np.ravel(np.asarray(val, dtype=np.float64)) if val is not None else None
-
-    if isinstance(payload, Mapping):
-        return (
-            np.ravel(np.asarray(payload["starts"], dtype=np.int64)),
-            np.ravel(np.asarray(payload["ends"], dtype=np.int64)),
-            np.ravel(np.asarray(payload["ratios"], dtype=np.float64)),
-            np.ravel(np.asarray(payload["weights"], dtype=np.float64)),
-            int(payload["contig_length"]),
-            _arr_f(payload.get("zscores")),
-            _arr_f(payload.get("counts")),
-            _arr_f(payload.get("expected")),
-        )
-    p = tuple(payload)
-    return (
-        np.ravel(np.asarray(p[0], dtype=np.int64)),
-        np.ravel(np.asarray(p[1], dtype=np.int64)),
-        np.ravel(np.asarray(p[2], dtype=np.float64)),
-        np.ravel(np.asarray(p[3], dtype=np.float64)),
-        int(p[4]),
-        _arr_f(p[5]) if len(p) >= 6 else None,
-        _arr_f(p[6]) if len(p) >= 7 else None,
-        _arr_f(p[7]) if len(p) >= 8 else None,
-    )
-
-
 def _cumulative(values: NDArray[np.float64]) -> NDArray[np.float64]:
     """Prefix cumulative sum with leading zero."""
     return np.concatenate((np.zeros(1, dtype=np.float64), np.cumsum(values)))
@@ -719,11 +630,10 @@ def _find_breakpoints(
     signal: NDArray[np.float64],
     block_usable: NDArray[np.bool_],
     penalty: float,
-    algorithm: Algorithm,
     min_size: int,
     jump: int,
 ) -> list[int]:
-    """Detect change-point indices in a euchromatic block."""
+    """Detect change-point indices in a euchromatic block via calibrated PELT."""
     n_samples = signal.shape[0]
     if n_samples < 2 * min_size:
         return [n_samples]
@@ -731,23 +641,16 @@ def _find_breakpoints(
     values = signal[:, 0]
     weights = signal[:, 1]
 
-    if algorithm == "pelt":
-        if np.all(block_usable) and np.allclose(weights, weights[0]):
-            pos_w = float(weights[0])
-            kernel_cpd_cls = getattr(rpt, "KernelCPD", None)
-            if kernel_cpd_cls is not None:
-                detector = kernel_cpd_cls(kernel="linear", min_size=min_size, jump=jump)
-                return list(
-                    detector.fit(values.reshape(-1, 1)).predict(pen=penalty / pos_w)
-                )
-        detector = rpt.Pelt(custom_cost=WeightedL2Cost(), min_size=min_size, jump=jump)
-        return list(detector.fit(signal).predict(pen=penalty))
-    if algorithm == "binseg":
-        detector = rpt.Binseg(
-            custom_cost=WeightedL2Cost(), min_size=min_size, jump=jump
-        )
-        return detector.fit(signal).predict(pen=penalty)
-    raise ValueError(f"unknown segmentation algorithm: {algorithm}")
+    if np.all(block_usable) and np.allclose(weights, weights[0]):
+        pos_w = float(weights[0])
+        kernel_cpd_cls = getattr(rpt, "KernelCPD", None)
+        if kernel_cpd_cls is not None:
+            detector = kernel_cpd_cls(kernel="linear", min_size=min_size, jump=jump)
+            return list(
+                detector.fit(values.reshape(-1, 1)).predict(pen=penalty / pos_w)
+            )
+    detector = rpt.Pelt(custom_cost=WeightedL2Cost(), min_size=min_size, jump=jump)
+    return list(detector.fit(signal).predict(pen=penalty))
 
 
 def _validate_inputs(
@@ -857,94 +760,4 @@ def _make_segment_from_indices(
         weight=total_weight,
         bin_count=n_usable,
         n_usable=n_usable,
-    )
-
-
-def compute_contig_rho1(z_contig: NDArray[np.float64]) -> float:
-    """Compute per-contig lag-1 autocorrelation on finite diploid-clipped z-scores."""
-    mask = np.isfinite(z_contig) & (np.abs(z_contig) <= 2.5)
-    z_clip = z_contig[mask]
-    if z_clip.size < 3:
-        return 0.0
-    x = z_clip[:-1]
-    y = z_clip[1:]
-    std_x = float(np.std(x))
-    std_y = float(np.std(y))
-    if std_x < 1e-12 or std_y < 1e-12:
-        return 0.0
-    corr = float(np.corrcoef(x, y)[0, 1])
-    if not np.isfinite(corr):
-        return 0.0
-    return float(np.clip(corr, 0.0, 0.95))
-
-
-def evaluate_stouffer_segment_scores(
-    bins_df: pl.DataFrame,
-    segs_df: pl.DataFrame,
-) -> pl.DataFrame:
-    """Evaluate autocorrelation-corrected Stouffer Z-scores via asof interval join."""
-    joined = (
-        bins_df.sort(["contig", "start"])
-        .join_asof(
-            segs_df.sort(["contig", "seg_start"]).select(
-                ["seg_id", "contig", "seg_start", "seg_end"]
-            ),
-            left_on="start",
-            right_on="seg_start",
-            by="contig",
-            strategy="backward",
-            check_sortedness=False,
-        )
-        .filter(pl.col("end") <= pl.col("seg_end"))
-    )
-
-    usable = joined.filter(pl.col("zscore").is_finite() & (pl.col("weight") > 0))
-    if usable.height == 0:
-        return segs_df.with_columns(
-            [pl.lit(0).alias("n_usable"), pl.lit(0.0).alias("zscore")]
-        ).sort("seg_id")
-
-    stats = (
-        usable.group_by("seg_id")
-        .agg(
-            [
-                pl.len().alias("n_usable"),
-                (pl.col("weight") * pl.col("zscore")).sum().alias("sum_w_z"),
-                (pl.col("weight") * pl.col("weight")).sum().alias("sum_w_sq"),
-                pl.col("rho1").first().alias("rho1"),
-            ]
-        )
-        .with_columns(
-            (
-                pl.col("sum_w_sq")
-                * (
-                    1.0
-                    + pl.when(pl.col("n_usable") > 1)
-                    .then(
-                        2.0
-                        * (pl.col("n_usable") - 1)
-                        / pl.col("n_usable")
-                        * pl.col("rho1")
-                    )
-                    .otherwise(0.0)
-                )
-            )
-            .sqrt()
-            .alias("denom")
-        )
-        .with_columns(
-            pl.when(pl.col("denom") > 1e-12)
-            .then(pl.col("sum_w_z") / pl.col("denom"))
-            .otherwise(0.0)
-            .alias("zscore")
-        )
-    )
-    return (
-        segs_df.join(
-            stats.select(["seg_id", "n_usable", "zscore"]), on="seg_id", how="left"
-        )
-        .with_columns(
-            [pl.col("n_usable").fill_null(0), pl.col("zscore").fill_null(0.0)]
-        )
-        .sort("seg_id")
     )

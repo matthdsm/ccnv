@@ -3,72 +3,67 @@
 from __future__ import annotations
 
 import logging
-import warnings
 from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 from numpy.typing import NDArray
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.linear_model import HuberRegressor
 
-from ccnv.features.cohort import compute_bin_exposure
+from ccnv.features.binning import compute_bin_exposure
 from ccnv.features.covariates import mask_covariates
-from ccnv.features.fragmentomics import (
-    extract_bin_fragmentomic_covariates,
-    resolve_fragmentomics_compatibility,
-)
-from ccnv.io.parquet import (
-    align_sample_grid_indices,
-    extract_reference_branch_arrays,
-    extract_sample_meta_and_counts,
-)
 from ccnv.io.tracks import (
-    load_fasta_gc_quantiles,
     load_gc_track,
     load_mappability_track,
 )
 from ccnv.models import (
     DEFAULT_MIN_MAPPABILITY,
+    NUM_GC_QUANTILES,
     NUM_PROTOTYPES_PER_BIN,
+    ArtifactKind,
     BinResult,
     CovariateError,
     PredictConfig,
     PredictError,
     ReferenceMetadata,
     SampleBuffers,
+    SampleMetadata,
     SchemaError,
+    decode_dictionary_contigs,
+    fixed_size_list_to_numpy,
+    reconstruct_sample_grid,
+    validate_schema,
 )
 from ccnv.stats.neighbors import (
+    LN2_SQ,
     compute_kish_loco_inflation,
     evaluate_loco_prototype_baseline,
     exact_poisson_log2_jensen_bias,
 )
+from ccnv.stats.pca import LOG_WAVE_CLIP, project_huber_pca_wave
 from ccnv.stats.regression import (
     build_exogenous_covariate_basis,
     fit_poisson_covariate_trends,
+    half_sample_mode,
+    hsm_biweight_mode,
 )
 
 logger = logging.getLogger(__name__)
 
-_LN2_SQ: Final[float] = float(np.log(2.0) ** 2)
 _COARSE_MASK_BLOCK_BINS: Final[int] = 100
 _COARSE_BLOCK_Z_THRESHOLD: Final[float] = 3.5
-_LOG_WAVE_CLIP: Final[float] = 4.0
 _TAU_MIN: Final[float] = 0.7
 _TAU_MAX: Final[float] = 2.5
 
 __all__ = [
     "BranchModel",
     "BranchNormalizationResult",
-    "ProjectedCoverage",
     "build_branch_model",
     "build_branch_model_from_tables",
     "half_sample_mode",
     "normalize_branch",
     "normalize_sample_branch",
-    "project_coverage",
 ]
 
 
@@ -88,28 +83,15 @@ class BranchModel:
     proto_weights: NDArray[np.float16]
     mean_distance: NDArray[np.float32]
     null_mean: NDArray[np.float64]
-    null_std: NDArray[np.float64]
+    bio_dispersion: NDArray[np.float64]
     gc: NDArray[np.floating] | None = None
     mappability: NDArray[np.floating] | None = None
-    mean_frag_len: NDArray[np.floating] | None = None
-    endpoint_ratio: NDArray[np.floating] | None = None
     gc_quantiles: NDArray[np.float32] | None = None
     ref_frag_len: NDArray[np.float32] | None = None
     ref_ep_rate: NDArray[np.float32] | None = None
-    bio_dispersion: NDArray[np.float64] | None = None
     bin_size: int | None = None
     is_flat: bool = False
     kappa_frag: NDArray[np.float32] | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ProjectedCoverage:
-    """Multiplicatively projected sample coverage and expected counts."""
-
-    normalized: NDArray[np.float64]
-    corrected: NDArray[np.float64]
-    usable: NDArray[np.bool_]
-    expected_counts: NDArray[np.float64] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,72 +104,77 @@ class BranchNormalizationResult:
     ratios: NDArray[np.float64]
     zscores: NDArray[np.float64]
     weights: NDArray[np.float64]
-    sigma_test: NDArray[np.float64]
     usable: NDArray[np.bool_]
     reference_sizes: NDArray[np.int64]
 
 
-def half_sample_mode(values: NDArray[np.floating]) -> float:
-    """Compute Robertson-Cryer O(N log N) iterative Half-Sample Mode."""
-    arr = np.asarray(values, dtype=np.float64)
-    finite = arr[np.isfinite(arr)]
-    if finite.size == 0:
-        return 0.0
-    s = np.sort(finite)
-    while s.size > 3:
-        n = int(s.size)
-        half = (n + 1) // 2
-        widths = s[half - 1 :] - s[: n - half + 1]
-        min_w = float(np.min(widths))
-        ties = np.flatnonzero(widths <= min_w + 1e-15)
-        best = int(ties[ties.size // 2])
-        s = s[best : best + half]
-    if s.size == 1:
-        return float(s[0])
-    if s.size == 2:
-        return 0.5 * float(s[0] + s[1])
-    d0 = float(s[1] - s[0])
-    d1 = float(s[2] - s[1])
-    if d0 < d1:
-        return 0.5 * float(s[0] + s[1])
-    if d1 < d0:
-        return 0.5 * float(s[1] + s[2])
-    return float(s[1])
+def _opt_sentinel_track[ScalarT: np.floating](
+    col: pa.Array | pa.ChunkedArray,
+    dtype: type[ScalarT],
+) -> NDArray[ScalarT] | None:
+    raw = np.asarray(col.combine_chunks().to_numpy(zero_copy_only=False), dtype=dtype)
+    valid = np.isfinite(raw) & (raw >= 0.0)
+    if not np.any(valid):
+        return None
+    return np.where(valid, raw, np.nan).astype(dtype, copy=False)
 
 
-def _hsm_biweight_mode(
-    values: NDArray[np.float64],
-    weights: NDArray[np.float64] | None = None,
-) -> float:
-    """Refine Half-Sample Mode with 2-step precision-weighted Tukey biweight."""
-    values = np.asarray(values, dtype=np.float64)
-    finite_mask = np.isfinite(values)
-    if weights is not None:
-        w_arr = np.asarray(weights, dtype=np.float64)
-        if w_arr.shape == finite_mask.shape:
-            weights = w_arr[finite_mask]
-    values = values[finite_mask]
-    if values.size == 0:
-        return 0.0
-    m = half_sample_mode(values)
-    if values.size < 6:
-        return m
-    mad = 1.4826 * float(np.median(np.abs(values - m)))
-    if mad <= 1e-8:
-        return m
-    c = 3.5 * mad
-    base_w = np.ones_like(values) if weights is None else np.maximum(weights, 0.0)
-    for _ in range(2):
-        u = (values - m) / c
-        inlier = np.abs(u) < 1.0
-        if not np.any(inlier):
-            return m
-        w = np.where(inlier, base_w * np.square(1.0 - np.square(u)), 0.0)
-        w_sum = float(np.sum(w))
-        if w_sum <= 0.0:
-            return m
-        m = float(np.sum(w * values)) / w_sum
-    return m
+def _align_sample_grid_indices(
+    s_meta: SampleMetadata,
+    ref_contigs: tuple[str, ...],
+    ref_starts: NDArray[np.int64],
+    ref_ends: NDArray[np.int64],
+    branch: str,
+) -> NDArray[np.int64]:
+    """Align reference branch bin coordinates to sample grid indices in O(B) time."""
+    n_ref = len(ref_contigs)
+    if n_ref == 0:
+        return np.empty(0, dtype=np.int64)
+
+    _, _, s_starts_u32, s_ends_u32 = reconstruct_sample_grid(s_meta)
+    s_starts = s_starts_u32.astype(np.int64, copy=False)
+    s_ends = s_ends_u32.astype(np.int64, copy=False)
+
+    contig_slices: dict[str, tuple[int, int]] = {}
+    offset = 0
+    for c_name in s_meta.contig_order:
+        c_bins = (
+            s_meta.contig_lengths[c_name] + s_meta.bin_size - 1
+        ) // s_meta.bin_size
+        contig_slices[c_name] = (offset, offset + c_bins)
+        offset += c_bins
+
+    ref_c_arr = np.asarray(ref_contigs, dtype=object)
+    out_idx = np.empty(n_ref, dtype=np.int64)
+    for c_name in dict.fromkeys(ref_contigs):
+        bounds = contig_slices.get(c_name)
+        if bounds is None:
+            raise PredictError(
+                f"sample is missing reference bins for branch {branch!r} on contig {c_name!r}"
+            )
+        s_lo, s_hi = bounds
+        s_s_sub = s_starts[s_lo:s_hi]
+        s_e_sub = s_ends[s_lo:s_hi]
+        r_mask = ref_c_arr == c_name
+        r_s = ref_starts[r_mask]
+        r_e = ref_ends[r_mask]
+        if s_s_sub.size == 0:
+            raise PredictError(
+                f"sample has zero bins on contig {c_name!r} for branch {branch!r}"
+            )
+        rel_idx = np.searchsorted(s_s_sub, r_s)
+        clipped = np.minimum(rel_idx, s_s_sub.size - 1)
+        matched = (
+            (rel_idx < s_s_sub.size)
+            & (s_s_sub[clipped] == r_s)
+            & (s_e_sub[clipped] == r_e)
+        )
+        if not np.all(matched):
+            raise PredictError(
+                f"sample bin coordinates do not match reference branch {branch!r} on contig {c_name!r}"
+            )
+        out_idx[r_mask] = s_lo + rel_idx
+    return out_idx
 
 
 def build_branch_model_from_tables(
@@ -198,77 +185,129 @@ def build_branch_model_from_tables(
     ref_meta: ReferenceMetadata | None = None,
 ) -> BranchModel:
     """Construct a BranchModel from a Reference Parquet table and optional sample."""
-    resolved_meta = (
-        ref_meta
-        if ref_meta is not None
-        else ReferenceMetadata.from_schema(ref_table.schema)
-    )
-    arrs = extract_reference_branch_arrays(ref_table, branch, resolved_meta)
+    try:
+        validate_schema(ref_table.schema, ArtifactKind.REFERENCE)
+        resolved_meta = (
+            ref_meta
+            if ref_meta is not None
+            else ReferenceMetadata.from_schema(ref_table.schema)
+        )
+        sub = ref_table.filter(pc.equal(ref_table.column("branch"), branch))
+        if sub.num_rows == 0:
+            raise PredictError(f"reference has no rows for branch {branch!r}")
+
+        n_bins = sub.num_rows
+        contigs = decode_dictionary_contigs(sub.column("contig"))
+        starts = np.asarray(
+            sub.column("start").combine_chunks().to_numpy(zero_copy_only=False),
+            dtype=np.int64,
+        )
+        ends = np.asarray(
+            sub.column("end").combine_chunks().to_numpy(zero_copy_only=False),
+            dtype=np.int64,
+        )
+        masked = np.asarray(
+            sub.column("masked").combine_chunks().to_numpy(zero_copy_only=False),
+            dtype=np.bool_,
+        )
+        pca_mean = np.asarray(
+            sub.column("pca_mean").combine_chunks().to_numpy(zero_copy_only=False),
+            dtype=np.float64,
+        )
+        mean_distance = np.asarray(
+            sub.column("mean_distance").combine_chunks().to_numpy(zero_copy_only=False),
+            dtype=np.float32,
+        )
+        null_mean = np.asarray(
+            sub.column("null_mean").combine_chunks().to_numpy(zero_copy_only=False),
+            dtype=np.float64,
+        )
+        bio_dispersion = np.maximum(
+            np.asarray(
+                sub.column("bio_dispersion")
+                .combine_chunks()
+                .to_numpy(zero_copy_only=False),
+                dtype=np.float64,
+            ),
+            0.0,
+        )
+
+        ld_col = sub.column("pca_loadings").combine_chunks()
+        ld_type = ld_col.type
+        if not isinstance(ld_type, pa.FixedSizeListType):
+            raise SchemaError(
+                f"expected FixedSizeListType for 'pca_loadings', found {ld_type}"
+            )
+        list_rank = ld_type.list_size
+        k_branch = (
+            resolved_meta.branch_pca_ranks.get(branch, list_rank)
+            if resolved_meta.branch_pca_ranks is not None
+            else list_rank
+        )
+        k_eff = max(0, min(int(k_branch), list_rank))
+        if k_eff == 0 or list_rank == 0:
+            pca_loadings = np.empty((0, n_bins), dtype=np.float32)
+        else:
+            ld_2d = fixed_size_list_to_numpy(ld_col, list_rank, np.float32)
+            pca_loadings = np.ascontiguousarray(ld_2d[:, :k_eff].T, dtype=np.float32)
+
+        proto_ids = fixed_size_list_to_numpy(
+            sub.column("proto_ids"), NUM_PROTOTYPES_PER_BIN, np.uint16
+        )
+        proto_weights = fixed_size_list_to_numpy(
+            sub.column("proto_weights"), NUM_PROTOTYPES_PER_BIN, np.float16
+        )
+        gc = _opt_sentinel_track(sub.column("gc"), np.float64)
+        mappability = _opt_sentinel_track(sub.column("mappability"), np.float64)
+        ref_frag_len = _opt_sentinel_track(sub.column("ref_frag_len"), np.float32)
+        ref_ep_rate = _opt_sentinel_track(sub.column("ref_ep_rate"), np.float32)
+
+        gc_q_col = sub.column("gc_quantiles").combine_chunks()
+        if gc_q_col.null_count == n_bins:
+            gc_quantiles: NDArray[np.float32] | None = None
+        else:
+            gc_q_raw = fixed_size_list_to_numpy(gc_q_col, NUM_GC_QUANTILES, np.float32)
+            gc_quantiles = (
+                gc_q_raw if np.any(np.isfinite(gc_q_raw) & (gc_q_raw >= 0.0)) else None
+            )
+    except SchemaError as err:
+        raise PredictError(str(err)) from err
+
     if sample_data is not None:
         try:
-            s_meta, s_counts = extract_sample_meta_and_counts(
-                sample_data, validate=True
-            )
+            bufs = SampleBuffers.coerce(sample_data, validate=True)
         except SchemaError as err:
             raise PredictError(str(err)) from err
-        s_idx = align_sample_grid_indices(
-            s_meta, arrs.contigs, arrs.starts, arrs.ends, branch
+        s_idx = _align_sample_grid_indices(bufs.meta, contigs, starts, ends, branch)
+        counts = np.asarray(bufs.count, dtype=np.float64)[s_idx]
+        kappa_frag: NDArray[np.float32] | None = (
+            bufs.kappa_frag[s_idx] if bufs.kappa_frag is not None else None
         )
-        counts = s_counts[s_idx]
-        if resolve_fragmentomics_compatibility(sample_data, ref_table):
-            f_len, e_rat = extract_bin_fragmentomic_covariates(sample_data)
-            mean_frag_len: NDArray[np.floating] | None = f_len[s_idx].astype(np.float64)
-            endpoint_ratio: NDArray[np.floating] | None = e_rat[s_idx].astype(
-                np.float64
-            )
-        else:
-            mean_frag_len, endpoint_ratio = None, None
-
-        if (
-            isinstance(sample_data, SampleBuffers)
-            and sample_data.kappa_frag is not None
-        ):
-            kappa_frag: NDArray[np.float32] | None = sample_data.kappa_frag[s_idx]
-        elif (
-            isinstance(sample_data, pa.Table)
-            and "kappa_frag" in sample_data.column_names
-        ):
-            kappa_frag = (
-                sample_data.column("kappa_frag")
-                .to_numpy(zero_copy_only=False)[s_idx]
-                .astype(np.float32)
-            )
-        else:
-            kappa_frag = None
     else:
-        counts = np.zeros(arrs.starts.size, dtype=np.float64)
-        mean_frag_len, endpoint_ratio = None, None
+        counts = np.zeros(starts.size, dtype=np.float64)
         kappa_frag = None
 
     return BranchModel(
         branch=branch,
-        contigs=arrs.contigs,
-        starts=arrs.starts,
-        ends=arrs.ends,
+        contigs=contigs,
+        starts=starts,
+        ends=ends,
         counts=counts,
-        masked=arrs.masked,
-        pca_mean=arrs.pca_mean,
-        pca_loadings=arrs.pca_loadings,
-        proto_ids=arrs.proto_ids,
-        proto_weights=arrs.proto_weights,
-        mean_distance=arrs.mean_distance,
-        null_mean=arrs.null_mean,
-        null_std=arrs.null_std,
-        gc=arrs.gc,
-        mappability=arrs.mappability,
-        mean_frag_len=mean_frag_len,
-        endpoint_ratio=endpoint_ratio,
-        gc_quantiles=arrs.gc_quantiles,
-        ref_frag_len=arrs.ref_frag_len,
-        ref_ep_rate=arrs.ref_ep_rate,
-        bio_dispersion=arrs.bio_dispersion,
-        bin_size=arrs.bin_size,
-        is_flat=arrs.is_flat,
+        masked=masked,
+        pca_mean=pca_mean,
+        pca_loadings=pca_loadings,
+        proto_ids=proto_ids,
+        proto_weights=proto_weights,
+        mean_distance=mean_distance,
+        null_mean=null_mean,
+        bio_dispersion=bio_dispersion,
+        gc=gc,
+        mappability=mappability,
+        gc_quantiles=gc_quantiles,
+        ref_frag_len=ref_frag_len,
+        ref_ep_rate=ref_ep_rate,
+        bin_size=resolved_meta.bin_size,
+        is_flat=resolved_meta.flat,
         kappa_frag=kappa_frag,
     )
 
@@ -290,23 +329,20 @@ def _infer_bin_size(model: BranchModel) -> int:
     return int(np.max(spans)) if spans.size > 0 else 5000
 
 
-def _expand_branch_field(
+def _align_branch_vector(
     values: NDArray[np.floating],
     unmasked: NDArray[np.bool_],
     n_bins: int,
-    *,
     name: str,
-    fill: float = 0.0,
 ) -> NDArray[np.float64]:
-    """Expand unmasked-indexed or full-length 1D array onto full branch length B."""
+    """Return 1D float64 vector of length n_bins, expanding unmasked-only inputs if needed."""
     arr = np.asarray(values, dtype=np.float64)
-    u_count = int(np.count_nonzero(unmasked))
-    if arr.ndim == 1 and arr.size == u_count:
-        out = np.full(n_bins, fill, dtype=np.float64)
+    if arr.ndim == 1 and arr.size == n_bins:
+        return arr
+    if arr.ndim == 1 and arr.size == int(np.count_nonzero(unmasked)):
+        out = np.zeros(n_bins, dtype=np.float64)
         out[unmasked] = arr
         return out
-    if arr.ndim == 1 and arr.size == n_bins:
-        return arr.copy()
     raise PredictError(f"{name} does not align with unmasked sample bins")
 
 
@@ -393,9 +429,7 @@ def _project_expected_counts(
     """Fit exogenous Poisson covariate trend, super-block scale, and Huber PCA wave."""
     n_bins = int(counts.size)
     unmasked = ~np.asarray(model.masked, dtype=np.bool_)
-    mu_full = _expand_branch_field(
-        model.pca_mean, unmasked, n_bins, name="PCA mean", fill=0.0
-    )
+    mu_full = _align_branch_vector(model.pca_mean, unmasked, n_bins, "PCA mean")
 
     gc = model.gc if gc_override is None else gc_override
     gc_q = (
@@ -476,83 +510,26 @@ def _project_expected_counts(
         fit_in_u = fit_cov[unmasked] & (e0[unmasked] > 0.0)
         if int(np.count_nonzero(fit_in_u)) < 2:
             fit_in_u = act_in_u
-        n_fit_u = int(np.count_nonzero(fit_in_u))
-        if n_fit_u >= 2:
-            v_fit = v_u[:, fit_in_u]
-            gram_v = 0.5 * (v_fit @ v_fit.T + (v_fit @ v_fit.T).T)
-            evals_v, evecs_v = np.linalg.eigh(gram_v)
-            tol_v = 1e-8 * max(float(np.max(evals_v)), 1.0)
-            keep_v = evals_v > tol_v
-            rank_eff = int(np.count_nonzero(keep_v))
-            if n_fit_u > rank_eff > 0:
-                proj_basis = evecs_v[:, keep_v].T
-                v_red_fit = proj_basis @ v_fit
-                v_red_u = proj_basis @ v_u
-                e0_fit = e0[u_idx[fit_in_u]]
-                c_fit = counts[u_idx[fit_in_u]]
-                w_fit = np.sqrt(e0_fit + 0.5)
-                y_fit = np.log((c_fit + 0.5) / (e0_fit + 0.5))
-                x_w = (v_red_fit * w_fit[np.newaxis, :]).T
-                y_w = y_fit * w_fit
-
-                coef: NDArray[np.float64] | None = None
-                if n_fit_u >= max(rank_eff + 2, 4) and float(np.std(y_w)) > 1e-12:
-                    try:
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", ConvergenceWarning)
-                            huber = HuberRegressor(
-                                fit_intercept=False,
-                                alpha=1e-4,
-                                epsilon=1.35,
-                                max_iter=100,
-                            )
-                            huber.fit(x_w, y_w)
-                            coef = np.asarray(huber.coef_, dtype=np.float64)
-                    except ValueError:
-                        coef = None
-                if coef is None or not bool(np.all(np.isfinite(coef))):
-                    coef = np.linalg.lstsq(x_w, y_w, rcond=None)[0]
-                eta_u = np.clip(v_red_u.T @ coef, -_LOG_WAVE_CLIP, _LOG_WAVE_CLIP)
-                hat_lambda[u_idx] = np.where(
-                    act_in_u,
-                    np.maximum(e0[u_idx] * np.exp(eta_u), 1e-12),
-                    0.0,
-                )
+        if int(np.count_nonzero(fit_in_u)) >= 2:
+            e0_fit = e0[u_idx[fit_in_u]]
+            c_fit = counts[u_idx[fit_in_u]]
+            w_fit = np.sqrt(e0_fit + 0.5)
+            y_fit = np.log((c_fit + 0.5) / (e0_fit + 0.5))
+            _, eta_u = project_huber_pca_wave(
+                y_fit,
+                v_u[:, fit_in_u],
+                whitening_scale=w_fit,
+                eval_loadings=v_u,
+                clip=LOG_WAVE_CLIP,
+            )
+            hat_lambda[u_idx] = np.where(
+                act_in_u,
+                np.maximum(e0[u_idx] * np.exp(eta_u), 1e-12),
+                0.0,
+            )
 
     usable = active_cov & np.isfinite(hat_lambda) & (hat_lambda > 0.0)
     return e0, hat_lambda, usable, design_u
-
-
-def project_coverage(
-    model: BranchModel,
-    *,
-    gc_override: NDArray[np.floating] | None = None,
-    mappability_override: NDArray[np.floating] | None = None,
-    n_mask_override: NDArray[np.bool_] | None = None,
-    min_mappability: float = DEFAULT_MIN_MAPPABILITY,
-) -> ProjectedCoverage:
-    """Project sample counts onto exogenous covariate trends and PCA subspace."""
-    counts = np.asarray(model.counts, dtype=np.float64)
-    exposure = compute_bin_exposure(model.starts, model.ends, _infer_bin_size(model))
-    e0, hat_lambda, usable, _ = _project_expected_counts(
-        counts,
-        exposure,
-        model,
-        gc_override=gc_override,
-        mappability_override=mappability_override,
-        n_mask_override=n_mask_override,
-        min_mappability=min_mappability,
-    )
-    normalized = np.full(counts.shape, np.nan, dtype=np.float64)
-    corrected = np.full(counts.shape, np.nan, dtype=np.float64)
-    normalized[usable] = (counts[usable] + 0.5) / (e0[usable] + 0.5)
-    corrected[usable] = (counts[usable] + 0.5) / (hat_lambda[usable] + 0.5)
-    return ProjectedCoverage(
-        normalized=normalized,
-        corrected=corrected,
-        usable=usable,
-        expected_counts=hat_lambda,
-    )
 
 
 def _calibrated_loco_baseline(
@@ -588,7 +565,6 @@ def _empty_norm_result(
         ratios=np.full(n_bins, np.nan, dtype=np.float64),
         zscores=np.full(n_bins, np.nan, dtype=np.float64),
         weights=np.zeros(n_bins, dtype=np.float64),
-        sigma_test=np.full(n_bins, np.nan, dtype=np.float64),
         usable=np.zeros(n_bins, dtype=np.bool_),
         reference_sizes=reference_sizes,
     )
@@ -612,28 +588,16 @@ def normalize_sample_branch(
     counts_arr = np.asarray(counts, dtype=np.float64)
     n_bins = int(counts_arr.size)
     unmasked = ~np.asarray(model.masked, dtype=np.bool_)
-    null_mean_full = _expand_branch_field(
-        model.null_mean, unmasked, n_bins, name="null_mean", fill=0.0
+    null_mean_full = _align_branch_vector(
+        model.null_mean, unmasked, n_bins, "null_mean"
     )
-    dist_full = _expand_branch_field(
-        model.mean_distance, unmasked, n_bins, name="mean_distance", fill=0.0
+    dist_full = _align_branch_vector(
+        model.mean_distance, unmasked, n_bins, "mean_distance"
     )
-    if model.bio_dispersion is not None:
-        bio_disp_full = np.maximum(
-            _expand_branch_field(
-                model.bio_dispersion,
-                unmasked,
-                n_bins,
-                name="bio_dispersion",
-                fill=0.0,
-            ),
-            0.0,
-        )
-    else:
-        null_std_full = _expand_branch_field(
-            model.null_std, unmasked, n_bins, name="null_std", fill=0.0
-        )
-        bio_disp_full = _LN2_SQ * np.square(np.maximum(null_std_full, 0.0))
+    bio_disp_full = np.maximum(
+        _align_branch_vector(model.bio_dispersion, unmasked, n_bins, "bio_dispersion"),
+        0.0,
+    )
 
     _, hat_lambda, usable_pre, design_u = _project_expected_counts(
         counts_arr,
@@ -711,7 +675,7 @@ def normalize_sample_branch(
         )
         sig0_it = np.sqrt(
             np.maximum(
-                ((kap_u / (_LN2_SQ * (eff_lam_it + 0.5))) + (phi_u / _LN2_SQ))
+                ((kap_u / (LN2_SQ * (eff_lam_it + 0.5))) + (phi_u / LN2_SQ))
                 * f_loco_it,
                 1e-12,
             )
@@ -773,14 +737,13 @@ def normalize_sample_branch(
     ratios = np.full(n_bins, np.nan, dtype=np.float64)
     zscores = np.full(n_bins, np.nan, dtype=np.float64)
     weights = np.zeros(n_bins, dtype=np.float64)
-    sigma_test = np.full(n_bins, np.nan, dtype=np.float64)
 
     f_loco_u = compute_kish_loco_inflation(
         c_ids_u, pids_u, pw_u, sup_u, eligible=donor_elig
     )
     eff_lam_v = lam_u[valid_u] * b_cal[valid_u]
     sig0_sq_v = np.maximum(
-        ((kap_u[valid_u] / (_LN2_SQ * (eff_lam_v + 0.5))) + (phi_u[valid_u] / _LN2_SQ))
+        ((kap_u[valid_u] / (LN2_SQ * (eff_lam_v + 0.5))) + (phi_u[valid_u] / LN2_SQ))
         * f_loco_u[valid_u],
         1e-12,
     )
@@ -802,7 +765,7 @@ def normalize_sample_branch(
             blk_means_list.append(float(np.sum(w0_u[lo:hi] * r_sub)) / w_blk)
             blk_weights_list.append(w_blk)
     hsm_shift = (
-        _hsm_biweight_mode(
+        hsm_biweight_mode(
             np.asarray(blk_means_list, dtype=np.float64),
             np.asarray(blk_weights_list, dtype=np.float64),
         )
@@ -838,7 +801,6 @@ def normalize_sample_branch(
                 tau_sample = float(np.clip(scale_d, _TAU_MIN, _TAU_MAX))
 
     sig_v = tau_sample * np.sqrt(sig0_sq_v)
-    sigma_test[valid_global] = sig_v
     zscores[valid_global] = (r_tilde_v - null_mean_full[valid_global]) / sig_v
     weights_v = 1.0 / np.square(sig_v)
 
@@ -866,33 +828,31 @@ def normalize_sample_branch(
         ratios=ratios,
         zscores=zscores,
         weights=weights,
-        sigma_test=sigma_test,
         usable=usable_final,
         reference_sizes=reference_sizes,
     )
 
 
-def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
+def normalize_branch(
+    model: BranchModel,
+    config: PredictConfig,
+    *,
+    gc_override: NDArray[np.float64] | None = None,
+    gc_quantiles_override: NDArray[np.float32] | None = None,
+    n_mask_override: NDArray[np.bool_] | None = None,
+    mappability_override: NDArray[np.float64] | None = None,
+) -> BinResult:
     """Normalize one branch according to PredictConfig and return BinResult."""
     logger.debug("normalizing branch %s (%d bins)", model.branch, model.counts.size)
     try:
-        gc_override, n_mask_override = (
-            load_gc_track(config.gc, model.contigs, model.starts, model.ends)
-            if config.gc
-            else (None, None)
-        )
-        gc_q_override = (
-            load_fasta_gc_quantiles(config.gc, model.contigs, model.starts, model.ends)
-            if config.gc
-            else None
-        )
-        mappability_override = (
-            load_mappability_track(
+        if config.gc is not None and gc_override is None:
+            gc_override, n_mask_override, gc_quantiles_override = load_gc_track(
+                config.gc, model.contigs, model.starts, model.ends
+            )
+        if config.mappability is not None and mappability_override is None:
+            mappability_override = load_mappability_track(
                 config.mappability, model.contigs, model.starts, model.ends
             )
-            if config.mappability
-            else None
-        )
     except CovariateError as err:
         raise PredictError(str(err)) from err
 
@@ -905,7 +865,7 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
         kappa_frag=model.kappa_frag,
         min_reference_bins=config.min_reference_bins,
         gc_override=gc_override,
-        gc_quantiles_override=gc_q_override,
+        gc_quantiles_override=gc_quantiles_override,
         mappability_override=mappability_override,
         n_mask_override=n_mask_override,
         min_mappability=config.min_mappability,

@@ -20,7 +20,6 @@ from ccnv.models import (
     PredictError,
     ReferenceError,
     SampleBuffers,
-    SampleMetadata,
     is_autosome_name,
     normalize_chr,
     reconstruct_sample_grid,
@@ -504,14 +503,8 @@ def infer_single_sample_sex(
         or not math.isfinite(float(cutoff))
     ):
         raise PredictError("cannot infer sample sex; pass --sex female or --sex male")
-    counts = (
-        np.asarray(sample.count, dtype=np.float64)
-        if isinstance(sample, SampleBuffers)
-        else np.asarray(
-            sample.column("count").combine_chunks().to_numpy(zero_copy_only=False),
-            dtype=np.float64,
-        )
-    )
+    bufs = SampleBuffers.coerce(sample)
+    counts = np.asarray(bufs.count, dtype=np.float64)
     total = float(np.sum(counts))
     if total <= 0:
         raise PredictError("sample has zero total coverage")
@@ -522,45 +515,17 @@ def infer_single_sample_sex(
         if isinstance(raw_clen, Mapping) and isinstance(raw_clen.get(signal), int)
         else 0
     )
-    if not isinstance(sample, SampleBuffers) and "contig" in sample.column_names:
-        contigs = np.asarray(
-            sample.column("contig").combine_chunks().to_numpy(zero_copy_only=False),
-            dtype=object,
+    codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(bufs.meta)
+    on_sig = (
+        nonpar_contig_mask(
+            codes == names.index(signal),
+            starts_u32,
+            ends_u32,
+            bufs.meta.contig_lengths.get(signal, sig_len),
         )
-        on_sig = contigs == signal
-        if (
-            "start" in sample.column_names
-            and "end" in sample.column_names
-            and np.any(on_sig)
-        ):
-            starts = np.asarray(
-                sample.column("start").combine_chunks().to_numpy(zero_copy_only=False),
-                dtype=np.int64,
-            )
-            ends = np.asarray(
-                sample.column("end").combine_chunks().to_numpy(zero_copy_only=False),
-                dtype=np.int64,
-            )
-            on_sig = nonpar_contig_mask(
-                on_sig, starts, ends, sig_len or int(np.max(ends[on_sig]))
-            )
-    else:
-        s_meta = (
-            sample.meta
-            if isinstance(sample, SampleBuffers)
-            else SampleMetadata.from_schema(sample.schema)
-        )
-        codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(s_meta)
-        on_sig = (
-            nonpar_contig_mask(
-                codes == names.index(signal),
-                starts_u32,
-                ends_u32,
-                s_meta.contig_lengths.get(signal, sig_len),
-            )
-            if signal in names
-            else np.zeros(counts.size, dtype=np.bool_)
-        )
+        if signal in names
+        else np.zeros(counts.size, dtype=np.bool_)
+    )
     fraction = float(np.sum(counts[on_sig])) / total
     sex: SexLabel = "male" if fraction > float(cutoff) else "female"
     logger.debug(

@@ -13,7 +13,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from numpy.typing import ArrayLike, NDArray
 
-from ccnv.extract import extract_for_predict, extracted_to_sample_buffers
+from ccnv.extract import extract_for_predict
 from ccnv.features.covariates import validate_min_mappability
 from ccnv.features.fragmentomics import (
     apply_prenatal_fisher_weighting,
@@ -22,22 +22,23 @@ from ccnv.features.fragmentomics import (
 from ccnv.features.normalization import (
     BranchModel,
     BranchNormalizationResult,
-    ProjectedCoverage,
     build_branch_model_from_tables,
     normalize_branch,
     normalize_sample_branch,
-    project_coverage,
 )
 from ccnv.features.prenatal import predict_prenatal
-from ccnv.features.prenatal_origin import annotate_prenatal_origin_and_lod
-from ccnv.features.rebinning import rebin_sample_buffers, rebin_sample_sketch
+from ccnv.features.prenatal_origin import annotate_sample_prenatal_segments
+from ccnv.features.rebinning import rebin_sample_buffers
 from ccnv.features.sex import infer_single_sample_sex
 from ccnv.io.parquet import (
     read_reference_parquet,
-    read_sample_parquet,
-    unique_dictionary_contigs,
+    read_sample_buffers,
 )
-from ccnv.io.tracks import load_cytobands_track
+from ccnv.io.tracks import (
+    load_cytobands_track,
+    load_gc_track,
+    load_mappability_track,
+)
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
@@ -48,7 +49,6 @@ from ccnv.models import (
     ArtifactKind,
     BinCompatibilityError,
     BinResult,
-    CallType,
     CovariateError,
     FetalFractionResult,
     PredictConfig,
@@ -59,14 +59,15 @@ from ccnv.models import (
     SampleBuffers,
     SegmentResult,
     decode_metadata,
-    validate_sample_table,
+    normalize_chr,
+    reconstruct_sample_grid,
+    unique_dictionary_contigs,
     validate_schema,
 )
 from ccnv.qc.predict import build_predict_qc_payload, write_predict_qc_json
 from ccnv.report import write_outputs
 from ccnv.stats.segmentation import (
-    compute_contig_rho1,
-    evaluate_stouffer_segment_scores,
+    ContigSegmentationInput,
     segment_and_score_genome,
 )
 
@@ -78,15 +79,12 @@ __all__ = [
     "BranchNormalizationResult",
     "PredictError",
     "PredictionInput",
-    "ProjectedCoverage",
     "SampleBuffers",
     "build_branch_model",
-    "call_segment",
     "extract_for_predict",
     "load_inputs",
     "normalize_branch",
     "normalize_sample_branch",
-    "project_coverage",
     "run",
     "run_predict",
     "segment_and_call",
@@ -95,11 +93,105 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class PredictionInput:
-    sample: pa.Table | SampleBuffers
+    """Loaded sample buffers and reference branches ready for normalization."""
+
+    sample: SampleBuffers
     reference: pa.Table
     contig_lengths: dict[str, int]
     sex: Sex | None
     branches: tuple[str, ...]
+
+
+def _normalize_branches_once(
+    inputs: PredictionInput,
+    config: PredictConfig,
+) -> tuple[BinResult, ...]:
+    models = tuple(build_branch_model(inputs, branch) for branch in inputs.branches)
+    if not models or (config.gc is None and config.mappability is None):
+        return tuple(normalize_branch(model, config) for model in models)
+
+    all_contigs: list[str] = []
+    offsets = [0]
+    for model in models:
+        all_contigs.extend(model.contigs)
+        offsets.append(len(all_contigs))
+    all_starts = (
+        np.concatenate([m.starts for m in models])
+        if all_contigs
+        else np.empty(0, dtype=np.int64)
+    )
+    all_ends = (
+        np.concatenate([m.ends for m in models])
+        if all_contigs
+        else np.empty(0, dtype=np.int64)
+    )
+
+    try:
+        gc_all, n_mask_all, gc_q_all = (
+            load_gc_track(config.gc, all_contigs, all_starts, all_ends)
+            if config.gc is not None
+            else (None, None, None)
+        )
+        map_all = (
+            load_mappability_track(
+                config.mappability, all_contigs, all_starts, all_ends
+            )
+            if config.mappability is not None
+            else None
+        )
+    except CovariateError as err:
+        raise PredictError(str(err)) from err
+
+    results: list[BinResult] = []
+    for idx, model in enumerate(models):
+        sl = slice(offsets[idx], offsets[idx + 1])
+        results.append(
+            normalize_branch(
+                model,
+                config,
+                gc_override=gc_all[sl] if gc_all is not None else None,
+                gc_quantiles_override=gc_q_all[sl] if gc_q_all is not None else None,
+                n_mask_override=n_mask_all[sl] if n_mask_all is not None else None,
+                mappability_override=map_all[sl] if map_all is not None else None,
+            )
+        )
+    return tuple(results)
+
+
+def _sample_usable_from_bin_results(
+    raw_sample: SampleBuffers,
+    bin_results: tuple[BinResult, ...],
+) -> NDArray[np.bool_] | None:
+    if raw_sample.num_rows == 0 or not bin_results:
+        return None
+    codes, names, starts_u32, _ = reconstruct_sample_grid(raw_sample.meta)
+    usable_by_contig: dict[str, tuple[int, NDArray[np.bool_]]] = {}
+    for br in bin_results:
+        if br.starts.size == 0:
+            continue
+        c_arr = np.asarray(br.contigs, dtype=object)
+        for c_name in dict.fromkeys(br.contigs):
+            mask = c_arr == c_name
+            b_starts = br.starts[mask]
+            b_ends = br.ends[mask]
+            ref_bs = max(1, int(np.max(b_ends - b_starts)))
+            b_idx = b_starts // ref_bs
+            u_grid = np.zeros(int(np.max(b_idx)) + 1, dtype=np.bool_)
+            u_grid[b_idx] = ~br.masked[mask]
+            usable_by_contig[normalize_chr(str(c_name))] = (ref_bs, u_grid)
+
+    out = np.zeros(starts_u32.size, dtype=np.bool_)
+    starts_i64 = starts_u32.astype(np.int64, copy=False)
+    for c_code, c_name in enumerate(names):
+        entry = usable_by_contig.get(normalize_chr(c_name))
+        if entry is None:
+            continue
+        ref_bs, u_grid = entry
+        s_mask = codes == c_code
+        idx = starts_i64[s_mask] // ref_bs
+        in_bounds = (idx >= 0) & (idx < u_grid.size)
+        out[s_mask] = in_bounds & u_grid[np.clip(idx, 0, max(u_grid.size - 1, 0))]
+    return out
 
 
 def run(config: PredictConfig) -> PredictionOutputs:
@@ -133,10 +225,7 @@ def run(config: PredictConfig) -> PredictionOutputs:
         if weighted_sample is not raw_sample:
             inputs = replace(inputs, sample=weighted_sample)
 
-    bin_results = tuple(
-        normalize_branch(build_branch_model(inputs, branch), config)
-        for branch in inputs.branches
-    )
+    bin_results = _normalize_branches_once(inputs, config)
     _require_aligned_results(bin_results)
     segments = segment_and_call(
         bin_results,
@@ -149,14 +238,15 @@ def run(config: PredictConfig) -> PredictionOutputs:
         mode=config.mode,
     )
     if config.mode == "prenatal" and prenatal_result is not None:
-        annotated_segs, lod_metrics = annotate_prenatal_origin_and_lod(
+        sample_usable = _sample_usable_from_bin_results(raw_sample, bin_results)
+        segments, lod_metrics = annotate_sample_prenatal_segments(
             segments,
-            sample_table=raw_sample,
+            raw_sample,
+            bin_usable=sample_usable,
             prenatal_meta=prenatal_meta,
             prenatal_result=prenatal_result,
             z_threshold=config.z_threshold,
         )
-        segments = tuple(annotated_segs)
         prenatal_result = replace(prenatal_result, lod_metrics=lod_metrics)
     qc_json_path = Path(f"{config.prefix}_qc.json")
     write_predict_qc_json(
@@ -201,7 +291,7 @@ def load_inputs(
     fasta: Path | None = None,
     threads: int = 1,
 ) -> PredictionInput:
-    """Load and validate sample and selective reference branches against each other."""
+    """Load and validate sample buffers and selective reference branches."""
     try:
         ref_schema = pq.read_schema(reference_path)
         validate_schema(ref_schema, ArtifactKind.REFERENCE)
@@ -211,17 +301,16 @@ def load_inputs(
         raise PredictError(f"failed to read reference {reference_path}: {err}") from err
 
     if sample_path.suffix.lower() in {".bam", ".cram"}:
-        extracted = extract_for_predict(
+        sample = extract_for_predict(
             sample_path,
             ref_meta_obj,
             threads=threads,
             fasta=fasta,
             collect_bands=(mode == "prenatal"),
         )
-        sample: pa.Table | SampleBuffers = extracted_to_sample_buffers(extracted)
     else:
         try:
-            sample = read_sample_parquet(sample_path)
+            sample = read_sample_buffers(sample_path)
         except Exception as err:
             raise PredictError(f"failed to read sample {sample_path}: {err}") from err
 
@@ -277,24 +366,14 @@ def load_inputs(
                 branches.append(sex_branch)
         read_branches = list(branches)
 
-    sample_meta_obj = (
-        sample.meta
-        if isinstance(sample, SampleBuffers)
-        else validate_sample_table(sample)
-    )
-    if sample_meta_obj.bin_size != ref_meta_obj.bin_size:
+    if sample.meta.bin_size != ref_meta_obj.bin_size:
         logger.debug(
             "rebinning sample from %d bp to reference bin size %d bp",
-            sample_meta_obj.bin_size,
+            sample.meta.bin_size,
             ref_meta_obj.bin_size,
         )
         try:
-            if isinstance(sample, SampleBuffers):
-                sample = rebin_sample_buffers(sample, ref_meta_obj.bin_size)
-                sample_meta_obj = sample.meta
-            else:
-                sample = rebin_sample_sketch(sample, ref_meta_obj.bin_size)
-                sample_meta_obj = validate_sample_table(sample)
+            sample = rebin_sample_buffers(sample, ref_meta_obj.bin_size)
         except BinCompatibilityError as err:
             raise PredictError(str(err)) from err
 
@@ -310,7 +389,7 @@ def load_inputs(
         pc.is_in(reference.column("branch"), pa.array(branches, type=pa.string()))
     )
     active_contigs = unique_dictionary_contigs(active_ref.column("contig"))
-    sample_lens = sample_meta_obj.contig_lengths
+    sample_lens = sample.meta.contig_lengths
     ref_lens = dict(ref_meta_obj.contig_lengths)
     missing_contigs = [c for c in active_contigs if c not in sample_lens]
     if missing_contigs:
@@ -355,32 +434,6 @@ def build_branch_model(
     return build_branch_model_from_tables(inputs, branch, ref_meta=ref_meta)
 
 
-def call_segment(
-    ratio: float,
-    zscore: float,
-    *,
-    z_threshold: float,
-    ratio_threshold: float | None = None,
-) -> CallType | None:
-    """Classify a segment using a symmetric ratio or z-score threshold."""
-    val, thresh = (
-        (ratio, ratio_threshold)
-        if ratio_threshold is not None
-        else (zscore, z_threshold)
-    )
-    if not np.isfinite(val):
-        return None
-    if val > thresh:
-        return "gain"
-    if val < -thresh:
-        return "loss"
-    return None
-
-
-_compute_contig_rho1 = compute_contig_rho1
-_evaluate_stouffer_segment_scores = evaluate_stouffer_segment_scores
-
-
 def segment_and_call(
     bins: tuple[BinResult, ...],
     contig_lengths: dict[str, int],
@@ -396,52 +449,30 @@ def segment_and_call(
     if not bins:
         return ()
 
-    by_contig: dict[
-        str,
-        tuple[
-            NDArray[np.int64],
-            NDArray[np.int64],
-            NDArray[np.float64],
-            NDArray[np.float64],
-            int,
-            NDArray[np.float64],
-            NDArray[np.float64] | None,
-            NDArray[np.float64] | None,
-        ],
-    ] = {}
-
+    by_contig: dict[str, ContigSegmentationInput] = {}
     for result in bins:
         contig_array = np.asarray(result.contigs, dtype=object)
         for contig_name in dict.fromkeys(result.contigs):
             selected = contig_array == contig_name
-            c_starts = result.starts[selected]
-            c_ends = result.ends[selected]
-            c_ratios = result.ratios[selected]
-            c_weights = result.weights[selected]
-            c_zscores = result.zscores[selected]
-            c_counts = result.counts[selected] if result.counts is not None else None
-            c_expected = (
-                result.expected_counts[selected]
-                if result.expected_counts is not None
-                else None
-            )
-
-            by_contig[contig_name] = (
-                c_starts,
-                c_ends,
-                c_ratios,
-                c_weights,
-                contig_lengths[contig_name],
-                c_zscores,
-                c_counts,
-                c_expected,
+            by_contig[contig_name] = ContigSegmentationInput(
+                starts=result.starts[selected],
+                ends=result.ends[selected],
+                ratios=result.ratios[selected],
+                weights=result.weights[selected],
+                contig_length=contig_lengths[contig_name],
+                zscores=result.zscores[selected],
+                counts=result.counts[selected] if result.counts is not None else None,
+                expected=(
+                    result.expected_counts[selected]
+                    if result.expected_counts is not None
+                    else None
+                ),
             )
 
     scored_segments = segment_and_score_genome(
         by_contig,
         penalty=None,
         sensitivity=penalty,
-        algorithm="pelt",
         z_threshold=z_threshold,
         ratio_threshold=ratio_threshold,
         max_blacklist_gap=max_blacklist_gap,
@@ -449,31 +480,22 @@ def segment_and_call(
         mode=mode,
     )
 
-    output: list[SegmentResult] = []
-    for s in scored_segments:
-        contig = s.contig
-        start = s.start
-        end = min(s.end, contig_lengths[contig])
-        ratio = s.mean
-        seg_zscore = s.zscore
-        weight = s.weight
-        bin_count = s.bin_count
-        call = s.call.lower() if s.call in ("gain", "loss", "GAIN", "LOSS") else None
-        output.append(
-            SegmentResult(
-                contig=contig,
-                start=start,
-                end=end,
-                ratio=ratio,
-                zscore=seg_zscore,
-                weight=weight,
-                bin_count=bin_count,
-                call=call,
-                copy_number=s.copy_number,
-                log_bf=s.log_bf,
-                q_value=s.q_value,
-            )
+    output = tuple(
+        SegmentResult(
+            contig=s.contig,
+            start=s.start,
+            end=min(s.end, contig_lengths[s.contig]),
+            ratio=s.mean,
+            zscore=s.zscore,
+            weight=s.weight,
+            bin_count=s.bin_count,
+            call=s.call,
+            copy_number=s.copy_number,
+            log_bf=s.log_bf,
+            q_value=s.q_value,
         )
+        for s in scored_segments
+    )
 
     gains = sum(1 for s in output if s.call == "gain")
     losses = sum(1 for s in output if s.call == "loss")
@@ -485,12 +507,12 @@ def segment_and_call(
         losses,
         neutral,
     )
-    return tuple(output)
+    return output
 
 
 def _resolve_sample_sex(
     requested: Literal["autosomal", "female", "male"],
-    sample: pa.Table | SampleBuffers,
+    sample: SampleBuffers | pa.Table,
     metadata: dict[str, object],
     branches: set[object],
 ) -> Sex | None:

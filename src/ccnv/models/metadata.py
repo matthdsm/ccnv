@@ -178,6 +178,26 @@ class FragmentomicsMetadata:
                     f"{attr} must contain {expected} elements, got {actual}"
                 )
 
+    def to_dict(self) -> dict[str, object]:
+        """Convert fragmentomics metadata container to a JSON-serializable dictionary."""
+        return {
+            "paired_end": bool(self.paired_end),
+            "total_paired_fragments": int(self.total_paired_fragments),
+            "chromatosome_mode_bp": float(self.chromatosome_mode_bp),
+            "core_shoulder_bp": float(self.core_shoulder_bp),
+            "sizing_shift_bp": float(self.sizing_shift_bp),
+            "self_referenced_peak_ratio": float(self.self_referenced_peak_ratio),
+            "dinucleosome_fraction": float(self.dinucleosome_fraction),
+            "high_mw_fraction": float(self.high_mw_fraction),
+            "helical_10bp_amplitude": float(self.helical_10bp_amplitude),
+            "helical_10bp_phase": float(self.helical_10bp_phase),
+            "motif_diversity_score": float(self.motif_diversity_score),
+            "hist_autosomal": [int(x) for x in self.hist_autosomal],
+            "hist_chry": [int(x) for x in self.hist_chry],
+            "hist_chrx": [int(x) for x in self.hist_chrx],
+            "end_motif_counts": [int(x) for x in self.end_motif_counts],
+        }
+
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> FragmentomicsMetadata:
         """Construct FragmentomicsMetadata from a decoded JSON dictionary."""
@@ -231,7 +251,7 @@ class PrenatalModelMetadata:
     ffy_std: float = 0.01
     ffa_std: float = 0.02
     ffx_std: float = 0.025
-    ffa_logit_mode: bool = False
+    ffa_logit_mode: bool = True
     p_fetal_density: list[float] | None = None
     p_maternal_density: list[float] | None = None
     ff_frag_weights: list[float] | None = None
@@ -295,7 +315,7 @@ class PrenatalModelMetadata:
             ffa_std=_req_float(data.get("ffa_std", 0.02), "ffa_std"),
             ffx_std=_req_float(data.get("ffx_std", 0.025), "ffx_std"),
             ffa_logit_mode=_req_bool(
-                data.get("ffa_logit_mode", False), "ffa_logit_mode"
+                data.get("ffa_logit_mode", True), "ffa_logit_mode"
             ),
             p_fetal_density=_opt_float_list(data, "p_fetal_density"),
             p_maternal_density=_opt_float_list(data, "p_maternal_density"),
@@ -447,6 +467,28 @@ class SampleMetadata:
             for c in self.contig_order
         )
 
+    def to_metadata(self) -> dict[str, object]:
+        """Convert sample metadata to a dictionary for Arrow table persistence."""
+        values: dict[str, object] = {
+            "artifact_kind": ArtifactKind.SAMPLE.value,
+            "schema_version": self.schema_version,
+            "coordinate_system": self.coordinate_system,
+            "contig_lengths": dict(self.contig_lengths),
+            "contig_order": list(self.contig_order),
+            "bin_size": int(self.bin_size),
+            "source_identity": dict(self.source_identity),
+            "reference_identity": dict(self.reference_identity),
+            "qc": dict(self.qc),
+            "filters": dict(self.filters),
+        }
+        if self.fragmentomics is not None:
+            values["fragmentomics"] = self.fragmentomics.to_dict()
+        return values
+
+    def build_arrow_metadata(self) -> dict[bytes, bytes]:
+        """Build Arrow metadata mapping containing sample metadata."""
+        return encode_metadata(self.to_metadata())
+
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> SampleMetadata:
         """Construct sample metadata from a decoded Arrow metadata dictionary."""
@@ -527,9 +569,8 @@ class ReferenceMetadata:
     branches: tuple[str, ...]
     autosomal_contigs: tuple[str, ...] = ()
     sex_contigs: tuple[str, ...] = ()
-    pca_components: int = 5
-    nearest_bins: int = 300
-    mode: AnalysisMode = "germline"
+    pca_components: int = 0
+    mode: AnalysisMode = AnalysisMode.germline
     prenatal_bin_size: int | None = None
     sample_identities: tuple[object, ...] = ()
     sex_signal_contig: str | None = None
@@ -555,7 +596,6 @@ class ReferenceMetadata:
         if self.prenatal_bin_size is not None:
             _check_pos_int(self.prenatal_bin_size, "prenatal_bin_size")
         _check_nonneg_int(self.pca_components, "pca_components")
-        _check_nonneg_int(self.nearest_bins, "nearest_bins")
         _check_nonneg_int(self.max_batch_memory_mb, "max_batch_memory_mb")
         if self.branch_pca_ranks is not None:
             for b_name, b_rank in self.branch_pca_ranks.items():
@@ -578,7 +618,12 @@ class ReferenceMetadata:
             if f.name in _REF_TOP_KEYS:
                 continue
             val = getattr(self, f.name)
-            model[f.name] = list(val) if isinstance(val, tuple) else val
+            if f.name == "prenatal_bin_size" and val is None:
+                continue
+            if f.name == "mode":
+                model[f.name] = str(val)
+            else:
+                model[f.name] = list(val) if isinstance(val, tuple) else val
         values: dict[str, object] = {
             "sample_identities": list(self.sample_identities),
             "model": model,
@@ -589,12 +634,14 @@ class ReferenceMetadata:
 
     def build_arrow_metadata(self) -> dict[bytes, bytes]:
         """Build Arrow metadata mapping containing reference metadata."""
-        from ccnv.models.schemas import metadata_for
-
-        return metadata_for(
-            ArtifactKind.REFERENCE,
-            contig_lengths=self.contig_lengths,
-            values=self.to_metadata(),
+        return encode_metadata(
+            {
+                "artifact_kind": ArtifactKind.REFERENCE.value,
+                "schema_version": self.schema_version,
+                "coordinate_system": self.coordinate_system,
+                "contig_lengths": dict(self.contig_lengths),
+                **self.to_metadata(),
+            }
         )
 
     @classmethod
@@ -633,7 +680,7 @@ class ReferenceMetadata:
                 raise ValueError(
                     f"mode must be 'germline' or 'prenatal', got {raw_mode!r}"
                 )
-            mode: AnalysisMode = "prenatal" if raw_mode == "prenatal" else "germline"
+            mode = AnalysisMode(raw_mode)
             raw_pbs = model.get("prenatal_bin_size")
             prenatal_bs = (
                 _req_int(raw_pbs, "prenatal_bin_size")
@@ -667,9 +714,8 @@ class ReferenceMetadata:
                 ),
                 sex_contigs=_opt_str_tuple(model.get("sex_contigs"), "sex_contigs"),
                 pca_components=_req_int(
-                    model.get("pca_components", 5), "pca_components"
+                    model.get("pca_components", 0), "pca_components"
                 ),
-                nearest_bins=_req_int(model.get("nearest_bins", 300), "nearest_bins"),
                 mode=mode,
                 prenatal_bin_size=prenatal_bs,
                 sample_identities=sample_identities,

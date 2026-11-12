@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol
 
 from ccnv._core import (
     read_alignment_header as _read_alignment_header_core,
@@ -12,37 +11,15 @@ from ccnv._core import (
 from ccnv._core import (
     scan_alignment_bins as _scan_alignment_bins_core,
 )
-from ccnv.models import AlignmentError, ReadFilters
+from ccnv.models import AlignmentError, ReadFilters, ScanAlignmentResult
 
 __all__ = [
-    "AlignmentReadLike",
+    "ScanAlignmentResult",
     "alignment_format",
     "read_alignment_header",
-    "rejection_reason",
     "scan_alignment_bins",
     "validate_alignment_inputs",
 ]
-
-
-class AlignmentReadLike(Protocol):
-    """Structural protocol for per-read filter inspection."""
-
-    @property
-    def reference_start(self) -> int | None: ...
-    @property
-    def mapping_quality(self) -> int: ...
-    @property
-    def is_unmapped(self) -> bool: ...
-    @property
-    def is_secondary(self) -> bool: ...
-    @property
-    def is_supplementary(self) -> bool: ...
-    @property
-    def is_duplicate(self) -> bool: ...
-    @property
-    def is_paired(self) -> bool: ...
-    @property
-    def is_proper_pair(self) -> bool: ...
 
 
 def alignment_format(path: Path) -> str:
@@ -103,7 +80,7 @@ def scan_alignment_bins(
     fasta: Path | str | None = None,
     collect_bands: bool = True,
     se_fragment_length: int = 0,
-) -> dict[str, object]:
+) -> ScanAlignmentResult:
     """Scan BAM or CRAM alignments into per-bin summary arrays via `ccnv._core`."""
     _, resolved, resolved_fasta = validate_alignment_inputs(path, fasta)
     active_filters = filters if filters is not None else ReadFilters()
@@ -122,23 +99,3 @@ def scan_alignment_bins(
         exclude_supplementary=active_filters.exclude_supplementary,
         exclude_unmapped=active_filters.exclude_unmapped,
     )
-
-
-def rejection_reason(read: AlignmentReadLike, filters: ReadFilters) -> str | None:
-    """Return the first matching QC counter name, or None if kept."""
-    if filters.exclude_unmapped and read.is_unmapped:
-        return "filter_unmapped"
-    start = read.reference_start
-    if start is None or int(start) < 0:
-        return "filter_no_start"
-    if filters.exclude_secondary and read.is_secondary:
-        return "filter_secondary"
-    if filters.exclude_supplementary and read.is_supplementary:
-        return "filter_supplementary"
-    if filters.exclude_duplicates and read.is_duplicate:
-        return "filter_duplicate"
-    if filters.require_proper_pair and read.is_paired and not read.is_proper_pair:
-        return "filter_improper_pair"
-    if int(read.mapping_quality) < filters.min_mapping_quality:
-        return "filter_mapq"
-    return None

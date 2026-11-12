@@ -18,11 +18,11 @@ from ccnv._core import (
     scan_fasta_gc_quantiles,
 )
 from ccnv.models import (
+    ContigLookup,
     CovariateError,
     Cytoband,
     ReferenceError,
     natural_sort_key,
-    resolve_contig_name,
     select_layout,
 )
 
@@ -30,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "load_cytobands_track",
-    "load_fasta_gc_quantiles",
     "load_gc_track",
     "load_mappability_track",
     "read_fasta_contigs",
@@ -259,57 +258,43 @@ def _compute_fasta_gc(
     contigs: Sequence[str],
     starts: NDArray[np.int64],
     ends: NDArray[np.int64],
-) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
-    """Compute per-bin GC fraction and >50% N-base mask from a FASTA via `ccnv._core`."""
+) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.float32]]:
+    """Compute per-bin GC fraction, >50% N-base mask, and 8-bin GC quantiles in one FASTA pass."""
     fasta = path.expanduser()
     if not fasta.is_file():
         raise CovariateError(f"FASTA not found: {fasta}")
 
     specs, bin_size, placements = _extract_contig_grid(contigs, starts, ends)
-    gc_core, n_frac_core, _ = scan_fasta_gc_quantiles(str(fasta), specs, bin_size)
+    gc_core, n_frac_core, gc_q_core = scan_fasta_gc_quantiles(
+        str(fasta), specs, bin_size
+    )
     if starts.size == 0:
-        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.bool_)
+        return (
+            np.empty(0, dtype=np.float64),
+            np.empty(0, dtype=np.bool_),
+            np.empty((0, 8), dtype=np.float32),
+        )
 
     if len(placements) == 1 and placements[0][2] is None:
         gc_raw = gc_core.astype(np.float64)
         n_frac = n_frac_core
+        gc_q_out = np.nan_to_num(gc_q_core, nan=0.0).astype(np.float32, copy=False)
     else:
         gc_raw = np.empty(starts.size, dtype=np.float64)
         n_frac = np.empty(starts.size, dtype=np.float32)
+        gc_q_out = np.empty((starts.size, gc_q_core.shape[1]), dtype=np.float32)
         for dst_slice, src_slice, bin_idx in placements:
             c_gc = gc_core[src_slice]
             c_nf = n_frac_core[src_slice]
+            c_gq = gc_q_core[src_slice]
             gc_raw[dst_slice] = c_gc if bin_idx is None else c_gc[bin_idx]
             n_frac[dst_slice] = c_nf if bin_idx is None else c_nf[bin_idx]
+            gc_q_out[dst_slice] = c_gq if bin_idx is None else c_gq[bin_idx]
+        gc_q_out = np.nan_to_num(gc_q_out, nan=0.0).astype(np.float32, copy=False)
 
     n_mask: NDArray[np.bool_] = (~np.isfinite(gc_raw)) | (n_frac > _MAX_N_FRACTION)
     gc_raw[n_mask] = np.nan
-    return gc_raw, n_mask
-
-
-def load_fasta_gc_quantiles(
-    path: Path,
-    contigs: Sequence[str],
-    starts: NDArray[np.int64],
-    ends: NDArray[np.int64],
-) -> NDArray[np.float32] | None:
-    """Load 8-element sliding-window GC quantile vectors when path is a FASTA file."""
-    if _classify_gc_source(path) != "fasta":
-        return None
-    fasta = path.expanduser()
-    if not fasta.is_file():
-        raise CovariateError(f"FASTA not found: {fasta}")
-    specs, bin_size, placements = _extract_contig_grid(contigs, starts, ends)
-    _, _, gc_q_core = scan_fasta_gc_quantiles(str(fasta), specs, bin_size)
-    if starts.size == 0:
-        return np.empty((0, 8), dtype=np.float32)
-    if len(placements) == 1 and placements[0][2] is None:
-        return np.asarray(gc_q_core, dtype=np.float32)
-    out = np.empty((starts.size, gc_q_core.shape[1]), dtype=np.float32)
-    for dst_slice, src_slice, bin_idx in placements:
-        chunk = gc_q_core[src_slice]
-        out[dst_slice] = chunk if bin_idx is None else chunk[bin_idx]
-    return np.nan_to_num(out, nan=0.0).astype(np.float32)
+    return gc_raw, n_mask, gc_q_out
 
 
 def _load_bed_gc(
@@ -391,13 +376,13 @@ def _load_bed_gc(
             contig_key = str(key[0]) if isinstance(key, tuple) else str(key)
             by_contig[contig_key] = part
 
-    avail = set(by_contig.keys())
+    lookup = ContigLookup.from_names(by_contig.keys())
     contig_arr = np.asarray(contigs, dtype=object)
     out = np.full(starts.size, np.nan, dtype=np.float64)
     matched_any = False
 
     for contig in dict.fromkeys(contigs):
-        bed_contig = resolve_contig_name(str(contig), avail)
+        bed_contig = lookup.resolve(str(contig))
         if bed_contig is None:
             continue
         matched_any = True
@@ -441,11 +426,12 @@ def load_gc_track(
     contigs: Sequence[str],
     starts: NDArray[np.int64],
     ends: NDArray[np.int64],
-) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
-    """Load per-bin GC content in [0, 1] and N-base mask from FASTA, BigWig, or BED."""
+) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.float32] | None]:
+    """Load per-bin GC content in [0, 1], N-base mask, and optional FASTA GC quantiles."""
     kind = _classify_gc_source(path)
+    gc_quantiles: NDArray[np.float32] | None = None
     if kind == "fasta":
-        gc, n_mask = _compute_fasta_gc(path, contigs, starts, ends)
+        gc, n_mask, gc_quantiles = _compute_fasta_gc(path, contigs, starts, ends)
     elif kind == "bigwig":
         gc = _load_bigwig_intervals(path, contigs, starts, ends, label="GC")
         n_mask = ~np.isfinite(gc)
@@ -471,18 +457,14 @@ def load_gc_track(
         int(np.count_nonzero(np.isfinite(gc) & ~n_mask)),
         gc.size,
     )
-    return gc, n_mask
+    return gc, n_mask, gc_quantiles
 
 
 def load_cytobands_track(
     path: Path, contig_lengths: Mapping[str, int]
 ) -> tuple[Cytoband, ...]:
     """Parse a UCSC cytoband BED/TSV file (.txt, .bed, or .gz) aligned to contigs."""
-    contig_lookup: dict[str, str] = {}
-    for c in contig_lengths:
-        contig_lookup[c.casefold()] = c
-        stripped = c[3:] if c.lower().startswith("chr") else c
-        contig_lookup[stripped.casefold()] = c
+    lookup = ContigLookup.from_names(contig_lengths.keys())
 
     open_fn = gzip.open if path.suffix.lower() == ".gz" else open
     bands: list[Cytoband] = []
@@ -494,13 +476,7 @@ def load_cytobands_track(
             fields = line.split("\t") if "\t" in line else line.split()
             if len(fields) < 4:
                 continue
-            raw_contig = fields[0]
-            stripped_raw = (
-                raw_contig[3:] if raw_contig.lower().startswith("chr") else raw_contig
-            )
-            canonical = contig_lookup.get(raw_contig.casefold()) or contig_lookup.get(
-                stripped_raw.casefold()
-            )
+            canonical = lookup.resolve(fields[0])
             if canonical is None:
                 continue
             try:
@@ -544,14 +520,14 @@ def read_fasta_contigs(
         raise ReferenceError(f"failed to read FASTA {fasta}: {error}") from error
     if not pairs:
         raise ReferenceError(f"{fasta} declares no contigs")
-    header_names = [name for name, _ in pairs]
-    header_lengths = [int(length) for _, length in pairs]
-    if any(length <= 0 for length in header_lengths):
+    if any(length <= 0 for _, length in pairs):
         raise ReferenceError(f"{fasta} contains non-positive contig lengths")
-    layout = select_layout(header_names, header_lengths, all_contigs=all_contigs)
-    if not layout:
+    if len({name for name, _ in pairs}) != len(pairs):
+        raise ReferenceError(f"{fasta} declares duplicate contig names")
+    selected = select_layout(pairs, all_contigs=all_contigs)
+    if not selected:
         raise ReferenceError(
             f"{fasta} declares no canonical chromosomes; "
             "pass --all-contigs to include every contig"
         )
-    return {contig.name: contig.length for contig in layout}
+    return dict(selected)

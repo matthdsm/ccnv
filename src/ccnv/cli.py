@@ -3,28 +3,25 @@
 import logging
 import os
 import sys
-from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
 from time import perf_counter
-from typing import Annotated, NoReturn, cast
+from typing import Annotated, NoReturn
 
 import typer
 
 from ccnv.extract import ExtractError
 from ccnv.extract import run as run_extract
-from ccnv.io.parquet import is_sample_parquet
 from ccnv.models import (
     DEFAULT_BIN_SIZE,
     DEFAULT_MIN_MAPPABILITY,
+    AnalysisMode,
     ExtractConfig,
     PredictConfig,
     ReadFilters,
     ReferenceConfig,
     ReferenceQCConfig,
-)
-from ccnv.models import (
-    AnalysisMode as AnalysisModeLiteral,
+    SexBranch,
 )
 from ccnv.predict import PredictError
 from ccnv.predict import run as run_predict
@@ -59,21 +56,6 @@ class LogLevel(StrEnum):
     warning = "WARNING"
     error = "ERROR"
     critical = "CRITICAL"
-
-
-class SexBranch(StrEnum):
-    """Allowed predict sex-branch values."""
-
-    autosomal = "autosomal"
-    female = "female"
-    male = "male"
-
-
-class AnalysisMode(StrEnum):
-    """Allowed pipeline analysis modes."""
-
-    germline = "germline"
-    prenatal = "prenatal"
 
 
 def configure_logging(level: LogLevel) -> None:
@@ -161,36 +143,6 @@ FastaOption = Annotated[
         help="Reference FASTA required for CRAM inputs",
     ),
 ]
-
-
-class SampleInputError(ValueError):
-    """Raised when reference sample arguments cannot be expanded."""
-
-
-def expand_sample_inputs(paths: Sequence[Path]) -> tuple[Path, ...]:
-    """Expand files and directories into unique sample Parquet paths."""
-
-    samples: list[Path] = []
-    seen: set[Path] = set()
-    for path in paths:
-        resolved = path.expanduser().resolve()
-        if resolved.is_dir():
-            matches = [
-                candidate.resolve()
-                for candidate in sorted(resolved.rglob("*.ccnv"))
-                if is_sample_parquet(candidate)
-            ]
-            if not matches:
-                raise SampleInputError(f"{path} contains no sample CCNV files")
-            for match in matches:
-                if match not in seen:
-                    seen.add(match)
-                    samples.append(match)
-            continue
-        if resolved not in seen:
-            seen.add(resolved)
-            samples.append(resolved)
-    return tuple(samples)
 
 
 @app.command()
@@ -296,13 +248,6 @@ def reference(
         Path,
         typer.Option(help="Output path prefix; writes PREFIX.ccnv"),
     ],
-    samples: Annotated[
-        list[Path] | None,
-        typer.Argument(
-            hidden=True,
-            help="Deprecated: provide --samplesheet or --fasta instead",
-        ),
-    ] = None,
     samplesheet: Annotated[
         Path | None,
         typer.Option(
@@ -370,15 +315,12 @@ def reference(
         ),
     ] = None,
     pca_components: Annotated[
-        int, typer.Option(min=1, help="PCA components per branch")
-    ] = 5,
-    nearest_bins: Annotated[
-        int,
+        int | None,
         typer.Option(
             min=1,
-            help="Nearest off-contig reference bins per target",
+            help="Maximum PCA components per branch (defaults to dynamic SVHT rank)",
         ),
-    ] = 300,
+    ] = None,
     max_batch_memory_mb: Annotated[
         int,
         typer.Option(min=1, help="Maximum memory in MiB for distance batches"),
@@ -425,38 +367,10 @@ def reference(
         threads,
     )
     started = perf_counter()
-    sample_paths: tuple[Path, ...] = ()
-    if samples and (samplesheet is not None or fasta is not None):
-        _fail(
-            ValueError(
-                "cannot combine positional sample arguments with "
-                "--samplesheet or --fasta"
-            ),
-            2,
-        )
     if samplesheet is None and fasta is None:
-        if samples:
-            if len(samples) == 1 and samples[0].suffix.lower() in (
-                ".fasta",
-                ".fa",
-                ".fna",
-            ):
-                fasta = samples[0]
-            else:
-                try:
-                    sample_paths = expand_sample_inputs(samples)
-                except SampleInputError as error:
-                    _fail(error, 2)
-        else:
-            _fail(
-                ValueError("provide exactly one of --samplesheet or --fasta"),
-                2,
-            )
-    elif samplesheet is not None and fasta is not None:
-        _fail(
-            ValueError("provide either --samplesheet or --fasta, not both"),
-            2,
-        )
+        _fail(ValueError("provide exactly one of --samplesheet or --fasta"), 2)
+    if samplesheet is not None and fasta is not None:
+        _fail(ValueError("provide either --samplesheet or --fasta, not both"), 2)
     try:
         run_reference(
             ReferenceConfig(
@@ -472,13 +386,11 @@ def reference(
                 min_cohort_size=min_cohort_size,
                 min_mappability=min_mappability,
                 min_sex_group_size=min_sex_group_size,
-                mode=cast(AnalysisModeLiteral, mode.value),
-                nearest_bins=nearest_bins,
+                mode=mode,
                 pca_components=pca_components,
                 prefix=prefix,
                 prenatal_bin_size=prenatal_binsize,
                 qc_report=qc_report,
-                samples=sample_paths,
                 samplesheet_path=samplesheet,
                 sex_contigs=(
                     tuple(sex_contig) if sex_contig is not None else DEFAULT_SEX_CONTIGS
@@ -669,7 +581,7 @@ def predict(
                 sample=sample,
                 reference=reference,
                 prefix=prefix if prefix is not None else sample.with_suffix(""),
-                sex=sex.value,
+                sex=sex,
                 penalty=penalty,
                 z_threshold=z_threshold,
                 ratio_threshold=ratio_threshold,
@@ -684,7 +596,7 @@ def predict(
                 gc=gc,
                 fasta=fasta,
                 min_mappability=min_mappability,
-                mode=cast(AnalysisModeLiteral, mode.value),
+                mode=mode,
                 threads=threads,
             )
         )

@@ -27,7 +27,7 @@ from ccnv.models import (
     fixed_size_list_to_numpy,
 )
 from ccnv.qc.sample import sanitize_qc_payload
-from ccnv.stats.neighbors import evaluate_loco_prototype_baseline
+from ccnv.stats.neighbors import compute_loco_prototype_support
 
 DEFAULT_MIN_REF_BINS: Final[int] = 150
 OUTLIER_N_SIGMA: Final[float] = 3.0
@@ -295,12 +295,7 @@ def compute_branch_qc(
         contigs = [str(v) for v in contig_col.to_numpy(zero_copy_only=False)]
         _, c_codes = np.unique(np.asarray(contigs, dtype=str), return_inverse=True)
 
-    _, n_refs = evaluate_loco_prototype_baseline(
-        np.ones(n_unmasked, dtype=np.float64),
-        c_codes,
-        pids,
-        pweights,
-    )
+    n_refs, _ = compute_loco_prototype_support(c_codes, pids, pweights)
     eff_min_refs = min(min_ref_bins, max(1, n_unmasked // 2))
 
     sum_proto_w = np.sum(pweights, axis=1)
@@ -415,8 +410,7 @@ def run_reference_qc_on_table(
         )
 
     is_flat = bool(model.get("flat", False))
-    nearest_bins = int(model.get("nearest_bins", 300))
-    min_ref_bins = min(DEFAULT_MIN_REF_BINS, max(1, nearest_bins // 2))
+    min_ref_bins = DEFAULT_MIN_REF_BINS
     signal_contig = model.get("sex_signal_contig")
     if signal_contig is not None:
         signal_contig = str(signal_contig)
@@ -517,12 +511,9 @@ def run_reference_qc_on_table(
             "female_chrx_ratio_std": female_chrx_ratio_std,
         }
 
-    if prefix is None:
-        json_path = Path("/dev/null")
-        actual_write_json = False
-    else:
-        json_path = Path(f"{prefix}_qc.json")
-        actual_write_json = write_json
+    json_path: Path | None = (
+        Path(f"{prefix}_qc.json") if (prefix is not None and write_json) else None
+    )
 
     qc_data: dict[str, object] = {
         "overall_verdict": overall_verdict,
@@ -534,7 +525,6 @@ def run_reference_qc_on_table(
             "mode": mode,
             "prenatal_bin_size": model.get("prenatal_bin_size"),
             "pca_components": model.get("pca_components"),
-            "nearest_bins": nearest_bins,
             "min_ref_bins": min_ref_bins,
             "flat": is_flat,
             "autosomal_contigs": model.get("autosomal_contigs"),
@@ -562,7 +552,7 @@ def run_reference_qc_on_table(
     if reference_path is not None:
         qc_data["reference_path"] = str(reference_path)
 
-    if actual_write_json:
+    if json_path is not None:
         write_reference_qc_json(json_path, qc_data)
 
     if emit_stderr:
@@ -571,8 +561,9 @@ def run_reference_qc_on_table(
         if isinstance(auto_qc, dict) and "mask_pct" in auto_qc:
             mask_info = f", {float(auto_qc['mask_pct']):.1f}% masked"
         cohort_info = "flat FASTA" if is_flat else f"{sample_count} samples"
+        suffix = f" -> {json_path}" if json_path is not None else ""
         summary_line = (
-            f"Reference QC: {overall_verdict} ({cohort_info}{mask_info}) -> {json_path}"
+            f"Reference QC: {overall_verdict} ({cohort_info}{mask_info}){suffix}"
         )
         sys.stderr.write(f"{summary_line}\n")
         sys.stderr.flush()

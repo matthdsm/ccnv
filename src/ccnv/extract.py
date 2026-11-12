@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
@@ -13,29 +12,24 @@ import numpy as np
 import pyarrow as pa
 
 from ccnv.io.alignments import (
+    ScanAlignmentResult,
     read_alignment_header,
     scan_alignment_bins,
     validate_alignment_inputs,
 )
 from ccnv.io.parquet import write_sample_parquet
 from ccnv.models import (
-    FRAGMENTOMICS_METADATA_KEY,
-    NUM_FRAG_BANDS,
-    SAMPLE_SCHEMA,
     AlignmentError,
-    ArtifactKind,
     BinCompatibilityError,
+    ContigLookup,
     ExtractConfig,
     ExtractError,
-    FragmentomicsMetadata,
     PredictError,
     ReadFilters,
     ReferenceMetadata,
     SampleBuffers,
     SampleMetadata,
-    metadata_for,
     parquet_path,
-    resolve_contig_name,
     select_layout,
 )
 from ccnv.qc.sample import build_sample_qc
@@ -47,15 +41,13 @@ __all__ = [
     "ExtractError",
     "extract_for_predict",
     "extract_sample_table",
-    "extracted_to_sample_buffers",
-    "extracted_to_sample_table",
     "run",
     "run_extract",
 ]
 
 
-def _scan_to_extracted(
-    scan: Mapping[str, object],
+def _scan_to_buffers(
+    scan: ScanAlignmentResult,
     selected: Sequence[tuple[str, int]],
     *,
     bin_size: int,
@@ -63,13 +55,7 @@ def _scan_to_extracted(
     resolved_alignment: Path,
     resolved_fasta: Path | None,
     filters: ReadFilters,
-) -> dict[str, object]:
-    counts = np.asarray(scan["count"], dtype=np.uint32)
-    paired_counts = np.asarray(scan["paired_count"], dtype=np.uint32)
-    frag_len_sums = np.asarray(scan["frag_len_sum"], dtype=np.uint64)
-    short_frag_counts = np.asarray(scan["short_frag_count"], dtype=np.uint32)
-    endpoint_counts = np.asarray(scan["endpoint_count"], dtype=np.uint32)
-    frag_gc_sums = np.asarray(scan["frag_gc_sum"], dtype=np.float32)
+) -> SampleBuffers:
     paired_end = bool(scan["paired_end"])
     raw_bands = scan["frag_bands"]
     bands_arr = (
@@ -77,17 +63,9 @@ def _scan_to_extracted(
         if paired_end and raw_bands is not None
         else None
     )
-    raw_qc_obj = scan["qc_counts"]
-    raw_qc = (
-        {
-            str(k): int(v)
-            for k, v in raw_qc_obj.items()
-            if isinstance(v, int) and not isinstance(v, bool)
-        }
-        if isinstance(raw_qc_obj, Mapping)
-        else {}
+    qc = build_sample_qc(
+        {str(k): int(v) for k, v in scan["qc_counts"].items() if isinstance(v, int)}
     )
-    qc = build_sample_qc(raw_qc)
     meta_frag = estimate_sample_landmarks(
         hist_autosomal=np.asarray(scan["hist_autosomal"], dtype=np.int64),
         hist_chry=np.asarray(scan["hist_chry"], dtype=np.int64),
@@ -110,143 +88,25 @@ def _scan_to_extracted(
             else {}
         ),
     }
-    qc_dict = dict(qc)
-    filters_dict = dict(asdict(filters))
     sample_meta = SampleMetadata(
         bin_size=bin_size,
         contig_order=tuple(contig_order),
         contig_lengths=contig_lengths,
         source_identity=source_id,
         reference_identity=ref_id,
-        qc=qc_dict,
-        filters=filters_dict,
+        qc=dict(qc),
+        filters=dict(asdict(filters)),
         fragmentomics=meta_frag,
     )
-    return {
-        "counts": counts,
-        "count": counts,
-        "paired_count": paired_counts,
-        "frag_len_sum": frag_len_sums,
-        "short_frag_count": short_frag_counts,
-        "endpoint_count": endpoint_counts,
-        "frag_gc_sum": frag_gc_sums,
-        "frag_bands": bands_arr,
-        "paired_end": paired_end,
-        "contig_lengths": contig_lengths,
-        "contig_order": contig_order,
-        "bin_size": bin_size,
-        "format": fmt,
-        "resolved_alignment": resolved_alignment,
-        "resolved_fasta": resolved_fasta,
-        "filters": filters,
-        "qc": qc_dict,
-        "fragmentomics": meta_frag,
-        "sample_metadata": sample_meta,
-    }
-
-
-def extracted_to_sample_buffers(extracted: Mapping[str, object]) -> SampleBuffers:
-    """Wrap extracted scan arrays and metadata directly without building a PyArrow Table."""
-    meta = extracted["sample_metadata"]
-    if not isinstance(meta, SampleMetadata):
-        raise ExtractError("extracted payload missing SampleMetadata")
-    raw_bands = extracted.get("frag_bands")
-    bands = (
-        np.asarray(raw_bands, dtype=np.uint32)
-        if bool(extracted["paired_end"]) and isinstance(raw_bands, np.ndarray)
-        else None
-    )
     return SampleBuffers(
-        meta=meta,
-        count=np.asarray(extracted["counts"], dtype=np.uint32),
-        paired_count=np.asarray(extracted["paired_count"], dtype=np.uint32),
-        frag_len_sum=np.asarray(extracted["frag_len_sum"], dtype=np.uint64),
-        short_frag_count=np.asarray(extracted["short_frag_count"], dtype=np.uint32),
-        endpoint_count=np.asarray(extracted["endpoint_count"], dtype=np.uint32),
-        frag_gc_sum=np.asarray(extracted["frag_gc_sum"], dtype=np.float32),
-        frag_bands=bands,
-    )
-
-
-def extracted_to_sample_table(extracted: Mapping[str, object]) -> pa.Table:
-    """Assemble a validated Schema v2.0.0 Arrow sample table from extracted scan arrays."""
-    counts = np.asarray(extracted["counts"], dtype=np.uint32)
-    n_bins = int(counts.shape[0])
-    paired_end = bool(extracted["paired_end"])
-    raw_bands = extracted.get("frag_bands")
-    if paired_end and isinstance(raw_bands, np.ndarray):
-        frag_bands_col: pa.Array = pa.FixedSizeListArray.from_arrays(
-            pa.array(raw_bands.astype(np.uint32, copy=False).ravel(), type=pa.uint32()),
-            NUM_FRAG_BANDS,
-        )
-    else:
-        frag_bands_col = pa.nulls(n_bins, type=pa.list_(pa.uint32(), NUM_FRAG_BANDS))
-
-    contig_order_raw = extracted["contig_order"]
-    if not isinstance(contig_order_raw, Sequence) or isinstance(
-        contig_order_raw, (str, bytes)
-    ):
-        raise ExtractError("extracted 'contig_order' must be a sequence")
-    contig_order = [str(x) for x in contig_order_raw]
-    contig_lengths_raw = extracted["contig_lengths"]
-    if not isinstance(contig_lengths_raw, Mapping):
-        raise ExtractError("extracted 'contig_lengths' must be a mapping")
-    contig_lengths = {str(k): int(v) for k, v in contig_lengths_raw.items()}
-    resolved_alignment = extracted["resolved_alignment"]
-    if not isinstance(resolved_alignment, Path):
-        raise ExtractError("extracted 'resolved_alignment' must be a Path")
-    resolved_fasta = extracted.get("resolved_fasta")
-    filters = extracted["filters"]
-    if not isinstance(filters, ReadFilters):
-        raise ExtractError("extracted 'filters' must be ReadFilters")
-    qc = extracted["qc"]
-    if not isinstance(qc, Mapping):
-        raise ExtractError("extracted 'qc' must be a mapping")
-    meta_frag = extracted["fragmentomics"]
-    if not isinstance(meta_frag, FragmentomicsMetadata):
-        raise ExtractError("extracted 'fragmentomics' must be FragmentomicsMetadata")
-
-    ref_id: dict[str, object] = {
-        "n_contigs": len(contig_order),
-        "contig_order": contig_order,
-        **(
-            {"fasta": str(resolved_fasta.resolve())}
-            if isinstance(resolved_fasta, Path)
-            else {}
-        ),
-    }
-    metadata = metadata_for(
-        ArtifactKind.SAMPLE,
-        contig_lengths=contig_lengths,
-        values={
-            "bin_size": int(str(extracted["bin_size"])),
-            "contig_order": contig_order,
-            "source_identity": {
-                "path": str(resolved_alignment.resolve()),
-                "format": str(extracted["format"]),
-            },
-            "reference_identity": ref_id,
-            "qc": dict(qc),
-            "filters": dict(asdict(filters)),
-        },
-    )
-    metadata[FRAGMENTOMICS_METADATA_KEY] = json.dumps(
-        asdict(meta_frag), sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-
-    return pa.table(
-        {
-            "count": counts,
-            "paired_count": np.asarray(extracted["paired_count"], dtype=np.uint32),
-            "frag_len_sum": np.asarray(extracted["frag_len_sum"], dtype=np.uint64),
-            "short_frag_count": np.asarray(
-                extracted["short_frag_count"], dtype=np.uint32
-            ),
-            "endpoint_count": np.asarray(extracted["endpoint_count"], dtype=np.uint32),
-            "frag_gc_sum": np.asarray(extracted["frag_gc_sum"], dtype=np.float32),
-            "frag_bands": frag_bands_col,
-        },
-        schema=SAMPLE_SCHEMA.with_metadata(metadata),
+        meta=sample_meta,
+        count=np.asarray(scan["count"], dtype=np.uint32),
+        paired_count=np.asarray(scan["paired_count"], dtype=np.uint32),
+        frag_len_sum=np.asarray(scan["frag_len_sum"], dtype=np.uint64),
+        short_frag_count=np.asarray(scan["short_frag_count"], dtype=np.uint32),
+        endpoint_count=np.asarray(scan["endpoint_count"], dtype=np.uint32),
+        frag_gc_sum=np.asarray(scan["frag_gc_sum"], dtype=np.float32),
+        frag_bands=bands_arr,
     )
 
 
@@ -285,8 +145,8 @@ def extract_for_predict(
     threads: int = 1,
     fasta: Path | None = None,
     collect_bands: bool = False,
-) -> dict[str, object]:
-    """Stream BAM/CRAM directly into reference-aligned bin arrays via ccnv._core."""
+) -> SampleBuffers:
+    """Stream BAM/CRAM directly into reference-aligned SampleBuffers via ccnv._core."""
     try:
         fmt, resolved_alignment, resolved_fasta = validate_alignment_inputs(
             alignment, fasta
@@ -301,9 +161,10 @@ def extract_for_predict(
     if len(header_map) != len(header):
         raise PredictError(f"{resolved_alignment} header declares duplicate contigs")
 
+    lookup = ContigLookup.from_names(header_map.keys())
     selected: list[tuple[str, int]] = []
     for name, expected_len in ref_meta.contig_lengths.items():
-        resolved = resolve_contig_name(name, header_map)
+        resolved = lookup.resolve(name)
         if resolved is None:
             continue
         actual_len = header_map[resolved]
@@ -329,7 +190,7 @@ def extract_for_predict(
     except (AlignmentError, ExtractError, ValueError, OSError) as err:
         raise PredictError(f"failed to stream alignment {alignment}: {err}") from err
 
-    return _scan_to_extracted(
+    return _scan_to_buffers(
         scan,
         selected,
         bin_size=ref_meta.bin_size,
@@ -369,7 +230,7 @@ def extract_sample_table(config: ExtractConfig) -> pa.Table:
         fasta=resolved_fasta,
         collect_bands=True,
     )
-    extracted = _scan_to_extracted(
+    buffers = _scan_to_buffers(
         scan,
         selected,
         bin_size=config.bin_size,
@@ -378,16 +239,15 @@ def extract_sample_table(config: ExtractConfig) -> pa.Table:
         resolved_fasta=resolved_fasta,
         filters=config.filters,
     )
-    qc = extracted["qc"]
-    if isinstance(qc, Mapping):
-        logger.debug(
-            "extract QC summary: %s reads seen, %s kept, %s mate_dedup_skipped, %s filtered",
-            qc.get("reads_seen"),
-            qc.get("reads_kept"),
-            qc.get("mate_dedup_skipped"),
-            qc.get("reads_filtered"),
-        )
-    return extracted_to_sample_table(extracted)
+    qc = buffers.meta.qc
+    logger.debug(
+        "extract QC summary: %s reads seen, %s kept, %s mate_dedup_skipped, %s filtered",
+        qc.get("reads_seen"),
+        qc.get("reads_kept"),
+        qc.get("mate_dedup_skipped"),
+        qc.get("reads_filtered"),
+    )
+    return buffers.to_table()
 
 
 def run(config: ExtractConfig) -> None:

@@ -24,7 +24,6 @@ from ccnv.report.bed import (
     sort_bin_results,
     sort_segments,
     write_bins_bed_streaming,
-    write_compressed_bed,
     write_segments_bed_streaming,
 )
 from ccnv.report.html import (
@@ -64,7 +63,6 @@ __all__ = [
     "sort_segments",
     "write_bins_bed_streaming",
     "write_bins_vcf",
-    "write_compressed_bed",
     "write_deliverables",
     "write_genome_plot",
     "write_outputs",

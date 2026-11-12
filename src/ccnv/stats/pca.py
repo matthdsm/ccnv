@@ -4,30 +4,32 @@ from __future__ import annotations
 
 import logging
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final
 
 import numpy as np
 import scipy.linalg
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 from sklearn.decomposition import PCA
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.linear_model import HuberRegressor
 from sklearn.utils.extmath import randomized_svd, svd_flip
 
 from ccnv.models.exceptions import ReferenceError
 
 logger = logging.getLogger(__name__)
 
+LOG_WAVE_CLIP: Final[float] = 4.0
 _MAX_PCA_CHUNK_ROWS: Final[int] = 32_768
 _TARGET_CHUNK_BYTES: Final[int] = 64 * 1024 * 1024
 _WINSOR_Z_CLIP: Final[float] = 3.0
-_LOG_WAVE_CLIP: Final[float] = 4.0
 
 __all__ = [
+    "LOG_WAVE_CLIP",
     "WhitenedPCAResult",
-    "fit_pca",
     "fit_whitened_pca",
-    "optimal_svht_rank",
     "pca_irlba_numpy",
+    "project_huber_pca_wave",
     "reconstruct_whitened_pca_expected",
 ]
 
@@ -40,6 +42,9 @@ class WhitenedPCAResult:
     loadings: NDArray[np.float32]
     singular_values: NDArray[np.float64]
     mp_sigma: float
+    scores: NDArray[np.float64] = field(
+        default_factory=lambda: np.empty((0, 0), dtype=np.float64)
+    )
 
 
 def _pca_chunk_rows(n_samples: int) -> int:
@@ -163,6 +168,7 @@ def fit_whitened_pca(
     chunk_rows = _pca_chunk_rows(n_samples)
     s_eff = max(0, n_samples - 1)
     m_nontrivial = min(u_count, s_eff)
+    empty_scores = np.empty((0, n_samples), dtype=np.float64)
 
     if n_samples <= u_count:
         gram = np.zeros((n_samples, n_samples), dtype=np.float64)
@@ -183,10 +189,11 @@ def fit_whitened_pca(
                 loadings=np.empty((0, u_count), dtype=np.float32),
                 singular_values=np.empty(0, dtype=np.float64),
                 mp_sigma=0.0,
+                scores=empty_scores,
             )
         evals, evecs = scipy.linalg.eigh(0.5 * (gram + gram.T))
         s_all = np.sqrt(np.maximum(evals[::-1][:m_nontrivial], 0.0))
-        u_samp_all = evecs[:, ::-1][:, :m_nontrivial]
+        u_samp_all = np.asarray(evecs[:, ::-1][:, :m_nontrivial], dtype=np.float64)
         u_bins_all: NDArray[np.float64] | None = None
     else:
         zc_full = np.empty((u_count, n_samples), dtype=np.float64)
@@ -197,12 +204,20 @@ def fit_whitened_pca(
             mu_u[c0:c1] = mu_chunk
             zc_full[c0:c1] = zc
         mean_rate[u_idx] = mu_u
-        u_bins_raw, s_raw, _ = randomized_svd(
+        if m_nontrivial == 0:
+            return WhitenedPCAResult(
+                mean_rate=mean_rate,
+                loadings=np.empty((0, u_count), dtype=np.float32),
+                singular_values=np.empty(0, dtype=np.float64),
+                mp_sigma=0.0,
+                scores=empty_scores,
+            )
+        u_bins_raw, s_raw, vt_raw = randomized_svd(
             zc_full, n_components=m_nontrivial, random_state=0
         )
         s_all = np.asarray(s_raw, dtype=np.float64)
         u_bins_all = np.asarray(u_bins_raw, dtype=np.float64)
-        u_samp_all = np.empty((0, 0), dtype=np.float64)
+        u_samp_all = np.asarray(vt_raw, dtype=np.float64).T
 
     mp_sigma = _svht_noise_cutoff(s_all, s_eff, u_count)
     if n_samples <= 2 or u_count <= 1:
@@ -225,12 +240,13 @@ def fit_whitened_pca(
             loadings=np.empty((0, u_count), dtype=np.float32),
             singular_values=np.empty(0, dtype=np.float64),
             mp_sigma=mp_sigma,
+            scores=empty_scores,
         )
 
+    u_top = u_samp_all[:, :rank]
     if u_bins_all is not None:
         v_bins = u_bins_all[:, :rank].copy()
     else:
-        u_top = u_samp_all[:, :rank]
         v_bins = np.empty((u_count, rank), dtype=np.float64)
         for c0 in range(0, u_count, chunk_rows):
             c1 = min(u_count, c0 + chunk_rows)
@@ -250,14 +266,18 @@ def fit_whitened_pca(
             loadings=np.empty((0, u_count), dtype=np.float32),
             singular_values=np.empty(0, dtype=np.float64),
             mp_sigma=mp_sigma,
+            scores=empty_scores,
         )
+
     v_unit = v_bins[:, keep] / norms[np.newaxis, keep]
+    u_samp_kept = u_top[:, keep]
     s_kept = s_all[:rank][keep]
-    _, flipped = svd_flip(
-        np.zeros((n_samples, int(s_kept.size)), dtype=np.float64),
+    u_samp_flipped, flipped = svd_flip(
+        u_samp_kept,
         v_unit.T,
         u_based_decision=False,
     )
+    scores = np.asarray(s_kept[:, np.newaxis] * u_samp_flipped.T, dtype=np.float64)
     total_sq = max(float(np.sum(np.square(s_all))), 1e-12)
     pct_vars = (np.square(s_kept) / total_sq) * 100.0
     logger.debug(
@@ -271,139 +291,156 @@ def fit_whitened_pca(
         loadings=np.asarray(flipped, dtype=np.float32),
         singular_values=np.asarray(s_kept, dtype=np.float64),
         mp_sigma=mp_sigma,
+        scores=scores,
     )
 
 
 def reconstruct_whitened_pca_expected(
-    counts: NDArray[np.float32],
-    expected: NDArray[np.float32],
+    expected: NDArray[np.float32] | NDArray[np.float64],
     usable: NDArray[np.bool_],
     pca_result: WhitenedPCAResult,
 ) -> NDArray[np.float32]:
     """Reconstruct positive per-sample expected counts lambda_hat from whitened PCA."""
-    n_bins, n_samples = expected.shape
+    exp_arr = expected if isinstance(expected, np.ndarray) else np.asarray(expected)
+    if exp_arr.ndim != 2:
+        raise ValueError("expected must be a 2D array")
+    n_bins, n_samples = exp_arr.shape
+    rank = int(pca_result.loadings.shape[0])
+    if pca_result.scores.shape != (rank, n_samples):
+        raise ValueError(
+            f"pca_result.scores shape {pca_result.scores.shape} does not match ({rank}, {n_samples})"
+        )
+
     mask = np.asarray(usable, dtype=np.bool_)
+    if mask.ndim != 1 or mask.shape[0] != n_bins:
+        raise ValueError("usable must be a 1D boolean mask aligned with expected")
     u_idx = np.flatnonzero(mask)
     u_count = int(u_idx.size)
     recon = np.zeros((n_bins, n_samples), dtype=np.float32)
     if u_count == 0:
         return recon
+    if int(pca_result.loadings.shape[1]) != u_count:
+        raise ValueError(
+            f"pca_result.loadings width {pca_result.loadings.shape[1]} does not match usable bin count {u_count}"
+        )
 
     mu_u = pca_result.mean_rate[u_idx]
-    rank = int(pca_result.loadings.shape[0])
-    chunk_rows = _pca_chunk_rows(n_samples)
-    if rank == 0:
-        for c0 in range(0, u_count, chunk_rows):
-            c1 = min(u_count, c0 + chunk_rows)
-            rows = u_idx[c0:c1]
-            e0 = np.asarray(expected[rows], dtype=np.float64) * mu_u[
-                c0:c1, np.newaxis
-            ].astype(np.float64)
-            recon[rows] = np.maximum(e0, 1e-12).astype(np.float32)
-        return recon
-
     v_f64 = np.asarray(pca_result.loadings, dtype=np.float64)
-    scores = np.zeros((rank, n_samples), dtype=np.float64)
-    for c0 in range(0, u_count, chunk_rows):
-        c1 = min(u_count, c0 + chunk_rows)
-        rows = u_idx[c0:c1]
-        zc = _whitened_centered_from_mu(
-            np.asarray(counts[rows], dtype=np.float64),
-            np.asarray(expected[rows], dtype=np.float64),
-            mu_u[c0:c1],
-        )
-        scores += v_f64[:, c0:c1] @ zc
+    scores = np.asarray(pca_result.scores, dtype=np.float64)
+    chunk_rows = _pca_chunk_rows(n_samples)
 
     for c0 in range(0, u_count, chunk_rows):
         c1 = min(u_count, c0 + chunk_rows)
         rows = u_idx[c0:c1]
-        e0 = np.asarray(expected[rows], dtype=np.float64) * mu_u[
+        e0 = np.asarray(exp_arr[rows], dtype=np.float64) * mu_u[
             c0:c1, np.newaxis
         ].astype(np.float64)
-        hat_z = v_f64[:, c0:c1].T @ scores
-        eta = np.clip(hat_z / np.sqrt(e0 + 0.5), -_LOG_WAVE_CLIP, _LOG_WAVE_CLIP)
-        recon[rows] = np.maximum(e0 * np.exp(eta), 1e-12).astype(np.float32)
+        if rank == 0:
+            recon[rows] = np.maximum(e0, 1e-12).astype(np.float32)
+        else:
+            hat_z = v_f64[:, c0:c1].T @ scores
+            eta = np.clip(hat_z / np.sqrt(e0 + 0.5), -LOG_WAVE_CLIP, LOG_WAVE_CLIP)
+            recon[rows] = np.maximum(e0 * np.exp(eta), 1e-12).astype(np.float32)
     return recon
 
 
-def optimal_svht_rank(
-    data: NDArray[np.floating],
-    max_components: int = 10,
-) -> int:
-    """Select optimal PCA rank using Gavish-Donoho (2014) SVHT."""
-    data_arr = np.asarray(data, dtype=np.float64)
-    if data_arr.ndim != 2 or data_arr.size == 0:
-        return 1
-    samples = data_arr.T
-    s_dim, u_dim = samples.shape
-    if s_dim < 1 or u_dim < 1:
-        return 1
-    mean = np.mean(samples, axis=0)
-    centered = samples - mean
-    s = np.linalg.svd(centered, compute_uv=False)
-    if s.size == 0:
-        return 1
-    beta = min(s_dim, u_dim) / max(s_dim, u_dim)
-    omega = 0.56 * (beta**3) - 0.95 * (beta**2) + 1.82 * beta + 1.43
-    tau = omega * float(np.median(s))
-    n_above = int(np.count_nonzero(s > tau))
-    upper = min(max_components, s_dim, u_dim)
-    return int(np.clip(n_above, 1, upper))
-
-
-def fit_pca(
-    masked_normalized: NDArray[np.floating],
-    n_components: int | None = None,
-) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-    """Fit a deterministic PCA model on samples-by-bins and correct coverage."""
-    data = np.asarray(masked_normalized, dtype=np.float64)
-    if data.ndim != 2 or data.size == 0:
-        raise ReferenceError("PCA requires a non-empty bins-by-samples matrix")
-    samples = data.T
-    if n_components is not None and n_components < 1:
-        raise ReferenceError("PCA requires at least one sample and one unmasked bin")
-    max_k = min(
-        10 if n_components is None else n_components,
-        samples.shape[0],
-        samples.shape[1],
-    )
-    if max_k < 1:
-        raise ReferenceError("PCA requires at least one sample and one unmasked bin")
-    rank = optimal_svht_rank(data, max_components=max_k)
-    rank = min(rank, samples.shape[0], samples.shape[1])
-    mean = np.mean(samples, axis=0)
-    if np.allclose(samples, mean):
-        return (
-            np.ones(data.shape, dtype=np.float64),
-            mean.astype(np.float64, copy=False),
-            np.zeros((rank, samples.shape[1]), dtype=np.float64),
+def project_huber_pca_wave(
+    log_signal: NDArray[np.float64],
+    loadings: NDArray[np.floating],
+    *,
+    whitening_scale: NDArray[np.float64] | None = None,
+    eval_loadings: NDArray[np.floating] | None = None,
+    epsilon: float = 1.35,
+    alpha: float = 1e-4,
+    clip: float | None = LOG_WAVE_CLIP,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Project 1D signal onto PCA loadings via rank-safe Huber M-estimation."""
+    y = np.asarray(log_signal, dtype=np.float64).ravel()
+    u_len = int(y.size)
+    ld = np.asarray(loadings, dtype=np.float64)
+    if ld.ndim != 2:
+        raise ValueError("loadings must be a 2D array of shape (K, U)")
+    k_rank, u_cols = ld.shape
+    if k_rank > 0 and u_cols != u_len:
+        raise ValueError(
+            f"loadings width {u_cols} does not match log_signal length {u_len}"
         )
-    pca = PCA(n_components=rank, svd_solver="full")
-    pca.fit(samples)
-    if (
-        hasattr(pca, "explained_variance_ratio_")
-        and pca.explained_variance_ratio_ is not None
-    ):
-        finite_vars = np.nan_to_num(pca.explained_variance_ratio_ * 100.0)
-        logger.debug(
-            "PCA fitted %d components: explained variance [%s] (total=%.2f%%)",
-            rank,
-            ", ".join(f"{v:.2f}%" for v in finite_vars),
-            float(np.sum(finite_vars)),
+    ev_ld = ld if eval_loadings is None else np.asarray(eval_loadings, dtype=np.float64)
+    if ev_ld.ndim != 2 or ev_ld.shape[0] != k_rank:
+        raise ValueError(
+            "eval_loadings must be a 2D array with matching component rank"
         )
-    reconstructed = pca.inverse_transform(pca.transform(samples))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        corrected = samples / reconstructed
-    corrected = np.nan_to_num(corrected, nan=1.0, posinf=1.0, neginf=1.0)
-    return (
-        corrected.T.astype(np.float64, copy=False),
-        pca.mean_.astype(np.float64, copy=False),
-        pca.components_.astype(np.float64, copy=False),
-    )
+    eval_len = int(ev_ld.shape[1])
+    if k_rank == 0 or u_len == 0:
+        return np.zeros(k_rank, dtype=np.float64), np.zeros(eval_len, dtype=np.float64)
+
+    finite = np.isfinite(y) & np.all(np.isfinite(ld), axis=0)
+    w_arr: NDArray[np.float64] | None = None
+    if whitening_scale is not None:
+        w_arr = np.asarray(whitening_scale, dtype=np.float64).ravel()
+        if w_arr.size != u_len:
+            raise ValueError(
+                f"whitening_scale length {w_arr.size} does not match log_signal length {u_len}"
+            )
+        finite &= np.isfinite(w_arr) & (w_arr > 0.0)
+
+    n_valid = int(np.count_nonzero(finite))
+    if n_valid < 2:
+        return np.zeros(k_rank, dtype=np.float64), np.zeros(eval_len, dtype=np.float64)
+
+    v_sub = ld[:, finite]
+    y_sub = y[finite]
+    gram_v = 0.5 * (v_sub @ v_sub.T + (v_sub @ v_sub.T).T)
+    evals_v, evecs_v = np.linalg.eigh(gram_v)
+    tol_v = 1e-8 * max(float(np.max(evals_v)), 1.0)
+    keep_v = evals_v > tol_v
+    rank_eff = int(np.count_nonzero(keep_v))
+    if rank_eff == 0 or n_valid <= rank_eff:
+        return np.zeros(k_rank, dtype=np.float64), np.zeros(eval_len, dtype=np.float64)
+
+    proj_basis = evecs_v[:, keep_v].T
+    v_red_fit = proj_basis @ v_sub
+    if w_arr is not None:
+        w_sub = w_arr[finite]
+        x_fit = (v_red_fit * w_sub[np.newaxis, :]).T
+        y_fit = y_sub * w_sub
+    else:
+        x_fit = v_red_fit.T
+        y_fit = y_sub
+
+    coef_red: NDArray[np.float64] | None = None
+    if n_valid >= max(rank_eff + 2, 4) and float(np.std(y_fit)) > 1e-12:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ConvergenceWarning)
+                huber = HuberRegressor(
+                    fit_intercept=False,
+                    alpha=alpha,
+                    max_iter=200,
+                    epsilon=epsilon,
+                )
+                huber.fit(x_fit, y_fit)
+                cand = np.asarray(huber.coef_, dtype=np.float64)
+                if np.all(np.isfinite(cand)):
+                    coef_red = cand
+        except ValueError:
+            coef_red = None
+
+    if coef_red is None:
+        coef_red = np.asarray(
+            np.linalg.lstsq(x_fit, y_fit, rcond=None)[0], dtype=np.float64
+        )
+
+    coef = np.asarray(proj_basis.T @ coef_red, dtype=np.float64)
+    ev_safe = np.where(np.isfinite(ev_ld), ev_ld, 0.0)
+    wave = ev_safe.T @ coef
+    if clip is not None:
+        wave = np.clip(wave, -clip, clip)
+    return coef, np.asarray(wave, dtype=np.float64)
 
 
 def pca_irlba_numpy(
-    X: NDArray[np.floating] | np.ndarray,
+    X: ArrayLike,
     n_components: int,
     seed: int = 42,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:

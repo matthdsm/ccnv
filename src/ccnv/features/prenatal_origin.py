@@ -18,7 +18,6 @@ import scipy.special
 from numpy.typing import NDArray
 
 from ccnv._core import FRAG_BAND_EDGES
-from ccnv.io.parquet import fixed_size_list_to_numpy
 from ccnv.models.domain import normalize_chr
 from ccnv.models.metadata import PrenatalModelMetadata
 from ccnv.models.results import (
@@ -30,7 +29,6 @@ from ccnv.models.results import (
 from ccnv.models.schemas import (
     NUM_FRAG_BANDS,
     SampleBuffers,
-    SampleMetadata,
     reconstruct_sample_grid,
 )
 from ccnv.stats.fragmentomics import FRAG_MIN_LEN
@@ -39,13 +37,14 @@ __all__ = [
     "BandPrefixSums",
     "PrenatalLoDMetrics",
     "annotate_prenatal_origin_and_lod",
-    "annotate_prenatal_segments",
+    "annotate_sample_prenatal_segments",
     "classify_segment_origin_5state",
 ]
 
 _QUAD_NODES_16: Final[tuple[NDArray[np.float64], NDArray[np.float64]]] = (
     np.polynomial.legendre.leggauss(16)
 )
+_STATE_LOG_PRIOR: Final[float] = math.log(0.20)
 
 
 class BandPrefixSums:
@@ -73,47 +72,28 @@ class BandPrefixSums:
 
         for c_idx, c_name in enumerate(contig_names):
             norm_name = normalize_chr(c_name)
-            idx = np.where(bin_contigs == c_idx)[0]
+            idx = np.flatnonzero(bin_contigs == c_idx)
             if idx.size == 0:
                 continue
             starts_c = np.asarray(bin_starts[idx], dtype=np.int64)
             ends_c = np.asarray(bin_ends[idx], dtype=np.int64)
-            bands_c = bands_f64[idx]
-
-            cum_c = np.zeros((len(idx) + 1, 24), dtype=np.float64)
-            cum_c[1:] = np.cumsum(bands_c, axis=0)
+            cum_c = np.zeros((idx.size + 1, NUM_FRAG_BANDS), dtype=np.float64)
+            cum_c[1:] = np.cumsum(bands_f64[idx], axis=0)
             self._contig_data[norm_name] = (starts_c, ends_c, cum_c)
 
     @classmethod
     def from_sample_table(
         cls,
-        table: pa.Table | SampleBuffers,
+        sample: SampleBuffers | pa.Table,
         bin_usable: NDArray[np.bool_] | None = None,
     ) -> BandPrefixSums | None:
         """Construct BandPrefixSums engine from SampleBuffers or pa.Table."""
-        if isinstance(table, SampleBuffers):
-            if table.num_rows == 0 or table.frag_bands is None:
-                return None
-            codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(table.meta)
-            return cls(
-                sample_bands=table.frag_bands,
-                bin_contigs=np.asarray(codes, dtype=np.int16),
-                contig_names=names,
-                bin_starts=np.asarray(starts_u32, dtype=np.int64),
-                bin_ends=np.asarray(ends_u32, dtype=np.int64),
-                bin_usable=bin_usable,
-            )
-
-        if table.num_rows == 0 or "frag_bands" not in table.column_names:
+        bufs = SampleBuffers.coerce(sample)
+        if bufs.num_rows == 0 or bufs.frag_bands is None:
             return None
-        bands_col = table.column("frag_bands").combine_chunks()
-        if bands_col.null_count == table.num_rows:
-            return None
-        sample_meta = SampleMetadata.from_table(table)
-        codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(sample_meta)
-        bands_np = fixed_size_list_to_numpy(bands_col, NUM_FRAG_BANDS, np.uint32)
+        codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(bufs.meta)
         return cls(
-            sample_bands=bands_np,
+            sample_bands=bufs.frag_bands,
             bin_contigs=np.asarray(codes, dtype=np.int16),
             contig_names=names,
             bin_starts=np.asarray(starts_u32, dtype=np.int64),
@@ -123,20 +103,16 @@ class BandPrefixSums:
 
     def query(self, contig: str, start: int, end: int) -> NDArray[np.float64]:
         """Query 24-band cumulative count vector in [start, end) on contig in O(log U)."""
-        norm_name = normalize_chr(contig)
-        data = self._contig_data.get(norm_name)
+        data = self._contig_data.get(normalize_chr(contig))
         if data is None:
-            return np.zeros(24, dtype=np.float64)
+            return np.zeros(NUM_FRAG_BANDS, dtype=np.float64)
 
         starts_c, ends_c, cum_c = data
         i_start = int(np.searchsorted(ends_c, start, side="right"))
         i_end = int(np.searchsorted(starts_c, end, side="left"))
-
         if i_start >= i_end:
-            return np.zeros(24, dtype=np.float64)
-
-        diff = cum_c[i_end] - cum_c[i_start]
-        return np.asarray(diff, dtype=np.float64)
+            return np.zeros(NUM_FRAG_BANDS, dtype=np.float64)
+        return np.asarray(cum_c[i_end] - cum_c[i_start], dtype=np.float64)
 
 
 def _dirichlet_multinomial_logpmf(
@@ -152,12 +128,11 @@ def _dirichlet_multinomial_logpmf(
     pos = k_vec > 0
     k_pos = k_vec[pos]
     alpha_pos = np.maximum(alpha_vec[pos], 1e-12)
-    ll = (
+    return float(
         gammaln(alpha_sum)
         - gammaln(total_n + alpha_sum)
         + float(np.sum(gammaln(k_pos + alpha_pos) - gammaln(alpha_pos)))
     )
-    return float(ll)
 
 
 def _gaussian_depth_loglik(
@@ -176,7 +151,7 @@ def _convert_571_to_24_bands(
 ) -> NDArray[np.float64]:
     """Convert 571-bin fragment length density into canonical 24 bands."""
     p_arr = np.asarray(p_571, dtype=np.float64)
-    if p_arr.size == 24:
+    if p_arr.size == NUM_FRAG_BANDS:
         res = np.clip(p_arr, 1e-8, None)
         return res / np.sum(res)
 
@@ -191,6 +166,53 @@ def _convert_571_to_24_bands(
     return p_24 / np.sum(p_24)
 
 
+def _integrate_mosaic_state(
+    m_low: float,
+    m_high: float,
+    delta_cn: float,
+    depth_scale: float,
+    f_bio: float,
+    f_se: float,
+    *,
+    is_fetal: bool,
+    r_obs: float,
+    sigma_r: float,
+    k_band_counts: NDArray[np.float64],
+    p_fetal_24: NDArray[np.float64],
+    p_maternal_24: NDArray[np.float64],
+    alpha_dm: float,
+) -> tuple[float, float, float]:
+    """Integrate coupled depth + DM mosaic likelihood over [m_low, m_high] via 16-node Gauss-Legendre quadrature."""
+    nodes_x, weights_w = _QUAD_NODES_16
+    half_span = 0.5 * (m_high - m_low)
+    m_nodes = half_span * nodes_x + 0.5 * (m_high + m_low)
+    m_weights = half_span * weights_w
+    jacobian = abs(delta_cn) * depth_scale
+
+    ll_nodes = np.empty(m_nodes.size, dtype=np.float64)
+    for idx, m in enumerate(m_nodes):
+        r_exp_m = 1.0 + delta_cn * m * depth_scale
+        if is_fetal:
+            f_mult = (1.0 + delta_cn * m) * f_bio
+            phi_m = f_mult / (1.0 - f_bio + f_mult)
+        else:
+            phi_m = f_bio / ((1.0 + delta_cn * m) * (1.0 - f_bio) + f_bio)
+        p_m_st = phi_m * p_fetal_24 + (1.0 - phi_m) * p_maternal_24
+        ll_nodes[idx] = _gaussian_depth_loglik(
+            r_obs, r_exp_m, sigma_r, abs(delta_cn) * m * f_se
+        ) + _dirichlet_multinomial_logpmf(k_band_counts, alpha_dm * p_m_st)
+
+    max_ll = float(np.max(ll_nodes))
+    unnorm = np.exp(ll_nodes - max_ll)
+    integral = float(np.sum(m_weights * unnorm))
+    log_ev = max_ll + math.log(max(integral, 1e-300)) + math.log(max(jacobian, 1e-6))
+    m_hat = float(np.sum(m_weights * m_nodes * unnorm) / max(integral, 1e-300))
+    var_m = float(
+        np.sum(m_weights * np.square(m_nodes - m_hat) * unnorm) / max(integral, 1e-300)
+    )
+    return log_ev, m_hat, var_m
+
+
 def classify_segment_origin_5state(
     r_obs: float,
     k_band_counts: NDArray[np.float64],
@@ -201,110 +223,73 @@ def classify_segment_origin_5state(
     active_ff_se: float,
     is_gain: bool,
     *,
+    depth_ff: float | None = None,
     alpha_dm: float = 10000.0,
     sigma_r: float = 0.005,
 ) -> tuple[str, dict[str, float], float | None, tuple[float, float] | None]:
     """Classify segment biological origin across 5 coupled Depth + DM hypotheses."""
-    cn_f = 3.0 if is_gain else 1.0
-    cn_m = 3.0 if is_gain else 1.0
-    f_eff = float(np.clip(active_ff, 0.001, 0.60))
-    f_se = max(float(active_ff_se), 0.001)
+    cn_alt = 3.0 if is_gain else 1.0
+    delta_cn = cn_alt / 2.0 - 1.0
+    f_bio = float(np.clip(active_ff, 0.001, 0.60))
+    f_dep = float(np.clip(depth_ff if depth_ff is not None else active_ff, 0.001, 0.60))
+    f_se = max(float(active_ff_se) * (f_dep / f_bio), 0.001)
 
-    nodes_x, weights_w = _QUAD_NODES_16
-    m_cpm_nodes = 0.5 * (0.95 - 0.05) * nodes_x + 0.5 * (0.95 + 0.05)
-    m_cpm_weights = 0.5 * (0.95 - 0.05) * weights_w
-
-    m_mat_nodes = 0.5 * (0.95 - 0.01) * nodes_x + 0.5 * (0.95 + 0.01)
-    m_mat_weights = 0.5 * (0.95 - 0.01) * weights_w
-
-    # 1. FETAL_CONSTITUTIONAL (CN_F in {1, 3}, CN_M = 2)
-    r_exp_fc = 1.0 + (cn_f / 2.0 - 1.0) * f_eff
-    phi_fc = (cn_f / 2.0 * f_eff) / (1.0 - f_eff + cn_f / 2.0 * f_eff)
+    r_exp_fc = 1.0 + delta_cn * f_dep
+    phi_fc = (cn_alt / 2.0 * f_bio) / (1.0 - f_bio + cn_alt / 2.0 * f_bio)
     p_fc = phi_fc * p_fetal_24 + (1.0 - phi_fc) * p_maternal_24
     ll_fc = _gaussian_depth_loglik(
-        r_obs, r_exp_fc, sigma_r, abs(cn_f / 2.0 - 1.0) * f_se
+        r_obs, r_exp_fc, sigma_r, abs(delta_cn) * f_se
     ) + _dirichlet_multinomial_logpmf(k_band_counts, alpha_dm * p_fc)
 
-    # 2. PLACENTAL_MOSAIC (CPM, m in [0.05, 0.95])
-    ll_cpm_nodes: list[float] = []
-    jac_cpm = abs(cn_f / 2.0 - 1.0) * f_eff
-    for m in m_cpm_nodes:
-        r_exp_m = 1.0 + (cn_f / 2.0 - 1.0) * m * f_eff
-        phi_m = (
-            (1.0 + (cn_f / 2.0 - 1.0) * m)
-            * f_eff
-            / (1.0 - f_eff + (1.0 + (cn_f / 2.0 - 1.0) * m) * f_eff)
-        )
-        p_m_st = phi_m * p_fetal_24 + (1.0 - phi_m) * p_maternal_24
-        ll_node = _gaussian_depth_loglik(
-            r_obs, r_exp_m, sigma_r, abs(cn_f / 2.0 - 1.0) * m * f_se
-        ) + _dirichlet_multinomial_logpmf(k_band_counts, alpha_dm * p_m_st)
-        ll_cpm_nodes.append(ll_node)
-    max_cpm = max(ll_cpm_nodes)
-    unnorm_cpm = np.exp(np.array(ll_cpm_nodes) - max_cpm)
-    int_cpm = float(np.sum(m_cpm_weights * unnorm_cpm))
-    ll_cpm = max_cpm + math.log(max(int_cpm, 1e-300)) + math.log(max(jac_cpm, 1e-6))
-    m_hat_cpm = float(
-        np.sum(m_cpm_weights * m_cpm_nodes * unnorm_cpm) / max(int_cpm, 1e-300)
-    )
-    var_cpm = float(
-        np.sum(m_cpm_weights * ((m_cpm_nodes - m_hat_cpm) ** 2) * unnorm_cpm)
-        / max(int_cpm, 1e-300)
+    ll_cpm, m_hat_cpm, var_cpm = _integrate_mosaic_state(
+        0.05,
+        0.95,
+        delta_cn,
+        f_dep,
+        f_bio,
+        f_se,
+        is_fetal=True,
+        r_obs=r_obs,
+        sigma_r=sigma_r,
+        k_band_counts=k_band_counts,
+        p_fetal_24=p_fetal_24,
+        p_maternal_24=p_maternal_24,
+        alpha_dm=alpha_dm,
     )
 
-    # 3. MATERNAL_UNINHERITED (CN_M in {1, 3}, CN_F = 2)
-    r_exp_mu = 1.0 + (cn_m / 2.0 - 1.0) * (1.0 - f_eff)
-    phi_mu = f_eff / (cn_m / 2.0 * (1.0 - f_eff) + f_eff)
+    r_exp_mu = 1.0 + delta_cn * (1.0 - f_dep)
+    phi_mu = f_bio / (cn_alt / 2.0 * (1.0 - f_bio) + f_bio)
     p_mu = phi_mu * p_fetal_24 + (1.0 - phi_mu) * p_maternal_24
     ll_mu = _gaussian_depth_loglik(
-        r_obs, r_exp_mu, sigma_r, abs(cn_m / 2.0 - 1.0) * f_se
+        r_obs, r_exp_mu, sigma_r, abs(delta_cn) * f_se
     ) + _dirichlet_multinomial_logpmf(k_band_counts, alpha_dm * p_mu)
 
-    # 4. MATERNAL_AND_FETAL_INHERITED (Mendelian, CN_M = CN_F in {1, 3})
-    r_exp_mfi = cn_m / 2.0
-    p_mfi = p_plasma_0
     ll_mfi = _gaussian_depth_loglik(
-        r_obs, r_exp_mfi, sigma_r, 0.0
-    ) + _dirichlet_multinomial_logpmf(k_band_counts, alpha_dm * p_mfi)
+        r_obs, cn_alt / 2.0, sigma_r, 0.0
+    ) + _dirichlet_multinomial_logpmf(k_band_counts, alpha_dm * p_plasma_0)
 
-    # 5. MATERNAL_MOSAIC (m in [0.01, 0.95])
-    ll_mat_nodes: list[float] = []
-    jac_mat = abs(cn_m / 2.0 - 1.0) * (1.0 - f_eff)
-    for m in m_mat_nodes:
-        r_exp_m = 1.0 + (cn_m / 2.0 - 1.0) * m * (1.0 - f_eff)
-        phi_m = f_eff / ((1.0 + (cn_m / 2.0 - 1.0) * m) * (1.0 - f_eff) + f_eff)
-        p_m_st = phi_m * p_fetal_24 + (1.0 - phi_m) * p_maternal_24
-        ll_node = _gaussian_depth_loglik(
-            r_obs, r_exp_m, sigma_r, abs(cn_m / 2.0 - 1.0) * m * f_se
-        ) + _dirichlet_multinomial_logpmf(k_band_counts, alpha_dm * p_m_st)
-        ll_mat_nodes.append(ll_node)
-    max_mat = max(ll_mat_nodes)
-    unnorm_mat = np.exp(np.array(ll_mat_nodes) - max_mat)
-    int_mat = float(np.sum(m_mat_weights * unnorm_mat))
-    ll_mm = max_mat + math.log(max(int_mat, 1e-300)) + math.log(max(jac_mat, 1e-6))
-    m_hat_mat = float(
-        np.sum(m_mat_weights * m_mat_nodes * unnorm_mat) / max(int_mat, 1e-300)
+    ll_mm, m_hat_mat, var_mat = _integrate_mosaic_state(
+        0.01,
+        0.95,
+        delta_cn,
+        1.0 - f_dep,
+        f_bio,
+        f_se,
+        is_fetal=False,
+        r_obs=r_obs,
+        sigma_r=sigma_r,
+        k_band_counts=k_band_counts,
+        p_fetal_24=p_fetal_24,
+        p_maternal_24=p_maternal_24,
+        alpha_dm=alpha_dm,
     )
-    var_mat = float(
-        np.sum(m_mat_weights * ((m_mat_nodes - m_hat_mat) ** 2) * unnorm_mat)
-        / max(int_mat, 1e-300)
-    )
-
-    priors: dict[str, float] = {
-        "FETAL_CONSTITUTIONAL": 0.20,
-        "PLACENTAL_MOSAIC": 0.20,
-        "MATERNAL_UNINHERITED": 0.20,
-        "MATERNAL_AND_FETAL_INHERITED": 0.20,
-        "MATERNAL_MOSAIC": 0.20,
-    }
 
     log_joints: dict[str, float] = {
-        "FETAL_CONSTITUTIONAL": ll_fc + math.log(priors["FETAL_CONSTITUTIONAL"]),
-        "PLACENTAL_MOSAIC": ll_cpm + math.log(priors["PLACENTAL_MOSAIC"]),
-        "MATERNAL_UNINHERITED": ll_mu + math.log(priors["MATERNAL_UNINHERITED"]),
-        "MATERNAL_AND_FETAL_INHERITED": ll_mfi
-        + math.log(priors["MATERNAL_AND_FETAL_INHERITED"]),
-        "MATERNAL_MOSAIC": ll_mm + math.log(priors["MATERNAL_MOSAIC"]),
+        "FETAL_CONSTITUTIONAL": ll_fc + _STATE_LOG_PRIOR,
+        "PLACENTAL_MOSAIC": ll_cpm + _STATE_LOG_PRIOR,
+        "MATERNAL_UNINHERITED": ll_mu + _STATE_LOG_PRIOR,
+        "MATERNAL_AND_FETAL_INHERITED": ll_mfi + _STATE_LOG_PRIOR,
+        "MATERNAL_MOSAIC": ll_mm + _STATE_LOG_PRIOR,
     }
     max_lj = max(log_joints.values())
     unnorm_post = {k: math.exp(v - max_lj) for k, v in log_joints.items()}
@@ -312,11 +297,7 @@ def classify_segment_origin_5state(
     posteriors = {k: unnorm_post[k] / sum_post for k in unnorm_post}
 
     best_state = max(posteriors.keys(), key=lambda k: posteriors[k])
-    call: str
-    if posteriors[best_state] < 0.80:
-        call = "INDETERMINATE"
-    else:
-        call = best_state
+    call = "INDETERMINATE" if posteriors[best_state] < 0.80 else best_state
 
     mosaic_frac: float | None = None
     mosaic_ci: tuple[float, float] | None = None
@@ -340,104 +321,52 @@ def classify_segment_origin_5state(
 
 def annotate_prenatal_origin_and_lod(
     segments: Sequence[SegmentResult],
+    *,
+    prefix_sums: BandPrefixSums | None = None,
     sample_bands: NDArray[np.uint32] | None = None,
-    bin_contigs: NDArray[np.int16] | None = None,
-    contig_names: Sequence[str] | None = None,
     bin_usable: NDArray[np.bool_] | None = None,
-    p_fetal_24: NDArray[np.float64] | None = None,
+    p_fetal_24: Sequence[float] | NDArray[np.floating] | None = None,
+    p_maternal_24: Sequence[float] | NDArray[np.floating] | None = None,
     mu_fetal_w: float = 1.0,
     mu_maternal_w: float = 1.0,
     active_ff: float = 0.0,
     active_ff_se: float = 0.01,
     sca_call: SCACall = "XX",
-    *,
     sample_depth_per_mb: float = 10000.0,
     sys_var_per_mb: float = 0.0001,
     z_threshold: float = 3.0,
-    bin_starts: NDArray[np.int64] | None = None,
-    bin_ends: NDArray[np.int64] | None = None,
-    p_maternal_24: NDArray[np.float64] | None = None,
-    prefix_sums: BandPrefixSums | None = None,
-    sample_table: pa.Table | SampleBuffers | None = None,
-    prenatal_meta: PrenatalModelMetadata | None = None,
-    prenatal_result: FetalFractionResult | None = None,
 ) -> tuple[tuple[SegmentResult, ...], PrenatalLoDMetrics]:
-    """Annotate segments with expected ratio, implied FF, discordance, origin, and LoD."""
-    if prenatal_result is not None:
-        active_ff = prenatal_result.active_ff
-        active_ff_se = (
-            prenatal_result.active_ff_se
-            if prenatal_result.active_ff_se is not None
-            else active_ff_se
-        )
-        sca_call = prenatal_result.sca.call
-
-    if prenatal_meta is not None:
-        if p_fetal_24 is None and prenatal_meta.p_fetal_density is not None:
-            p_fetal_24 = _convert_571_to_24_bands(prenatal_meta.p_fetal_density)
-        if p_maternal_24 is None and prenatal_meta.p_maternal_density is not None:
-            p_maternal_24 = _convert_571_to_24_bands(prenatal_meta.p_maternal_density)
-        if prenatal_meta.mu_fetal_w is not None:
-            mu_fetal_w = float(prenatal_meta.mu_fetal_w)
-        if prenatal_meta.mu_maternal_w is not None:
-            mu_maternal_w = float(prenatal_meta.mu_maternal_w)
-
-    if prefix_sums is None and sample_table is not None:
-        prefix_sums = BandPrefixSums.from_sample_table(sample_table)
-
-    # 1. Analytical Limit of Detection (LoD) minimum fetal fraction thresholds
-    z_target = 3.0 + 2.3263479
+    """Annotate segments with expected ratio, implied FF, discordance, 5-state origin, and LoD."""
+    z_target = max(float(z_threshold), 0.1) + 2.3263479
     d_mb = max(float(sample_depth_per_mb), 1.0)
     v_sys = max(float(sys_var_per_mb), 0.0)
-
     sig_35mb = math.sqrt(1.0 / (d_mb * 35.0) + v_sys / 35.0)
     sig_3mb = math.sqrt(1.0 / (d_mb * 3.0) + v_sys / 3.0)
     lod_ff_35mb = float(np.clip(2.0 * z_target * sig_35mb, 0.005, 0.49))
     lod_ff_3mb = float(np.clip(2.0 * z_target * sig_3mb, lod_ff_35mb + 0.001, 0.499))
     lod_metrics = PrenatalLoDMetrics(lod_ff_35mb=lod_ff_35mb, lod_ff_3mb=lod_ff_3mb)
 
-    # 2. Build PrefixSums if needed
-    if (
-        prefix_sums is None
-        and sample_bands is not None
-        and bin_contigs is not None
-        and contig_names is not None
-        and bin_starts is not None
-        and bin_ends is not None
-    ):
-        prefix_sums = BandPrefixSums(
-            sample_bands=sample_bands,
-            bin_contigs=bin_contigs,
-            contig_names=contig_names,
-            bin_starts=bin_starts,
-            bin_ends=bin_ends,
-            bin_usable=bin_usable,
-        )
-
-    # 3. Reference and self-referenced plasma densities
+    uniform_24 = np.full(NUM_FRAG_BANDS, 1.0 / NUM_FRAG_BANDS, dtype=np.float64)
     p_f24 = (
-        _convert_571_to_24_bands(p_fetal_24)
-        if p_fetal_24 is not None
-        else np.ones(24, dtype=np.float64) / 24.0
+        _convert_571_to_24_bands(p_fetal_24) if p_fetal_24 is not None else uniform_24
     )
-
     if p_maternal_24 is not None:
         p_m24 = _convert_571_to_24_bands(p_maternal_24)
         p0_plasma = active_ff * p_f24 + (1.0 - active_ff) * p_m24
     elif sample_bands is not None and sample_bands.size > 0:
         usable_idx = (
-            np.where(bin_usable)[0]
+            np.flatnonzero(bin_usable)
             if bin_usable is not None and np.any(bin_usable)
             else np.arange(sample_bands.shape[0])
         )
         sum_bands = np.sum(sample_bands[usable_idx], axis=0, dtype=np.float64)
         total_k = float(np.sum(sum_bands))
-        p0_plasma = sum_bands / max(total_k, 1.0) if total_k > 0 else np.ones(24) / 24.0
+        p0_plasma = sum_bands / max(total_k, 1.0) if total_k > 0 else uniform_24
         p_m_raw = np.clip(p0_plasma - active_ff * p_f24, 1e-8, None)
         p_m24 = p_m_raw / np.sum(p_m_raw)
     else:
-        p0_plasma = np.ones(24, dtype=np.float64) / 24.0
-        p_m24 = np.ones(24, dtype=np.float64) / 24.0
+        p0_plasma = uniform_24
+        p_m24 = uniform_24
 
     f_act = max(float(active_ff), 0.0)
     mu_f = max(float(mu_fetal_w), 1e-4)
@@ -445,6 +374,7 @@ def annotate_prenatal_origin_and_lod(
     f_eff = float(
         np.clip((f_act * mu_f) / ((1.0 - f_act) * mu_m + f_act * mu_f), 0.0, 0.60)
     )
+    log_ratio_fm = np.log(np.maximum(p_f24, 1e-12)) - np.log(np.maximum(p_m24, 1e-12))
 
     annotated: list[SegmentResult] = []
     is_aneuploid = sca_call not in ("XX", "XY")
@@ -455,20 +385,23 @@ def annotate_prenatal_origin_and_lod(
         elif seg.ratio >= 0.0:
             expected_ratio = math.log2(1.0 + 0.5 * f_eff)
         else:
-            arg = max(1e-6, 1.0 - 0.5 * f_eff)
-            expected_ratio = math.log2(arg)
+            expected_ratio = math.log2(max(1e-6, 1.0 - 0.5 * f_eff))
 
         r_obs = 2.0**seg.ratio
-        implied_ff_raw = 2.0 * abs(r_obs - 1.0)
-        implied_ff = float(implied_ff_raw)
+        implied_eff = 2.0 * abs(r_obs - 1.0)
+        if implied_eff < 0.9999 and abs(mu_f - mu_m) > 1e-9:
+            implied_ff = float(
+                (implied_eff * mu_m)
+                / max((1.0 - implied_eff) * mu_f + implied_eff * mu_m, 1e-12)
+            )
+        else:
+            implied_ff = float(implied_eff)
 
-        norm_contig = normalize_chr(seg.contig)
-        is_gonosome = norm_contig in {"X", "Y"}
+        is_gonosome = normalize_chr(seg.contig) in {"X", "Y"}
         has_call = (seg.call is not None) or (abs(seg.zscore) >= z_threshold)
 
         discordant = False
         reason: str | None = None
-
         if is_gonosome and (is_aneuploid or has_call):
             discordant = True
             reason = "SCA_DISCORDANT"
@@ -490,14 +423,10 @@ def annotate_prenatal_origin_and_lod(
             total_seg_k = float(np.sum(k_s))
             if total_seg_k > 0:
                 frag_short_ratio = float(np.sum(k_s[:6]) / total_seg_k)
-                log_ratio_fm = np.log(np.maximum(p_f24, 1e-12)) - np.log(
-                    np.maximum(p_m24, 1e-12)
-                )
                 frag_llr_size = float(np.sum(k_s * log_ratio_fm))
-
                 if has_call:
                     is_gain = (
-                        seg.call.lower() == "gain"
+                        seg.call == "gain"
                         if seg.call is not None
                         else (seg.ratio >= 0.0)
                     )
@@ -508,9 +437,10 @@ def annotate_prenatal_origin_and_lod(
                             p_fetal_24=p_f24,
                             p_maternal_24=p_m24,
                             p_plasma_0=p0_plasma,
-                            active_ff=f_eff,
+                            active_ff=f_act,
                             active_ff_se=active_ff_se,
                             is_gain=is_gain,
+                            depth_ff=f_eff,
                         )
                     )
 
@@ -532,26 +462,46 @@ def annotate_prenatal_origin_and_lod(
     return tuple(annotated), lod_metrics
 
 
-def annotate_prenatal_segments(
+def annotate_sample_prenatal_segments(
     segments: Sequence[SegmentResult],
+    sample: SampleBuffers | pa.Table,
+    *,
+    bin_usable: NDArray[np.bool_] | None = None,
+    prenatal_meta: PrenatalModelMetadata | None = None,
     prenatal_result: FetalFractionResult,
     z_threshold: float = 3.0,
-    sample_table: pa.Table | SampleBuffers | None = None,
-    prenatal_meta: PrenatalModelMetadata | None = None,
-    *,
-    sample_depth_per_mb: float = 10000.0,
-    sys_var_per_mb: float = 0.0001,
-) -> list[SegmentResult]:
-    """Backwards-compatible wrapper annotating segments and attaching origin and LoD."""
-    annotated, lod = annotate_prenatal_origin_and_lod(
-        segments=segments,
+) -> tuple[tuple[SegmentResult, ...], PrenatalLoDMetrics]:
+    """Annotate sample segments using prenatal model metadata and sample band prefix sums."""
+    bufs = SampleBuffers.coerce(sample)
+    prefix_sums = BandPrefixSums.from_sample_table(bufs, bin_usable=bin_usable)
+    total_bp = sum(bufs.meta.contig_lengths.values())
+    depth_per_mb = float(np.sum(bufs.count)) / max(total_bp / 1e6, 1e-6)
+    return annotate_prenatal_origin_and_lod(
+        segments,
+        prefix_sums=prefix_sums,
+        sample_bands=bufs.frag_bands,
+        bin_usable=bin_usable,
+        p_fetal_24=prenatal_meta.p_fetal_density if prenatal_meta is not None else None,
+        p_maternal_24=(
+            prenatal_meta.p_maternal_density if prenatal_meta is not None else None
+        ),
+        mu_fetal_w=(
+            float(prenatal_meta.mu_fetal_w)
+            if prenatal_meta is not None and prenatal_meta.mu_fetal_w is not None
+            else 1.0
+        ),
+        mu_maternal_w=(
+            float(prenatal_meta.mu_maternal_w)
+            if prenatal_meta is not None and prenatal_meta.mu_maternal_w is not None
+            else 1.0
+        ),
+        active_ff=prenatal_result.active_ff,
+        active_ff_se=(
+            prenatal_result.active_ff_se
+            if prenatal_result.active_ff_se is not None
+            else 0.01
+        ),
+        sca_call=prenatal_result.sca.call,
+        sample_depth_per_mb=depth_per_mb,
         z_threshold=z_threshold,
-        sample_table=sample_table,
-        prenatal_meta=prenatal_meta,
-        prenatal_result=prenatal_result,
-        sample_depth_per_mb=sample_depth_per_mb,
-        sys_var_per_mb=sys_var_per_mb,
     )
-    if isinstance(prenatal_result, FetalFractionResult):
-        object.__setattr__(prenatal_result, "lod_metrics", lod)
-    return list(annotated)

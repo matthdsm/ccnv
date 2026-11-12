@@ -1,19 +1,17 @@
 """External format ingestion and pipeline table storage for ccnv."""
 
 from ccnv.io.alignments import (
-    AlignmentReadLike,
+    ScanAlignmentResult,
     alignment_format,
     read_alignment_header,
-    rejection_reason,
     scan_alignment_bins,
     validate_alignment_inputs,
 )
 from ccnv.io.parquet import (
     is_sample_parquet,
-    load_cohort,
     read_reference_parquet,
+    read_sample_buffers,
     read_sample_parquet,
-    read_sample_tables,
     write_reference_parquet,
     write_sample_parquet,
 )
@@ -28,10 +26,9 @@ from ccnv.io.tracks import (
 )
 
 __all__ = [
-    "AlignmentReadLike",
+    "ScanAlignmentResult",
     "alignment_format",
     "is_sample_parquet",
-    "load_cohort",
     "load_cytobands_track",
     "load_gc_track",
     "load_mappability_track",
@@ -39,9 +36,8 @@ __all__ = [
     "read_alignment_header",
     "read_fasta_contigs",
     "read_reference_parquet",
+    "read_sample_buffers",
     "read_sample_parquet",
-    "read_sample_tables",
-    "rejection_reason",
     "scan_alignment_bins",
     "validate_alignment_inputs",
     "write_reference_parquet",

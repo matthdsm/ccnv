@@ -9,20 +9,15 @@ from dataclasses import dataclass
 from typing import Final
 
 import numpy as np
-import scipy.optimize
 import scipy.special
 import scipy.stats
 from numpy.typing import NDArray
 from sklearn.exceptions import ConvergenceWarning
-from sklearn.linear_model import (
-    ElasticNetCV,
-    HuberRegressor,
-    RidgeCV,
-)
-from sklearn.mixture import GaussianMixture
-from sklearn.model_selection import KFold, cross_val_predict
+from sklearn.linear_model import HuberRegressor
+from sklearn.model_selection import KFold
 
 from ccnv.models.results import ActiveFFSource, SCACall
+from ccnv.stats.regression import fit_logit_linear_ensemble
 
 __all__ = [
     "MSYSexModel",
@@ -30,16 +25,12 @@ __all__ = [
     "classify_sca_ray_4d",
     "compute_autosomal_density",
     "evaluate_poisson_msy_ffy",
-    "fit_elasticnet_ffy",
     "fit_ffa_logit_ensemble",
     "fit_forward_ffx_model",
     "fit_msy_sex_mixture",
     "fit_poisson_msy_ffy",
-    "fit_preface_logit_ensemble",
     "fuse_active_fetal_fraction_student_t4",
-    "infer_sex_gmm_1d",
     "ols_fit",
-    "rlm_huber",
 ]
 
 
@@ -134,12 +125,10 @@ def fit_msy_sex_mixture(
             bimodal=False,
         )
 
-    # Model 1: 1-component unimodal Poisson
     lambda_bg_1 = float(np.sum(c) / np.sum(e))
     mu_1 = lambda_bg_1 * e
     l1 = float(np.sum(_poisson_logpmf(c, mu_1)))
 
-    # Model 2: 2-component EM mixture
     r = c / e
     med_r = float(np.median(r))
     lower_r = r[r <= med_r]
@@ -193,7 +182,6 @@ def fit_msy_sex_mixture(
         if diff < 1e-6:
             break
 
-    # Evaluate L2 log-likelihood
     mu_fem = lambda_bg * e
     mu_male = (lambda_bg + delta_male) * e
     ll_fem = _poisson_logpmf(c, mu_fem)
@@ -288,7 +276,7 @@ def fit_poisson_msy_ffy(
             raw_vec = np.array(raw_ff_list, dtype=np.float64)
             lab_vec = np.array(lab_list, dtype=np.float64)
             if float(np.ptp(raw_vec)) > 1e-4:
-                slope, _ = ols_fit(raw_vec, lab_vec)
+                _, slope = ols_fit(raw_vec, lab_vec)
                 if 0.5 <= slope <= 2.0:
                     kappa_cal = float(slope)
 
@@ -396,132 +384,12 @@ def fit_forward_ffx_model(
     return alpha_0, alpha_1, sigma_sys
 
 
-def infer_sex_gmm_1d(
-    yfracs: NDArray[np.floating] | np.ndarray,
-    seed: int = 42,
-) -> tuple[NDArray[np.bool_], float]:
-    """Fit a 2-component 1D Gaussian Mixture Model on chrY read fractions.
-
-    Uses deterministic quantile initialization (25th and 75th percentiles) with
-    scikit-learn GaussianMixture and brentq root-finding for the P = 0.5
-    posterior decision threshold.
-    """
-    y = np.asarray(yfracs, dtype=np.float64).ravel()
-    n = y.size
-    if n == 0:
-        return np.empty(0, dtype=np.bool_), 0.0
-    if n == 1:
-        return np.zeros(1, dtype=np.bool_), float(y[0])
-
-    mu0 = float(np.percentile(y, 25.0))
-    mu1 = float(np.percentile(y, 75.0))
-    if mu0 > mu1:
-        mu0, mu1 = mu1, mu0
-
-    sample_var = float(np.var(y))
-    if mu1 - mu0 < 1e-8 or sample_var < 1e-8:
-        thresh = float(mu0)
-        return y >= thresh, thresh
-
-    gmm = GaussianMixture(
-        n_components=2,
-        covariance_type="full",
-        tol=1e-6,
-        reg_covar=1e-8,
-        max_iter=100,
-        means_init=np.array([[mu0], [mu1]], dtype=np.float64),
-        weights_init=np.array([0.5, 0.5], dtype=np.float64),
-        random_state=seed,
-    )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
-        gmm.fit(y.reshape(-1, 1))
-
-    means = gmm.means_.ravel()
-    male_idx = int(np.argmax(means))
-    female_idx = 1 - male_idx
-    mu_low = float(means[female_idx])
-    mu_high = float(means[male_idx])
-
-    if mu_high - mu_low < 1e-8:
-        thresh = mu_low
-        return y >= thresh, thresh
-
-    def _posterior_diff(val: float) -> float:
-        """Evaluate difference between male component posterior probability and 0.5."""
-        probs = gmm.predict_proba(np.array([[val]], dtype=np.float64))
-        return float(probs[0, male_idx] - 0.5)
-
-    f_low = _posterior_diff(mu_low)
-    f_high = _posterior_diff(mu_high)
-    if f_low * f_high <= 0.0:
-        thresh = float(scipy.optimize.brentq(_posterior_diff, mu_low, mu_high))
-    else:
-        thresh = 0.5 * (mu_low + mu_high)
-
-    return y >= thresh, float(thresh)
-
-
-def fit_elasticnet_ffy(
-    X: NDArray[np.floating] | np.ndarray,
-    y: NDArray[np.floating] | np.ndarray,
-    seed: int = 42,
-) -> tuple[NDArray[np.float64], float]:
-    """Solve non-negative ElasticNetCV on chrY bins to estimate fetal fraction.
-
-    Minimizes:
-        (1 / (2 * N)) * ||Xw + b - y||_2^2 + alpha * rho * ||w||_1
-        + (alpha * (1 - rho) / 2) * ||w||_2^2
-    subject to w >= 0, selecting alpha and rho in {0.01, 0.05, 0.10} via CV.
-    """
-    x_arr = np.asarray(X, dtype=np.float64)
-    y_arr = np.asarray(y, dtype=np.float64).ravel()
-    n_samples, n_features = x_arr.shape
-
-    if (
-        n_samples < 2
-        or n_features == 0
-        or np.allclose(x_arr, 0.0)
-        or np.allclose(y_arr, 0.0)
-    ):
-        return np.zeros(n_features, dtype=np.float64), 0.0
-
-    cv_folds = min(5, max(2, n_samples))
-    model = ElasticNetCV(
-        l1_ratio=[0.01, 0.05, 0.1],
-        positive=True,
-        fit_intercept=True,
-        cv=cv_folds,
-        random_state=seed,
-        max_iter=3000,
-    )
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
-        warnings.simplefilter("ignore", UserWarning)
-        model.fit(x_arr, y_arr)
-
-    weights = np.asarray(model.coef_, dtype=np.float64)
-    intercept = float(model.intercept_)
-    return weights, intercept
-
-
 def fit_ffa_logit_ensemble(
     X: NDArray[np.floating] | np.ndarray,
     y: NDArray[np.floating] | np.ndarray,
     seed: int = 42,
 ) -> tuple[NDArray[np.float64], float, float]:
-    """Fit convex logit-link RidgeCV and ElasticNetCV ensemble for FFA.
-
-    Transforms fetal fraction targets to logit space u_i = logit(clip(y_i, 0.005, 0.85))
-    and fits RidgeCV (alphas in 10^-2 to 10^4) and ElasticNetCV (l1_ratio in {0.1, 0.5}).
-    Averages linear coefficients in logit space:
-        w_ens = 0.5 * (w_ridge + w_enet)
-        b_ens = 0.5 * (b_ridge + b_enet)
-    Predictions in (0, 1) are given by:
-        y_hat = expit(x^T w_ens + b_ens)
-
-    Returns (w_ens, b_ens, sigma_ffa) where sigma_ffa is the RMSE of predictions.
-    """
+    """Fit convex logit-link RidgeCV and ElasticNetCV ensemble for FFA."""
     x_arr = np.asarray(X, dtype=np.float64)
     y_arr = np.asarray(y, dtype=np.float64).ravel()
     n_samples, n_features = x_arr.shape
@@ -533,72 +401,38 @@ def fit_ffa_logit_ensemble(
 
     y_clip = np.clip(y_arr, 0.005, 0.85)
     u = scipy.special.logit(y_clip)
+    ridge_alphas = np.logspace(-2, 4, 40)
 
-    cv_folds = min(5, max(2, n_samples))
-    ridge = RidgeCV(alphas=np.logspace(-2, 4, 40), store_cv_results=True)
-    enet = ElasticNetCV(
-        l1_ratio=[0.1, 0.5],
-        cv=cv_folds,
-        random_state=seed,
+    w_ens, b_ens = fit_logit_linear_ensemble(
+        x_arr,
+        u,
+        ridge_alphas=ridge_alphas,
+        l1_ratio=(0.1, 0.5),
+        seed=seed,
         max_iter=3000,
     )
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
-        warnings.simplefilter("ignore", UserWarning)
-        ridge.fit(x_arr, u)
-        enet.fit(x_arr, u)
-
-    w_ens = 0.5 * (
-        np.asarray(ridge.coef_, dtype=np.float64)
-        + np.asarray(enet.coef_, dtype=np.float64)
-    )
-    b_ens = 0.5 * (float(ridge.intercept_) + float(enet.intercept_))
-
-    sigma_ffa: float | None = None
     if n_samples >= 6:
-        try:
-            cv_outer = min(5, n_samples)
-            cv_inner = max(
-                2, min(3, n_samples - (n_samples + cv_outer - 1) // cv_outer)
+        cv_outer = min(5, n_samples)
+        oof_u = np.empty(n_samples, dtype=np.float64)
+        cv = KFold(n_splits=cv_outer, shuffle=True, random_state=seed)
+        for tr_idx, va_idx in cv.split(x_arr):
+            w_fold, b_fold = fit_logit_linear_ensemble(
+                x_arr[tr_idx],
+                u[tr_idx],
+                ridge_alphas=ridge_alphas,
+                l1_ratio=(0.1, 0.5),
+                seed=seed,
+                max_iter=3000,
             )
-            cv = KFold(n_splits=cv_outer, shuffle=True, random_state=seed)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", (ConvergenceWarning, UserWarning))
-                r_pred = cross_val_predict(
-                    RidgeCV(alphas=np.logspace(-2, 4, 40)), x_arr, u, cv=cv
-                )
-                e_pred = cross_val_predict(
-                    ElasticNetCV(
-                        l1_ratio=[0.1, 0.5],
-                        cv=cv_inner,
-                        random_state=seed,
-                        max_iter=3000,
-                    ),
-                    x_arr,
-                    u,
-                    cv=cv,
-                )
-            ens_pred = scipy.special.expit(0.5 * (r_pred + e_pred))
-            sigma_ffa = max(float(np.sqrt(np.mean((ens_pred - y_clip) ** 2))), 0.005)
-        except (
-            ValueError,
-            TypeError,
-            ZeroDivisionError,
-            FloatingPointError,
-            RuntimeError,
-        ):
-            sigma_ffa = None
-
-    if sigma_ffa is None:
+            oof_u[va_idx] = x_arr[va_idx] @ w_fold + b_fold
+        ens_pred = scipy.special.expit(oof_u)
+        sigma_ffa = max(float(np.sqrt(np.mean((ens_pred - y_clip) ** 2))), 0.005)
+    else:
         y_pred = scipy.special.expit(x_arr @ w_ens + b_ens)
         sigma_ffa = max(float(np.sqrt(np.mean((y_pred - y_clip) ** 2))), 0.005)
 
     return w_ens, b_ens, sigma_ffa
-
-
-# Backwards compatibility alias for PREFACE
-fit_preface_logit_ensemble = fit_ffa_logit_ensemble
 
 
 def ols_fit(
@@ -613,38 +447,6 @@ def ols_fit(
 
     res = scipy.stats.linregress(xv, yv)
     return float(res.intercept), float(res.slope)
-
-
-def rlm_huber(
-    x: NDArray[np.floating] | np.ndarray,
-    y: NDArray[np.floating] | np.ndarray,
-    k: float = 1.345,
-    max_iter: int = 50,
-    tol: float = 1e-6,
-) -> tuple[float, float]:
-    """Robust linear model using scikit-learn HuberRegressor."""
-    xv = np.asarray(x, dtype=np.float64).ravel()
-    yv = np.asarray(y, dtype=np.float64).ravel()
-    if xv.size < 2 or float(np.var(xv)) < 1e-12 or float(np.var(yv)) < 1e-12:
-        return ols_fit(xv, yv)
-
-    model = HuberRegressor(
-        epsilon=max(float(k), 1.0),
-        max_iter=max(max_iter, 100),
-        tol=tol,
-        alpha=0.0,
-    )
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", ConvergenceWarning)
-            model.fit(xv.reshape(-1, 1), yv)
-    except ValueError:
-        return ols_fit(xv, yv)
-    intercept = float(model.intercept_)
-    slope = float(model.coef_[0])
-    if math.isfinite(intercept) and math.isfinite(slope):
-        return intercept, slope
-    return ols_fit(xv, yv)
 
 
 _SCA_RAY_DIRECTIONS: Final[dict[str, tuple[float, float, float, float]]] = {
@@ -674,11 +476,7 @@ def fuse_active_fetal_fraction_student_t4(
     max_iter: int = 5,
     tol: float = 1e-4,
 ) -> tuple[float, float]:
-    """Fuse multi-modal fetal fraction estimates via Student-t4 IRLS.
-
-    Iteratively reweights estimators with w_i = ((nu + 1) / (nu + (r_i / sigma_i)^2)) * (1 / sigma_i^2),
-    robustly handling single-estimator failures without pulling active FF.
-    """
+    """Fuse multi-modal fetal fraction estimates via Student-t4 IRLS."""
     valid_pairs = [
         (float(est), float(se))
         for est, se in zip(estimates, standard_errors, strict=False)
@@ -694,7 +492,6 @@ def fuse_active_fetal_fraction_student_t4(
     se_arr = np.array([p[1] for p in valid_pairs], dtype=np.float64)
     nu = max(float(df), 1.0)
 
-    # Initial precision-weighted mean
     w = 1.0 / (se_arr**2)
     current_f = float(np.sum(w * est_arr) / np.sum(w))
 
@@ -728,11 +525,7 @@ def classify_sca_ray_4d(
     corr_matrix: NDArray[np.float64] | None = None,
     clinical_priors: dict[str, float] | None = None,
 ) -> tuple[SCACall, dict[str, float], float, float, ActiveFFSource]:
-    """Classify Sex Chromosome Aneuploidies via 4D closed-form erfc ray marginalization.
-
-    Integrates ray likelihoods over f in [0, 0.60] for XX, XY, XO, XXX, XXY, XYY,
-    applies clinical prior odds, Mahalanobis chi^2 gate, and Student-t4 active FF fusion.
-    """
+    """Classify Sex Chromosome Aneuploidies via 4D closed-form erfc ray marginalization."""
     priors_dict = (
         clinical_priors if clinical_priors is not None else _SCA_CLINICAL_PRIORS
     )
@@ -777,7 +570,6 @@ def classify_sca_ray_4d(
         d2 = max(0.0, float(y.T @ omega @ y - vk * (mk**2)))
         d2_dict[k] = d2
 
-        # Ray integral: erf(sqrt(vk/2)*(0.60 - mk)) - erf(-sqrt(vk/2)*mk)
         arg_high = math.sqrt(0.5 * vk) * (f_max - mk)
         arg_low = -math.sqrt(0.5 * vk) * mk
         delta_erf = scipy.special.erf(arg_high) - scipy.special.erf(arg_low)
@@ -823,7 +615,6 @@ def classify_sca_ray_4d(
     else:
         posteriors["DISCORDANT_MIXED"] = 0.0
 
-    # Active fetal fraction fusion based on best karyotype ray direction
     ref_dir = _SCA_RAY_DIRECTIONS[best_k]
     ff_cands: list[float] = []
     se_cands: list[float] = []

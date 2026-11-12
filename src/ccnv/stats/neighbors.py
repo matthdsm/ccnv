@@ -1,11 +1,10 @@
-"""Prototype Graph fitting, LOCO evaluation, nearest-neighbor search, and null moderation."""
+"""Prototype Graph fitting, LOCO evaluation, and Empirical Bayes dispersion moderation."""
 
 from __future__ import annotations
 
 import logging
 import tempfile
 import warnings
-from collections.abc import Sequence
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Final
@@ -21,24 +20,21 @@ from sklearn.exceptions import ConvergenceWarning
 
 logger = logging.getLogger(__name__)
 
-_LN2_SQ: Final[float] = float(np.log(2.0) ** 2)
+LN2_SQ: Final[float] = float(np.log(2.0) ** 2)
 _MAX_INMEM_RATIO_ELEMENTS: Final[int] = 32_000_000
 _DISPERSION_ROW_CHUNK: Final[int] = 32_768
 _WINSOR_DISPERSION_SIGMA: Final[float] = 3.5
 
 __all__ = [
-    "build_signal_space_features",
+    "LN2_SQ",
     "build_whitened_subspace_features",
     "calibrate_prototype_dispersion",
     "compute_kish_loco_inflation",
-    "compute_null_models",
-    "compute_prototype_null_models",
-    "distance_cutoff",
+    "compute_loco_prototype_support",
     "evaluate_loco_prototype_baseline",
     "exact_poisson_log2_jensen_bias",
     "exact_poisson_log_variance",
     "fit_prototype_graph",
-    "select_nearest_bins",
     "squeeze_var",
 ]
 
@@ -86,37 +82,6 @@ def exact_poisson_log_variance(lam: NDArray[np.floating]) -> NDArray[np.float64]
         lh = l_clamped[hi] + 0.5
         out[hi] = (1.0 / lh) + (1.0 / np.square(lh))
     return out
-
-
-def build_signal_space_features(
-    pca_loadings: NDArray[np.floating],
-    singular_values: NDArray[np.floating] | None = None,
-    covariate_mat: NDArray[np.floating] | None = None,
-) -> NDArray[np.float64]:
-    """Assemble low-dimensional signal-space feature matrix for prototype/neighbor search."""
-    loadings = np.asarray(pca_loadings, dtype=np.float64)
-    if loadings.ndim == 2:
-        feats = loadings.T
-    elif loadings.ndim == 1:
-        feats = loadings[:, np.newaxis]
-    else:
-        feats = np.empty((0, 0), dtype=np.float64)
-
-    if singular_values is not None and feats.size > 0:
-        s = np.asarray(singular_values, dtype=np.float64)
-        feats = feats * s
-
-    if covariate_mat is not None:
-        cov = np.asarray(covariate_mat, dtype=np.float64)
-        if cov.ndim == 1:
-            cov = cov[:, np.newaxis]
-        if cov.size > 0:
-            if feats.size > 0 and not np.allclose(feats, 0.0):
-                feats = np.column_stack([feats, cov])
-            else:
-                feats = cov
-
-    return np.asarray(feats, dtype=np.float64)
 
 
 def build_whitened_subspace_features(
@@ -254,6 +219,104 @@ def fit_prototype_graph(
     return centers, proto_ids, proto_weights, mean_distance
 
 
+def _resolve_prototype_weights(
+    pids: NDArray[np.intp],
+    pw: NDArray[np.float64],
+    valid_proto: NDArray[np.bool_],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
+    """Resolve effective prototype weights and deduplicated support mask per bin."""
+    u_count, r_cols = pids.shape
+    first_occ = np.ones((u_count, r_cols), dtype=np.bool_)
+    for col_j in range(1, r_cols):
+        first_occ[:, col_j] = np.all(
+            pids[:, :col_j] != pids[:, col_j : col_j + 1], axis=1
+        )
+    valid_w = valid_proto & (pw > 0.0)
+    eff_w = np.where(valid_w, pw, 0.0)
+    w_sum = np.sum(eff_w, axis=1)
+    fallback_proto = valid_proto & first_occ
+    need_unif = (w_sum <= 0.0) & np.any(fallback_proto, axis=1)
+    if np.any(need_unif):
+        eff_w = np.where(
+            need_unif[:, np.newaxis], np.where(fallback_proto, 1.0, 0.0), eff_w
+        )
+        w_sum = np.sum(eff_w, axis=1)
+    used_mask = np.where(need_unif[:, np.newaxis], fallback_proto, valid_w & first_occ)
+    return eff_w, w_sum, used_mask
+
+
+def compute_loco_prototype_support(
+    contig_ids: NDArray[np.integer],
+    proto_ids: NDArray[np.uint16],
+    proto_weights: NDArray[np.floating],
+    *,
+    eligible: NDArray[np.bool_] | None = None,
+) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
+    """Compute O(U) LOCO prototype donor support counts and inverse effective sample sizes."""
+    u_count = int(contig_ids.size)
+    if u_count == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+    if proto_ids.size == 0:
+        return np.zeros(u_count, dtype=np.int64), np.ones(u_count, dtype=np.float64)
+
+    elig = (
+        np.ones(u_count, dtype=np.bool_)
+        if eligible is None
+        else np.asarray(eligible, dtype=np.bool_)
+    )
+    e_total = int(np.count_nonzero(elig))
+    if e_total == 0:
+        return np.zeros(u_count, dtype=np.int64), np.ones(u_count, dtype=np.float64)
+
+    _, c_compact = np.unique(
+        np.asarray(contig_ids, dtype=np.int64), return_inverse=True
+    )
+    pids = np.asarray(proto_ids, dtype=np.intp)
+    pw = np.asarray(proto_weights, dtype=np.float64)
+    n_contigs = int(np.max(c_compact)) + 1
+    n_protos = int(np.max(pids)) + 1
+
+    e_prim = pids[elig, 0]
+    e_c = c_compact[elig]
+    full_cnt = np.bincount(e_prim, minlength=n_protos)
+    c_elig_cnt = np.bincount(e_c, minlength=n_contigs)
+    if n_contigs > 1:
+        pc_cnt = np.zeros((n_protos, n_contigs), dtype=np.int64)
+        np.add.at(pc_cnt, (e_prim, e_c), 1)
+        loco_cnt = full_cnt[:, np.newaxis] - pc_cnt
+    else:
+        loco_cnt = np.where(full_cnt == 1, 0, full_cnt)[:, np.newaxis]
+
+    p_cnt = loco_cnt[pids, c_compact[:, np.newaxis]]
+    eff_w, w_sum, used_mask = _resolve_prototype_weights(pids, pw, p_cnt > 0)
+    has_est = w_sum > 0.0
+    support = np.sum(np.where(used_mask, p_cnt, 0), axis=1, dtype=np.int64)
+
+    if np.any(~has_est):
+        off_cnt = (
+            e_total - c_elig_cnt[c_compact]
+            if n_contigs > 1
+            else np.zeros(u_count, dtype=np.int64)
+        )
+        lso_cnt = (
+            np.ones(u_count, dtype=np.int64)
+            if e_total == 1
+            else (e_total - elig.astype(np.int64))
+        )
+        fallback_sup = np.where(off_cnt > 0, off_cnt, lso_cnt)
+        support = np.where(has_est, support, fallback_sup)
+
+    w_norm = eff_w / np.where(has_est, w_sum, 1.0)[:, np.newaxis]
+    inv_keff = np.where(
+        has_est,
+        np.sum(
+            np.where(used_mask, np.square(w_norm) / np.maximum(p_cnt, 1), 0.0), axis=1
+        ),
+        1.0 / np.maximum(support.astype(np.float64), 1.0),
+    )
+    return support, inv_keff
+
+
 def evaluate_loco_prototype_baseline(
     values: NDArray[np.floating],
     contig_ids: NDArray[np.integer],
@@ -386,32 +449,6 @@ def evaluate_loco_prototype_baseline(
     return baselines, support
 
 
-def _resolve_prototype_weights(
-    pids: NDArray[np.intp],
-    pw: NDArray[np.float64],
-    valid_proto: NDArray[np.bool_],
-) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
-    """Resolve effective prototype weights and deduplicated support mask per bin."""
-    u_count, r_cols = pids.shape
-    first_occ = np.ones((u_count, r_cols), dtype=np.bool_)
-    for col_j in range(1, r_cols):
-        first_occ[:, col_j] = np.all(
-            pids[:, :col_j] != pids[:, col_j : col_j + 1], axis=1
-        )
-    valid_w = valid_proto & (pw > 0.0)
-    eff_w = np.where(valid_w, pw, 0.0)
-    w_sum = np.sum(eff_w, axis=1)
-    fallback_proto = valid_proto & first_occ
-    need_unif = (w_sum <= 0.0) & np.any(fallback_proto, axis=1)
-    if np.any(need_unif):
-        eff_w = np.where(
-            need_unif[:, np.newaxis], np.where(fallback_proto, 1.0, 0.0), eff_w
-        )
-        w_sum = np.sum(eff_w, axis=1)
-    used_mask = np.where(need_unif[:, np.newaxis], fallback_proto, valid_w & first_occ)
-    return eff_w, w_sum, used_mask
-
-
 def compute_kish_loco_inflation(
     contig_ids: NDArray[np.integer],
     proto_ids: NDArray[np.uint16],
@@ -428,88 +465,14 @@ def compute_kish_loco_inflation(
         return 1.0 + 0.5 * np.pi / np.maximum(
             np.asarray(support, dtype=np.float64), 1.0
         )
-
-    elig = (
-        np.ones(u_count, dtype=np.bool_)
-        if eligible is None
-        else np.asarray(eligible, dtype=np.bool_)
+    sup_calc, inv_keff = compute_loco_prototype_support(
+        contig_ids, proto_ids, proto_weights, eligible=eligible
     )
-    if not np.any(elig):
+    if np.all(sup_calc == 0):
         return 1.0 + 0.5 * np.pi / np.maximum(
             np.asarray(support, dtype=np.float64), 1.0
         )
-
-    _, c_compact = np.unique(
-        np.asarray(contig_ids, dtype=np.int64), return_inverse=True
-    )
-    pids = np.asarray(proto_ids, dtype=np.intp)
-    pw = np.asarray(proto_weights, dtype=np.float64)
-    n_contigs = int(np.max(c_compact)) + 1
-    n_protos = int(np.max(pids)) + 1
-
-    e_prim = pids[elig, 0]
-    e_c = c_compact[elig]
-    full_cnt = np.bincount(e_prim, minlength=n_protos)
-    if n_contigs > 1:
-        pc_cnt = np.zeros((n_protos, n_contigs), dtype=np.int64)
-        np.add.at(pc_cnt, (e_prim, e_c), 1)
-        loco_cnt = full_cnt[:, np.newaxis] - pc_cnt
-    else:
-        loco_cnt = np.where(full_cnt == 1, 0, full_cnt)[:, np.newaxis]
-
-    p_cnt = loco_cnt[pids, c_compact[:, np.newaxis]]
-    eff_w, w_sum, used_mask = _resolve_prototype_weights(pids, pw, p_cnt > 0)
-    has_est = w_sum > 0.0
-    w_norm = eff_w / np.where(has_est, w_sum, 1.0)[:, np.newaxis]
-    inv_keff = np.where(
-        has_est,
-        np.sum(
-            np.where(used_mask, np.square(w_norm) / np.maximum(p_cnt, 1), 0.0), axis=1
-        ),
-        1.0 / np.maximum(np.asarray(support, dtype=np.float64), 1.0),
-    )
     return 1.0 + 0.5 * np.pi * inv_keff
-
-
-def _winsorized_mean_and_var(
-    r_chunk: NDArray[np.float64],
-    ddof: float,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compute row-wise winsorized mean and DOF-adjusted variance safely over NaNs."""
-    n_rows, n_samples = r_chunk.shape
-    if n_samples == 0:
-        return np.zeros(n_rows, dtype=np.float64), np.zeros(n_rows, dtype=np.float64)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        med = np.nanmedian(r_chunk, axis=1, keepdims=True)
-        mad = 1.4826 * np.nanmedian(np.abs(r_chunk - med), axis=1, keepdims=True)
-        sd = (
-            np.nanstd(r_chunk, axis=1, ddof=1, keepdims=True)
-            if n_samples > 1
-            else np.zeros_like(med)
-        )
-        scale = np.where(
-            np.isfinite(mad) & (mad > 1e-8), mad, np.nan_to_num(sd, nan=0.0)
-        )
-        med_safe = np.nan_to_num(med, nan=0.0)
-        r_win = np.where(
-            np.isfinite(r_chunk) & (scale > 1e-12),
-            np.clip(
-                r_chunk,
-                med_safe - _WINSOR_DISPERSION_SIGMA * scale,
-                med_safe + _WINSOR_DISPERSION_SIGMA * scale,
-            ),
-            r_chunk,
-        )
-        cnt = np.sum(np.isfinite(r_win), axis=1)
-        mean_out = np.where(
-            cnt > 0, np.nan_to_num(np.nanmean(r_win, axis=1), nan=0.0), 0.0
-        )
-        sse = np.nansum(np.square(r_win - mean_out[:, np.newaxis]), axis=1)
-        denom = np.maximum(1.0, cnt.astype(np.float64) - ddof)
-        var_out = np.where(cnt > 1, sse / denom, 0.0)
-    return mean_out, var_out
 
 
 def _winsorized_anscombe_mean_and_var(
@@ -653,7 +616,7 @@ def calibrate_prototype_dispersion(
             ) - exact_poisson_log2_jensen_bias(eff_lam[ok])
             r_col[ok] = r_unbiased.astype(np.float32)
             r_store[:, s_idx] = r_col
-            shot_sum[ok] += exact_poisson_log_variance(eff_lam[ok]) / _LN2_SQ
+            shot_sum[ok] += exact_poisson_log_variance(eff_lam[ok]) / LN2_SQ
             lam_sum[ok] += eff_lam[ok]
             shot_cnt[ok] += 1
 
@@ -703,7 +666,7 @@ def calibrate_prototype_dispersion(
     f_loco = compute_kish_loco_inflation(c_ids_u, pids_u, pw_u, last_sup)
     v_shot = np.where(shot_cnt > 0, shot_sum / np.maximum(shot_cnt, 1), 0.0)
     v_tot = obs_var_u / f_loco
-    raw_phi = np.where(has_support, _LN2_SQ * np.maximum(0.0, v_tot - v_shot), 0.0)
+    raw_phi = np.where(has_support, LN2_SQ * np.maximum(0.0, v_tot - v_shot), 0.0)
 
     pos_bins = has_support & (raw_phi > 1e-12)
     disp_u = np.zeros(u_count, dtype=np.float64)
@@ -722,99 +685,6 @@ def calibrate_prototype_dispersion(
         n_samples,
     )
     return null_mean, bio_disp
-
-
-def compute_prototype_null_models(
-    corrected: NDArray[np.floating],
-    contig_ids: NDArray[np.integer],
-    proto_ids: NDArray[np.uint16],
-    proto_weights: NDArray[np.floating],
-    *,
-    n_pca_components: int = 0,
-) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-    """Compute Empirical Bayes moderated null_mean and bio_dispersion on normalized rates."""
-    mat = np.asarray(corrected, dtype=np.float64)
-    n_bins, n_samples = mat.shape
-    if n_bins == 0 or n_samples == 0:
-        return np.zeros(n_bins, dtype=np.float32), np.zeros(n_bins, dtype=np.float32)
-
-    ratios = np.full((n_bins, n_samples), np.nan, dtype=np.float64)
-    has_support = np.zeros(n_bins, dtype=np.bool_)
-    for s_idx in range(n_samples):
-        col = mat[:, s_idx]
-        base, sup = evaluate_loco_prototype_baseline(
-            col, contig_ids, proto_ids, proto_weights
-        )
-        valid = (
-            np.isfinite(col)
-            & (col > 0.0)
-            & np.isfinite(base)
-            & (base > 0.0)
-            & (sup > 0)
-        )
-        has_support |= sup > 0
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ratios[valid, s_idx] = np.log2(col[valid] / base[valid])
-
-    ddof = 1.0 + float(max(0, n_pca_components)) / float(max(n_samples, 1))
-    out_mean, raw_vars = _winsorized_mean_and_var(ratios, ddof=ddof)
-    out_mean = np.where(has_support, out_mean, 0.0)
-    d = max(1, n_samples - 1 - n_pca_components)
-    if n_samples > 1 and n_pca_components > 0:
-        raw_vars = raw_vars * (float(n_samples) - ddof) / float(d)
-    raw_vars = np.where(has_support, raw_vars, 0.0)
-
-    valid_bins = has_support & (raw_vars > 1e-16)
-    if n_bins >= 10 and np.count_nonzero(valid_bins) >= 2:
-        mod_vars, _, _ = squeeze_var(raw_vars, df=float(d))
-        disp = np.where(valid_bins, np.maximum(mod_vars, 0.0), 0.0)
-    else:
-        disp = np.where(valid_bins, np.maximum(raw_vars, 0.0), 0.0)
-
-    disp[~np.isfinite(disp) | (disp <= 1e-16)] = 0.0
-    return out_mean.astype(np.float32), disp.astype(np.float32)
-
-
-def select_nearest_bins(
-    profiles: NDArray[np.floating],
-    contig_ids: NDArray[np.integer],
-    k: int,
-    max_batch_memory_mb: int = 256,
-    threads: int = 1,
-) -> tuple[list[list[int]], list[list[float]]]:
-    """Pick k nearest off-contig bins via per-contig leave-one-out KDTree query."""
-    del max_batch_memory_mb
-    data = np.asarray(profiles, dtype=np.float64)
-    contig_ids = np.asarray(contig_ids)
-    n_bins = data.shape[0]
-    if k < 1:
-        raise ValueError("nearest_bins must be a positive integer")
-    if n_bins == 0:
-        return [], []
-
-    out_indices: list[list[int]] = [[] for _ in range(n_bins)]
-    out_distances: list[list[float]] = [[] for _ in range(n_bins)]
-
-    unique_cids = np.unique(contig_ids)
-    for cid in unique_cids:
-        on_contig = np.flatnonzero(contig_ids == cid)
-        off_contig = np.flatnonzero(contig_ids != cid)
-        if len(off_contig) == 0:
-            continue
-
-        take = min(k, len(off_contig))
-        tree = KDTree(data[off_contig])
-        dists, local_idx = tree.query(data[on_contig], k=take, p=2, workers=threads)
-        dists = np.asarray(dists, dtype=np.float64).reshape(len(on_contig), take)
-        local_idx = np.asarray(local_idx, dtype=np.int64).reshape(len(on_contig), take)
-        global_idx = off_contig[local_idx]
-        sq_dists = dists**2
-
-        for r_idx, b_idx in enumerate(on_contig):
-            out_indices[b_idx] = [int(x) for x in global_idx[r_idx]]
-            out_distances[b_idx] = [float(x) for x in sq_dists[r_idx]]
-
-    return out_indices, out_distances
 
 
 def squeeze_var(
@@ -850,98 +720,3 @@ def squeeze_var(
     var_post = var_arr.copy()
     var_post[valid] = (d0_hat * s0_sq_hat + df * v) / (d0_hat + df)
     return var_post, d0_hat, s0_sq_hat
-
-
-def compute_null_models(
-    corrected: NDArray[np.float64],
-    nearest_indices: Sequence[Sequence[int]],
-    threads: int = 1,
-    n_pca_components: int = 0,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compute per-bin reference medians and DOF-corrected empirical Bayes null statistics."""
-    del threads
-    n_bins, n_samples = corrected.shape
-    if n_samples == 0 or n_bins == 0:
-        return np.zeros(n_bins, dtype=np.float64), np.zeros(n_bins, dtype=np.float64)
-
-    max_k = max((len(idx) for idx in nearest_indices), default=0)
-    if max_k == 0:
-        return np.zeros(n_bins, dtype=np.float64), np.zeros(n_bins, dtype=np.float64)
-
-    pad_idx = np.full((n_bins, max_k), -1, dtype=np.int64)
-    for i, idx in enumerate(nearest_indices):
-        if idx:
-            pad_idx[i, : len(idx)] = idx
-
-    d = max(1, n_samples - 1 - n_pca_components)
-    dof_scale = (n_samples - 1) / d if n_samples > 1 else 0.0
-    sub_with_nan = np.vstack([corrected, np.full((1, n_samples), np.nan)])
-
-    out_mean = np.zeros(n_bins, dtype=np.float64)
-    raw_vars = np.zeros(n_bins, dtype=np.float64)
-
-    bytes_per_row = max_k * n_samples * 8
-    chunk_size = min(4096, max(1, (256 * 1024 * 1024) // max(bytes_per_row, 1)))
-
-    for c_start in range(0, n_bins, chunk_size):
-        c_stop = min(c_start + chunk_size, n_bins)
-        chunk_pad = pad_idx[c_start:c_stop]
-        has_neighbors = (chunk_pad != -1).any(axis=1)
-
-        with warnings.catch_warnings(), np.errstate(all="ignore"):
-            warnings.simplefilter("ignore", RuntimeWarning)
-            ref = np.nanmedian(sub_with_nan[chunk_pad], axis=1)
-            values = np.log2(corrected[c_start:c_stop] / ref)
-            values_clean = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
-            out_mean[c_start:c_stop] = np.where(
-                has_neighbors, np.mean(values_clean, axis=1), 0.0
-            )
-            if n_samples > 1:
-                chunk_vars = np.var(values_clean, axis=1, ddof=1) * dof_scale
-            else:
-                chunk_vars = np.zeros(c_stop - c_start, dtype=np.float64)
-            raw_vars[c_start:c_stop] = np.where(has_neighbors, chunk_vars, 0.0)
-
-    valid_bins = (pad_idx != -1).any(axis=1) & (raw_vars > 1e-16)
-    if n_bins >= 10 and np.count_nonzero(valid_bins) >= 2:
-        mod_vars, _, _ = squeeze_var(raw_vars, df=float(d))
-        out_std = np.sqrt(np.maximum(mod_vars, 0.0))
-        out_std[~valid_bins] = 0.0
-    else:
-        out_std = np.sqrt(np.maximum(raw_vars, 0.0))
-        out_std[~valid_bins] = 0.0
-
-    out_std[~np.isfinite(out_std) | (out_std <= 1e-8)] = 0.0
-    return out_mean, out_std
-
-
-def distance_cutoff(
-    distances: (
-        tuple[NDArray[np.float64], ...]
-        | NDArray[np.floating]
-        | Sequence[Sequence[float]]
-    ),
-    repeats: int = 3,
-) -> float:
-    """Return an iterative three-sigma cutoff for nearest-bin distances."""
-    if isinstance(distances, np.ndarray):
-        values = distances.ravel()
-    elif (
-        isinstance(distances, tuple)
-        and distances
-        and isinstance(distances[0], np.ndarray)
-    ):
-        values = np.concatenate(distances)
-    else:
-        values = np.asarray([d for sub in distances for d in sub], dtype=np.float64)
-
-    values = values[np.isfinite(values) & (values >= 0)]
-    if values.size == 0:
-        return float("inf")
-    cutoff = float("inf")
-    for _ in range(repeats):
-        selected = values[values < cutoff]
-        if selected.size == 0:
-            break
-        cutoff = float(np.mean(selected) + 3.0 * np.std(selected))
-    return cutoff
