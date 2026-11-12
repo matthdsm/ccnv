@@ -99,6 +99,7 @@ class BranchModel:
     bio_dispersion: NDArray[np.float64] | None = None
     bin_size: int | None = None
     is_flat: bool = False
+    kappa_frag: NDArray[np.float32] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +160,15 @@ def _hsm_biweight_mode(
     weights: NDArray[np.float64] | None = None,
 ) -> float:
     """Refine Half-Sample Mode with 2-step precision-weighted Tukey biweight."""
+    values = np.asarray(values, dtype=np.float64)
+    finite_mask = np.isfinite(values)
+    if weights is not None:
+        w_arr = np.asarray(weights, dtype=np.float64)
+        if w_arr.shape == finite_mask.shape:
+            weights = w_arr[finite_mask]
+    values = values[finite_mask]
+    if values.size == 0:
+        return 0.0
     m = half_sample_mode(values)
     if values.size < 6:
         return m
@@ -213,9 +223,27 @@ def build_branch_model_from_tables(
             )
         else:
             mean_frag_len, endpoint_ratio = None, None
+
+        if (
+            isinstance(sample_data, SampleBuffers)
+            and sample_data.kappa_frag is not None
+        ):
+            kappa_frag: NDArray[np.float32] | None = sample_data.kappa_frag[s_idx]
+        elif (
+            isinstance(sample_data, pa.Table)
+            and "kappa_frag" in sample_data.column_names
+        ):
+            kappa_frag = (
+                sample_data.column("kappa_frag")
+                .to_numpy(zero_copy_only=False)[s_idx]
+                .astype(np.float32)
+            )
+        else:
+            kappa_frag = None
     else:
         counts = np.zeros(arrs.starts.size, dtype=np.float64)
         mean_frag_len, endpoint_ratio = None, None
+        kappa_frag = None
 
     return BranchModel(
         branch=branch,
@@ -241,6 +269,7 @@ def build_branch_model_from_tables(
         bio_dispersion=arrs.bio_dispersion,
         bin_size=arrs.bin_size,
         is_flat=arrs.is_flat,
+        kappa_frag=kappa_frag,
     )
 
 
@@ -873,6 +902,7 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
         exposure,
         model,
         mask_repeats=config.mask_repeats,
+        kappa_frag=model.kappa_frag,
         min_reference_bins=config.min_reference_bins,
         gc_override=gc_override,
         gc_quantiles_override=gc_q_override,
@@ -890,4 +920,6 @@ def normalize_branch(model: BranchModel, config: PredictConfig) -> BinResult:
         weights=norm.weights,
         reference_sizes=norm.reference_sizes,
         masked=~norm.usable,
+        counts=norm.counts,
+        expected_counts=norm.expected_counts,
     )

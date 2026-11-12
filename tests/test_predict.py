@@ -363,7 +363,7 @@ class TestCalling(unittest.TestCase):
                 contigs=("chr1",) * 25,
                 starts=np.arange(25, dtype=np.int64) * 100,
                 ends=np.arange(1, 26, dtype=np.int64) * 100,
-                ratios=np.full(25, 0.35, dtype=np.float64),
+                ratios=np.full(25, 0.585, dtype=np.float64),
                 zscores=z,
                 weights=np.ones(25, dtype=np.float64),
                 reference_sizes=np.full(25, 10, dtype=np.int64),

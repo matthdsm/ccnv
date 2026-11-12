@@ -80,7 +80,7 @@ class TestReferenceQC(unittest.TestCase):
             "n_valid": 1000,
             "std_of_means": 1.0,
             "outlier_pct": 0.0,
-            "n_low_refs": 5,
+            "n_low_refs": 6,
         }
         verdict, msg = evaluate_autosomal_or_female_verdict(
             m_low_refs, min_ref_bins=150

@@ -186,8 +186,10 @@ class TestQCPredict(unittest.TestCase):
 
     def test_build_predict_qc_payload_prenatal(self) -> None:
         table = make_sample_table([10, 20], bin_size=100)
-        segments = []
         sca = SCAResult("XY", False, 0.95, 0.1, 0.0)
+        from ccnv.models import PrenatalLoDMetrics
+
+        lod = PrenatalLoDMetrics(lod_ff_35mb=0.015, lod_ff_3mb=0.048)
         ff_res = FetalFractionResult(
             fetal_sex="M",
             active_ff=0.12,
@@ -201,7 +203,33 @@ class TestQCPredict(unittest.TestCase):
             sca=sca,
             low_ff_warning=False,
             warnings=(),
+            active_ff_se=0.008,
+            lod_metrics=lod,
         )
+        segments = [
+            SegmentResult(
+                "chr1",
+                0,
+                100,
+                1,
+                0.5,
+                3.2,
+                0.001,
+                "gain",
+                origin_call="FETAL_CONSTITUTIONAL",
+            ),
+            SegmentResult(
+                "chr1",
+                100,
+                300,
+                2,
+                -0.5,
+                -3.2,
+                0.001,
+                "loss",
+                origin_call="MATERNAL_UNINHERITED",
+            ),
+        ]
         payload = build_predict_qc_payload(
             "prenatal", table, segments, prenatal_result=ff_res
         )
@@ -209,6 +237,13 @@ class TestQCPredict(unittest.TestCase):
         self.assertIsNotNone(payload["prenatal"])
         self.assertEqual(payload["prenatal"]["fetal_sex"], "M")
         self.assertEqual(payload["prenatal"]["active_ff"], 0.12)
+        self.assertEqual(payload["prenatal"]["active_ff_se"], 0.008)
+        self.assertEqual(payload["prenatal"]["lod_ff_35mb"], 0.015)
+        self.assertEqual(payload["prenatal"]["lod_ff_3mb"], 0.048)
+        self.assertEqual(
+            payload["prenatal"]["origin_summary"],
+            {"FETAL_CONSTITUTIONAL": 1, "MATERNAL_UNINHERITED": 1},
+        )
 
     def test_write_predict_qc_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

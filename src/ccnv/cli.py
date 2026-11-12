@@ -202,7 +202,10 @@ def extract(
             file_okay=True,
             dir_okay=False,
             readable=True,
-            help="BAM or CRAM input; a missing index is created automatically",
+            help=(
+                "BAM or CRAM input; single-threaded extraction streams without an "
+                "index, while --threads > 1 requires a .bai, .csi, or .crai index"
+            ),
         ),
     ],
     prefix: Annotated[
@@ -248,8 +251,8 @@ def extract(
             "--threads",
             min=1,
             help=(
-                "CPU budget split between contig worker processes and "
-                "per-handle BAM/CRAM decode threads"
+                "CPU budget for parallel 50 Mb tile streaming and BAM/CRAM "
+                "decompression (requires alignment index when > 1)"
             ),
         ),
     ] = DEFAULT_THREADS,
@@ -562,7 +565,10 @@ def predict(
     ] = SexBranch.autosomal,
     penalty: Annotated[
         float,
-        typer.Option(min=0.0, help="Weighted-SSE segmentation penalty"),
+        typer.Option(
+            min=0.0,
+            help="Breakpoint penalty multiplier (gamma) for calibrated mBIC segmentation",
+        ),
     ] = 1.0,
     z_threshold: Annotated[
         float,
@@ -618,7 +624,8 @@ def predict(
     vcf: Annotated[
         bool,
         typer.Option(
-            "--vcf/--no-vcf", help="Write VCFv4.2 outputs for bins and segments"
+            "--vcf/--no-vcf",
+            help="Write VCFv4.2 outputs for segments and calls (use --bins-vcf for per-bin VCF)",
         ),
     ] = True,
     bins_vcf: Annotated[

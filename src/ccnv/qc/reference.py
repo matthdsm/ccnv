@@ -126,16 +126,23 @@ def compute_signal_contig_metrics(
 def evaluate_autosomal_or_female_verdict(
     m: dict[str, object],
     min_ref_bins: int,
+    dist_scale: float = 1.0,
 ) -> tuple[str, str]:
     """Evaluate quality verdict for autosomal or female_sex branch."""
-    if m.get("n_valid", 0) == 0:
+    n_valid = int(m.get("n_valid", 0))
+    if n_valid == 0:
         return "FAIL", "no unmasked bins"
 
     result = ("PASS", "")
     n_low_refs = int(m["n_low_refs"])
-    if n_low_refs > 0:
+    p_low = n_low_refs / max(n_valid, 1)
+    if p_low > 0.005:
         result = _escalate(
-            result, ("WARN", f"n_refs<{min_ref_bins} in {n_low_refs} bins")
+            result,
+            (
+                "WARN",
+                f"n_refs<{min_ref_bins} in {n_low_refs} bins ({p_low * 100:.2f}%)",
+            ),
         )
 
     outlier_pct = float(m["outlier_pct"])
@@ -143,11 +150,13 @@ def evaluate_autosomal_or_female_verdict(
         result = _escalate(result, ("WARN", f"outlier bins = {outlier_pct:.2f}%"))
 
     std_of_means = float(m["std_of_means"])
-    if std_of_means > 10.0:
+    std_thresh_fail = 10.0 * dist_scale
+    std_thresh_warn = 2.0 * dist_scale
+    if std_of_means > std_thresh_fail:
         result = _escalate(
             result, ("FAIL", f"std(per-bin mean dist) = {std_of_means:.2f} (high)")
         )
-    elif std_of_means > 2.0:
+    elif std_of_means > std_thresh_warn:
         result = _escalate(
             result, ("WARN", f"std(per-bin mean dist) = {std_of_means:.2f}")
         )
@@ -158,53 +167,65 @@ def evaluate_autosomal_or_female_verdict(
 def evaluate_male_verdict(
     m: dict[str, object],
     min_ref_bins: int,
+    dist_scale: float = 1.0,
 ) -> tuple[str, str]:
     """Evaluate quality verdict for male_sex branch."""
-    if m.get("n_valid", 0) == 0:
+    n_valid = int(m.get("n_valid", 0))
+    if n_valid == 0:
         return "FAIL", "no unmasked bins"
 
     result = ("PASS", "")
     n_low_refs = int(m["n_low_refs"])
-    if n_low_refs > 0:
+    p_low = n_low_refs / max(n_valid, 1)
+    if p_low > 0.005:
         result = _escalate(
-            result, ("WARN", f"n_refs<{min_ref_bins} in {n_low_refs} bins")
+            result,
+            (
+                "WARN",
+                f"n_refs<{min_ref_bins} in {n_low_refs} bins ({p_low * 100:.2f}%)",
+            ),
         )
 
     mean_of_means = float(m["mean_of_means"])
-    if mean_of_means > 10.0:
+    mean_thresh_fail = 10.0 * dist_scale
+    mean_thresh_warn = 2.0 * dist_scale
+    if mean_of_means > mean_thresh_fail:
         result = _escalate(
             result,
             ("FAIL", f"mean(per-bin mean dist) = {mean_of_means:.2f} (heavy tail)"),
         )
-    elif mean_of_means > 2.0:
+    elif mean_of_means > mean_thresh_warn:
         result = _escalate(
             result, ("WARN", f"mean(per-bin mean dist) = {mean_of_means:.2f}")
         )
 
     cy = m.get("signal_contig_metrics")
-    if isinstance(cy, dict) and cy.get("n_valid", 0) > 0:
+    if isinstance(cy, dict):
         usable_pct = float(cy.get("usable_pct", float("nan")))
         sig_name = cy.get("signal_contig", "chrY")
-        if np.isfinite(usable_pct):
-            if usable_pct < CHRY_MIN_USABLE_PCT_FAIL:
-                result = _escalate(
-                    result,
-                    (
-                        "FAIL",
-                        f"usable {sig_name} bins = {usable_pct:.1f}% (<{CHRY_MIN_USABLE_PCT_FAIL:.0f}%)",
-                    ),
-                )
-            elif usable_pct < CHRY_MIN_USABLE_PCT_WARN:
-                result = _escalate(
-                    result,
-                    (
-                        "WARN",
-                        f"usable {sig_name} bins = {usable_pct:.1f}% (<{CHRY_MIN_USABLE_PCT_WARN:.0f}%)",
-                    ),
-                )
+        n_usable = cy.get("n_usable")
+        if (n_usable == 0 and (usable_pct == 0.0 or not np.isfinite(usable_pct))) or (
+            np.isfinite(usable_pct) and usable_pct < CHRY_MIN_USABLE_PCT_FAIL
+        ):
+            result = _escalate(
+                result,
+                (
+                    "FAIL",
+                    f"usable {sig_name} bins = {usable_pct:.1f}% (<{CHRY_MIN_USABLE_PCT_FAIL:.0f}%)",
+                ),
+            )
+        elif np.isfinite(usable_pct) and usable_pct < CHRY_MIN_USABLE_PCT_WARN:
+            result = _escalate(
+                result,
+                (
+                    "WARN",
+                    f"usable {sig_name} bins = {usable_pct:.1f}% (<{CHRY_MIN_USABLE_PCT_WARN:.0f}%)",
+                ),
+            )
+
         ym = cy.get("mean_of_means")
         if ym is not None and np.isfinite(ym):
-            if float(ym) > CHRY_MEAN_DIST_FAIL:
+            if float(ym) > CHRY_MEAN_DIST_FAIL * dist_scale:
                 result = _escalate(
                     result,
                     (
@@ -212,7 +233,7 @@ def evaluate_male_verdict(
                         f"{sig_name} mean distance = {float(ym):.1f} (very poor {sig_name})",
                     ),
                 )
-            elif float(ym) > CHRY_MEAN_DIST_WARN:
+            elif float(ym) > CHRY_MEAN_DIST_WARN * dist_scale:
                 result = _escalate(
                     result, ("WARN", f"{sig_name} mean distance = {float(ym):.1f}")
                 )
@@ -229,6 +250,7 @@ def compute_branch_qc(
     branch_name: str,
     signal_contig: str | None,
     min_ref_bins: int,
+    dist_scale: float = 1.0,
 ) -> dict[str, object] | None:
     """Extract metrics and verdict for one reference branch."""
     branch_table = table.filter(pc.equal(table["branch"], branch_name))
@@ -250,6 +272,7 @@ def compute_branch_qc(
             "mask_pct": mask_pct,
             "verdict": "FAIL",
             "message": "all bins masked",
+            "lambda_gc": 1.0,
         }
 
     mean_d = (
@@ -279,6 +302,11 @@ def compute_branch_qc(
         pweights,
     )
     eff_min_refs = min(min_ref_bins, max(1, n_unmasked // 2))
+
+    sum_proto_w = np.sum(pweights, axis=1)
+    zero_weight = (sum_proto_w <= 0.0) | (n_refs == 0)
+    mean_d = np.where(zero_weight, np.nan, mean_d)
+
     valid = np.isfinite(mean_d)
     n_valid = int(np.sum(valid))
     if n_valid == 0:
@@ -289,6 +317,7 @@ def compute_branch_qc(
             "mask_pct": mask_pct,
             "verdict": "FAIL",
             "message": "no valid bin distances",
+            "lambda_gc": 1.0,
         }
 
     mean_of_means = float(np.mean(mean_d[valid]))
@@ -304,9 +333,31 @@ def compute_branch_qc(
 
     sig_metrics = None
     if branch_name == BRANCH_MALE_SEX and signal_contig:
-        sig_metrics = compute_signal_contig_metrics(
-            contigs, signal_contig, mean_d, n_refs, cutoff_outlier, eff_min_refs
-        )
+        all_c_col = branch_table.column("contig").combine_chunks()
+        if isinstance(all_c_col, pa.DictionaryArray):
+            all_vocab = [str(v) for v in all_c_col.dictionary.to_pylist()]
+            all_codes = all_c_col.indices.to_numpy(zero_copy_only=False)
+            all_contigs = [all_vocab[int(c)] for c in all_codes]
+        else:
+            all_contigs = [str(v) for v in all_c_col.to_numpy(zero_copy_only=False)]
+        has_signal_contig = any(c == signal_contig for c in all_contigs)
+        if has_signal_contig:
+            sig_metrics = compute_signal_contig_metrics(
+                contigs, signal_contig, mean_d, n_refs, cutoff_outlier, eff_min_refs
+            )
+            if sig_metrics is None:
+                total_sig = sum(1 for c in all_contigs if c == signal_contig)
+                sig_metrics = {
+                    "signal_contig": signal_contig,
+                    "n_bins": total_sig,
+                    "n_valid": 0,
+                    "mean_of_means": None,
+                    "std_of_means": None,
+                    "n_mean_outlier": 0,
+                    "n_low_refs": 0,
+                    "n_usable": 0,
+                    "usable_pct": 0.0,
+                }
 
     metrics: dict[str, object] = {
         "n_bins": total_branch_bins,
@@ -319,12 +370,17 @@ def compute_branch_qc(
         "outlier_pct": outlier_pct,
         "n_low_refs": n_low_refs,
         "signal_contig_metrics": sig_metrics,
+        "lambda_gc": 1.0,
     }
 
     if branch_name == BRANCH_MALE_SEX:
-        verdict, message = evaluate_male_verdict(metrics, eff_min_refs)
+        verdict, message = evaluate_male_verdict(
+            metrics, eff_min_refs, dist_scale=dist_scale
+        )
     else:
-        verdict, message = evaluate_autosomal_or_female_verdict(metrics, eff_min_refs)
+        verdict, message = evaluate_autosomal_or_female_verdict(
+            metrics, eff_min_refs, dist_scale=dist_scale
+        )
 
     metrics["verdict"] = verdict
     metrics["message"] = message
@@ -344,7 +400,7 @@ def write_reference_qc_json(path: Path | str, data: Mapping[str, object]) -> Pat
 
 def run_reference_qc_on_table(
     table: pa.Table,
-    prefix: Path,
+    prefix: Path | str | None = None,
     *,
     reference_path: Path | None = None,
     write_json: bool = True,
@@ -364,6 +420,13 @@ def run_reference_qc_on_table(
     signal_contig = model.get("sex_signal_contig")
     if signal_contig is not None:
         signal_contig = str(signal_contig)
+
+    gc_corr = bool(model.get("gc_corrected", False))
+    map_corr = bool(model.get("mappability_corrected", False))
+    frag_corr = bool(model.get("fragmentomics_corrected", False))
+    n_cov = int(gc_corr) + int(map_corr) + (2 if frag_corr else 0)
+    pca_comp = int(model.get("pca_components", 5))
+    dist_scale = float(np.sqrt(max(pca_comp + n_cov, 1)))
 
     branches_qc: dict[str, object] = {}
     severities: list[int] = []
@@ -386,6 +449,7 @@ def run_reference_qc_on_table(
             branch_name=branch_name,
             signal_contig=signal_contig,
             min_ref_bins=min_ref_bins,
+            dist_scale=dist_scale,
         )
         if b_qc is not None:
             branches_qc[branch_name] = b_qc
@@ -453,11 +517,18 @@ def run_reference_qc_on_table(
             "female_chrx_ratio_std": female_chrx_ratio_std,
         }
 
-    json_path = Path(f"{prefix}_qc.json")
+    if prefix is None:
+        json_path = Path("/dev/null")
+        actual_write_json = False
+    else:
+        json_path = Path(f"{prefix}_qc.json")
+        actual_write_json = write_json
+
     qc_data: dict[str, object] = {
         "overall_verdict": overall_verdict,
         "worst_severity": worst,
         "messages": messages,
+        "lambda_gc": 1.0,
         "parameters": {
             "bin_size": model.get("bin_size"),
             "mode": mode,
@@ -491,7 +562,7 @@ def run_reference_qc_on_table(
     if reference_path is not None:
         qc_data["reference_path"] = str(reference_path)
 
-    if write_json:
+    if actual_write_json:
         write_reference_qc_json(json_path, qc_data)
 
     if emit_stderr:

@@ -335,6 +335,10 @@ def sort_bin_result(result: BinResult) -> BinResult:
         weights=result.weights[idx],
         reference_sizes=result.reference_sizes[idx],
         masked=result.masked[idx],
+        counts=result.counts[idx] if result.counts is not None else None,
+        expected_counts=(
+            result.expected_counts[idx] if result.expected_counts is not None else None
+        ),
     )
 
 

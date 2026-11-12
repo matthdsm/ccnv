@@ -13,6 +13,7 @@ from ccnv.features.fragmentomics import extract_sample_fragmentomics
 from ccnv.models import (
     SCHEMA_VERSION,
     AnalysisMode,
+    BinResult,
     FetalFractionResult,
     SampleBuffers,
     SegmentResult,
@@ -45,6 +46,7 @@ def build_predict_qc_payload(
     sample_table: pa.Table | SampleBuffers,
     segments: Sequence[SegmentResult],
     prenatal_result: FetalFractionResult | None = None,
+    bin_results: Sequence[BinResult] | None = None,
 ) -> dict[str, object]:
     """Construct structured QC metrics for a prediction invocation."""
     if isinstance(sample_table, SampleBuffers):
@@ -63,9 +65,28 @@ def build_predict_qc_payload(
         )
         source_identity = sample_meta.get("source_identity")
         frag_meta = extract_sample_fragmentomics(sample_meta)
-    total_bins = int(counts.size)
-    usable_bins = int(np.count_nonzero(counts > 0))
-    masked_bins = total_bins - usable_bins
+
+    if bin_results is not None and len(bin_results) > 0:
+        total_bins = sum(int(b.masked.size) for b in bin_results)
+        usable_bins = sum(int(np.count_nonzero(~b.masked)) for b in bin_results)
+        masked_bins = total_bins - usable_bins
+        usable_zs = [b.zscores[~b.masked] for b in bin_results if np.any(~b.masked)]
+        if usable_zs:
+            concat_z = np.concatenate(usable_zs)
+            finite_z = concat_z[np.isfinite(concat_z)]
+            lambda_gc: float | None = (
+                float(np.median(finite_z**2) / 0.4549364231195728)
+                if finite_z.size > 0
+                else 1.0
+            )
+        else:
+            lambda_gc = 1.0
+    else:
+        total_bins = int(counts.size)
+        usable_bins = int(np.count_nonzero(counts > 0))
+        masked_bins = total_bins - usable_bins
+        lambda_gc = None
+
     mean_bin_count = float(np.mean(counts)) if total_bins > 0 else 0.0
     median_bin_count = float(np.median(counts)) if total_bins > 0 else 0.0
 
@@ -99,6 +120,7 @@ def build_predict_qc_payload(
         "masked_bins": masked_bins,
         "mean_bin_count": mean_bin_count,
         "median_bin_count": median_bin_count,
+        "lambda_gc": lambda_gc,
     }
 
     sample_name = "SAMPLE"
@@ -110,8 +132,8 @@ def build_predict_qc_payload(
             sample_name = str(source_identity["sample_name"])
 
     total_segments = len(segments)
-    gain_calls = sum(1 for s in segments if s.call == "gain")
-    loss_calls = sum(1 for s in segments if s.call == "loss")
+    gain_calls = sum(1 for s in segments if s.call in ("gain", "GAIN"))
+    loss_calls = sum(1 for s in segments if s.call in ("loss", "LOSS"))
     discordant_segments = sum(1 for s in segments if s.discordant)
 
     cnv_summary: dict[str, object] = {
@@ -123,9 +145,19 @@ def build_predict_qc_payload(
 
     prenatal_data: dict[str, object] | None = None
     if mode == "prenatal" and prenatal_result is not None:
+        origin_counts: dict[str, int] = {}
+        for s in segments:
+            if s.origin_call:
+                origin_counts[s.origin_call] = origin_counts.get(s.origin_call, 0) + 1
+
         prenatal_data = {
             "fetal_sex": prenatal_result.fetal_sex,
             "active_ff": float(prenatal_result.active_ff),
+            "active_ff_se": (
+                float(prenatal_result.active_ff_se)
+                if prenatal_result.active_ff_se is not None
+                else None
+            ),
             "active_ff_source": prenatal_result.active_ff_source,
             "ffy": (
                 float(prenatal_result.ffy) if prenatal_result.ffy is not None else None
@@ -153,6 +185,17 @@ def build_predict_qc_payload(
             },
             "low_ff_warning": bool(prenatal_result.low_ff_warning),
             "warnings": list(prenatal_result.warnings),
+            "origin_summary": origin_counts,
+            "lod_ff_35mb": (
+                float(prenatal_result.lod_metrics.lod_ff_35mb)
+                if prenatal_result.lod_metrics is not None
+                else None
+            ),
+            "lod_ff_3mb": (
+                float(prenatal_result.lod_metrics.lod_ff_3mb)
+                if prenatal_result.lod_metrics is not None
+                else None
+            ),
         }
 
     frag_data: dict[str, object] | None = None

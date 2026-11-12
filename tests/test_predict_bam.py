@@ -151,7 +151,7 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
                 contig="chr1",
                 start=10000,
                 end=20000,
-                ratio=0.07,
+                ratio=0.536,
                 zscore=4.5,
                 weight=1.0,
                 bin_count=1,
@@ -167,12 +167,12 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
         )
 
         self.assertEqual(len(annotated), 2)
-        # First segment should be fetal confirmed
+        # First segment should be fetal constitutional
         self.assertGreater(annotated[0].frag_llr_size, 2.0)
-        self.assertEqual(annotated[0].origin_call, "FETAL_CONFIRMED")
-        # Second segment should be maternal confirmed
+        self.assertEqual(annotated[0].origin_call, "FETAL_CONSTITUTIONAL")
+        # Second segment should be maternal uninherited
         self.assertLess(annotated[1].frag_llr_size, -2.0)
-        self.assertEqual(annotated[1].origin_call, "MATERNAL_CONFIRMED")
+        self.assertEqual(annotated[1].origin_call, "MATERNAL_UNINHERITED")
 
     def test_fragmentomics_compatibility_and_observed_qc_counts(self) -> None:
         # 1. ReferenceMetadata round-trip persists fragmentomics_corrected
