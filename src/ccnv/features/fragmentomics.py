@@ -34,14 +34,14 @@ from ccnv.stats.fragmentomics import (
     FRAG_NUM_BINS,
     align_histogram,
     build_fragmentomic_feature_vector,
+    compute_band_fisher_weights,
     deconvolve_fetal_maternal_densities,
-    fisher_optimal_weights,
+    evaluate_band_weighted_counts,
     fit_ff_fragmentomics_ensemble,
     segment_fragment_llr,
 )
 
 __all__ = [
-    "align_reference_to_weighted_sample",
     "apply_prenatal_fisher_weighting",
     "evaluate_weighted_coverage",
     "extract_bin_fragmentomic_covariates",
@@ -507,134 +507,44 @@ def fit_cohort_fragmentomics_model(
     )
 
 
-def align_reference_to_weighted_sample(
-    reference: pa.Table,
-    sample: pa.Table | SampleBuffers,
-    weighted_sample: pa.Table | SampleBuffers,
-) -> pa.Table:
-    """Calibrate reference pca_mean to the Fisher-weighted sample baseline."""
-    u_counts = (
-        np.asarray(sample.count, dtype=np.float64)
-        if isinstance(sample, SampleBuffers)
-        else np.asarray(
-            sample.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
-        )
-    )
-    w_counts = (
-        np.asarray(weighted_sample.count, dtype=np.float64)
-        if isinstance(weighted_sample, SampleBuffers)
-        else np.asarray(
-            weighted_sample.column("count").to_numpy(zero_copy_only=False),
-            dtype=np.float64,
-        )
-    )
-    s_meta = (
-        sample.meta
-        if isinstance(sample, SampleBuffers)
-        else SampleMetadata.from_table(sample)
-    )
-    s_codes, s_names, s_starts, s_ends = reconstruct_sample_grid(s_meta)
-    coord_to_idx: dict[tuple[str, int, int], int] = {
-        (s_names[int(c)], int(st), int(en)): idx
-        for idx, (c, st, en) in enumerate(zip(s_codes, s_starts, s_ends, strict=True))
-    }
-
-    ref_branch = reference.column("branch").combine_chunks()
-    ref_contig = reference.column("contig").combine_chunks()
-    b_vals = (
-        ref_branch.dictionary.to_pylist()
-        if isinstance(ref_branch, pa.DictionaryArray)
-        else []
-    )
-    b_idx = (
-        ref_branch.indices.to_numpy(zero_copy_only=False)
-        if isinstance(ref_branch, pa.DictionaryArray)
-        else np.empty(0, dtype=np.int8)
-    )
-    c_vals = (
-        ref_contig.dictionary.to_pylist()
-        if isinstance(ref_contig, pa.DictionaryArray)
-        else []
-    )
-    c_idx = (
-        ref_contig.indices.to_numpy(zero_copy_only=False)
-        if isinstance(ref_contig, pa.DictionaryArray)
-        else np.empty(0, dtype=np.int16)
-    )
-    r_starts = reference.column("start").to_numpy(zero_copy_only=False)
-    r_ends = reference.column("end").to_numpy(zero_copy_only=False)
-    r_masked = reference.column("masked").to_numpy(zero_copy_only=False)
-
-    n_ref = reference.num_rows
-    matched_mask = np.zeros(n_ref, dtype=np.bool_)
-    sample_indices = np.full(n_ref, -1, dtype=np.intp)
-    for r_i in range(n_ref):
-        key = (str(c_vals[int(c_idx[r_i])]), int(r_starts[r_i]), int(r_ends[r_i]))
-        s_i = coord_to_idx.get(key, -1)
-        if s_i >= 0:
-            matched_mask[r_i] = True
-            sample_indices[r_i] = s_i
-
-    is_auto = np.array(
-        [str(b_vals[int(b_idx[i])]) == "autosomal" for i in range(n_ref)],
-        dtype=np.bool_,
-    )
-    cand = matched_mask & is_auto & (~r_masked)
-    if not np.any(cand):
-        cand = matched_mask & (~r_masked)
-    if not np.any(cand):
-        cand = matched_mask
-
-    baseline_scale = 1.0
-    if np.any(cand):
-        u_m = u_counts[sample_indices[cand]]
-        w_m = w_counts[sample_indices[cand]]
-        pos = (u_m > 0.0) & np.isfinite(u_m) & np.isfinite(w_m)
-        if np.any(pos):
-            med = float(np.median(w_m[pos] / u_m[pos]))
-            if np.isfinite(med) and med > 0.0:
-                baseline_scale = med
-
-    old_pca_mean = np.asarray(
-        reference.column("pca_mean").to_numpy(zero_copy_only=False), dtype=np.float64
-    )
-    new_pca_mean = np.where(
-        matched_mask, old_pca_mean * baseline_scale, old_pca_mean
-    ).astype(np.float32)
-    pca_idx = reference.schema.get_field_index("pca_mean")
-    return reference.set_column(
-        pca_idx, "pca_mean", pa.array(new_pca_mean, type=pa.float32())
-    )
-
-
 def apply_prenatal_fisher_weighting[SampleT: (pa.Table, SampleBuffers)](
     sample: SampleT,
     prenatal_meta: PrenatalModelMetadata | None,
 ) -> SampleT:
-    """Evaluate Fisher-optimal weighted coverage and replace the count column."""
+    """Evaluate 24-band Fisher-optimal weighted coverage and attach per-bin Kish factor."""
     if (
         prenatal_meta is None
-        or prenatal_meta.p_fetal_density is None
-        or prenatal_meta.p_maternal_density is None
+        or (
+            prenatal_meta.band_fisher_weights is None
+            and (
+                prenatal_meta.p_fetal_density is None
+                or prenatal_meta.p_maternal_density is None
+            )
+        )
         or sample.num_rows == 0
     ):
+        return sample
+
+    if prenatal_meta.band_fisher_weights is not None:
+        w_24 = np.asarray(prenatal_meta.band_fisher_weights, dtype=np.float64)
+    elif (
+        prenatal_meta.p_fetal_density is not None
+        and prenatal_meta.p_maternal_density is not None
+    ):
+        w_24, _, _ = compute_band_fisher_weights(
+            np.asarray(prenatal_meta.p_fetal_density, dtype=np.float64),
+            np.asarray(prenatal_meta.p_maternal_density, dtype=np.float64),
+        )
+    else:
         return sample
 
     if isinstance(sample, SampleBuffers):
         if sample.frag_bands is None or not np.any(sample.paired_count > 0):
             return sample
-        shift_bp = (
-            sample.meta.fragmentomics.sizing_shift_bp
-            if sample.meta.fragmentomics is not None
-            else 0.0
+        w_counts, kappa = evaluate_band_weighted_counts(
+            sample.frag_bands, sample.count, sample.paired_count, w_24
         )
-        weights = fisher_optimal_weights(
-            prenatal_meta.p_fetal_density,
-            prenatal_meta.p_maternal_density,
-            target_ff=0.10,
-        )
-        w_counts = evaluate_weighted_coverage(sample, weights, shift_bp=shift_bp)
-        return replace(sample, count=w_counts)
+        return replace(sample, count=w_counts, kappa_frag=kappa)
 
     if "frag_bands" not in sample.column_names:
         return sample
@@ -646,16 +556,29 @@ def apply_prenatal_fisher_weighting[SampleT: (pa.Table, SampleBuffers)](
         if total_paired == 0:
             return sample
 
-    frag_meta = extract_sample_fragmentomics(decode_metadata(sample.schema.metadata))
-    shift_bp = frag_meta.sizing_shift_bp if frag_meta is not None else 0.0
-    weights = fisher_optimal_weights(
-        prenatal_meta.p_fetal_density,
-        prenatal_meta.p_maternal_density,
-        target_ff=0.10,
+    bands_2d = fixed_size_list_to_numpy(bands_col, NUM_FRAG_BANDS, np.uint32)
+    counts_raw = np.asarray(
+        sample.column("count").to_numpy(zero_copy_only=False), dtype=np.float64
     )
-    w_counts = evaluate_weighted_coverage(sample, weights, shift_bp=shift_bp)
+    paired_raw = (
+        np.asarray(
+            sample.column("paired_count").to_numpy(zero_copy_only=False),
+            dtype=np.float64,
+        )
+        if "paired_count" in sample.column_names
+        else counts_raw
+    )
+    w_counts, kappa = evaluate_band_weighted_counts(
+        bands_2d, counts_raw, paired_raw, w_24
+    )
     count_idx = sample.schema.get_field_index("count")
-    return sample.set_column(count_idx, "count", pa.array(w_counts, type=pa.float64()))
+    out = sample.set_column(count_idx, "count", pa.array(w_counts, type=pa.float64()))
+    if "kappa_frag" in out.column_names:
+        k_idx = out.schema.get_field_index("kappa_frag")
+        out = out.set_column(k_idx, "kappa_frag", pa.array(kappa, type=pa.float32()))
+    else:
+        out = out.append_column("kappa_frag", pa.array(kappa, type=pa.float32()))
+    return out
 
 
 def is_paired_sample_metadata(metadata: Mapping[object, object] | None) -> bool:

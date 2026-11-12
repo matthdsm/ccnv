@@ -80,6 +80,15 @@ def _req_int_list(data: Mapping[str, object], key: str) -> list[int]:
     return [_req_int(item, key) for item in raw]
 
 
+def _opt_int_list(data: Mapping[str, object], key: str) -> list[int] | None:
+    raw = data.get(key)
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        raise TypeError(f"{key} must be a sequence of integers, got {raw!r}")
+    return [_req_int(item, key) for item in raw]
+
+
 def _req_str_tuple(raw: object, name: str) -> tuple[str, ...]:
     if not isinstance(raw, (list, tuple)) or any(not isinstance(x, str) for x in raw):
         raise TypeError(f"{name} must be a sequence of strings, got {raw!r}")
@@ -230,6 +239,15 @@ class PrenatalModelMetadata:
     ff_frag_feature_mean: list[float] | None = None
     ff_frag_feature_scale: list[float] | None = None
     ff_size_std: float = 0.018
+    msy_bg_rate: float | None = None
+    clean_msy_bins: list[int] | None = None
+    alpha_0: float | None = None
+    alpha_1: float | None = None
+    sigma_x_sys: float | None = None
+    quarantined_samples: list[int] | None = None
+    band_fisher_weights: list[float] | None = None
+    mu_fetal_w: float | None = None
+    mu_maternal_w: float | None = None
 
     def __post_init__(self) -> None:
         """Validate prenatal model metadata dimensions and types."""
@@ -244,6 +262,10 @@ class PrenatalModelMetadata:
                 out[f.name] = val
             elif f.name == "prenatal_bin_size":
                 out[f.name] = int(val)
+            elif f.name in ("clean_msy_bins", "quarantined_samples") and isinstance(
+                val, (list, tuple)
+            ):
+                out[f.name] = [int(x) for x in val]
             elif isinstance(val, (list, tuple)):
                 out[f.name] = [float(x) for x in val]
             else:
@@ -284,6 +306,39 @@ class PrenatalModelMetadata:
             ff_frag_feature_mean=_opt_float_list(data, "ff_frag_feature_mean"),
             ff_frag_feature_scale=_opt_float_list(data, "ff_frag_feature_scale"),
             ff_size_std=_req_float(data.get("ff_size_std", 0.018), "ff_size_std"),
+            msy_bg_rate=(
+                None
+                if data.get("msy_bg_rate") is None
+                else _req_float(data["msy_bg_rate"], "msy_bg_rate")
+            ),
+            clean_msy_bins=_opt_int_list(data, "clean_msy_bins"),
+            alpha_0=(
+                None
+                if data.get("alpha_0") is None
+                else _req_float(data["alpha_0"], "alpha_0")
+            ),
+            alpha_1=(
+                None
+                if data.get("alpha_1") is None
+                else _req_float(data["alpha_1"], "alpha_1")
+            ),
+            sigma_x_sys=(
+                None
+                if data.get("sigma_x_sys") is None
+                else _req_float(data["sigma_x_sys"], "sigma_x_sys")
+            ),
+            quarantined_samples=_opt_int_list(data, "quarantined_samples"),
+            band_fisher_weights=_opt_float_list(data, "band_fisher_weights"),
+            mu_fetal_w=(
+                None
+                if data.get("mu_fetal_w") is None
+                else _req_float(data["mu_fetal_w"], "mu_fetal_w")
+            ),
+            mu_maternal_w=(
+                None
+                if data.get("mu_maternal_w") is None
+                else _req_float(data["mu_maternal_w"], "mu_maternal_w")
+            ),
         )
 
     def encode(self) -> bytes:

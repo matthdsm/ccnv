@@ -7,10 +7,10 @@ from typing import Literal
 import numpy as np
 from numpy.typing import NDArray
 
-CallType = Literal["gain", "loss"]
+CallType = Literal["gain", "loss", "GAIN", "LOSS", "neutral", "NEUTRAL"]
 SCACall = Literal["XX", "XY", "XO", "XXX", "XXY", "XYY", "DISCORDANT_MIXED"]
 FetalSex = Literal["M", "F"]
-ActiveFFSource = Literal["FFY", "FFA", "FF_SIZE", "FUSED"]
+ActiveFFSource = Literal["FFY", "FFA", "FFX", "FF_SIZE", "FUSED"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +26,8 @@ class BinResult:
     weights: NDArray[np.float64]
     reference_sizes: NDArray[np.int64]
     masked: NDArray[np.bool_]
+    counts: NDArray[np.float64] | None = None
+    expected_counts: NDArray[np.float64] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +49,19 @@ class SegmentResult:
     frag_short_ratio: float | None = None
     frag_llr_size: float | None = None
     origin_call: str | None = None
+    copy_number: int | None = None
+    log_bf: float | None = None
+    q_value: float = 1.0
+    mosaic_fraction: float | None = None
+    mosaic_ci: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PrenatalLoDMetrics:
+    """Analytical Limit of Detection (LoD) minimum fetal fraction thresholds."""
+
+    lod_ff_35mb: float
+    lod_ff_3mb: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +97,8 @@ class FetalFractionResult:
     ff_size: float | None = None
     low_ff_warning: bool = False
     warnings: tuple[str, ...] = ()
+    active_ff_se: float | None = None
+    lod_metrics: PrenatalLoDMetrics | None = None
 
     @property
     def preface(self) -> float:
@@ -119,6 +136,29 @@ class PredictionOutputs:
 
 
 @dataclass(frozen=True, slots=True)
+class BranchQCStatus:
+    """Wrapper around branch QC metrics dictionary providing status and verdict attributes."""
+
+    data: dict[str, object]
+
+    @property
+    def status(self) -> str:
+        """Branch quality verdict string (PASS, WARN, or FAIL)."""
+        return str(self.data.get("verdict", ""))
+
+    @property
+    def verdict(self) -> str:
+        """Alias for status."""
+        return str(self.data.get("verdict", ""))
+
+    def __getitem__(self, key: str) -> object:
+        return self.data[key]
+
+    def get(self, key: str, default: object = None) -> object:
+        return self.data.get(key, default)
+
+
+@dataclass(frozen=True, slots=True)
 class ReferenceQCOutputs:
     """Artifacts and verdict produced by reference QC."""
 
@@ -127,14 +167,29 @@ class ReferenceQCOutputs:
     worst_severity: int
     data: dict[str, object]
 
+    @property
+    def branches(self) -> dict[str, BranchQCStatus]:
+        """Typed map of branch QC results by branch name."""
+        raw = self.data.get("branches")
+        if isinstance(raw, dict):
+            return {
+                str(k): (
+                    BranchQCStatus(v) if isinstance(v, dict) else BranchQCStatus({})
+                )
+                for k, v in raw.items()
+            }
+        return {}
+
 
 __all__ = [
     "ActiveFFSource",
     "BinResult",
+    "BranchQCStatus",
     "CallType",
     "FetalFractionResult",
     "FetalSex",
     "PredictionOutputs",
+    "PrenatalLoDMetrics",
     "ReferenceQCOutputs",
     "SCACall",
     "SCAResult",

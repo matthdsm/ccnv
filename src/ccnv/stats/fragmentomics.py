@@ -8,11 +8,12 @@ from typing import Final
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import ndimage, signal
+from scipy import ndimage, optimize, signal
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import ElasticNetCV, RidgeCV
 from sklearn.model_selection import KFold
 
+from ccnv._core import FRAG_BAND_EDGES
 from ccnv.models.schemas import FragmentomicsMetadata, PrenatalModelMetadata
 
 FRAG_MIN_LEN: Final[int] = 30
@@ -95,18 +96,21 @@ def compute_helical_periodicity(hist: NDArray[np.number]) -> tuple[float, float]
     if len(h) < idx_end + 1:
         return 0.0, 0.0
 
-    sub_hist = h[idx_start : idx_end + 1]
-    if np.sum(sub_hist) <= 0.0:
+    total = float(np.sum(h))
+    if total <= 0.0:
         return 0.0, 0.0
 
+    p = h / total
+    sub_p = p[idx_start : idx_end + 1]
+
     # Detrend linear background
-    detrended = signal.detrend(sub_hist)
+    detrended = signal.detrend(sub_p)
     lengths = np.arange(80, 156, dtype=np.float64)
     f_helix = 1.0 / 10.4
 
     # Discrete Fourier component at f_helix
     fourier_comp = np.sum(detrended * np.exp(-2.0j * np.pi * f_helix * lengths))
-    amp = float(np.abs(fourier_comp) * (2.0 / len(sub_hist)))
+    amp = float(np.abs(fourier_comp) * (2.0 / len(sub_p)))
     phase = float(np.angle(fourier_comp))
     return amp, phase
 
@@ -178,7 +182,7 @@ def estimate_sample_landmarks(
         y1 = smoothed[peak_idx]
         y2 = smoothed[peak_idx + 1]
         denom = 2.0 * (y0 - 2.0 * y1 + y2)
-        if abs(denom) > 1e-9:
+        if denom < -1e-9:
             delta = (y0 - y2) / denom
             sub_bin = peak_idx + np.clip(delta, -1.0, 1.0)
         else:
@@ -233,6 +237,138 @@ def estimate_sample_landmarks(
     )
 
 
+def deconvolve_fetal_maternal_em(
+    hist_auto: NDArray[np.float64],
+    hist_chry: NDArray[np.float64],
+    f_estimates: NDArray[np.float64],
+    is_male: NDArray[np.bool_],
+    is_female: NDArray[np.bool_],
+    *,
+    smooth_sigma: float = 1.2,
+    em_steps: int = 8,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Cohort deconvolution of pure fetal and maternal cfDNA fragment length densities.
+
+    Employs exposure-scaled female background subtraction on chrY, pure maternal baseline
+    recovery via male algebraic subtraction, and coupled Poisson-EM iterations.
+    """
+    lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
+    auto = np.asarray(hist_auto, dtype=np.float64)
+    chry = np.asarray(hist_chry, dtype=np.float64)
+    ff = np.asarray(f_estimates, dtype=np.float64)
+    male_arr = np.asarray(is_male, dtype=bool)
+    female_arr = np.asarray(is_female, dtype=bool)
+
+    n_samples = auto.shape[0] if auto.ndim == 2 else 0
+    if n_samples == 0:
+        param_f = np.exp(-0.5 * ((lengths - 143.0) / 10.0) ** 2)
+        param_m = np.exp(-0.5 * ((lengths - 166.0) / 12.0) ** 2)
+        return param_f / np.sum(param_f), param_m / np.sum(param_m)
+
+    # 1. Initial pure fetal density p_F^(0) from chrY
+    n_reads = np.sum(auto, axis=1)
+    eligible_males = male_arr & np.isfinite(ff) & (ff >= 0.02)
+    if np.any(eligible_males) and np.sum(chry[eligible_males]) > 0.0:
+        h_male_y = np.sum(chry[eligible_males], axis=0)
+        h_female_y = (
+            np.sum(chry[female_arr], axis=0)
+            if np.any(female_arr)
+            else np.zeros(FRAG_NUM_BINS, dtype=np.float64)
+        )
+        s_male_y = ndimage.gaussian_filter1d(h_male_y, sigma=smooth_sigma)
+        s_female_y = ndimage.gaussian_filter1d(h_female_y, sigma=smooth_sigma)
+
+        sum_male_n = float(np.sum((1.0 - ff[eligible_males]) * n_reads[eligible_males]))
+        sum_female_n = float(np.sum(n_reads[female_arr])) if np.any(female_arr) else 0.0
+        bg_scale = sum_male_n / max(sum_female_n, 1.0) if sum_female_n > 0.0 else 0.0
+
+        h_f0 = np.maximum(s_male_y - bg_scale * s_female_y, 0.0)
+        sum_f0 = float(np.sum(h_f0))
+        if sum_f0 > 0.0:
+            p_f0 = h_f0 / sum_f0
+        else:
+            param_f = np.exp(-0.5 * ((lengths - 143.0) / 10.0) ** 2)
+            p_f0 = param_f / np.sum(param_f)
+    else:
+        param_f = np.exp(-0.5 * ((lengths - 143.0) / 10.0) ** 2)
+        p_f0 = param_f / np.sum(param_f)
+
+    # 2. Initial pure maternal density p_M^(0) via male-only algebraic subtraction
+    h_m0 = np.zeros(FRAG_NUM_BINS, dtype=np.float64)
+    for i in np.flatnonzero(eligible_males):
+        f_s = float(np.clip(ff[i], 0.002, 0.55))
+        n_s = float(n_reads[i])
+        if n_s > 0.0:
+            p_s = auto[i] / n_s
+            h_m0 += n_s * np.maximum(p_s - f_s * p_f0, 0.0)
+
+    sum_m0 = float(np.sum(h_m0))
+    if sum_m0 > 0.0:
+        p_m0 = h_m0 / sum_m0
+    else:
+        param_m = np.exp(-0.5 * ((lengths - 166.0) / 12.0) ** 2)
+        p_m0 = param_m / np.sum(param_m)
+
+    # Regularize initial densities
+    p_f = ndimage.gaussian_filter1d(p_f0, sigma=1.0)
+    p_f = np.maximum(p_f, 0.0)
+    p_f /= np.sum(p_f)
+
+    p_m = ndimage.gaussian_filter1d(p_m0, sigma=1.0)
+    p_m = np.maximum(p_m, 0.0)
+    p_m /= np.sum(p_m)
+
+    # 3. Coupled Poisson-EM iterations across all autosomal histograms
+    f_curr = np.zeros(n_samples, dtype=np.float64)
+    for i in range(n_samples):
+        if eligible_males[i]:
+            f_curr[i] = float(np.clip(ff[i], 0.002, 0.55))
+        else:
+            f_curr[i] = 0.05
+
+    for _ in range(max(1, em_steps)):
+        # E-step: update fetal fraction estimates on female (unanchored) samples
+        for i in range(n_samples):
+            if eligible_males[i] or n_reads[i] <= 0.0:
+                continue
+            h_i = auto[i]
+
+            def _neg_ll(
+                f_val: float,
+                h_target: NDArray[np.float64] = h_i,
+                pf_step: NDArray[np.float64] = p_f,
+                pm_step: NDArray[np.float64] = p_m,
+            ) -> float:
+                p_mix = f_val * pf_step + (1.0 - f_val) * pm_step
+                return -float(np.sum(h_target * np.log(np.maximum(p_mix, 1e-12))))
+
+            res = optimize.minimize_scalar(
+                _neg_ll, bounds=(0.002, 0.55), method="bounded"
+            )
+            f_curr[i] = float(np.clip(res.x, 0.002, 0.55))
+
+        # Responsibilities gamma_{s, F}(L)
+        mix = (
+            f_curr[:, np.newaxis] * p_f[np.newaxis, :]
+            + (1.0 - f_curr[:, np.newaxis]) * p_m[np.newaxis, :]
+        )
+        gamma_f = (f_curr[:, np.newaxis] * p_f[np.newaxis, :]) / np.maximum(mix, 1e-12)
+        h_f_acc = np.sum(auto * gamma_f, axis=0)
+        h_m_acc = np.sum(auto * (1.0 - gamma_f), axis=0)
+
+        # M-step: regularized update with Gaussian smoothing
+        if np.sum(h_f_acc) > 0.0:
+            s_f = ndimage.gaussian_filter1d(h_f_acc, sigma=1.0)
+            p_f = np.maximum(s_f, 0.0)
+            p_f /= np.sum(p_f)
+        if np.sum(h_m_acc) > 0.0:
+            s_m = ndimage.gaussian_filter1d(h_m_acc, sigma=1.0)
+            p_m = np.maximum(s_m, 0.0)
+            p_m /= np.sum(p_m)
+
+    return p_f, p_m
+
+
 def deconvolve_fetal_maternal_densities(
     aligned_auto_hists: NDArray[np.number],
     aligned_chry_hists: NDArray[np.number],
@@ -240,85 +376,131 @@ def deconvolve_fetal_maternal_densities(
     ffy_values: NDArray[np.number],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Cohort deconvolution of pure fetal and maternal cfDNA fragment length densities."""
-    lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
-    male_arr = np.asarray(male_mask, dtype=bool)
+    auto = np.asarray(aligned_auto_hists, dtype=np.float64)
+    chry = np.asarray(aligned_chry_hists, dtype=np.float64)
+    males = np.asarray(male_mask, dtype=bool)
     ff = np.asarray(ffy_values, dtype=np.float64)
-    eligible_males = male_arr & np.isfinite(ff) & (ff >= 0.08)
-    female_mask = ~male_arr
-    n_eligible_males = int(np.sum(eligible_males))
-    n_females = int(np.sum(female_mask))
-
-    chry_arr = np.asarray(aligned_chry_hists, dtype=np.float64)
-    auto_arr = np.asarray(aligned_auto_hists, dtype=np.float64)
-
-    male_chry_reads = (
-        float(np.sum(chry_arr[eligible_males])) if n_eligible_males > 0 else 0.0
+    females = ~males
+    return deconvolve_fetal_maternal_em(
+        auto, chry, ff, males, females, smooth_sigma=1.2, em_steps=8
     )
 
-    # 1. Pure Fetal Density p_F(L)
-    if n_eligible_males >= 5 and male_chry_reads >= 500.0:
-        pooled_male = np.sum(chry_arr[eligible_males], axis=0)
-        pooled_female = (
-            np.sum(chry_arr[female_mask], axis=0)
-            if n_females > 0
-            else np.zeros(FRAG_NUM_BINS)
-        )
-        bg_scale = float(n_eligible_males) / max(float(n_females), 1.0)
-        h_fetal = np.maximum(pooled_male - bg_scale * pooled_female, 0.0)
-        # Smooth with Gaussian sigma=1.5
-        smoothed_f = ndimage.gaussian_filter1d(h_fetal, sigma=1.5)
-        sum_f = np.sum(smoothed_f)
-        p_fetal = (
-            smoothed_f / sum_f
-            if sum_f > 0.0
-            else np.ones(FRAG_NUM_BINS) / FRAG_NUM_BINS
-        )
-    else:
-        # Fallback to canonical parametric fetal template
-        param_f = (
-            np.exp(-0.5 * ((lengths - 143.0) / 10.0) ** 2)
-            * (1.0 + 0.15 * np.cos(2.0 * np.pi * (lengths - 143.0) / 10.4))
-            + 0.15 * np.exp(-0.5 * ((lengths - 133.0) / 8.0) ** 2)
-            + 0.05 * np.exp(-0.5 * ((lengths - 123.0) / 6.0) ** 2)
-        )
-        param_f = np.maximum(param_f, 0.0)
-        p_fetal = param_f / np.sum(param_f)
 
-    # 2. Pure Maternal Density p_M(L)
-    # Autosomal normalized densities per sample
-    row_sums = np.sum(auto_arr, axis=1, keepdims=True)
-    row_sums[row_sums == 0.0] = 1.0
-    norm_auto = auto_arr / row_sums
+def predict_ff_kl_deconvolution(
+    hist_sample: NDArray[np.float64],
+    p_fetal: NDArray[np.float64],
+    p_maternal: NDArray[np.float64],
+) -> tuple[float, float]:
+    """Zero-parameter maximum likelihood estimation of fetal fraction via KL deconvolution.
 
-    if len(ff) >= 5 and np.ptp(ff) > 0.03:
-        # Fit OLS across samples for each bin to find intercept at f=0
-        # norm_auto ~ beta_1 * ff + beta_0
-        ff_centered = ff - np.mean(ff)
-        var_ff = float(np.sum(ff_centered**2))
-        if var_ff > 1e-6:
-            slope = np.sum(norm_auto * ff_centered[:, np.newaxis], axis=0) / var_ff
-            intercept = np.mean(norm_auto, axis=0) - slope * np.mean(ff)
-            p_mat_raw = np.maximum(intercept, 0.0)
+    Returns (hat_f, sigma_kl) where sigma_kl is the analytical standard error from
+    observed Fisher information.
+    """
+    h = np.asarray(hist_sample, dtype=np.float64)
+    pf = np.asarray(p_fetal, dtype=np.float64)
+    pm = np.asarray(p_maternal, dtype=np.float64)
+
+    total = float(np.sum(h))
+    if total <= 0.0 or pf.size != FRAG_NUM_BINS or pm.size != FRAG_NUM_BINS:
+        return 0.0, 0.05
+
+    def _neg_ll(f: float) -> float:
+        mix = f * pf + (1.0 - f) * pm
+        return -float(np.sum(h * np.log(np.maximum(mix, 1e-12))))
+
+    res = optimize.minimize_scalar(_neg_ll, bounds=(0.002, 0.55), method="bounded")
+    hat_f = float(np.clip(res.x, 0.002, 0.55))
+
+    delta_p = pf - pm
+    p_mix_hat = hat_f * pf + (1.0 - hat_f) * pm
+    score_sq = (delta_p / np.maximum(p_mix_hat, 1e-12)) ** 2
+    obs_info = float(np.sum(h * score_sq))
+
+    sigma_kl = float(1.0 / math.sqrt(obs_info)) if obs_info > 1e-9 else 0.05
+    return hat_f, sigma_kl
+
+
+def compute_band_fisher_weights(
+    p_fetal_571: NDArray[np.float64],
+    p_maternal_571: NDArray[np.float64],
+    *,
+    f0: float = 0.08,
+) -> tuple[NDArray[np.float64], float, float]:
+    """Derive Fisher-optimal read weights mapped to 24 discrete fragmentomic bands.
+
+    Returns (w_24, mu_fetal_w, mu_maternal_w) normalized such that expected diploid
+    baseline coverage is 1.0.
+    """
+    pf = np.asarray(p_fetal_571, dtype=np.float64)
+    pm = np.asarray(p_maternal_571, dtype=np.float64)
+    edges = np.asarray(FRAG_BAND_EDGES, dtype=np.int64)
+    n_bands = len(edges) - 1
+
+    pf_24 = np.zeros(n_bands, dtype=np.float64)
+    pm_24 = np.zeros(n_bands, dtype=np.float64)
+    for k in range(n_bands):
+        i_s = int(edges[k]) - FRAG_MIN_LEN
+        i_e = int(edges[k + 1]) - FRAG_MIN_LEN
+        pf_24[k] = float(np.sum(pf[i_s:i_e]))
+        pm_24[k] = float(np.sum(pm[i_s:i_e]))
+
+    sum_pf = float(np.sum(pf_24))
+    if sum_pf > 0.0:
+        pf_24 /= sum_pf
+    sum_pm = float(np.sum(pm_24))
+    if sum_pm > 0.0:
+        pm_24 /= sum_pm
+
+    eff_f0 = float(np.clip(f0, 0.01, 0.40))
+    p_mix = eff_f0 * pf_24 + (1.0 - eff_f0) * pm_24
+    raw_weights = pf_24 / np.maximum(p_mix, 1e-12)
+
+    # Solve for scale alpha such that sum_b pm_24[b] * clip(alpha * raw_weights[b], 0.25, 3.0) == 1.0
+    low, high = 0.05, 20.0
+    for _ in range(30):
+        mid = 0.5 * (low + high)
+        val = float(np.sum(pm_24 * np.clip(mid * raw_weights, 0.25, 3.0)))
+        if val < 1.0:
+            low = mid
         else:
-            p_mat_raw = np.median(norm_auto, axis=0)
-    else:
-        p_mat_raw = (
-            np.median(norm_auto, axis=0)
-            if len(auto_arr) > 0
-            else np.zeros(FRAG_NUM_BINS)
-        )
+            high = mid
 
-    if np.sum(p_mat_raw) <= 0.0:
-        param_m = np.exp(-0.5 * ((lengths - 166.0) / 12.0) ** 2)
-        p_mat_raw = param_m
+    alpha = 0.5 * (low + high)
+    w_24 = np.clip(alpha * raw_weights, 0.25, 3.0)
 
-    smoothed_m = ndimage.gaussian_filter1d(p_mat_raw, sigma=1.0)
-    sum_m = np.sum(smoothed_m)
-    p_maternal = (
-        smoothed_m / sum_m if sum_m > 0.0 else np.ones(FRAG_NUM_BINS) / FRAG_NUM_BINS
-    )
+    mu_m_w = float(np.sum(pm_24 * w_24))
+    mu_f_w = float(np.sum(pf_24 * w_24))
+    return w_24, mu_f_w, mu_m_w
 
-    return p_fetal, p_maternal
+
+def evaluate_band_weighted_counts(
+    frag_bands: NDArray[np.uint32],
+    raw_counts: NDArray[np.uint32] | NDArray[np.float64],
+    paired_counts: NDArray[np.uint32] | NDArray[np.float64],
+    band_weights_24: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float32]]:
+    """Evaluate Fisher-weighted coverage and per-bin Kish design factor from 24 frag_bands."""
+    bands_f64 = np.asarray(frag_bands, dtype=np.float64)
+    raw_f64 = np.asarray(raw_counts, dtype=np.float64)
+    paired_f64 = np.asarray(paired_counts, dtype=np.float64)
+    w_24 = np.asarray(band_weights_24, dtype=np.float64)
+
+    w_paired = bands_f64 @ w_24
+    raw_unpaired = np.maximum(raw_f64 - paired_f64, 0.0)
+    w_counts = raw_unpaired + w_paired
+
+    # Per-bin Kish design factor: kappa = paired_c * sum(k_b * w_b^2) / max((sum k_b * w_b)^2, 1e-12)
+    sum_w_sq = bands_f64 @ (w_24**2)
+    w_paired_sq = np.maximum(w_paired**2, 1e-12)
+    has_paired = paired_f64 > 0.0
+
+    kappa = np.ones(raw_f64.shape, dtype=np.float32)
+    kappa[has_paired] = np.maximum(
+        paired_f64[has_paired] * sum_w_sq[has_paired] / w_paired_sq[has_paired],
+        1.0,
+    ).astype(np.float32)
+
+    return w_counts, kappa
 
 
 def fisher_optimal_weights(
@@ -340,7 +522,6 @@ def fisher_optimal_weights(
     raw_weights = pf / p_mix_safe
     c_min, c_max = clip_bounds
 
-    # Solve for scaling factor alpha such that E_{p_mix}[clip(alpha * raw_weights)] == 1.0
     low, high = 0.05, 20.0
     for _ in range(25):
         mid = 0.5 * (low + high)
@@ -364,39 +545,39 @@ def build_fragmentomic_feature_vector(
         return np.zeros(36, dtype=np.float64)
 
     p = auto / total
-    # Align histogram by sizing shift
-    p_aligned = align_histogram(p, meta.sizing_shift_bp)
-
     features: list[float] = []
 
-    # 1. 28 mode-aligned 5 bp log-density bands in [80, 220] bp
-    # Canonical chromatosome ref density around 166 bp ([164, 168] bp)
+    # 1. Feature 0: scalar chromatosome mode landmark
+    features.append(float(meta.chromatosome_mode_bp))
+
+    # Reference density around 166 bp ([164, 168] bp)
     idx_164 = 164 - FRAG_MIN_LEN
     idx_168 = 168 - FRAG_MIN_LEN
-    ref_density = float(np.mean(p_aligned[idx_164 : idx_168 + 1]))
+    ref_density = float(np.mean(p[idx_164 : idx_168 + 1]))
     ref_safe = max(ref_density, 1e-8)
 
-    for start_bp in range(80, 220, 5):
+    # 2. 27 5-bp log-density bands in [85, 220) bp
+    for start_bp in range(85, 220, 5):
         i_s = start_bp - FRAG_MIN_LEN
         i_e = i_s + 5
-        band_density = float(np.mean(p_aligned[i_s:i_e]))
+        band_density = float(np.mean(p[i_s:i_e]))
         features.append(math.log(max(band_density, 1e-8) / ref_safe))
 
-    # 2. Self-referenced peak ratio
+    # 3. Self-referenced peak ratio (1 feature)
     features.append(float(meta.self_referenced_peak_ratio))
 
-    # 3. Sub-nucleosomal peak ratios: densities at 112, 122, 133, 143 vs 166 bp (4 features)
+    # 4. Sub-nucleosomal peak ratios at 112, 122, 133, 143 vs 166 bp (4 features)
     for bp in (112, 122, 133, 143):
         idx = bp - FRAG_MIN_LEN
-        features.append(float(p_aligned[idx] / ref_safe))
+        features.append(float(p[idx] / ref_safe))
 
-    # 4. Helical periodicity amplitude (1 feature)
+    # 5. Helical periodicity amplitude (1 feature)
     features.append(float(meta.helical_10bp_amplitude))
 
-    # 5. Motif Diversity Score (1 feature)
+    # 6. Motif Diversity Score (1 feature)
     features.append(float(meta.motif_diversity_score))
 
-    # 6. Top cleavage 4-mer motif frequencies (CCCA, CCAG, CCTG) (1 feature)
+    # 7. Top cleavage 4-mer motif frequencies (CCCA, CCAG, CCTG) (1 feature)
     motifs = np.asarray(meta.end_motif_counts, dtype=np.float64)
     sum_motifs = max(float(np.sum(motifs)), 1.0)
     top_indices = [
@@ -478,22 +659,49 @@ def predict_ff_fragmentomics(
     meta: FragmentomicsMetadata,
     model: PrenatalModelMetadata,
 ) -> float | None:
-    """Predict fetal fraction from fragmentomics metadata via logit ensemble."""
-    if not meta.paired_end or model.ff_frag_weights is None:
-        return None
-    if model.ff_frag_feature_mean is None or model.ff_frag_feature_scale is None:
+    """Predict fetal fraction from fragmentomics metadata via logit ensemble or KL MLE."""
+    if not meta.paired_end:
         return None
 
-    feat = build_fragmentomic_feature_vector(meta)
-    mean = np.asarray(model.ff_frag_feature_mean, dtype=np.float64)
-    scale = np.asarray(model.ff_frag_feature_scale, dtype=np.float64)
-    weights = np.asarray(model.ff_frag_weights, dtype=np.float64)
-    bias = float(model.ff_frag_bias or 0.0)
+    f_kl: float | None = None
+    if (
+        model.p_fetal_density is not None
+        and model.p_maternal_density is not None
+        and len(meta.hist_autosomal) == FRAG_NUM_BINS
+    ):
+        f_val, _ = predict_ff_kl_deconvolution(
+            np.asarray(meta.hist_autosomal, dtype=np.float64),
+            np.asarray(model.p_fetal_density, dtype=np.float64),
+            np.asarray(model.p_maternal_density, dtype=np.float64),
+        )
+        f_kl = f_val
 
-    z = (feat - mean) / scale
-    u = float(np.dot(z, weights) + bias)
-    ff = 1.0 / (1.0 + math.exp(-u))
-    return float(np.clip(ff, 0.005, 0.50))
+    f_ens: float | None = None
+    if (
+        model.ff_frag_weights is not None
+        and model.ff_frag_feature_mean is not None
+        and model.ff_frag_feature_scale is not None
+    ):
+        feat = build_fragmentomic_feature_vector(meta)
+        mean = np.asarray(model.ff_frag_feature_mean, dtype=np.float64)
+        scale = np.asarray(model.ff_frag_feature_scale, dtype=np.float64)
+        weights = np.asarray(model.ff_frag_weights, dtype=np.float64)
+        bias = float(model.ff_frag_bias or 0.0)
+
+        z = (feat - mean) / scale
+        u = float(np.dot(z, weights) + bias)
+        f_ens = 1.0 / (1.0 + math.exp(-u))
+
+    if f_kl is not None and f_ens is not None:
+        f_final = 0.5 * f_kl + 0.5 * f_ens
+    elif f_kl is not None:
+        f_final = f_kl
+    elif f_ens is not None:
+        f_final = f_ens
+    else:
+        return None
+
+    return float(np.clip(f_final, 0.005, 0.50))
 
 
 def segment_fragment_llr(
@@ -547,13 +755,17 @@ __all__ = [
     "FRAG_NUM_BINS",
     "align_histogram",
     "build_fragmentomic_feature_vector",
+    "compute_band_fisher_weights",
     "compute_helical_periodicity",
     "compute_motif_diversity_score",
     "deconvolve_fetal_maternal_densities",
+    "deconvolve_fetal_maternal_em",
     "encode_kmer_4",
     "estimate_sample_landmarks",
+    "evaluate_band_weighted_counts",
     "fisher_optimal_weights",
     "fit_ff_fragmentomics_ensemble",
     "predict_ff_fragmentomics",
+    "predict_ff_kl_deconvolution",
     "segment_fragment_llr",
 ]

@@ -154,7 +154,13 @@ def build_vcf_header(
                     '##INFO=<ID=FRAG_LLR,Number=1,Type=Float,Description="Fragment length log-likelihood ratio for fetal vs maternal origin">',
                     (
                         "##INFO=<ID=ORIGIN,Number=1,Type=String,"
-                        'Description="Fragmentomic origin call: FETAL_CONFIRMED, MATERNAL_CONFIRMED, or INDETERMINATE">'
+                        'Description="Fragmentomic origin call: FETAL_CONSTITUTIONAL, '
+                        "PLACENTAL_MOSAIC, MATERNAL_UNINHERITED, "
+                        'MATERNAL_AND_FETAL_INHERITED, MATERNAL_MOSAIC, or INDETERMINATE">'
+                    ),
+                    (
+                        "##INFO=<ID=MOSAIC_FRAC,Number=1,Type=Float,"
+                        'Description="Inferred mosaic fraction for mosaic origin calls">'
                     ),
                 ]
             )
@@ -397,6 +403,16 @@ def write_segments_vcf(
                     ],
                     dtype=pl.Float64,
                 )
+                cols["mosaic_fraction"] = pl.Series(
+                    "mosaic_fraction",
+                    [
+                        vcf_float(s.mosaic_fraction)
+                        if s.mosaic_fraction is not None
+                        else None
+                        for s in batch
+                    ],
+                    dtype=pl.Float64,
+                )
 
             svtype_expr = (
                 pl.when(pl.col("call") == "gain")
@@ -455,6 +471,16 @@ def write_segments_vcf(
                         )
                         .then(
                             pl.concat_str([pl.lit(";ORIGIN="), pl.col("origin_call")])
+                        )
+                        .otherwise(pl.lit("")),
+                        pl.when(pl.col("mosaic_fraction").is_finite())
+                        .then(
+                            pl.concat_str(
+                                [
+                                    pl.lit(";MOSAIC_FRAC="),
+                                    pl.col("mosaic_fraction").round(4).cast(pl.String),
+                                ]
+                            )
                         )
                         .otherwise(pl.lit("")),
                     ]

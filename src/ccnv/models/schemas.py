@@ -318,6 +318,7 @@ class SampleBuffers:
     endpoint_count: NDArray[np.uint32]
     frag_gc_sum: NDArray[np.float32]
     frag_bands: NDArray[np.uint32] | None = None
+    kappa_frag: NDArray[np.float32] | None = None
 
     @property
     def num_rows(self) -> int:

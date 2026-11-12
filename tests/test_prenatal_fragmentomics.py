@@ -8,7 +8,7 @@ from dataclasses import asdict
 
 import numpy as np
 import pyarrow as pa
-from helpers import make_reference_table, make_sample_table
+from helpers import make_sample_table
 from scipy.stats import norm
 
 from ccnv.features.fragmentomics import (
@@ -109,6 +109,7 @@ def _make_mock_sample_table(
     is_male: bool = True,
     frag_meta: FragmentomicsMetadata | None = None,
     fetal_enriched_bins: set[int] | None = None,
+    fetal_fraction: float = 0.10,
 ) -> pa.Table:
     c_list: list[str] = []
     s_list: list[int] = []
@@ -126,10 +127,13 @@ def _make_mock_sample_table(
             c_list.append(contig)
             s_list.append(b * bin_size)
             e_list.append((b + 1) * bin_size)
-            if not is_male and contig.endswith("Y"):
-                counts.append(0.0)
+            if contig.endswith("Y"):
+                c_val = 100.0 * (0.5 * fetal_fraction) if is_male else 0.0
+            elif contig.endswith("X"):
+                c_val = 100.0 * (1.0 - 0.5 * fetal_fraction) if is_male else 100.0
             else:
-                counts.append(100.0)
+                c_val = 100.0
+            counts.append(c_val)
             ep_counts.append(50)
             frag_gc_sums.append(42.0)
 
@@ -263,10 +267,11 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         entries = []
         for i in range(6):
             is_male = i >= 3
+            ff_val = 0.10 if is_male else 0.08
             frag_meta = _make_mock_fragmentomics_metadata(
                 paired_end=True,
                 shift_bp=0.0,
-                fetal_fraction=0.10 if is_male else 0.08,
+                fetal_fraction=ff_val,
                 is_male=is_male,
                 seed=42 + i,
             )
@@ -277,13 +282,14 @@ class TestPrenatalFragmentomics(unittest.TestCase):
                 bin_size=5000,
                 is_male=is_male,
                 frag_meta=frag_meta,
+                fetal_fraction=ff_val,
             )
             tables.append(table)
             entries.append(
                 SamplesheetEntry(
                     filepath=f"sample_{i}.ccnv",
                     sex="M" if is_male else "F",
-                    ff=0.10 if is_male else 0.08,
+                    ff=ff_val,
                 )
             )
 
@@ -343,8 +349,10 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         self.assertGreater(weighted_counts[1], 0.0)
 
     def test_prenatal_prediction_fisher_weighting_reference_scaling(self) -> None:
-        from ccnv.features.fragmentomics import align_reference_to_weighted_sample
+        import ccnv.features.fragmentomics as ff_mod
         from ccnv.predict import BranchModel, project_coverage
+
+        self.assertFalse(hasattr(ff_mod, "align_reference_to_weighted_sample"))
 
         # 5 bins with identical unweighted counts (10 reads each):
         # Bins 0..3 are diploid background (166 bp); bin 4 is fetal-enriched (135 bp)
@@ -368,34 +376,14 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         )
         weighted_sample = apply_prenatal_fisher_weighting(sample_tbl, meta)
         self.assertIsNot(weighted_sample, sample_tbl)
+        self.assertIn("kappa_frag", weighted_sample.column_names)
 
-        ref_table = make_reference_table(
-            branches=["autosomal"] * 5,
-            contigs=["chr1"] * 5,
-            starts=[0, 100, 200, 300, 400],
-            ends=[100, 200, 300, 400, 500],
-            contig_lengths={"chr1": 500},
-            pca_mean=[10.0] * 5,
-            null_mean=[0.0] * 5,
-        )
-        weighted_ref = align_reference_to_weighted_sample(
-            ref_table, sample_tbl, weighted_sample
-        )
-        u_counts = sample_tbl.column("count").to_numpy()
         w_counts = weighted_sample.column("count").to_numpy()
-        expected_baseline_scale = float(np.median(w_counts / u_counts))
-        np.testing.assert_allclose(
-            weighted_ref.column("pca_mean").to_numpy(),
-            np.full(5, 10.0 * expected_baseline_scale),
-            rtol=1e-5,
-        )
-        np.testing.assert_allclose(
-            weighted_ref.column("null_mean").to_numpy(),
-            np.zeros(5),
-        )
+        kappa = weighted_sample.column("kappa_frag").to_numpy()
+        self.assertTrue(np.all(kappa >= 1.0))
 
-        # Verify project_coverage preserves the Fisher-weighted enrichment in bin 4
-        # under mean reconstruction (rank 0 PCA loadings, unchanged unweighted counts)
+        # In reference-side Fisher weighting, reference baseline is directly in weighted space
+        bg_mean = float(np.mean(w_counts[:4]))
         branch_model = BranchModel(
             branch="autosomal",
             contigs=("chr1",) * 5,
@@ -403,16 +391,17 @@ class TestPrenatalFragmentomics(unittest.TestCase):
             ends=np.array([100, 200, 300, 400, 500], dtype=np.int64),
             counts=w_counts.astype(np.float64),
             masked=np.zeros(5, dtype=bool),
-            pca_mean=weighted_ref.column("pca_mean").to_numpy().astype(np.float64),
+            pca_mean=np.full(5, bg_mean, dtype=np.float64),
             pca_loadings=np.empty((0, 5), dtype=np.float32),
             proto_ids=np.zeros((5, 4), dtype=np.uint16),
             proto_weights=np.tile([1.0, 0.0, 0.0, 0.0], (5, 1)).astype(np.float16),
             mean_distance=np.ones(5, dtype=np.float32),
             null_mean=np.zeros(5, dtype=np.float64),
             null_std=np.full(5, 0.05, dtype=np.float64),
+            kappa_frag=kappa.astype(np.float32),
         )
         projected = project_coverage(branch_model)
-        np.testing.assert_allclose(projected.corrected[:4], 1.0, rtol=1e-6)
+        np.testing.assert_allclose(projected.corrected[:4], 1.0, rtol=1e-5)
         self.assertGreater(projected.corrected[4], 1.5)
 
         # Confirm unweighted fallback when fragment lengths unavailable

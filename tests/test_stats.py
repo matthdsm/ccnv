@@ -18,12 +18,9 @@ from ccnv.stats.pca import (
     pca_irlba_numpy,
 )
 from ccnv.stats.prenatal_math import (
-    fit_lasso_fista,
-    fit_rprop_mlp,
     infer_sex_gmm_1d,
     ols_fit,
     rlm_huber,
-    train_olm,
 )
 from ccnv.stats.regression import (
     apply_1d_correction,
@@ -51,13 +48,18 @@ class TestStatsPackageExports(unittest.TestCase):
             "build_joint_covariate_basis",
             "build_signal_space_features",
             "compute_null_models",
+            "MSYSexModel",
+            "PoissonFFYModel",
+            "compute_autosomal_density",
             "distance_cutoff",
+            "evaluate_poisson_msy_ffy",
             "fit_elasticnet_ffy",
             "fit_ffa_logit_ensemble",
-            "fit_lasso_fista",
+            "fit_forward_ffx_model",
+            "fit_msy_sex_mixture",
             "fit_pca",
+            "fit_poisson_msy_ffy",
             "fit_preface_logit_ensemble",
-            "fit_rprop_mlp",
             "fit_sample_trend",
             "infer_sex_gmm_1d",
             "ols_fit",
@@ -68,7 +70,6 @@ class TestStatsPackageExports(unittest.TestCase):
             "segment_genome",
             "select_nearest_bins",
             "squeeze_var",
-            "train_olm",
         ]
         for symbol in expected_symbols:
             self.assertTrue(hasattr(stats, symbol), f"Symbol {symbol} missing in stats")
@@ -352,31 +353,9 @@ class TestPrenatalMath(unittest.TestCase):
         self.assertGreater(threshold, 0.0005)
         self.assertLess(threshold, 0.01)
 
-    def test_fit_lasso_fista(self) -> None:
-        rng = np.random.default_rng(42)
-        X = np.abs(rng.normal(size=(20, 5)))
-        true_w = np.array([1.0, 0.0, 2.0, 0.0, 0.5])
-        y = X @ true_w
-        w = fit_lasso_fista(X, y, alpha=0.01)
-        self.assertEqual(w.shape, (5,))
-        self.assertTrue(np.all(w >= 0.0))
-
-    def test_fit_rprop_mlp(self) -> None:
-        rng = np.random.default_rng(42)
-        X = rng.normal(size=(20, 4))
-        y = rng.uniform(0.01, 0.25, size=20)
-        w1, b1, w2, b2 = fit_rprop_mlp(X, y, hidden_dim=2, n_inits=2, max_epochs=50)
-        self.assertEqual(w1.shape, (4, 2))
-        self.assertEqual(b1.shape, (2,))
-        self.assertEqual(w2.shape, (2, 1))
-        self.assertEqual(b2.shape, (1,))
-
     def test_ols_and_rlm(self) -> None:
         x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
         y = 2.0 * x + 1.0
-        w, b = train_olm(x.reshape(-1, 1), y)
-        self.assertAlmostEqual(float(w[0]), 2.0)
-        self.assertAlmostEqual(b, 1.0)
 
         intercept, slope = ols_fit(x, y)
         self.assertAlmostEqual(intercept, 1.0)

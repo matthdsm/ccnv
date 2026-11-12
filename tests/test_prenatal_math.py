@@ -5,16 +5,12 @@ import unittest
 import unittest.mock
 
 import numpy as np
-import scipy.special
 
 from ccnv.stats.pca import pca_irlba_numpy
 from ccnv.stats.prenatal_math import (
-    fit_lasso_fista,
-    fit_rprop_mlp,
     infer_sex_gmm_1d,
     ols_fit,
     rlm_huber,
-    train_olm,
 )
 
 
@@ -55,56 +51,6 @@ class TestInferSexGMM1D(unittest.TestCase):
         flags2, thresh2 = infer_sex_gmm_1d(yfracs)
         self.assertEqual(thresh1, thresh2)
         np.testing.assert_array_equal(flags1, flags2)
-
-
-class TestFitLassoFISTA(unittest.TestCase):
-    def test_sparse_recovery_and_non_negativity(self) -> None:
-        rng = np.random.default_rng(42)
-        n_samples = 120
-        n_features = 8
-        x = rng.standard_normal(size=(n_samples, n_features))
-        true_w = np.array([2.5, 0.0, 1.2, 0.0, 0.0, 3.0, 0.0, 0.5])
-        y = x @ true_w + rng.normal(0.0, 0.05, size=n_samples)
-
-        weights = fit_lasso_fista(x, y, alpha=0.05, max_iter=2000, tol=1e-7)
-
-        self.assertTrue(np.all(weights >= 0.0))
-        # Active features should be positive
-        for idx in (0, 2, 5, 7):
-            self.assertGreater(weights[idx], 0.2)
-        # Inactive features should be strongly shrunk toward zero
-        for idx in (1, 3, 4, 6):
-            self.assertLess(weights[idx], 0.05)
-
-    def test_high_alpha_shrinks_to_zero(self) -> None:
-        rng = np.random.default_rng(42)
-        x = rng.standard_normal(size=(50, 5))
-        y = rng.standard_normal(size=50)
-
-        weights = fit_lasso_fista(x, y, alpha=50.0)
-        np.testing.assert_allclose(weights, 0.0, atol=1e-9)
-
-    def test_zero_alpha_nnls(self) -> None:
-        rng = np.random.default_rng(99)
-        x = rng.uniform(1.0, 2.0, size=(40, 3))
-        true_w = np.array([1.0, 2.0, 3.0])
-        y = x @ true_w
-
-        weights = fit_lasso_fista(x, y, alpha=0.0, max_iter=2500, tol=1e-8)
-        self.assertTrue(np.all(weights >= 0.0))
-        np.testing.assert_allclose(weights, true_w, rtol=1e-3, atol=1e-3)
-
-    def test_empty_input(self) -> None:
-        weights = fit_lasso_fista(np.empty((0, 5)), np.empty(0), alpha=0.1)
-        self.assertEqual(weights.shape, (5,))
-        np.testing.assert_array_equal(weights, 0.0)
-
-    def test_fit_lasso_fista_all_zero_target_no_warning(self) -> None:
-        rng = np.random.default_rng(42)
-        x = rng.uniform(0.0, 1.0, size=(20, 10))
-        y = np.zeros(20, dtype=np.float64)
-        w = fit_lasso_fista(x, y, alpha=1e-4)
-        np.testing.assert_allclose(w, 0.0, atol=1e-12)
 
 
 class TestFitElasticNetFFY(unittest.TestCase):
@@ -236,96 +182,6 @@ class TestPCAIrlbaNumpy(unittest.TestCase):
         self.assertEqual(center[3], 0.0)
         self.assertTrue(np.all(np.isfinite(scores)))
         self.assertTrue(np.all(np.isfinite(rotation)))
-
-
-class TestFitRpropMLP(unittest.TestCase):
-    def test_output_bounded_in_unit_interval(self) -> None:
-        rng = np.random.default_rng(42)
-        x = rng.standard_normal(size=(30, 4))
-        y = rng.uniform(0.1, 0.9, size=30)
-
-        w1, b1, w2, b2 = fit_rprop_mlp(
-            x, y, hidden_dim=2, n_inits=3, max_epochs=200, seed=42
-        )
-
-        # Test on unseen out-of-range inputs
-        x_extreme = np.array([[-100.0, 50.0, 0.0, -20.0], [30.0, -40.0, 10.0, 100.0]])
-        h = scipy.special.expit(x_extreme @ w1 + b1)
-        pred = scipy.special.expit(h @ w2 + b2)
-
-        self.assertTrue(np.all(pred > 0.0))
-        self.assertTrue(np.all(pred < 1.0))
-
-    def test_convergence_on_smooth_target(self) -> None:
-        rng = np.random.default_rng(42)
-        x = rng.uniform(-2.0, 2.0, size=(50, 2))
-        y = scipy.special.expit(0.8 * x[:, 0] - 0.5 * x[:, 1] + 0.2)
-
-        w1, b1, w2, b2 = fit_rprop_mlp(
-            x, y, hidden_dim=2, n_inits=3, max_epochs=500, seed=42
-        )
-
-        h = scipy.special.expit(x @ w1 + b1)
-        pred = scipy.special.expit(h @ w2 + b2).ravel()
-        mse = float(np.mean((pred - y) ** 2))
-        self.assertLess(mse, 0.015)
-
-    def test_deterministic_across_runs(self) -> None:
-        rng = np.random.default_rng(77)
-        x = rng.standard_normal(size=(20, 3))
-        y = rng.uniform(0.2, 0.8, size=20)
-
-        w1_a, b1_a, w2_a, b2_a = fit_rprop_mlp(
-            x, y, hidden_dim=2, n_inits=2, max_epochs=100, seed=77
-        )
-        w1_b, b1_b, w2_b, b2_b = fit_rprop_mlp(
-            x, y, hidden_dim=2, n_inits=2, max_epochs=100, seed=77
-        )
-
-        np.testing.assert_array_equal(w1_a, w1_b)
-        np.testing.assert_array_equal(b1_a, b1_b)
-        np.testing.assert_array_equal(w2_a, w2_b)
-        np.testing.assert_array_equal(b2_a, b2_b)
-
-    def test_insufficient_samples_guard(self) -> None:
-        w1, b1, w2, b2 = fit_rprop_mlp(np.empty((0, 3)), np.empty(0))
-        self.assertEqual(w1.shape, (3, 2))
-        np.testing.assert_array_equal(w1, 0.0)
-        np.testing.assert_array_equal(b1, 0.0)
-        np.testing.assert_array_equal(w2, 0.0)
-        np.testing.assert_array_equal(b2, 0.0)
-
-        w1_s, b1_s, w2_s, b2_s = fit_rprop_mlp(np.ones((1, 3)), np.ones(1))
-        self.assertEqual(w1_s.shape, (3, 2))
-        np.testing.assert_array_equal(w1_s, 0.0)
-        np.testing.assert_array_equal(b1_s, 0.0)
-        np.testing.assert_array_equal(w2_s, 0.0)
-        np.testing.assert_array_equal(b2_s, 0.0)
-
-
-class TestTrainOLM(unittest.TestCase):
-    def test_recovers_linear_parameters(self) -> None:
-        rng = np.random.default_rng(42)
-        x = rng.standard_normal(size=(80, 3))
-        true_w = np.array([2.0, -1.5, 0.75])
-        true_bias = 3.25
-        y = x @ true_w + true_bias
-
-        weights, bias = train_olm(x, y)
-
-        self.assertAlmostEqual(bias, true_bias, places=6)
-        np.testing.assert_allclose(weights, true_w, rtol=1e-5, atol=1e-6)
-
-    def test_empty_input(self) -> None:
-        weights, bias = train_olm(np.empty((0, 4)), np.empty(0))
-        self.assertEqual(weights.shape, (4,))
-        self.assertEqual(bias, 0.0)
-
-    def test_single_sample_guard(self) -> None:
-        weights, bias = train_olm(np.ones((1, 4)), np.ones(1))
-        self.assertEqual(weights.shape, (4,))
-        self.assertEqual(bias, 0.0)
-        np.testing.assert_array_equal(weights, 0.0)
 
 
 class TestOLSFit(unittest.TestCase):

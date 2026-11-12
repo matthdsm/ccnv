@@ -263,18 +263,24 @@ def build_reference_table(
             bin_size=eff_bs,
             prenatal_bin_size=config.prenatal_bin_size,
             seed=config.seed,
+            cohort_gc=cohort_gc,
+            cohort_mappability=cohort_map,
         )
 
         sexes: tuple[SexLabel, ...] | None = tuple(
             "male" if m else "female" for m in np.array(is_m, dtype=np.bool_)
         )
         sex_source, signal = "prenatal_model", _resolve_sex_signal(cohort, config)
+        quarantined = np.zeros(len(is_m), dtype=np.bool_)
+        if prenatal_meta is not None and prenatal_meta.quarantined_samples is not None:
+            quarantined[prenatal_meta.quarantined_samples] = True
         inference: SexInference | None = SexInference(
             labels=sexes,
             cutoff=float(prenatal_meta.yfrac_threshold),
             fractions=(),
             passed=True,
             reason="prenatal_model",
+            quarantined_mask=quarantined,
         )
     else:
         _, cohort_c_ids = np.unique(

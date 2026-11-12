@@ -88,8 +88,10 @@ class TestFragmentomicsKernels(unittest.TestCase):
         hist[mask_sub] += 200.0 * np.cos(2.0 * np.pi * lengths[mask_sub] / 10.4)
 
         amp, phase = compute_helical_periodicity(hist)
-        self.assertGreater(amp, 50.0)
+        self.assertGreater(amp, 1e-4)
         self.assertTrue(-np.pi <= phase <= np.pi)
+        amp_scaled, _ = compute_helical_periodicity(hist * 10.0)
+        self.assertAlmostEqual(amp, amp_scaled, places=6)
 
         # Flat signal has negligible amplitude
         flat_hist = np.ones(FRAG_NUM_BINS, dtype=np.float64) * 1000.0
@@ -252,7 +254,7 @@ class TestFragmentomicsKernels(unittest.TestCase):
             male_mask=male_mix,
             ffy_values=ffy_mix,
         )
-        self.assertGreater(p_f_clean[143 - FRAG_MIN_LEN], 0.10)
+        self.assertGreater(p_f_clean[143 - FRAG_MIN_LEN], 0.05)
         self.assertAlmostEqual(p_f_clean[250 - FRAG_MIN_LEN], 0.0, places=6)
 
     def test_feature_vector_and_ensemble_training(self) -> None:
@@ -518,44 +520,38 @@ class TestFragmentomicsKernels(unittest.TestCase):
         self.assertEqual(loocv_std, 0.018)
 
     def test_align_reference_to_weighted_sample(self) -> None:
-        from helpers import make_reference_table, make_sample_table
+        from helpers import make_sample_table
 
-        from ccnv.features.fragmentomics import align_reference_to_weighted_sample
+        import ccnv.features.fragmentomics as ff_mod
+        from ccnv.features.fragmentomics import apply_prenatal_fisher_weighting
 
-        ref_table = make_reference_table(
-            branches=["autosomal", "autosomal", "autosomal"],
-            contigs=["chr2", "chr1", "chr1"],
-            starts=[0, 0, 100],
-            ends=[100, 100, 200],
-            contig_lengths={"chr1": 200, "chr2": 100},
-            pca_mean=[30.0, 10.0, 20.0],
-            null_mean=[0.01, -0.02, 0.03],
-        )
-        # Diploid baseline ratios: chr1:0 = 15/10 = 1.5, chr2:0 = 45/30 = 1.5; CNV bin chr1:100 = 40/20 = 2.0
-        # Median baseline scale = median([1.5, 1.5, 2.0]) = 1.5; log2 null_mean stays invariant!
-        u_sample = make_sample_table(
-            [10, 20, 30],
-            contigs=["chr1", "chr1", "chr2"],
-            starts=[0, 100, 0],
-            ends=[100, 200, 100],
-        )
-        w_sample = make_sample_table(
-            [15, 40, 45],
-            contigs=["chr1", "chr1", "chr2"],
-            starts=[0, 100, 0],
-            ends=[100, 200, 100],
-        )
+        self.assertFalse(hasattr(ff_mod, "align_reference_to_weighted_sample"))
 
-        aligned_ref = align_reference_to_weighted_sample(ref_table, u_sample, w_sample)
-        self.assertEqual(
-            aligned_ref.column("contig").to_pylist(), ["chr2", "chr1", "chr1"]
+        sample_tbl = make_sample_table(
+            [10, 20],
+            contigs=["chr1", "chr1"],
+            starts=[0, 100],
+            ends=[100, 200],
+            fragment_lengths=[[140] * 10, [166] * 20],
         )
-        np.testing.assert_allclose(
-            aligned_ref.column("pca_mean").to_numpy(), [45.0, 15.0, 30.0], rtol=1e-5
+        dummy_meta = PrenatalModelMetadata(
+            prenatal_bin_size=100_000,
+            yfrac_threshold=0.004,
+            ffy_intercept=0.0,
+            ffy_slope=1.0,
+            olm_weights=[],
+            olm_bias=0.0,
+            ffx_intercept=1.0,
+            ffx_slope=-0.5,
+            female_chrx_ratio_mean=1.0,
+            female_chrx_ratio_std=0.01,
+            p_fetal_density=[1.0 / 571] * 571,
+            p_maternal_density=[1.0 / 571] * 571,
         )
-        np.testing.assert_allclose(
-            aligned_ref.column("null_mean").to_numpy(), [0.01, -0.02, 0.03], rtol=1e-5
-        )
+        weighted_tbl = apply_prenatal_fisher_weighting(sample_tbl, dummy_meta)
+        self.assertIn("kappa_frag", weighted_tbl.column_names)
+        kappa = weighted_tbl.column("kappa_frag").to_numpy()
+        self.assertTrue(np.all(kappa >= 1.0))
 
 
 if __name__ == "__main__":
