@@ -10,16 +10,16 @@ Copynumber-CNV (`ccnv`) is an independent Python 3.14+ bioinformatics toolkit fo
 
 ## Key Features
 
-- **Versioned Parquet Storage (`1.0.0`)**: Sample bin counts, per-bin cfDNA fragmentomic channels (`fragment_lengths`, `endpoint_count`, `frag_gc_sum`), and reference models are stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC, `ccnv.fragmentomics`, and optional `ccnv.prenatal` metadata.
-- **Constitutional & Prenatal Analysis Modes**: Supports germline CNV profiling (`--mode germline`) and cell-free DNA (cfDNA) non-invasive prenatal screening (`--mode prenatal`) with pure NumPy/SciPy/scikit-learn fetal fraction estimation (`FFY`, `FFX`, `FFA`, `FF_size`), Fisher-optimal fragment length read weighting, 2D stoichiometric Bayesian sex chromosome aneuploidy calling, and segment discordance and fragmentomic origin annotation.
-- **Organism-Agnostic & 0-Based Half-Open Coordinates**: Contig names, order, and lengths are read directly from alignment or FASTA headers without assuming a fixed 24-chromosome layout. All intervals are 0-based half-open `[start, end)`.
-- **Pure-Python & DataFrame-Native Execution**: Uses `polars`, `pysam`, `pyBigWig`, `numpy`, `scipy`, `pyarrow`, `scikit-learn`, and weighted `ruptures` segmentation without external R or container runtime dependencies.
+- **Versioned Parquet Storage (`2.0.0`)**: Sample sketches, per-bin cfDNA fragmentomic channels (`count`, `paired_count`, `frag_len_sum`, `short_frag_count`, `endpoint_count`, `frag_gc_sum`, `frag_bands`), and reference prototype models are stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC, `ccnv.fragmentomics`, and `ccnv.prenatal` metadata.
+- **Constitutional & Prenatal Analysis Modes**: Supports germline CNV profiling (`--mode germline`) and cell-free DNA (cfDNA) non-invasive prenatal screening (`--mode prenatal`) with closed-form Poisson MSY `FFY`, convex logit-link `FFA`, forward $R_X$, reference-side 24-band Fisher weighting, 4D erfc ray-marginalized SCA classification, Student-$t_4$ active FF fusion, and 5-state self-referenced origin and mosaicism calling.
+- **Calibrated Pelt Segmentation & Integer CN Bayes Factors**: Calibrated `ruptures.Pelt` with mBIC penalty and dyadic multi-scale BLUE Z-scores, paired with discrete integer copy-number log-Bayes factors ($CN \in \{0, 1, 2, 3, 4+\}$) recovering homozygous deletions ($CN=0$) and focal deletions down to $0.1\times$ sequencing coverage.
+- **Rust-Accelerated & Organism-Agnostic Execution**: Compiled Rust `ccnv._core` extension wrapping `noodles` and `bigtools` for high-performance multi-threaded BAM/CRAM and BigWig streaming and single-pass BGZF/tabix writing without runtime dependencies on `pysam` or `pybigwig`. Contig names, ordering, and lengths are read directly from alignment or FASTA headers without assuming a fixed 24-chromosome layout.
 
 ---
 
 ## Pipeline Overview
 
-The pipeline structures CNV identification across shallow whole-genome sequencing datasets into four stages: alignment ingestion and binning (`extract`), cohort or FASTA reference construction with covariate bias removal (`reference`), reference usability verification (`ref-qc`), and single-sample projection, change-point segmentation, and event calling (`predict`).
+The pipeline structures CNV identification across shallow whole-genome sequencing datasets into four stages: alignment ingestion and binning (`extract`), cohort or FASTA reference construction with Prototype Graph modeling (`reference`), reference usability verification (`ref-qc`), and single-sample projection, calibrated Pelt segmentation, and copy-number calling (`predict`).
 
 ```mermaid
 flowchart LR

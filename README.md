@@ -11,10 +11,10 @@ Complete documentation, architecture diagrams, and methodology are available at 
 
 ## Features
 
-- **Versioned Parquet Storage (`1.0.0`)**: Sample bin counts, per-bin cfDNA fragmentomic channels (`fragment_lengths`, `endpoint_count`, `frag_gc_sum`), and reference models stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC, `ccnv.fragmentomics`, and optional `ccnv.prenatal` metadata.
-- **Germline & Prenatal Analysis Modes**: Supports constitutional CNV profiling (`--mode germline`) and cfDNA non-invasive prenatal screening (`--mode prenatal`) with pure NumPy/SciPy/scikit-learn fetal fraction estimation (`FFY`, `FFX`, `FFA`, `FF_size`), depth-conserving Fisher-optimal fragment length read weighting, 2D stoichiometric Bayesian sex chromosome aneuploidy calling, segment discordance annotation, and fragmentomic origin calling.
-- **Organism-Agnostic & 0-Based Coordinates**: Contig names, order, and lengths are read directly from alignment or FASTA headers without assuming a fixed 24-chromosome layout. All intervals are 0-based half-open `[start, end)`.
-- **Pure-Python & DataFrame-Native**: Built on `polars`, `pysam`, `pyBigWig`, `numpy`, `scipy`, `pyarrow`, `scikit-learn`, and weighted `ruptures` segmentation without external R or container runtime dependencies.
+- **Versioned Parquet Storage (`2.0.0`)**: Sample sketches, per-bin cfDNA fragmentomic channels (`count`, `paired_count`, `frag_len_sum`, `short_frag_count`, `endpoint_count`, `frag_gc_sum`, `frag_bands`), and reference prototype models are stored as Zstandard-compressed Apache Arrow/Parquet `.ccnv` files with embedded QC, `ccnv.fragmentomics`, and optional `ccnv.prenatal` metadata.
+- **Germline & Prenatal Analysis Modes**: Supports constitutional CNV profiling (`--mode germline`) and cfDNA non-invasive prenatal screening (`--mode prenatal`) with closed-form Poisson MSY `FFY`, convex logit-link `FFA`, forward $`R_X`$, reference-side 24-band Fisher weighting, 4D erfc ray-marginalized SCA classification, Student-$`t_4`$ active FF fusion, and 5-state self-referenced origin calling.
+- **Calibrated Pelt Segmentation & Integer CN Bayes Factors**: Calibrated `ruptures.Pelt` with mBIC penalty and dyadic multi-scale BLUE Z-scores, paired with discrete integer copy-number log-Bayes factors ($`CN \in \lbrace 0, 1, 2, 3, 4+\rbrace`$) recovering homozygous deletions ($`CN=0`$) and focal deletions down to $`0.1\times`$ sequencing coverage.
+- **Rust-Accelerated & Organism-Agnostic Execution**: Built on compiled Rust `ccnv._core` (`noodles` and `bigtools`), `polars`, `numpy`, `scipy`, `pyarrow`, `scikit-learn`, and `ruptures` without runtime dependencies on `pysam` or `pybigwig`. Contig names, order, and lengths are read directly from alignment or FASTA headers without assuming a fixed 24-chromosome layout. All intervals are 0-based half-open `[start, end)`.
 
 ---
 

@@ -394,3 +394,24 @@ class TestDocsMarkdown(unittest.TestCase):
             finally:
                 self.tracked_md_files = orig_files
                 self.repo_root = orig_root
+
+    def test_no_stale_v1_schema_or_solver_claims_in_published_docs(self) -> None:
+        """Verify no obsolete v1 schema names, removed functions, or legacy solver claims exist."""
+        stale_tokens = (
+            "list<uint16>",
+            "nearest_ref_indices",
+            "align_reference_to_weighted_sample",
+            "pysam.AlignmentFile",
+            "MATERNAL_SOMATIC",
+            "write_calls_vcf",
+        )
+        for path in self.tracked_md_files:
+            if path.name == "CHANGELOG.md":
+                continue
+            text = path.read_text(encoding="utf-8")
+            for token in stale_tokens:
+                self.assertNotIn(
+                    token,
+                    text,
+                    f"Stale v1 token {token!r} found in {path.relative_to(self.repo_root)}",
+                )
