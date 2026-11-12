@@ -13,6 +13,7 @@ use crate::{ContigLookup, covariate_error, normalize_chr_name};
 const NUM_GC_QUANTILES: usize = 8;
 const FASTA_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 const SLIDING_GC_WINDOW_BP: usize = 200;
+const _: () = assert!(crate::GC_QUANTILE_EDGES_ARR.len() == NUM_GC_QUANTILES + 1);
 
 const FASTA_BASE_LUT: [u8; 256] = build_fasta_base_lut();
 
@@ -41,30 +42,21 @@ const fn build_fasta_base_lut() -> [u8; 256] {
 
 #[inline]
 fn gc_quantile_bin(gc: f64) -> usize {
-    if gc < 0.30 {
-        0
-    } else if gc < 0.35 {
-        1
-    } else if gc < 0.40 {
-        2
-    } else if gc < 0.45 {
-        3
-    } else if gc < 0.50 {
-        4
-    } else if gc < 0.55 {
-        5
-    } else if gc < 0.65 {
-        6
-    } else {
-        7
+    for q in 0..(NUM_GC_QUANTILES - 1) {
+        if gc < crate::GC_QUANTILE_EDGES_ARR[q + 1] {
+            return q;
+        }
     }
+    NUM_GC_QUANTILES - 1
 }
 
 struct ContigBinScanner {
     contig_len: u64,
+    max_pos: u64,
     bin_size: u64,
     n_bins: usize,
     pos: u64,
+    stopped: bool,
     cur_bin: usize,
     cur_bin_end: u64,
     cur_eff_win: usize,
@@ -84,14 +76,20 @@ struct ContigBinScanner {
 
 impl ContigBinScanner {
     fn new(contig_len: u64, bin_size: u64) -> Self {
+        Self::with_max_pos(contig_len, contig_len, bin_size)
+    }
+
+    fn with_max_pos(contig_len: u64, max_pos: u64, bin_size: u64) -> Self {
         let n_bins = contig_len.div_ceil(bin_size) as usize;
         let first_end = bin_size.min(contig_len);
         let first_eff_win = (first_end as usize).clamp(1, SLIDING_GC_WINDOW_BP);
         Self {
             contig_len,
+            max_pos: max_pos.min(contig_len),
             bin_size,
             n_bins,
             pos: 0,
+            stopped: false,
             cur_bin: 0,
             cur_bin_end: first_end,
             cur_eff_win: first_eff_win,
@@ -108,6 +106,11 @@ impl ContigBinScanner {
             n_frac: vec![1.0f32; n_bins],
             gc_quantiles: vec![0.0f32; n_bins * NUM_GC_QUANTILES],
         }
+    }
+
+    #[inline]
+    fn is_stopped(&self) -> bool {
+        self.stopped
     }
 
     #[inline]
@@ -152,7 +155,8 @@ impl ContigBinScanner {
 
     fn feed_bytes(&mut self, buf: &[u8]) {
         for &byte in buf {
-            if self.pos >= self.contig_len {
+            if self.pos >= self.max_pos || byte == b'>' {
+                self.stopped = true;
                 break;
             }
             let code = FASTA_BASE_LUT[usize::from(byte)];
@@ -344,7 +348,7 @@ fn scan_indexed_fasta_contig(
         return Err("invalid FASTA .fai record line dimensions".to_owned());
     }
 
-    let mut scanner = ContigBinScanner::new(target_len, bin_size);
+    let mut scanner = ContigBinScanner::with_max_pos(target_len, seq_len, bin_size);
     if seq_len == 0 {
         return Ok(scanner.finish());
     }
@@ -357,7 +361,7 @@ fn scan_indexed_fasta_contig(
         .map_err(|e| format!("FASTA seek error: {e}"))?;
 
     let mut remaining = total_file_bytes;
-    while remaining > 0 {
+    while remaining > 0 && !scanner.is_stopped() {
         let to_read = (remaining as usize).min(chunk_buf.len());
         let n = file
             .read(&mut chunk_buf[..to_read])
@@ -516,14 +520,14 @@ pub(crate) fn read_fasta_contigs_core(
 pub(crate) fn scan_fasta_gc_quantiles<'py>(
     py: Python<'py>,
     fasta_path: &str,
-    contigs: Vec<(String, usize)>,
-    bin_size: usize,
+    contigs: Vec<(String, isize)>,
+    bin_size: isize,
 ) -> PyResult<(
     Bound<'py, PyArray1<f32>>,
     Bound<'py, PyArray1<f32>>,
     Bound<'py, PyArray2<f32>>,
 )> {
-    if bin_size == 0 {
+    if bin_size <= 0 {
         return Err(covariate_error("bin_size must be a positive integer"));
     }
     let p = PathBuf::from(fasta_path);
@@ -534,14 +538,16 @@ pub(crate) fn scan_fasta_gc_quantiles<'py>(
             if !p.is_file() {
                 return Err(format!("FASTA not found: {}", p.display()));
             }
-            for (cname, clen) in &contigs {
-                if *clen == 0 {
+            let mut checked_contigs = Vec::with_capacity(contigs.len());
+            for (cname, clen) in contigs {
+                if clen <= 0 {
                     return Err(format!("contig {cname} length must be positive"));
                 }
+                checked_contigs.push((cname, clen as usize));
             }
             let fai_path = PathBuf::from(format!("{}.fai", p.display()));
             if !fai_path.is_file() {
-                return scan_unindexed_fasta(&p, &contigs, bsize_u64);
+                return scan_unindexed_fasta(&p, &checked_contigs, bsize_u64);
             }
 
             let fai = fasta::fai::fs::read(&fai_path)
@@ -555,7 +561,7 @@ pub(crate) fn scan_fasta_gc_quantiles<'py>(
 
             let mut matched_any = false;
             let mut total_bins = 0usize;
-            for (_, clen) in &contigs {
+            for (_, clen) in &checked_contigs {
                 total_bins += (*clen as u64).div_ceil(bsize_u64) as usize;
             }
 
@@ -566,7 +572,7 @@ pub(crate) fn scan_fasta_gc_quantiles<'py>(
                 File::open(&p).map_err(|e| format!("failed to open FASTA {}: {e}", p.display()))?;
             let mut chunk_buf = vec![0u8; FASTA_WINDOW_BYTES];
 
-            for (cname, clen) in &contigs {
+            for (cname, clen) in &checked_contigs {
                 let nb = (*clen as u64).div_ceil(bsize_u64) as usize;
                 let arrays = if let Some(fa_idx) = lookup.resolve(cname) {
                     matched_any = true;
@@ -583,7 +589,7 @@ pub(crate) fn scan_fasta_gc_quantiles<'py>(
                 append_contig_gc(&mut gc_all, &mut nf_all, &mut gq_all, nb, arrays);
             }
 
-            if !matched_any && !contigs.is_empty() {
+            if !matched_any && !checked_contigs.is_empty() {
                 return Err(format!(
                     "FASTA {} contains none of the target contigs",
                     p.display()
@@ -604,11 +610,11 @@ pub(crate) fn scan_fasta_gc_quantiles<'py>(
 pub(crate) fn scan_bigwig_means<'py>(
     py: Python<'py>,
     bw_path: &str,
-    contigs: Vec<(String, usize)>,
-    bin_size: usize,
+    contigs: Vec<(String, isize)>,
+    bin_size: isize,
     full_bin_denominator: bool,
 ) -> PyResult<Bound<'py, PyArray1<f32>>> {
-    if bin_size == 0 {
+    if bin_size <= 0 {
         return Err(covariate_error("bin_size must be a positive integer"));
     }
     let p = PathBuf::from(bw_path);
@@ -636,7 +642,7 @@ pub(crate) fn scan_bigwig_means<'py>(
             };
             let mut total_bins = 0usize;
             for (cname, clen) in &contigs {
-                if *clen == 0 {
+                if *clen <= 0 {
                     return Err(format!("contig {cname} length must be positive"));
                 }
                 total_bins += (*clen as u64).div_ceil(bsize_u64) as usize;
@@ -786,5 +792,42 @@ mod tests {
             )
         );
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn indexed_scanner_stops_at_seq_len_and_header_marker_and_quantile_edges() {
+        use std::num::NonZeroU64;
+
+        use noodles::fasta::fai;
+
+        use super::{gc_quantile_bin, scan_indexed_fasta_contig};
+
+        assert_eq!(gc_quantile_bin(0.0), 0);
+        assert_eq!(gc_quantile_bin(0.299), 0);
+        assert_eq!(gc_quantile_bin(0.30), 1);
+        assert_eq!(gc_quantile_bin(0.50), 5);
+        assert_eq!(gc_quantile_bin(0.65), 7);
+        assert_eq!(gc_quantile_bin(1.0), 7);
+
+        // Stale .fai claims 8 bases at offset 6, but >chr2 appears after 4 G bases.
+        let raw = b">chr1\nGGGG\n>chr2\nTTTT\n";
+        let tmp = std::env::temp_dir().join(format!("ccnv_stale_fai_{}.fa", std::process::id()));
+        std::fs::File::create(&tmp).unwrap().write_all(raw).unwrap();
+        let mut f = std::fs::File::open(&tmp).unwrap();
+        let stale_rec = fai::Record::new(
+            "chr1",
+            8,
+            6,
+            NonZeroU64::try_from(4).unwrap(),
+            NonZeroU64::try_from(5).unwrap(),
+        );
+        let mut buf = vec![0u8; 64];
+        let (gc, nf, _) = scan_indexed_fasta_contig(&mut f, &stale_rec, 8, 4, &mut buf).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        // Bin 0 sees 4 G bases (gc=1.0, nf=0.0); '>' stops before bin 1 so bin 1 stays untouched (NAN, nf=1.0).
+        assert_eq!(gc[0], 1.0);
+        assert!(gc[1].is_nan());
+        assert_eq!(nf, vec![0.0, 1.0]);
     }
 }

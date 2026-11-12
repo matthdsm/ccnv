@@ -1,11 +1,12 @@
 """Type stubs for the compiled ccnv._core Rust extension module."""
 
 from collections.abc import Iterable, Sequence
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
-from ccnv.models.results import ScanAlignmentResult, ScanQcCounts
+from ccnv.models.results import ScanAlignmentResult as _ScanAlignmentResult
 
 FRAG_BAND_EDGES: tuple[int, ...]
 GC_QUANTILE_EDGES: tuple[float, ...]
@@ -13,8 +14,6 @@ GC_QUANTILE_EDGES: tuple[float, ...]
 __all__ = [
     "FRAG_BAND_EDGES",
     "GC_QUANTILE_EDGES",
-    "ScanAlignmentResult",
-    "ScanQcCounts",
     "read_alignment_header",
     "read_fasta_contigs_core",
     "scan_alignment_bins",
@@ -42,7 +41,7 @@ def scan_alignment_bins(
     exclude_secondary: bool = True,
     exclude_supplementary: bool = True,
     exclude_unmapped: bool = True,
-) -> ScanAlignmentResult: ...
+) -> _ScanAlignmentResult: ...
 def read_fasta_contigs_core(fasta_path: str) -> list[tuple[str, int]]: ...
 def scan_fasta_gc_quantiles(
     fasta_path: str,
@@ -57,7 +56,7 @@ def scan_bigwig_means(
 ) -> NDArray[np.float32]: ...
 def write_bgzf_indexed(
     gz_path: str,
-    preset: str,
+    preset: Literal["bed", "vcf"],
     contig_names: Sequence[str],
     max_contig_len: int,
     chunks: Iterable[bytes],

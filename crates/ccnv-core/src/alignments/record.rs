@@ -393,7 +393,7 @@ pub(super) fn process_record<R: AlignmentRecord>(
     if flags.is_segmented() {
         acc.paired_end = true;
         if tlen <= 0 {
-            if tlen < 0 && flags.is_properly_segmented() {
+            if tlen < 0 {
                 let (_, first_m, last_m) = record.cigar_summary()?;
                 if let Some(m) = extract_motif(&seq, is_rev, first_m, last_m) {
                     acc.motif_counts[usize::from(m)] += 1;
@@ -417,8 +417,8 @@ pub(super) fn process_record<R: AlignmentRecord>(
 
     if flags.is_segmented() {
         let tlen_usize = tlen as usize;
-        let p = (start_0 + tlen_usize / 2).min(max_coord);
-        let end_pos = start_0.max(start_0 + tlen_usize - 1).min(max_coord);
+        let p = start_0.saturating_add(tlen_usize / 2).min(max_coord);
+        let end_pos = start_0.saturating_add(tlen_usize - 1).min(max_coord);
 
         acc.add_endpoint(target.bin_offset + (start_0 / bin_size));
         acc.add_endpoint(target.bin_offset + (end_pos / bin_size));
@@ -453,15 +453,18 @@ pub(super) fn process_record<R: AlignmentRecord>(
         } else {
             seq.len().max(1)
         };
-        let read_end = start_0 + span;
+        let read_end = start_0.saturating_add(span);
         let p = if filters.se_fragment_length == 0 {
             start_0.min(max_coord)
         } else if !is_rev {
-            (start_0 + filters.se_fragment_length / 2).min(max_coord)
+            start_0
+                .saturating_add(filters.se_fragment_length / 2)
+                .min(max_coord)
         } else {
-            let half = (filters.se_fragment_length / 2) as isize;
-            let shifted = (read_end as isize) - 1 - half;
-            (shifted.max(0) as usize).min(max_coord)
+            read_end
+                .saturating_sub(1)
+                .saturating_sub(filters.se_fragment_length / 2)
+                .min(max_coord)
         };
         let five_prime = if !is_rev {
             start_0.min(max_coord)
@@ -659,5 +662,43 @@ mod tests {
                 out_ascii.qc.mate_dedup_skipped
             )
         );
+    }
+
+    #[test]
+    fn improper_pair_motif_gating_is_symmetric_and_saturates_large_tlen() {
+        let target = TargetContig {
+            header_ref_id: 0,
+            length: 1000,
+            bin_offset: 0,
+            role: ContigRole::Autosomal,
+        };
+        let improper_fwd = Flags::SEGMENTED | Flags::FIRST_SEGMENT;
+        let improper_rev = Flags::SEGMENTED | Flags::LAST_SEGMENT | Flags::REVERSE_COMPLEMENTED;
+        let m8 = [(CigarKind::Match, 8)];
+        let r_fwd = make_record(improper_fwd, Some(100), 60, i32::MAX, &m8, b"CCCCAAAA");
+        let r_rev = make_record(improper_rev, Some(200), 60, -140, &m8, b"TTTTGGGG");
+
+        let filters = FilterSpec {
+            min_mapq: 1,
+            require_proper_pair: false,
+            exclude_duplicates: true,
+            exclude_secondary: true,
+            exclude_supplementary: true,
+            exclude_unmapped: true,
+            collect_bands: false,
+            se_fragment_length: 0,
+        };
+        let mut acc = TileAccumulator::new(0, 0, 10, false);
+        process_record(&r_fwd, &target, 100, filters, None, &mut acc).unwrap();
+        process_record(&r_rev, &target, 100, filters, None, &mut acc).unwrap();
+        let out = reduce_tile_accumulators(vec![acc], 10, false);
+
+        // Both CCCC (0b01_01_01_01 = 85) on forward and revcomp(GGGG) = CCCC (85) on reverse
+        // must be counted symmetrically when require_proper_pair is false.
+        assert_eq!(out.motif_counts[85], 2);
+        // Large i32::MAX tlen clamps midpoint and downstream endpoint to last bin without overflow.
+        assert_eq!(out.count[9], 1);
+        assert_eq!(out.endpoint_count[0], 1);
+        assert_eq!(out.endpoint_count[9], 1);
     }
 }
