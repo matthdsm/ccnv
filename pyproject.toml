@@ -68,6 +68,9 @@ jsonschema = ">=4.20.0"
 rust = "*"
 maturin = ">=1.8,<2.0"
 
+[tool.pixi.target.linux.dependencies]
+binutils = "*"
+
 [tool.pixi.pypi-dependencies]
 ccnv = { path = ".", editable = true }
 
@@ -97,7 +100,7 @@ format = "ruff check --fix . && ruff format ."
 lint = "ruff check ."
 test = "pytest"
 hooks = "prek run --all-files"
-docker-build = "docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/matthdsm/copynumber-cnv:dev ."
+docker-build = "docker build --platform linux/amd64 -t ghcr.io/matthdsm/copynumber-cnv:dev ."
 docs-build = "pixi run -e docs zensical build --clean --strict"
 docs-serve = "pixi run -e docs zensical serve"
 

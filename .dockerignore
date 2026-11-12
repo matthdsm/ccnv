@@ -8,6 +8,10 @@ __pycache__
 *.py[cod]
 build
 dist
+target
+*.so
+*.dylib
+*.pyd
 tests
 docs
 benchmarks

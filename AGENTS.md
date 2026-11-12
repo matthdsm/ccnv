@@ -70,7 +70,7 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 - `pixi run format`: Format code with Ruff.
 - `pixi run test`: Run the test suite.
 - `pixi run hooks`: Run pre-commit hooks (managed by `prek`).
-- `pixi run docker-build`: Build the Docker image for `linux/amd64` and `linux/arm64` (Buildx cache; not loaded into the local daemon).
+- `pixi run docker-build`: Build the local `linux/amd64` Docker image (`ghcr.io/matthdsm/copynumber-cnv:dev`).
 - `pixi run docs-build`: Build the documentation site in the `docs` environment with Zensical (`pixi run -e docs zensical build --clean --strict`).
 - `pixi run docs-serve`: Serve the documentation site locally in the `docs` environment with Zensical (`pixi run -e docs zensical serve`).
 

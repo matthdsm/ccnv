@@ -7,8 +7,8 @@ COPY src ./src
 
 RUN rm -f /app/src/ccnv/*.so /app/src/ccnv/*.dylib /app/src/ccnv/*.pyd \
     && pixi install --locked -e prod \
+    && pixi shell-hook --as-is -e prod -s bash > /shell-hook \
     && rm -rf /app/.pixi/envs/prod/lib/rustlib /app/.pixi/envs/prod/bin/rust* /app/.pixi/envs/prod/bin/cargo* \
-    && pixi shell-hook -e prod -s bash > /shell-hook \
     && printf '#!/bin/bash\n' > /app/entrypoint.sh \
     && cat /shell-hook >> /app/entrypoint.sh \
     && printf '\nexec "$@"\n' >> /app/entrypoint.sh

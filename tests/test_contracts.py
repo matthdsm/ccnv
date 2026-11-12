@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import io
 import tokenize
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -22,13 +23,22 @@ class TestPackagingContracts(unittest.TestCase):
 
     def test_dockerfile_copies_rust_crates_and_strips_build_artifacts(self) -> None:
         dockerfile = (self.repo_root / "Dockerfile").read_text(encoding="utf-8")
+        pyproject = tomllib.loads(
+            (self.repo_root / "pyproject.toml").read_text(encoding="utf-8")
+        )
         self.assertIn("Cargo.toml", dockerfile)
         self.assertIn("Cargo.lock", dockerfile)
         self.assertIn("crates", dockerfile)
-        self.assertIn("FROM ghcr.io/prefix-dev/pixi:0.84.1 AS build", dockerfile)
+        self.assertRegex(
+            dockerfile, r"(?m)^FROM ghcr\.io/prefix-dev/pixi:\d+\.\d+\.\d+ AS build$"
+        )
         self.assertIn("FROM ubuntu:26.04 AS production", dockerfile)
         self.assertIn("rm -rf", dockerfile)
         self.assertIn("rustlib", dockerfile)
+        self.assertIn(
+            "binutils",
+            pyproject["tool"]["pixi"]["target"]["linux"]["dependencies"],
+        )
 
     def test_ci_preserves_action_versions_and_expands_multiarch_matrix(self) -> None:
         ci = (self.repo_root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
