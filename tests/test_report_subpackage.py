@@ -27,7 +27,6 @@ from ccnv.report.html import (
 )
 from ccnv.report.vcf import (
     build_vcf_header,
-    vcf_float,
     write_bins_vcf,
     write_segments_vcf,
 )
@@ -122,15 +121,10 @@ class TestBedReport(unittest.TestCase):
                 records = list(tbx.fetch("chr1", 0, 200))
                 self.assertEqual(len(records), 2)
                 self.assertIn("1.234568", records[0])
-                self.assertIn("NaN", records[1])
+                self.assertIn("\t.\t.\t0.000000\t0\ttrue\tautosomal", records[1])
 
 
 class TestVcfReport(unittest.TestCase):
-    def test_vcf_float(self) -> None:
-        self.assertIsNone(vcf_float(float("nan")))
-        self.assertIsNone(vcf_float(float("inf")))
-        self.assertEqual(vcf_float(2.5), 2.5)
-
     def test_build_vcf_header(self) -> None:
         header = build_vcf_header(
             contig_lengths={"chr1": 1000, "chr2": 2000},
@@ -319,3 +313,5 @@ class TestHtmlReport(unittest.TestCase):
                 payload = json.loads(match.group(1))
                 self.assertEqual(payload["sample"], "TEST_SAMPLE")
                 self.assertEqual(payload["contigs"], ["chr1"])
+                self.assertEqual(payload["r_thresh"], 0.0)
+                self.assertEqual(payload["segment_calls"], ["gain"])

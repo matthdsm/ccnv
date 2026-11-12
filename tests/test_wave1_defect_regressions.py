@@ -15,7 +15,7 @@ import yaml
 
 import ccnv.predict
 from ccnv.features.cohort import (
-    _alloc_cohort_counts,
+    alloc_cohort_counts,
     build_fisher_weighted_cohort,
     load_and_assemble_cohort,
 )
@@ -322,17 +322,17 @@ class TestWave1DefectRegressions(unittest.TestCase):
                 )
             )
 
-        auto_fit, ffy_fit, p_meta, _ = fit_prenatal_models(
+        p_meta, (auto_fit, ffy_fit), _ = fit_prenatal_models(
             tables,
             entries,
-            bin_size=bin_size,
             prenatal_bin_size=100_000,
             cohort_gc=cohort_gc,
             cohort_mappability=cohort_map,
         )
         self.assertIsNotNone(ffy_fit.gc)
         self.assertIsNotNone(ffy_fit.mappability)
-        assert ffy_fit.gc is not None and ffy_fit.mappability is not None
+        if ffy_fit.gc is None or ffy_fit.mappability is None:
+            self.fail("expected ffy_fit gc and mappability")
         np.testing.assert_allclose(ffy_fit.gc, 0.55, atol=1e-6)
         np.testing.assert_allclose(ffy_fit.mappability, 0.80, atol=1e-6)
 
@@ -349,13 +349,14 @@ class TestWave1DefectRegressions(unittest.TestCase):
         ref_table = assemble_reference_table([autosomal_5k_fit, auto_fit, ffy_fit])
         res = predict_prenatal(tables[4], ref_table, p_meta)
         self.assertIsNotNone(res.ffy)
-        assert res.ffy is not None
+        if res.ffy is None:
+            self.fail("expected res.ffy")
         self.assertAlmostEqual(res.ffy, 0.12, delta=0.03)
 
     def test_defect3_fetal_fraction_result_accepts_ffx_and_ffa_logit_default(
         self,
     ) -> None:
-        call, _, act_ff, act_se, act_source = classify_sca_ray_4d(
+        sca_cls = classify_sca_ray_4d(
             delta_x=-0.06,
             sigma_x=0.01,
             ffy=0.0,
@@ -373,32 +374,29 @@ class TestWave1DefectRegressions(unittest.TestCase):
                 "XYY": 1e-6,
             },
         )
-        self.assertEqual(call, "XO")
-        self.assertEqual(act_source, "FFX")
+        self.assertEqual(sca_cls.call, "XO")
+        self.assertEqual(sca_cls.active_ff_source, "FFX")
         ff_res = FetalFractionResult(
             fetal_sex="F",
-            active_ff=act_ff,
-            active_ff_source=act_source,
+            active_ff=sca_cls.active_ff,
+            active_ff_source=sca_cls.active_ff_source,
             ffy=None,
-            ffx=act_ff,
+            ffx=sca_cls.active_ff,
             ffa=0.0,
             chrx_ratio=0.94,
             chry_score=0.0,
             yfrac_threshold=0.005,
             sca=SCAResult("XO", True, 0.95, -6.0, None),
-            active_ff_se=act_se,
+            active_ff_se=sca_cls.active_ff_se,
         )
         self.assertEqual(ff_res.active_ff_source, "FFX")
 
-        raw_meta = {
+        raw_meta: dict[str, object] = {
             "prenatal_bin_size": 100_000,
             "yfrac_threshold": 0.005,
-            "ffy_intercept": 0.0,
             "ffy_slope": 1.0,
             "olm_weights": [0.2],
             "olm_bias": -2.0,
-            "ffx_intercept": 1.0,
-            "ffx_slope": -0.5,
             "female_chrx_ratio_mean": 1.0,
             "female_chrx_ratio_std": 0.01,
         }
@@ -491,10 +489,10 @@ class TestWave1DefectRegressions(unittest.TestCase):
 
     def test_defect5_alloc_cohort_counts_memmap_threshold_exact_bytes(self) -> None:
         # 262,144 float32 elements == 1,048,576 bytes == 1 MiB exact -> in-RAM ndarray
-        in_ram = _alloc_cohort_counts(262_144, 1, max_batch_memory_mb=1)
+        in_ram = alloc_cohort_counts(262_144, 1, max_batch_memory_mb=1)
         self.assertFalse(isinstance(in_ram, np.memmap))
         # 262,145 float32 elements == 1,048,580 bytes > 1 MiB -> disk-backed memmap
-        spilled = _alloc_cohort_counts(262_145, 1, max_batch_memory_mb=1)
+        spilled = alloc_cohort_counts(262_145, 1, max_batch_memory_mb=1)
         self.assertIsInstance(spilled, np.memmap)
 
     def test_defect6_pca_components_none_dynamic_svht_vs_explicit_five_cap(
@@ -599,6 +597,8 @@ class TestWave1DefectRegressions(unittest.TestCase):
         )
         usable = np.array([True, False, True, True], dtype=np.bool_)
         ps = BandPrefixSums.from_sample_table(bufs, bin_usable=usable)
+        if ps is None:
+            self.fail("expected non-None BandPrefixSums")
         seg_counts = ps.query("chr1", 0, 20_000)
         self.assertEqual(int(seg_counts[20]), 0)
         self.assertEqual(int(seg_counts[3]), 150)
@@ -657,8 +657,8 @@ class TestWave1DefectRegressions(unittest.TestCase):
         annotated, _ = annotate_prenatal_origin_and_lod(
             [seg],
             prefix_sums=ps_trisomy,
-            p_fetal_24=p_f24,
-            p_maternal_24=p_m24,
+            p_fetal_density=p_f24,
+            p_maternal_density=p_m24,
             mu_fetal_w=mu_f_w,
             mu_maternal_w=1.0,
             active_ff=active_ff,

@@ -2,6 +2,7 @@ import gzip
 import json
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -12,10 +13,9 @@ from helpers import write_synthetic_sample
 from typer.testing import CliRunner
 
 from ccnv.cli import app
+from ccnv.features import covariates as covariates_mod
 from ccnv.features.covariates import (
-    build_exogenous_covariate_basis,
     covariate_features,
-    fit_poisson_covariate_trends,
     mask_covariates,
     validate_min_mappability,
 )
@@ -34,6 +34,10 @@ from ccnv.models import (
 from ccnv.models.schemas import decode_metadata
 from ccnv.predict import run as run_predict
 from ccnv.reference import run as run_reference
+from ccnv.stats.regression import (
+    build_exogenous_covariate_basis,
+    fit_poisson_covariate_trends,
+)
 
 
 def _write_bigwig(
@@ -181,9 +185,12 @@ class TestTrackLoadingAndMasking(unittest.TestCase):
             self.assertIsNone(gc_q_bw)
 
     def test_validate_min_mappability_rejects_invalid_values(self) -> None:
+        check_fn: Callable[..., None] = validate_min_mappability
         for bad in (-0.1, 1.1, float("nan"), float("inf"), True):
             with self.subTest(bad=bad), self.assertRaises(CovariateError):
-                validate_min_mappability(bad)  # type: ignore[arg-type]
+                check_fn(bad)
+        self.assertFalse(hasattr(covariates_mod, "build_exogenous_covariate_basis"))
+        self.assertFalse(hasattr(covariates_mod, "fit_poisson_covariate_trends"))
 
 
 class TestCovariateRegression(unittest.TestCase):

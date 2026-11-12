@@ -66,7 +66,7 @@ class TestBenchmarkNumericAgreement(unittest.TestCase):
                 abs(segments[0].end - expected_end * BIN_SIZE),
                 BIN_SIZE,
             )
-            absolute_errors.append(abs(segments[0].mean - expected_ratio))
+            absolute_errors.append(abs(segments[0].ratio - expected_ratio))
 
             r_arr = np.asarray(ratios, dtype=np.float64)
             z_arr = np.asarray(zscores, dtype=np.float64)
@@ -138,8 +138,8 @@ class TestBenchmarkNumericAgreement(unittest.TestCase):
                 contig_length=int(columns[1][-1]),
                 penalty=0.05,
             ):
-                if math.isfinite(segment.mean) and abs(segment.mean) > 0.05:
-                    call = "gain" if segment.mean > 0.0 else "loss"
+                if math.isfinite(segment.ratio) and abs(segment.ratio) > 0.05:
+                    call = "gain" if segment.ratio > 0.0 else "loss"
                     observed.append((contig, segment.start, segment.end, call))
 
         self.assertEqual(len(expected), 1)

@@ -24,12 +24,12 @@ from typer.testing import CliRunner
 from ccnv.cli import app
 from ccnv.features.cohort import (
     cohort_from_fasta,
-    infer_sample_sexes,
     load_and_assemble_cohort,
     mask_low_coverage_per_contig,
     validate_cohort,
 )
-from ccnv.io.parquet import read_sample_parquet
+from ccnv.features.sex import infer_sample_sexes
+from ccnv.io.parquet import read_sample_buffers
 from ccnv.io.tracks import read_fasta_contigs
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
@@ -38,19 +38,14 @@ from ccnv.models import (
     PredictConfig,
     ReferenceConfig,
     ReferenceError,
-    SampleMetadata,
     SamplesheetEntry,
-    parquet_path,
-)
-from ccnv.models.schemas import (
-    ArtifactKind,
     SchemaError,
     decode_metadata,
-    validate_table,
+    parquet_path,
+    validate_reference_table,
 )
 from ccnv.predict import run as predict
 from ccnv.reference import (
-    DEFAULT_SEX_CONTIGS,
     build_reference_table,
     run,
 )
@@ -114,7 +109,7 @@ class TestReferenceSchemaRejection(unittest.TestCase):
             SchemaError,
             "does not match previous bin end|duplicates|strictly monotonic|non-overlapping|contiguous",
         ):
-            validate_table(table, ArtifactKind.REFERENCE)
+            validate_reference_table(table)
 
 
 class TestMaskingAndPca(unittest.TestCase):
@@ -213,7 +208,7 @@ class TestSexInference(unittest.TestCase):
                 min_sex_group_size=3,
             ),
         )
-        validate_table(table, ArtifactKind.REFERENCE)
+        validate_reference_table(table)
         branches = set(table.column("branch").to_pylist())
         self.assertEqual(
             branches,
@@ -260,16 +255,18 @@ class TestSexInference(unittest.TestCase):
         self.assertEqual(model["sex_signal_contig"], "chrY")
 
     def test_defaults_select_unprefixed_x_and_y(self) -> None:
+        females = [[40, 20, 1], [38, 21, 2]]
+        males = [[40, 10, 18], [42, 11, 19]]
         tables = [
             _sample_table(
-                [40, 2, 1],
+                counts,
                 contigs=["1", "X", "Y"],
                 starts=[0, 0, 0],
                 ends=[100, 100, 100],
                 contig_lengths={"1": 100, "X": 100, "Y": 100},
                 identity={"id": f"s{index}"},
             )
-            for index in range(4)
+            for index, counts in enumerate(females + males)
         ]
         table = build_reference_table(
             validate_cohort(tuple(tables)),
@@ -279,8 +276,6 @@ class TestSexInference(unittest.TestCase):
                     for index in range(4)
                 ),
                 prefix=Path("unused"),
-                sex_contigs=DEFAULT_SEX_CONTIGS,
-                sex_signal_contig="chrY",
                 pca_components=2,
                 min_cohort_size=4,
                 min_sex_group_size=2,
@@ -312,8 +307,6 @@ class TestSexInference(unittest.TestCase):
                     for index in range(4)
                 ),
                 prefix=Path("unused"),
-                sex_contigs=DEFAULT_SEX_CONTIGS,
-                sex_signal_contig="chrY",
                 pca_components=2,
                 min_cohort_size=4,
             ),
@@ -457,7 +450,7 @@ class TestSexInference(unittest.TestCase):
             run(replace(config, prefix=root / "ref2"))
             first = pq.read_table(root / "ref.ccnv")
             second = pq.read_table(root / "ref2.ccnv")
-            validate_table(first, ArtifactKind.REFERENCE)
+            validate_reference_table(first)
             self.assertEqual(
                 decode_metadata(first.schema.metadata)["model"],
                 decode_metadata(second.schema.metadata)["model"],
@@ -503,7 +496,7 @@ class TestSexInference(unittest.TestCase):
                 run(config)
                 ref_path = root / f"ref_{cohort_size}.ccnv"
                 table = pq.read_table(ref_path)
-                validate_table(table, ArtifactKind.REFERENCE)
+                validate_reference_table(table)
                 self.assertIn("proto_ids", table.column_names)
                 self.assertIn("proto_weights", table.column_names)
                 self.assertIn("mean_distance", table.column_names)
@@ -544,12 +537,9 @@ class TestReferencePublishedCrams(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0, result.output)
                 sample_paths.append(parquet_path(prefix))
 
-            samples = [read_sample_parquet(path) for path in sample_paths]
+            samples = [read_sample_buffers(path) for path in sample_paths]
             self.assertEqual(samples[0].num_rows, samples[1].num_rows)
-            self.assertEqual(
-                SampleMetadata.from_table(samples[0]).contig_order,
-                ("chr21",),
-            )
+            self.assertEqual(samples[0].meta.contig_order, ("chr21",))
 
             sheet_path = root / "samplesheet.yaml"
             sheet_path.write_text(
@@ -576,7 +566,7 @@ class TestReferencePublishedCrams(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
 
             table = pq.read_table(parquet_path(reference_prefix))
-            validate_table(table, ArtifactKind.REFERENCE)
+            validate_reference_table(table)
             metadata = decode_metadata(table.schema.metadata)
             model = metadata["model"]
             assert isinstance(model, dict)
@@ -624,7 +614,7 @@ class TestFlatFastaReference(unittest.TestCase):
                 )
             )
             table = pq.read_table(parquet_path(prefix))
-            validate_table(table, ArtifactKind.REFERENCE)
+            validate_reference_table(table)
             model = decode_metadata(table.schema.metadata)["model"]
             assert isinstance(model, dict)
             self.assertTrue(model["flat"])

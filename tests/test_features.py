@@ -14,29 +14,31 @@ from ccnv.features.binning import (
 )
 from ccnv.features.cohort import (
     Cohort,
-    estimate_superblock_size_factors,
-    infer_sample_sexes,
+    estimate_size_factors,
     mask_low_coverage_per_contig,
     validate_cohort,
 )
 from ccnv.features.covariates import (
-    DEFAULT_MIN_MAPPABILITY,
-    build_exogenous_covariate_basis,
     covariate_features,
-    fit_poisson_covariate_trends,
     mask_covariates,
     validate_min_mappability,
 )
 from ccnv.features.prenatal_origin import annotate_prenatal_origin_and_lod
-from ccnv.features.rebinning import rebin_sample_buffers, rebin_sample_sketch
+from ccnv.features.rebinning import rebin_sample_buffers
+from ccnv.features.sex import infer_sample_sexes
 from ccnv.models import (
+    DEFAULT_MIN_MAPPABILITY,
     BinCompatibilityError,
     CovariateError,
-    ReferenceError,
+    InvalidInputError,
     SampleBuffers,
     SegmentResult,
 )
 from ccnv.stats.prenatal_math import classify_sca_ray_4d
+from ccnv.stats.regression import (
+    build_exogenous_covariate_basis,
+    fit_poisson_covariate_trends,
+)
 
 
 class TestFeaturesBinning(unittest.TestCase):
@@ -97,20 +99,20 @@ class TestFeaturesCohort(unittest.TestCase):
         starts = np.array([0, 100], dtype=np.int64)
         ends = np.array([100, 200], dtype=np.int64)
         usable = np.ones(2, dtype=np.bool_)
-        sf = estimate_superblock_size_factors(
-            counts, contigs, starts, ends, usable, block_bp=100
+        sf = estimate_size_factors(
+            counts, usable, contigs=contigs, starts=starts, ends=ends, block_bp=100
         )
         np.testing.assert_allclose(sf[1] / sf[0], 2.0, rtol=1e-6)
 
     def test_superblock_size_factors_zero_sum_fails(self) -> None:
         counts = np.array([[0.0, 10.0], [0.0, 20.0]], dtype=np.float32)
-        with self.assertRaises(ReferenceError):
-            estimate_superblock_size_factors(
+        with self.assertRaises(InvalidInputError):
+            estimate_size_factors(
                 counts,
-                ("chr1", "chr1"),
-                np.array([0, 100], dtype=np.int64),
-                np.array([100, 200], dtype=np.int64),
                 np.ones(2, dtype=np.bool_),
+                contigs=("chr1", "chr1"),
+                starts=np.array([0, 100], dtype=np.int64),
+                ends=np.array([100, 200], dtype=np.int64),
                 block_bp=100,
             )
 
@@ -150,15 +152,14 @@ class TestFeaturesCohort(unittest.TestCase):
         np.testing.assert_allclose(cohort.counts[:, 0], [10.0, 20.0])
         np.testing.assert_allclose(cohort.counts[:, 1], [10.0, 20.0])
 
-    def test_rebin_sample_sketch_and_buffers(self) -> None:
+    def test_rebin_sample_buffers(self) -> None:
         t = make_sample_table([5, 5, 10, 10], contig_lengths={"chr1": 200}, bin_size=50)
-        rebinned = rebin_sample_sketch(t, target_bin_size=100)
-        self.assertEqual(rebinned.num_rows, 2)
-        np.testing.assert_allclose(rebinned.column("count").to_numpy(), [10, 20])
-        bufs = rebin_sample_buffers(SampleBuffers.from_table(t), 100)
+        src = SampleBuffers.from_table(t)
+        bufs = rebin_sample_buffers(src, 100)
+        self.assertEqual(bufs.num_rows, 2)
         np.testing.assert_allclose(bufs.count, [10, 20])
         with self.assertRaises(BinCompatibilityError):
-            rebin_sample_sketch(t, target_bin_size=25)
+            rebin_sample_buffers(src, 25)
 
 
 class TestFeaturesCovariates(unittest.TestCase):
@@ -235,7 +236,7 @@ class TestFeaturesPrenatal(unittest.TestCase):
             "XO": 1e-6,
             "XXX": 1e-6,
         }
-        call_xx, *_ = classify_sca_ray_4d(
+        res_xx = classify_sca_ray_4d(
             delta_x=0.0,
             sigma_x=0.02,
             ffy=0.0,
@@ -244,9 +245,9 @@ class TestFeaturesPrenatal(unittest.TestCase):
             sigma_ffa=0.02,
             clinical_priors=fem_priors,
         )
-        self.assertEqual(call_xx, "XX")
+        self.assertEqual(res_xx.call, "XX")
 
-        call_xo, *_ = classify_sca_ray_4d(
+        res_xo = classify_sca_ray_4d(
             delta_x=-0.05,
             sigma_x=0.01,
             ffy=0.0,
@@ -255,9 +256,9 @@ class TestFeaturesPrenatal(unittest.TestCase):
             sigma_ffa=0.02,
             clinical_priors=fem_priors,
         )
-        self.assertEqual(call_xo, "XO")
+        self.assertEqual(res_xo.call, "XO")
 
-        call_xxx, *_ = classify_sca_ray_4d(
+        res_xxx = classify_sca_ray_4d(
             delta_x=0.05,
             sigma_x=0.01,
             ffy=0.0,
@@ -266,9 +267,9 @@ class TestFeaturesPrenatal(unittest.TestCase):
             sigma_ffa=0.02,
             clinical_priors=fem_priors,
         )
-        self.assertEqual(call_xxx, "XXX")
+        self.assertEqual(res_xxx.call, "XXX")
 
-        call_xy, *_ = classify_sca_ray_4d(
+        res_xy = classify_sca_ray_4d(
             delta_x=-0.05,
             sigma_x=0.02,
             ffy=0.10,
@@ -277,9 +278,9 @@ class TestFeaturesPrenatal(unittest.TestCase):
             sigma_ffa=0.02,
             clinical_priors=male_priors,
         )
-        self.assertEqual(call_xy, "XY")
+        self.assertEqual(res_xy.call, "XY")
 
-        call_xxy, *_ = classify_sca_ray_4d(
+        res_xxy = classify_sca_ray_4d(
             delta_x=0.0,
             sigma_x=0.01,
             ffy=0.10,
@@ -288,7 +289,7 @@ class TestFeaturesPrenatal(unittest.TestCase):
             sigma_ffa=0.02,
             clinical_priors=male_priors,
         )
-        self.assertEqual(call_xxy, "XXY")
+        self.assertEqual(res_xxy.call, "XXY")
 
     def test_annotate_prenatal_origin_and_lod(self) -> None:
         segments = [

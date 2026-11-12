@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 from helpers import make_sample_table
 
@@ -16,9 +17,16 @@ from ccnv.features.cohort import (
     rebin_cohort,
     validate_cohort,
 )
-from ccnv.features.rebinning import rebin_sample_buffers, rebin_sample_sketch
-from ccnv.models import SamplesheetEntry
+from ccnv.features.rebinning import rebin_sample_buffers
+from ccnv.io.parquet import read_sample_buffers, write_sample_parquet
+from ccnv.models import SampleBuffers, SamplesheetEntry
 from ccnv.models.exceptions import ReferenceError
+
+
+def _rebin_table(table: pa.Table, target_bin_size: int) -> pa.Table:
+    return rebin_sample_buffers(
+        SampleBuffers.from_table(table), target_bin_size
+    ).to_table(base_metadata=table.schema.metadata)
 
 
 class TestCohortCompatibility(unittest.TestCase):
@@ -120,15 +128,18 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
     def test_normalize_depth_median_of_ratios_matches_deseq2_and_resists_trisomy(
         self,
     ) -> None:
-        # 10 bins x 4 samples; sample 0 has 2x library depth and a 10x amplification in bins 0..2
-        base = np.full((10, 4), 100.0, dtype=np.float64)
+        # 100 bins of 100 kb (10 x 1 Mb super-blocks) x 4 samples;
+        # sample 0 has 2x library depth and a 10x amplification in bins 0..29 (3 super-blocks)
+        base = np.full((100, 4), 100.0, dtype=np.float64)
         base[:, 0] = 200.0
-        base[0:3, 0] = 2000.0  # 30% of genome amplified 10x in sample 0
+        base[0:30, 0] = 2000.0
+        contigs = ["chr1"] * 100
+        starts = np.arange(100, dtype=np.int64) * 100_000
+        ends = starts + 100_000
 
-        # Reference DESeq2 formula: geometric mean per row, then median of ratios per sample
         log_gm = np.mean(np.log(base), axis=1, keepdims=True)
         expected_sf = np.median(base / np.exp(log_gm), axis=0)
-        sf = estimate_size_factors(base)
+        sf = estimate_size_factors(base, contigs=contigs, starts=starts, ends=ends)
         np.testing.assert_allclose(
             sf / np.median(sf),
             expected_sf / np.median(expected_sf),
@@ -136,12 +147,17 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         )
 
         normed = base / sf
-        # Unamplified diploid bins (3..9) in sample 0 must equal diploid bins in samples 1..3
-        np.testing.assert_allclose(normed[3:, 0], normed[3:, 1], rtol=1e-12)
+        # Unamplified diploid bins (30..99) in sample 0 must equal diploid bins in samples 1..3
+        np.testing.assert_allclose(normed[30:, 0], normed[30:, 1], rtol=1e-12)
 
     def test_normalize_depth_sparse_zero_fallback(self) -> None:
         sparse = np.array([[10.0, 0.0], [0.0, 20.0]], dtype=np.float64)
-        sf = estimate_size_factors(sparse)
+        sf = estimate_size_factors(
+            sparse,
+            contigs=["chr1", "chr2"],
+            starts=np.array([0, 0], dtype=np.int64),
+            ends=np.array([100_000, 100_000], dtype=np.int64),
+        )
         normed = sparse / sf
         np.testing.assert_allclose(normed.sum(axis=0), [15.0, 15.0], rtol=1e-12)
 
@@ -162,25 +178,42 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         np.testing.assert_allclose(rebinned.counts, [[4.0, 6.0], [12.0, 14.0]])
 
     def test_estimate_size_factors_validation(self) -> None:
-        with self.assertRaises(InvalidInputError):
-            estimate_size_factors(np.array([1.0, 2.0]))
+        c2 = ["chr1", "chr2"]
+        s2 = np.array([0, 0], dtype=np.int64)
+        e2 = np.array([100_000, 100_000], dtype=np.int64)
 
         with self.assertRaises(InvalidInputError):
-            estimate_size_factors(np.array([[-1.0, 2.0], [3.0, 4.0]]))
+            estimate_size_factors(np.array([[1.0, 2.0], [3.0, 4.0]]))
 
         with self.assertRaises(InvalidInputError):
-            estimate_size_factors(np.array([[0.0, 2.0], [0.0, 4.0]]))
+            estimate_size_factors(np.array([1.0, 2.0]), contigs=c2, starts=s2, ends=e2)
+
+        with self.assertRaises(InvalidInputError):
+            estimate_size_factors(
+                np.array([[-1.0, 2.0], [3.0, 4.0]]), contigs=c2, starts=s2, ends=e2
+            )
+
+        with self.assertRaises(InvalidInputError):
+            estimate_size_factors(
+                np.array([[0.0, 2.0], [0.0, 4.0]]), contigs=c2, starts=s2, ends=e2
+            )
 
         with self.assertRaises(InvalidInputError):
             estimate_size_factors(
                 np.array([[1.0, 2.0], [3.0, 4.0]]),
                 mask=np.array([True]),
+                contigs=c2,
+                starts=s2,
+                ends=e2,
             )
 
         with self.assertRaises(InvalidInputError):
             estimate_size_factors(
                 np.array([[1.0, 2.0], [3.0, 4.0]]),
                 mask=np.array([False, False]),
+                contigs=c2,
+                starts=s2,
+                ends=e2,
             )
 
     def test_rebin_sample_table_polars_fast_path(self) -> None:
@@ -194,7 +227,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             contig_lengths={"chr1": 180, "chr2": 100},
             bin_size=50,
         )
-        rebinned = rebin_sample_sketch(table, 100)
+        rebinned = _rebin_table(table, 100)
         codes, names, starts, ends = reconstruct_sample_grid(
             SampleMetadata.from_table(rebinned)
         )
@@ -215,7 +248,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             contig_lengths={"chr1": 140},
             bin_size=20,
         )
-        rebinned = rebin_sample_sketch(table, 50)
+        rebinned = _rebin_table(table, 50)
         _, _, starts, ends = reconstruct_sample_grid(
             SampleMetadata.from_table(rebinned)
         )
@@ -275,7 +308,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             frag_gc_sums=[0.8, 0.4, 0.9, 0.5],
         )
 
-        rebinned = rebin_sample_sketch(table, 100)
+        rebinned = _rebin_table(table, 100)
         self.assertEqual(rebinned.num_rows, 2)
         _, _, starts, ends = reconstruct_sample_grid(
             SampleMetadata.from_table(rebinned)
@@ -340,7 +373,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         table_with_frag = table.replace_schema_metadata(meta_dict)
 
         with self.assertLogs("ccnv.features.rebinning", level="WARNING") as cm:
-            rebinned = rebin_sample_sketch(table_with_frag, 50)
+            rebinned = _rebin_table(table_with_frag, 50)
 
         self.assertTrue(any("clears fragmentomic channels" in msg for msg in cm.output))
         self.assertNotIn(FRAGMENTOMICS_METADATA_KEY, rebinned.schema.metadata or {})
@@ -369,7 +402,7 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         ):
             validate_cohort([s1, s2])
 
-    def test_read_sample_parquet_and_extract_cram(self) -> None:
+    def test_read_sample_buffers_and_extract_cram(self) -> None:
         from published_fixtures import (
             PUBLISHED_BIN_SIZE,
             PUBLISHED_CRAM,
@@ -379,16 +412,15 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         )
 
         from ccnv.extract import extract_sample_table
-        from ccnv.io.parquet import read_sample_parquet, write_sample_parquet
         from ccnv.models import ExtractConfig
 
         table = make_sample_table([5, 10], contig_lengths={"chr1": 200}, bin_size=100)
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "sample.parquet"
             write_sample_parquet(table, p)
-            loaded = read_sample_parquet(p)
+            loaded = read_sample_buffers(p)
             self.assertEqual(loaded.num_rows, table.num_rows)
-            self.assertEqual(loaded.column("count").to_pylist(), [5, 10])
+            self.assertEqual(loaded.count.tolist(), [5, 10])
 
         cram = ensure_published_file(PUBLISHED_CRAM, PUBLISHED_CRAM_URL)
         fasta = ensure_published_fasta()

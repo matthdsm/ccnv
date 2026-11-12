@@ -19,13 +19,13 @@ class TestWeightedL2Cost(unittest.TestCase):
     def test_matches_direct_weighted_residual_sum_of_squares(self) -> None:
         values = np.array([1.0, 2.0, 10.0])
         weights = np.array([1.0, 3.0, 0.0])
-        cost = WeightedL2Cost().fit(values, weights)
+        cost = WeightedL2Cost().fit(np.column_stack((values, weights)))
 
         expected = np.sum(weights[:2] * np.square(values[:2] - 1.75))
         self.assertAlmostEqual(cost.error(0, 3), expected)
 
     def test_zero_weight_slice_has_zero_cost(self) -> None:
-        cost = WeightedL2Cost().fit([1.0, 2.0], [0.0, 0.0])
+        cost = WeightedL2Cost().fit(np.column_stack(([1.0, 2.0], [0.0, 0.0])))
 
         self.assertEqual(cost.error(0, 2), 0.0)
 
@@ -45,7 +45,7 @@ class TestSegmentContig(unittest.TestCase):
         self.assertEqual(
             [(item.start, item.end) for item in segments], [(0, 400), (400, 800)]
         )
-        self.assertEqual([item.mean for item in segments], [0.0, 1.0])
+        self.assertEqual([item.ratio for item in segments], [0.0, 1.0])
         self.assertEqual([item.weight for item in segments], [4.0, 6.0])
 
     def test_pre_split_blacklist_gap_decouples_chromosome_arms(self) -> None:
@@ -82,7 +82,7 @@ class TestSegmentContig(unittest.TestCase):
             min_size=2,
             max_blacklist_gap=2_000_000,
         )
-        coords = [(s.start, s.end, round(s.mean, 2)) for s in segments]
+        coords = [(s.start, s.end, round(s.ratio, 2)) for s in segments]
         self.assertEqual(
             coords,
             [
@@ -110,7 +110,7 @@ class TestSegmentContig(unittest.TestCase):
             min_size=2,
         )
         self.assertEqual(
-            [(s.start, s.end, round(s.mean, 2)) for s in segments],
+            [(s.start, s.end, round(s.ratio, 2)) for s in segments],
             [(200_000, 500_000, 0.0), (500_000, 800_000, 1.0)],
         )
 
@@ -188,7 +188,7 @@ class TestSegmentContig(unittest.TestCase):
         )
 
         self.assertEqual([(item.start, item.end) for item in segments], [(100, 300)])
-        self.assertAlmostEqual(segments[0].mean, 0.2)
+        self.assertAlmostEqual(segments[0].ratio, 0.2)
         self.assertLessEqual(segments[0].end, 350)
 
     def test_preserves_arbitrary_x_and_y_contig_names(self) -> None:
@@ -252,7 +252,7 @@ class TestSegmentContig(unittest.TestCase):
 
         self.assertEqual(len(segments), 1)
         self.assertEqual((segments[0].start, segments[0].end), (0, 7))
-        self.assertEqual(segments[0].mean, 0.25)
+        self.assertEqual(segments[0].ratio, 0.25)
 
     def test_rejects_interval_past_contig_end(self) -> None:
         with self.assertRaisesRegex(ValueError, "exceeds"):
@@ -300,7 +300,7 @@ class TestBenchmarkConcordance(unittest.TestCase):
             )
             self.assertEqual(len(result), 1)
             self.assertEqual(result[0].end // 100_000, expected[contig][1])
-            if result[0].mean > 0.2:
+            if result[0].ratio > 0.2:
                 observed_calls.append("gain")
         self.assertEqual(observed_calls, ["gain"])
 
@@ -364,7 +364,9 @@ class TestBenchmarkConcordance(unittest.TestCase):
         self.assertEqual(matched_observed, 49)
         self.assertEqual(len(observed_segments), 50)
         gains = [
-            (item.contig, item.start, item.end) for item in observed if item.mean > 0.05
+            (item.contig, item.start, item.end)
+            for item in observed
+            if item.ratio > 0.05
         ]
         self.assertEqual(gains, [("21", 13_000_000, 46_700_000)])
 

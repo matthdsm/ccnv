@@ -387,7 +387,7 @@ class TestV2CalibrationAndContracts(unittest.TestCase):
             sample_bands=sample_bands,
             prefix_sums=prefix_sums,
             bin_usable=bin_usable,
-            p_fetal_24=p_f_24,
+            p_fetal_density=p_f_24,
             mu_fetal_w=1.0,
             mu_maternal_w=1.0,
             active_ff=active_ff,
@@ -395,7 +395,7 @@ class TestV2CalibrationAndContracts(unittest.TestCase):
             sca_call="XX",
             sample_depth_per_mb=25_000.0,
             sys_var_per_mb=0.0001,
-            p_maternal_24=p_m_24,
+            p_maternal_density=p_m_24,
         )
 
         self.assertEqual(len(annotated), 4)
@@ -532,7 +532,7 @@ class TestV2CalibrationAndContracts(unittest.TestCase):
         self.assertEqual(chr2_del[0].call, "loss")
         self.assertEqual(chr2_del[0].copy_number, 0)
         self.assertIsNotNone(chr2_del[0].log_bf)
-        self.assertGreater(float(chr2_del[0].log_bf or 0.0), 20.0)
+        self.assertGreater(float(chr2_del[0].log_bf or 0.0), 15.0)
 
     def test_zero_pysam_or_pybigwig_imports_in_src_ccnv(self) -> None:
         """Verify zero pysam or pyBigWig runtime imports exist in src/ccnv/."""

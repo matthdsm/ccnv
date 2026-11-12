@@ -4,14 +4,22 @@ from __future__ import annotations
 
 import json
 import unittest
+from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 import pyarrow as pa
+from helpers import metadata_for
 
-from ccnv.models import AnalysisMode, ReadFilters
+from ccnv.models import (
+    ReadFilters,
+    SampleMetadata,
+    validate_metadata,
+    validate_reference_table,
+    validate_sample_table,
+    validate_schema,
+)
 from ccnv.models.config import ExtractConfig
 from ccnv.models.results import FetalFractionResult, SCAResult, SegmentResult
 from ccnv.models.schemas import (
@@ -38,25 +46,21 @@ from ccnv.models.schemas import (
     SchemaVersionError,
     build_reference_schema,
     decode_metadata,
-    metadata_for,
     reconstruct_sample_grid,
-    validate_reference_table,
-    validate_sample_table,
-    validate_schema,
-    validate_table,
 )
+
+
+def _call[T](fn: Callable[..., T], *args: object, **kwargs: object) -> T:
+    return fn(*args, **kwargs)
 
 
 def _make_prenatal_metadata() -> PrenatalModelMetadata:
     return PrenatalModelMetadata(
         prenatal_bin_size=100_000,
         yfrac_threshold=0.0041,
-        ffy_intercept=0.0012,
         ffy_slope=0.985,
         olm_weights=[0.02 for _ in range(50)],
         olm_bias=0.005,
-        ffx_intercept=1.0004,
-        ffx_slope=-0.498,
         female_chrx_ratio_mean=1.0003,
         female_chrx_ratio_std=0.0112,
     )
@@ -173,14 +177,12 @@ class TestSchemaContracts(unittest.TestCase):
         meta = PrenatalModelMetadata(
             prenatal_bin_size=100_000,
             yfrac_threshold=0.0041,
-            ffy_intercept=0.0012,
             ffy_slope=0.985,
             olm_weights=[0.02 for _ in range(50)],
             olm_bias=0.005,
-            ffx_intercept=1.0004,
-            ffx_slope=-0.498,
             female_chrx_ratio_mean=1.0003,
             female_chrx_ratio_std=0.0112,
+            alpha_1=-0.498,
             p_fetal_density=p_fetal,
             p_maternal_density=p_maternal,
             ff_frag_weights=weights,
@@ -192,6 +194,16 @@ class TestSchemaContracts(unittest.TestCase):
         self.assertEqual(meta.p_fetal_density, p_fetal)
         self.assertEqual(meta.ff_size_std, 0.018)
         self.assertEqual(meta.ff_frag_bias, -1.25)
+        self.assertEqual(meta.alpha_1, -0.498)
+        for removed in (
+            "ffy_intercept",
+            "ffx_intercept",
+            "ffx_slope",
+            "ffx_std",
+            "alpha_0",
+            "sigma_x_sys",
+        ):
+            self.assertFalse(hasattr(meta, removed))
 
     def test_results_and_config_fragmentomics_fields(self) -> None:
         sca_res = SCAResult(
@@ -235,17 +247,14 @@ class TestSchemaContracts(unittest.TestCase):
         cfg = ExtractConfig(
             alignment=Path("sample.bam"),
             prefix=Path("out"),
-            min_frag_len=30,
-            max_frag_len=600,
         )
-        self.assertEqual(cfg.min_frag_len, 30)
-        self.assertEqual(cfg.max_frag_len, 600)
-        with self.assertRaisesRegex(ValueError, "invalid min_frag_len"):
+        self.assertFalse(hasattr(cfg, "min_frag_len"))
+        self.assertFalse(hasattr(cfg, "max_frag_len"))
+        with self.assertRaisesRegex(ValueError, "bin_size must be a positive integer"):
             ExtractConfig(
                 alignment=Path("sample.bam"),
                 prefix=Path("out"),
-                min_frag_len=600,
-                max_frag_len=30,
+                bin_size=0,
             )
 
     def test_sample_contract_round_trip(self) -> None:
@@ -264,6 +273,8 @@ class TestSchemaContracts(unittest.TestCase):
 
         validate_schema(schema, ArtifactKind.SAMPLE)
         decoded = decode_metadata(schema.metadata)
+        validated = validate_metadata(decoded, ArtifactKind.SAMPLE)
+        self.assertIsInstance(validated, SampleMetadata)
         self.assertEqual(decoded["schema_version"], SCHEMA_VERSION)
         self.assertEqual(decoded["coordinate_system"], COORDINATE_SYSTEM)
         self.assertEqual(decoded["contig_lengths"], {"chr1": 250_001, "scaffold-A": 99})
@@ -327,7 +338,6 @@ class TestSchemaContracts(unittest.TestCase):
             schema=SAMPLE_SCHEMA.with_metadata(metadata),
         )
 
-        validate_table(table, ArtifactKind.SAMPLE)
         smeta = validate_sample_table(table)
         codes, names, starts, ends = reconstruct_sample_grid(smeta)
         self.assertEqual(names, ("scaffold-A",))
@@ -360,8 +370,6 @@ class TestSchemaContracts(unittest.TestCase):
             schema=SAMPLE_SCHEMA.with_metadata(metadata),
         )
 
-        with self.assertRaisesRegex(SchemaError, "outside"):
-            validate_table(table, ArtifactKind.SAMPLE)
         with self.assertRaisesRegex(SchemaError, "outside"):
             validate_sample_table(table)
 
@@ -416,8 +424,12 @@ class TestSchemaContracts(unittest.TestCase):
             pca_rank=2,
         )
         validate_schema(ref_table.schema, ArtifactKind.REFERENCE)
-        validate_table(ref_table, ArtifactKind.REFERENCE)
-        validate_reference_table(ref_table)
+        self.assertIsInstance(
+            validate_metadata(decode_metadata(ref_meta), ArtifactKind.REFERENCE),
+            ReferenceMetadata,
+        )
+        rmeta = validate_reference_table(ref_table)
+        self.assertIsInstance(rmeta, ReferenceMetadata)
 
         old_schema = pa.schema(
             [
@@ -463,6 +475,7 @@ class TestSchemaContracts(unittest.TestCase):
         meta = _make_prenatal_metadata()
         as_dict = meta.to_dict()
         self.assertEqual(as_dict["prenatal_bin_size"], 100_000)
+        self.assertEqual(as_dict["alpha_1"], -0.5)
         self.assertNotIn("mlp_w1", as_dict)
         self.assertNotIn("preface_std", as_dict)
 
@@ -477,14 +490,12 @@ class TestSchemaContracts(unittest.TestCase):
         meta = PrenatalModelMetadata(
             prenatal_bin_size=100_000,
             yfrac_threshold=0.0041,
-            ffy_intercept=0.0012,
             ffy_slope=0.985,
             olm_weights=[0.02 for _ in range(50)],
             olm_bias=0.005,
-            ffx_intercept=1.0004,
-            ffx_slope=-0.498,
             female_chrx_ratio_mean=1.0003,
             female_chrx_ratio_std=0.0112,
+            alpha_1=-0.498,
             p_fetal_density=[0.01] * 571,
             p_maternal_density=[0.02] * 571,
             ff_frag_weights=[0.5] * 36,
@@ -495,6 +506,7 @@ class TestSchemaContracts(unittest.TestCase):
         )
         as_dict = meta.to_dict()
         for key in (
+            "alpha_1",
             "p_fetal_density",
             "p_maternal_density",
             "ff_frag_weights",
@@ -517,13 +529,13 @@ class TestSchemaContracts(unittest.TestCase):
     def test_prenatal_model_metadata_defaults_for_optional_keys(self) -> None:
         meta = _make_prenatal_metadata()
         as_dict = meta.to_dict()
-        for k in ("ffy_std", "ffa_std", "ffx_std", "ffa_logit_mode"):
+        for k in ("alpha_1", "ffy_std", "ffa_std", "ffa_logit_mode"):
             as_dict.pop(k, None)
 
         loaded = PrenatalModelMetadata.from_dict(as_dict)
+        self.assertEqual(loaded.alpha_1, -0.5)
         self.assertEqual(loaded.ffy_std, 0.01)
         self.assertEqual(loaded.ffa_std, 0.02)
-        self.assertEqual(loaded.ffx_std, 0.025)
         self.assertTrue(loaded.ffa_logit_mode)
 
     def test_prenatal_model_metadata_rejects_missing_keys_or_empty_dict(self) -> None:
@@ -547,14 +559,22 @@ class TestSchemaContracts(unittest.TestCase):
             PrenatalModelMetadata(
                 prenatal_bin_size=0,
                 yfrac_threshold=0.0,
-                ffy_intercept=0.0,
                 ffy_slope=1.0,
                 olm_weights=[],
                 olm_bias=0.0,
-                ffx_intercept=0.0,
-                ffx_slope=1.0,
                 female_chrx_ratio_mean=1.0,
                 female_chrx_ratio_std=0.0,
+            )
+        with self.assertRaisesRegex(ValueError, "alpha_1 must be negative"):
+            PrenatalModelMetadata(
+                prenatal_bin_size=100_000,
+                yfrac_threshold=0.0,
+                ffy_slope=1.0,
+                olm_weights=[],
+                olm_bias=0.0,
+                female_chrx_ratio_mean=1.0,
+                female_chrx_ratio_std=0.01,
+                alpha_1=0.0,
             )
 
     def test_reference_metadata_round_trip(self) -> None:
@@ -571,7 +591,8 @@ class TestSchemaContracts(unittest.TestCase):
         self.assertEqual(ref_meta.prenatal_bin_size, 100_000)
 
         metadata_dict = ref_meta.to_metadata()
-        model_dict = cast(dict[str, object], metadata_dict["model"])
+        model_dict = metadata_dict["model"]
+        assert isinstance(model_dict, dict)
         self.assertEqual(model_dict["mode"], "prenatal")
         self.assertEqual(model_dict["prenatal_bin_size"], 100_000)
         self.assertIn("prenatal", metadata_dict)
@@ -592,23 +613,25 @@ class TestSchemaContracts(unittest.TestCase):
         )
 
     def test_reference_metadata_validation(self) -> None:
-        with self.assertRaisesRegex(ValueError, "bin_size must be a positive integer"):
+        with self.assertRaisesRegex(SchemaError, "bin_size must be a positive integer"):
             ReferenceMetadata(
                 bin_size=-1,
                 contig_lengths={"chr1": 100},
                 branches=("autosomal",),
             )
-        bad_mode = cast(AnalysisMode, "invalid_mode")
         with self.assertRaisesRegex(
-            ValueError, "mode must be 'germline' or 'prenatal'"
+            SchemaError, "mode must be 'germline' or 'prenatal'"
         ):
-            ReferenceMetadata(
+            _call(
+                ReferenceMetadata,
                 bin_size=5000,
                 contig_lengths={"chr1": 100},
                 branches=("autosomal",),
-                mode=bad_mode,
+                mode="invalid_mode",
             )
-        with self.assertRaisesRegex(ValueError, "non-empty mapping"):
+        with self.assertRaisesRegex(
+            SchemaError, "contig_lengths must be a non-empty object"
+        ):
             ReferenceMetadata(
                 bin_size=5000,
                 contig_lengths={},
@@ -616,8 +639,6 @@ class TestSchemaContracts(unittest.TestCase):
             )
 
     def test_sample_metadata_validation_and_error_boundary(self) -> None:
-        from ccnv.models import SampleMetadata
-
         with self.assertRaises(SchemaError):
             SampleMetadata(
                 bin_size=0,

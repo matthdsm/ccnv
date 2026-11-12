@@ -12,17 +12,40 @@ import pyarrow as pa
 from ccnv._core import FRAG_BAND_EDGES
 from ccnv.io.parquet import write_reference_parquet, write_sample_parquet
 from ccnv.models import (
+    COORDINATE_SYSTEM,
     NUM_FRAG_BANDS,
     NUM_GC_QUANTILES,
     NUM_PROTOTYPES_PER_BIN,
-    ReadFilters,
-)
-from ccnv.models.schemas import (
     SAMPLE_SCHEMA,
+    SCHEMA_VERSION,
     ArtifactKind,
+    ReadFilters,
     build_reference_schema,
-    metadata_for,
+    encode_metadata,
+    validate_metadata,
 )
+
+
+def metadata_for(
+    kind: ArtifactKind,
+    *,
+    contig_lengths: Mapping[str, int],
+    values: Mapping[str, object],
+) -> dict[bytes, bytes]:
+    """Build complete metadata for a test artifact, preserving sample contig order."""
+    extra: dict[str, object] = {}
+    if kind is ArtifactKind.SAMPLE and "contig_order" not in values:
+        extra["contig_order"] = list(contig_lengths.keys())
+    metadata: dict[str, object] = {
+        "artifact_kind": kind.value,
+        "schema_version": SCHEMA_VERSION,
+        "coordinate_system": COORDINATE_SYSTEM,
+        "contig_lengths": dict(contig_lengths),
+        **extra,
+        **values,
+    }
+    validate_metadata(metadata, kind)
+    return encode_metadata(metadata)
 
 
 def make_sample_table(

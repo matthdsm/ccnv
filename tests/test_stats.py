@@ -7,7 +7,8 @@ import unittest
 import numpy as np
 
 from ccnv import stats
-from ccnv.models.exceptions import ReferenceError
+from ccnv.models.exceptions import InvalidInputError
+from ccnv.models.results import SegmentResult
 from ccnv.stats.neighbors import (
     build_whitened_subspace_features,
     calibrate_prototype_dispersion,
@@ -25,17 +26,16 @@ from ccnv.stats.prenatal_math import (
     classify_sca_ray_4d,
     fit_msy_sex_mixture,
     fuse_active_fetal_fraction_student_t4,
-    ols_fit,
 )
 from ccnv.stats.regression import (
     build_exogenous_covariate_basis,
     fit_poisson_covariate_trends,
     half_sample_mode,
+    mad_scale,
     standardize_column,
 )
 from ccnv.stats.segmentation import (
     ContigSegmentationInput,
-    Segment,
     WeightedL2Cost,
     segment_and_score_genome,
     segment_contig,
@@ -53,10 +53,11 @@ class TestStatsPackageExports(unittest.TestCase):
             "LN2_SQ",
             "LOG_WAVE_CLIP",
             "ContigSegmentationInput",
+            "FragmentomicLandmarks",
+            "LogitEnsembleFit",
             "MSYSexModel",
             "PoissonFFYModel",
-            "PreparedContigData",
-            "Segment",
+            "SCARayClassification",
             "WeightedL2Cost",
             "WhitenedPCAResult",
             "align_histogram",
@@ -67,23 +68,22 @@ class TestStatsPackageExports(unittest.TestCase):
             "classify_sca_ray_4d",
             "compute_autosomal_density",
             "compute_band_fisher_weights",
+            "compute_fragment_length_llr",
             "compute_helical_periodicity",
             "compute_kish_loco_inflation",
             "compute_loco_prototype_support",
             "compute_motif_diversity_score",
             "deconvolve_fetal_maternal_densities",
-            "deconvolve_fetal_maternal_em",
             "encode_kmer_4",
             "estimate_dyadic_inflation",
             "estimate_sample_landmarks",
+            "estimate_superblock_scales",
             "evaluate_band_weighted_counts",
-            "evaluate_blue_scores_and_bayes_factors",
             "evaluate_loco_prototype_baseline",
             "evaluate_poisson_msy_ffy",
             "exact_poisson_log2_jensen_bias",
             "exact_poisson_log_variance",
             "fit_ff_fragmentomics_ensemble",
-            "fit_ffa_logit_ensemble",
             "fit_forward_ffx_model",
             "fit_logit_linear_ensemble",
             "fit_msy_sex_mixture",
@@ -95,7 +95,8 @@ class TestStatsPackageExports(unittest.TestCase):
             "half_sample_mode",
             "hsm_biweight_mode",
             "interpolate_dyadic_inflation",
-            "ols_fit",
+            "mad_scale",
+            "partition_contiguous_superblocks",
             "pca_irlba_numpy",
             "predict_ff_fragmentomics",
             "predict_ff_kl_deconvolution",
@@ -106,9 +107,9 @@ class TestStatsPackageExports(unittest.TestCase):
             "squeeze_var",
             "standardize_column",
         ]
+        self.assertEqual(stats.__all__, expected_symbols)
         for symbol in expected_symbols:
             self.assertTrue(hasattr(stats, symbol), f"Symbol {symbol} missing in stats")
-            self.assertIn(symbol, stats.__all__)
 
 
 class TestWhitenedPCA(unittest.TestCase):
@@ -148,11 +149,16 @@ class TestWhitenedPCA(unittest.TestCase):
         self.assertTrue(np.all(np.isfinite(wave)))
 
     def test_fit_whitened_pca_invalid_shapes(self) -> None:
-        with self.assertRaises((ReferenceError, ValueError)):
+        with self.assertRaises(InvalidInputError):
             fit_whitened_pca(
                 np.empty((0, 0), dtype=np.float32),
                 np.empty((0, 0), dtype=np.float32),
                 np.empty(0, dtype=bool),
+            )
+        with self.assertRaises(InvalidInputError):
+            project_huber_pca_wave(
+                np.zeros(4, dtype=np.float64),
+                np.zeros((2, 5), dtype=np.float32),
             )
 
     def test_pca_irlba_numpy_matches_expected_shapes(self) -> None:
@@ -171,12 +177,11 @@ class TestPrototypeNeighbors(unittest.TestCase):
         contig_ids = np.repeat(np.arange(4, dtype=np.int16), 10)
         usable = np.ones(n_bins, dtype=bool)
         features = rng.normal(size=(n_bins, 3)).astype(np.float32)
-        centers, proto_ids, proto_weights, mean_dist = fit_prototype_graph(
+        proto_ids, proto_weights, mean_dist = fit_prototype_graph(
             features,
             max_prototypes=12,
             top_r=4,
         )
-        self.assertEqual(centers.shape[1], 3)
         self.assertEqual(proto_ids.shape, (n_bins, 4))
         self.assertEqual(proto_weights.shape, (n_bins, 4))
         self.assertEqual(mean_dist.shape, (n_bins,))
@@ -191,7 +196,6 @@ class TestPrototypeNeighbors(unittest.TestCase):
             proto_ids,
             proto_weights,
             pca_rank=1,
-            n_prototypes=int(centers.shape[0]),
         )
         self.assertEqual(null_mean.shape, (n_bins,))
         self.assertEqual(bio_disp.shape, (n_bins,))
@@ -212,9 +216,7 @@ class TestPrototypeNeighbors(unittest.TestCase):
         true_sigma2 = (d0_true * s0_sq_true) / rng.chisquare(df=d0_true, size=2000)
         sample_var = true_sigma2 * (rng.chisquare(df=df, size=2000) / df)
 
-        var_post, d0_hat, s0_sq_hat = squeeze_var(
-            sample_var, df=df, winsor_tail_p=(0.0, 0.0)
-        )
+        var_post, d0_hat, s0_sq_hat = squeeze_var(sample_var, df=df)
         self.assertAlmostEqual(s0_sq_hat, s0_sq_true, delta=0.008)
         self.assertAlmostEqual(d0_hat, d0_true, delta=2.5)
         expected_post = (d0_hat * s0_sq_hat + df * sample_var) / (d0_hat + df)
@@ -235,7 +237,7 @@ class TestSegmentationAndRegression(unittest.TestCase):
     def test_weighted_l2_cost_and_segment_genome(self) -> None:
         values = np.array([1.0, 2.0, 10.0])
         weights = np.array([1.0, 3.0, 0.0])
-        cost = WeightedL2Cost().fit(values, weights)
+        cost = WeightedL2Cost().fit(np.column_stack((values, weights)))
         expected = np.sum(weights[:2] * np.square(values[:2] - 1.75))
         self.assertAlmostEqual(cost.error(0, 3), float(expected))
 
@@ -255,7 +257,7 @@ class TestSegmentationAndRegression(unittest.TestCase):
             min_size=2,
         )
         self.assertGreaterEqual(len(segs), 1)
-        self.assertIsInstance(segs[0], Segment)
+        self.assertIsInstance(segs[0], SegmentResult)
 
         scored = segment_and_score_genome(
             {
@@ -305,6 +307,7 @@ class TestSegmentationAndRegression(unittest.TestCase):
         self.assertAlmostEqual(
             half_sample_mode(rng.normal(2.0, 0.01, 50)), 2.0, delta=0.05
         )
+        self.assertGreater(mad_scale(np.array([1.0, 2.0, 3.0, 4.0])), 0.0)
 
         sex_model = fit_msy_sex_mixture(
             np.array([2, 3, 1, 2, 80, 95, 110, 90], dtype=np.float64),
@@ -312,9 +315,6 @@ class TestSegmentationAndRegression(unittest.TestCase):
         )
         self.assertTrue(sex_model.bimodal)
         self.assertGreater(sex_model.bg_rate, 0.0)
-        b0, b1 = ols_fit(np.array([1.0, 2.0, 3.0]), np.array([3.0, 5.0, 7.0]))
-        self.assertAlmostEqual(b0, 1.0, places=6)
-        self.assertAlmostEqual(b1, 2.0, places=6)
 
         fused_ff, fused_se = fuse_active_fetal_fraction_student_t4(
             [0.10, 0.105, 0.098], [0.008, 0.02, 0.018]
@@ -322,7 +322,7 @@ class TestSegmentationAndRegression(unittest.TestCase):
         self.assertAlmostEqual(fused_ff, 0.10, delta=0.01)
         self.assertGreater(fused_se, 0.0)
 
-        call, _posteriors, act_ff, act_se, _src = classify_sca_ray_4d(
+        sca_res = classify_sca_ray_4d(
             delta_x=-0.05,
             sigma_x=0.005,
             ffy=0.10,
@@ -332,9 +332,10 @@ class TestSegmentationAndRegression(unittest.TestCase):
             ff_size=0.10,
             sigma_size=0.018,
         )
-        self.assertEqual(call, "XY")
-        self.assertAlmostEqual(act_ff, 0.10, delta=0.015)
-        self.assertGreater(act_se, 0.0)
+        self.assertEqual(sca_res.call, "XY")
+        self.assertAlmostEqual(sca_res.active_ff, 0.10, delta=0.015)
+        self.assertGreater(sca_res.active_ff_se, 0.0)
+        self.assertIn("XY", sca_res.posteriors)
 
 
 if __name__ == "__main__":

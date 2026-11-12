@@ -9,12 +9,11 @@ from scipy.special import expit
 from ccnv.stats.pca import pca_irlba_numpy
 from ccnv.stats.prenatal_math import (
     evaluate_poisson_msy_ffy,
-    fit_ffa_logit_ensemble,
     fit_forward_ffx_model,
     fit_msy_sex_mixture,
     fit_poisson_msy_ffy,
-    ols_fit,
 )
+from ccnv.stats.regression import fit_logit_linear_ensemble
 
 
 class TestMSYSexMixtureAndPoissonFFY(unittest.TestCase):
@@ -93,13 +92,15 @@ class TestForwardFFXAndFFALogitEnsemble(unittest.TestCase):
         true_beta = rng.uniform(-0.5, 0.5, size=n_features)
         true_ff = expit(x_mat @ true_beta - 2.0)
 
-        weights, bias, sigma = fit_ffa_logit_ensemble(x_mat, true_ff, seed=42)
-        self.assertEqual(weights.shape, (n_features,))
-        self.assertTrue(math.isfinite(bias))
-        self.assertGreater(sigma, 0.0)
-        self.assertLess(sigma, 0.10)
+        fit = fit_logit_linear_ensemble(
+            x_mat, true_ff, standardize=False, l1_ratios=(0.1, 0.5), seed=42
+        )
+        self.assertEqual(fit.weights.shape, (n_features,))
+        self.assertTrue(math.isfinite(fit.intercept))
+        self.assertGreater(fit.oof_rmse, 0.0)
+        self.assertLess(fit.oof_rmse, 0.10)
 
-        preds = expit(x_mat @ weights + bias)
+        preds = expit(x_mat @ fit.weights + fit.intercept)
         self.assertTrue(np.all((preds > 0.0) & (preds < 1.0)))
         np.testing.assert_allclose(preds, true_ff, atol=0.05)
 
@@ -152,21 +153,6 @@ class TestPCAIrlbaNumpy(unittest.TestCase):
         self.assertEqual(center[3], 0.0)
         self.assertTrue(np.all(np.isfinite(scores)))
         self.assertTrue(np.all(np.isfinite(rotation)))
-
-
-class TestOLSFit(unittest.TestCase):
-    def test_recovers_exact_line_and_zero_variance_fallback(self) -> None:
-        x = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        y = 2.5 + 1.8 * x
-        intercept, slope = ols_fit(x, y)
-        self.assertAlmostEqual(intercept, 2.5, places=6)
-        self.assertAlmostEqual(slope, 1.8, places=6)
-
-        intercept_c, slope_c = ols_fit(
-            np.array([3.0, 3.0, 3.0]), np.array([1.0, 2.0, 3.0])
-        )
-        self.assertEqual(intercept_c, 0.0)
-        self.assertEqual(slope_c, 1.0)
 
 
 if __name__ == "__main__":

@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import tempfile
 import unittest
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 import pyBigWig
 import pysam
-from numpy.typing import NDArray
 
+import ccnv._core as core_mod
 from ccnv._core import (
     FRAG_BAND_EDGES,
     GC_QUANTILE_EDGES,
@@ -24,8 +24,42 @@ from ccnv._core import (
     write_bgzf_indexed,
 )
 from ccnv.io.tracks import load_gc_track, load_mappability_track
-from ccnv.models import AlignmentError, CovariateError
+from ccnv.models import AlignmentError, CovariateError, ScanAlignmentResult
 from ccnv.stats.fragmentomics import encode_kmer_4
+
+
+def _assert_scan_parity(lhs: ScanAlignmentResult, rhs: ScanAlignmentResult) -> None:
+    np.testing.assert_array_equal(lhs["count"], rhs["count"], err_msg="count")
+    np.testing.assert_array_equal(
+        lhs["paired_count"], rhs["paired_count"], err_msg="paired_count"
+    )
+    np.testing.assert_array_equal(
+        lhs["frag_len_sum"], rhs["frag_len_sum"], err_msg="frag_len_sum"
+    )
+    np.testing.assert_array_equal(
+        lhs["short_frag_count"], rhs["short_frag_count"], err_msg="short_frag_count"
+    )
+    np.testing.assert_array_equal(
+        lhs["endpoint_count"], rhs["endpoint_count"], err_msg="endpoint_count"
+    )
+    if lhs["frag_bands"] is None or rhs["frag_bands"] is None:
+        assert lhs["frag_bands"] is rhs["frag_bands"]
+    else:
+        np.testing.assert_array_equal(
+            lhs["frag_bands"], rhs["frag_bands"], err_msg="frag_bands"
+        )
+    np.testing.assert_array_equal(
+        lhs["hist_autosomal"], rhs["hist_autosomal"], err_msg="hist_autosomal"
+    )
+    np.testing.assert_array_equal(
+        lhs["hist_chrx"], rhs["hist_chrx"], err_msg="hist_chrx"
+    )
+    np.testing.assert_array_equal(
+        lhs["hist_chry"], rhs["hist_chry"], err_msg="hist_chry"
+    )
+    np.testing.assert_array_equal(
+        lhs["motif_counts"], rhs["motif_counts"], err_msg="motif_counts"
+    )
 
 
 def _make_fasta(path: Path, contigs: dict[str, str]) -> Path:
@@ -116,6 +150,26 @@ class TestRustCoreIO(unittest.TestCase):
         self.assertEqual(len(FRAG_BAND_EDGES), 25)
         self.assertEqual(GC_QUANTILE_EDGES, expected_gc_edges)
         self.assertEqual(len(GC_QUANTILE_EDGES), 9)
+        self.assertFalse(hasattr(core_mod, "ScanAlignmentResult"))
+        self.assertFalse(hasattr(core_mod, "ScanQcCounts"))
+        stub_path = Path(__file__).resolve().parents[1] / "src" / "ccnv" / "_core.pyi"
+        stub_tree = ast.parse(stub_path.read_text(encoding="utf-8"))
+        stub_all: list[str] = []
+        for node in stub_tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets
+                )
+                and isinstance(node.value, (ast.List, ast.Tuple))
+            ):
+                stub_all = [
+                    elt.value
+                    for elt in node.value.elts
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                ]
+        self.assertNotIn("ScanAlignmentResult", stub_all)
+        self.assertNotIn("ScanQcCounts", stub_all)
 
     def test_bam_and_cram_parity_with_pysam_and_mate_dedup_accounting(self) -> None:
         rng = np.random.default_rng(12345)
@@ -248,39 +302,24 @@ class TestRustCoreIO(unittest.TestCase):
             )
             self.assertIsNone(res_no_bands["frag_bands"])
 
-            for key in (
-                "count",
-                "paired_count",
-                "frag_len_sum",
-                "short_frag_count",
-                "endpoint_count",
-                "frag_bands",
-                "hist_autosomal",
-                "hist_chrx",
-                "hist_chry",
-                "motif_counts",
-            ):
-                arr_bam = cast(NDArray[np.generic], res_bam[key])
-                arr_t1 = cast(NDArray[np.generic], res_bam_t1[key])
-                arr_cram = cast(NDArray[np.generic], res_cram[key])
-                np.testing.assert_array_equal(arr_bam, arr_t1, err_msg=key)
-                np.testing.assert_array_equal(arr_bam, arr_cram, err_msg=key)
-
-            gc_bam = cast(NDArray[np.float32], res_bam["frag_gc_sum"])
-            gc_cram = cast(NDArray[np.float32], res_cram["frag_gc_sum"])
-            np.testing.assert_allclose(gc_bam, gc_cram, atol=1e-6)
+            _assert_scan_parity(res_bam, res_bam_t1)
+            _assert_scan_parity(res_bam, res_cram)
+            np.testing.assert_allclose(
+                res_bam["frag_gc_sum"], res_cram["frag_gc_sum"], atol=1e-6
+            )
 
             self.assertIs(res_bam["paired_end"], True)
-            counts = cast(NDArray[np.uint32], res_bam["count"])
-            paired_counts = cast(NDArray[np.uint32], res_bam["paired_count"])
-            frag_len_sum = cast(NDArray[np.uint64], res_bam["frag_len_sum"])
-            short_counts = cast(NDArray[np.uint32], res_bam["short_frag_count"])
-            endpoints = cast(NDArray[np.uint32], res_bam["endpoint_count"])
-            bands = cast(NDArray[np.uint32], res_bam["frag_bands"])
-            hist_auto = cast(NDArray[np.uint64], res_bam["hist_autosomal"])
-            hist_x = cast(NDArray[np.uint64], res_bam["hist_chrx"])
-            hist_y = cast(NDArray[np.uint64], res_bam["hist_chry"])
-            motifs = cast(NDArray[np.uint64], res_bam["motif_counts"])
+            counts = res_bam["count"]
+            paired_counts = res_bam["paired_count"]
+            frag_len_sum = res_bam["frag_len_sum"]
+            short_counts = res_bam["short_frag_count"]
+            endpoints = res_bam["endpoint_count"]
+            bands = res_bam["frag_bands"]
+            assert bands is not None
+            hist_auto = res_bam["hist_autosomal"]
+            hist_x = res_bam["hist_chrx"]
+            hist_y = res_bam["hist_chry"]
+            motifs = res_bam["motif_counts"]
 
             # 8 bins total: 4 on chr1, 2 on chrX, 2 on chrY
             np.testing.assert_array_equal(counts, [1, 1, 1, 1, 1, 0, 1, 0])
@@ -306,12 +345,15 @@ class TestRustCoreIO(unittest.TestCase):
             # 6 proper pairs -> 12 valid 5' 4-mer motifs across both upstream and downstream mates
             self.assertEqual(int(np.sum(motifs)), 12)
             m_up = encode_kmer_4(r1_a.query_sequence[:4])
-            m_dn = encode_kmer_4(r2_a.query_sequence[-4:], reverse_complement=True)
+            dn_rc = r2_a.query_sequence[-4:][::-1].translate(
+                str.maketrans("ACGTacgt", "TGCAtgca")
+            )
+            m_dn = encode_kmer_4(dn_rc)
             assert m_up is not None and m_dn is not None
             self.assertGreaterEqual(int(motifs[m_up]), 1)
             self.assertGreaterEqual(int(motifs[m_dn]), 1)
 
-            qc = cast(dict[str, int], res_bam["qc_counts"])
+            qc = res_bam["qc_counts"]
             self.assertEqual(
                 qc["reads_seen"],
                 qc["reads_kept"] + qc["mate_dedup_skipped"] + qc["reads_filtered"],
@@ -364,18 +406,15 @@ class TestRustCoreIO(unittest.TestCase):
             str(bam_path), [("chr1", 20_000)], 5_000, 20, True, 1, None, False, 0
         )
         self.assertIs(res_unshifted["paired_end"], False)
-        counts_unshifted = cast(NDArray[np.uint32], res_unshifted["count"])
-        np.testing.assert_array_equal(counts_unshifted, [1, 1, 0, 0])
+        np.testing.assert_array_equal(res_unshifted["count"], [1, 1, 0, 0])
 
         res_shifted = scan_alignment_bins(
             str(bam_path), [("chr1", 20_000)], 5_000, 20, True, 1, None, False, 160
         )
-        counts_shifted = cast(NDArray[np.uint32], res_shifted["count"])
         # Both shifted midpoints (5030 in bin 1 and 4979 in bin 0) swap bins cleanly
-        np.testing.assert_array_equal(counts_shifted, [1, 1, 0, 0])
-        ep_shifted = cast(NDArray[np.uint32], res_shifted["endpoint_count"])
+        np.testing.assert_array_equal(res_shifted["count"], [1, 1, 0, 0])
         # Forward 5' start=4950 (bin 0), reverse 5' end-1=5059 (bin 1)
-        np.testing.assert_array_equal(ep_shifted, [1, 1, 0, 0])
+        np.testing.assert_array_equal(res_shifted["endpoint_count"], [1, 1, 0, 0])
 
         with self.assertRaisesRegex(AlignmentError, "index|--threads 1"):
             scan_alignment_bins(str(bam_path), [("chr1", 20_000)], 5_000, 20, True, 4)
@@ -770,33 +809,16 @@ class TestRustCoreIO(unittest.TestCase):
                 str(cram_path), targets, 5_000, 20, True, 2, str(fa_path)
             )
 
-            for key in (
-                "count",
-                "paired_count",
-                "frag_len_sum",
-                "short_frag_count",
-                "endpoint_count",
-                "frag_bands",
-                "hist_autosomal",
-                "motif_counts",
-            ):
-                expected_arr = cast(NDArray[np.generic], bam_t1[key])
-                np.testing.assert_array_equal(
-                    cast(NDArray[np.generic], bam_t2[key]), expected_arr, err_msg=key
-                )
-                np.testing.assert_array_equal(
-                    cast(NDArray[np.generic], cram_t1[key]), expected_arr, err_msg=key
-                )
-                np.testing.assert_array_equal(
-                    cast(NDArray[np.generic], cram_t2[key]), expected_arr, err_msg=key
-                )
+            _assert_scan_parity(bam_t1, bam_t2)
+            _assert_scan_parity(bam_t1, cram_t1)
+            _assert_scan_parity(bam_t1, cram_t2)
 
             self.assertEqual(bam_t1["qc_counts"], bam_t2["qc_counts"])
             self.assertEqual(bam_t1["qc_counts"], cram_t1["qc_counts"])
             self.assertEqual(bam_t1["qc_counts"], cram_t2["qc_counts"])
 
-            counts = cast(NDArray[np.uint32], cram_t2["count"])
-            endpoints = cast(NDArray[np.uint32], cram_t2["endpoint_count"])
+            counts = cram_t2["count"]
+            endpoints = cram_t2["endpoint_count"]
             self.assertEqual(int(counts.sum()), 5)
             self.assertEqual(int(counts[9_999]), 1)
             self.assertEqual(int(counts[10_000]), 1)

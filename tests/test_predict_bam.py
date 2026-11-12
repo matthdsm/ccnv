@@ -70,8 +70,9 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
 
             fasta = ensure_published_fasta()
             # Direct CRAM path in germline mode skips frag_bands and SAMPLE_SCHEMA table construction
-            with patch(
-                "ccnv.models.schemas.SampleBuffers.to_table",
+            with patch.object(
+                SampleBuffers,
+                "to_table",
                 side_effect=AssertionError("must not materialize SAMPLE_SCHEMA table"),
             ):
                 inputs = load_inputs(
@@ -96,12 +97,9 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
         prenatal_meta = PrenatalModelMetadata(
             prenatal_bin_size=100000,
             yfrac_threshold=0.001,
-            ffy_intercept=0.0,
             ffy_slope=1.0,
             olm_weights=[],
             olm_bias=0.0,
-            ffx_intercept=2.0,
-            ffx_slope=-2.0,
             female_chrx_ratio_mean=1.0,
             female_chrx_ratio_std=0.01,
             ffy_std=0.01,
@@ -126,13 +124,15 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
 
         # Segment 1: Fetal-enriched (lengths=143 bp)
         # Segment 2: Maternal-enriched (lengths=166 bp)
-        sample = make_sample_table(
-            counts=[100, 100],
-            contigs=["chr1", "chr1"],
-            starts=[0, 10000],
-            ends=[10000, 20000],
-            bin_size=10000,
-            fragment_lengths=[[143] * 50, [166] * 50],
+        sample = SampleBuffers.from_table(
+            make_sample_table(
+                counts=[100, 300],
+                contigs=["chr1", "chr1"],
+                starts=[0, 10000],
+                ends=[10000, 20000],
+                bin_size=10000,
+                fragment_lengths=[[143] * 100, [166] * 300],
+            )
         )
 
         segs = [
@@ -150,9 +150,9 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
                 contig="chr1",
                 start=10000,
                 end=20000,
-                ratio=0.536,
-                zscore=4.5,
-                weight=1.0,
+                ratio=0.53605,
+                zscore=60.0,
+                weight=100.0,
                 bin_count=1,
                 call="gain",
             ),
@@ -288,12 +288,9 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
         prenatal_meta = PrenatalModelMetadata(
             prenatal_bin_size=20000,
             yfrac_threshold=0.005,
-            ffy_intercept=0.0,
             ffy_slope=1.0,
             olm_weights=[0.0],
             olm_bias=-2.0,
-            ffx_intercept=2.0,
-            ffx_slope=-2.0,
             female_chrx_ratio_mean=1.0,
             female_chrx_ratio_std=0.01,
             p_fetal_density=p_fet.tolist(),
@@ -317,6 +314,11 @@ class TestPredictPolymorphicAndOrigin(unittest.TestCase):
             null_mean=[0.0] * 5,
             bio_dispersion=[0.0025, 0.0025, 0.0, 0.0, 0.0],
             model={
+                "branches": [
+                    BRANCH_AUTOSOMAL,
+                    BRANCH_PRENATAL_AUTOSOMAL,
+                    BRANCH_PRENATAL_FFY,
+                ],
                 "bin_size": 10000,
                 "mode": "prenatal",
                 "prenatal_bin_size": 20000,

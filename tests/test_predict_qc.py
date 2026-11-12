@@ -9,15 +9,16 @@ from dataclasses import asdict
 from pathlib import Path
 
 import pyarrow as pa
+from helpers import metadata_for
 
-from ccnv.models import NUM_FRAG_BANDS, ReadFilters
-from ccnv.models.results import FetalFractionResult, SCAResult, SegmentResult
-from ccnv.models.schemas import (
+from ccnv.models import (
+    NUM_FRAG_BANDS,
     SAMPLE_SCHEMA,
     SCHEMA_VERSION,
     ArtifactKind,
-    metadata_for,
+    ReadFilters,
 )
+from ccnv.models.results import FetalFractionResult, SCAResult, SegmentResult
 from ccnv.qc.predict import build_predict_qc_payload, write_predict_qc_json
 
 

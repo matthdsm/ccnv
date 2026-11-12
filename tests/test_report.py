@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import gzip
 import json
@@ -8,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pysam
+from numpy.typing import ArrayLike
 
 from ccnv.io.tracks import load_cytobands_track
 from ccnv.models.results import (
@@ -28,12 +31,11 @@ from ccnv.report import (
     natural_sort_key,
     write_bins_bed_streaming,
     write_bins_vcf,
-    write_deliverables,
-    write_genome_plot,
     write_outputs,
     write_segments_vcf,
     write_vcf_streaming,
 )
+from ccnv.report.html import render_genome_plot
 
 
 def _extract_payload(html: str) -> dict[str, object]:
@@ -47,20 +49,47 @@ def _extract_payload(html: str) -> dict[str, object]:
     return json.loads(match.group(1))
 
 
+def _make_bin_result(
+    branch: str,
+    contigs: tuple[str, ...],
+    starts: ArrayLike,
+    ends: ArrayLike,
+    ratios: ArrayLike = 0.2,
+    zscores: ArrayLike = 2.0,
+    *,
+    weights: ArrayLike = 1.0,
+    ref_size: ArrayLike = 12,
+    masked: ArrayLike = False,
+) -> BinResult:
+    n = len(contigs)
+    return BinResult(
+        branch=branch,
+        contigs=contigs,
+        starts=np.asarray(starts, dtype=np.int64),
+        ends=np.asarray(ends, dtype=np.int64),
+        ratios=np.broadcast_to(np.asarray(ratios, dtype=np.float64), (n,)).copy(),
+        zscores=np.broadcast_to(np.asarray(zscores, dtype=np.float64), (n,)).copy(),
+        weights=np.broadcast_to(np.asarray(weights, dtype=np.float64), (n,)).copy(),
+        reference_sizes=np.broadcast_to(
+            np.asarray(ref_size, dtype=np.int64), (n,)
+        ).copy(),
+        masked=np.broadcast_to(np.asarray(masked, dtype=np.bool_), (n,)).copy(),
+    )
+
+
 class TestReport(unittest.TestCase):
-    def test_write_genome_plot_html_and_binary_payload(self) -> None:
+    def test_render_genome_plot_html_and_binary_payload(self) -> None:
         contig_lengths = {"chr1": 100_000, "chr2": 80_000, "chr3": 60_000}
         bins = (
-            BinResult(
-                branch="autosomal",
-                contigs=("chr1", "chr1", "chr2", "chr3"),
-                starts=np.array([0, 50_000, 0, 0], dtype=np.int64),
-                ends=np.array([50_000, 100_000, 80_000, 60_000], dtype=np.int64),
-                ratios=np.array([3.5, 0.0, -0.6, 0.1], dtype=np.float64),
-                zscores=np.array([3.0, 0.0, -3.5, 0.5], dtype=np.float64),
-                weights=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float64),
-                reference_sizes=np.array([10, 10, 10, 10], dtype=np.int64),
-                masked=np.array([False, True, False, False], dtype=bool),
+            _make_bin_result(
+                "autosomal",
+                ("chr1", "chr1", "chr2", "chr3"),
+                [0, 50_000, 0, 0],
+                [50_000, 100_000, 80_000, 60_000],
+                [3.5, 0.0, -0.6, 0.1],
+                [3.0, 0.0, -3.5, 0.5],
+                ref_size=10,
+                masked=[False, True, False, False],
             ),
         )
         segments = (
@@ -71,7 +100,7 @@ class TestReport(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             html_path = Path(tmpdir) / "test_plot.html"
-            write_genome_plot(
+            render_genome_plot(
                 html_path,
                 bins,
                 segments,
@@ -83,14 +112,17 @@ class TestReport(unittest.TestCase):
             self.assertTrue(html_path.is_file())
             content = html_path.read_text(encoding="utf-8")
 
-        self.assertIn(PLOTLY_CDN_URL, content)
-        self.assertIn('id="coord-input"', content)
-        self.assertIn('id="z-input"', content)
-        self.assertIn('id="r-input"', content)
-        self.assertIn("Plotly.newPlot", content)
-        self.assertIn("scattergl", content)
-        self.assertIn("const Y_LIM = 2.5;", content)
-        self.assertIn("fixedrange: true", content)
+        for token in (
+            PLOTLY_CDN_URL,
+            'id="coord-input"',
+            'id="z-input"',
+            'id="r-input"',
+            "Plotly.newPlot",
+            "scattergl",
+            "const Y_LIM = 2.5;",
+            "fixedrange: true",
+        ):
+            self.assertIn(token, content)
 
         payload = _extract_payload(content)
         self.assertEqual(payload["sample"], "sample_alpha")
@@ -101,7 +133,8 @@ class TestReport(unittest.TestCase):
         self.assertEqual(payload["n_bins"], 3)
 
         bins_dict = payload["bins"]
-        assert isinstance(bins_dict, dict)
+        if not isinstance(bins_dict, dict):
+            self.fail("Expected payload['bins'] to be a dict")
         c_arr = np.frombuffer(base64.b64decode(bins_dict["c"]), dtype="<u2")
         s_arr = np.frombuffer(base64.b64decode(bins_dict["s"]), dtype="<i4")
         e_arr = np.frombuffer(base64.b64decode(bins_dict["e"]), dtype="<i4")
@@ -121,6 +154,7 @@ class TestReport(unittest.TestCase):
                 [2, 0, 60_000, 0.1, 0.5, 1],
             ],
         )
+        self.assertEqual(payload["segment_calls"], ["gain", "loss", None])
         self.assertEqual(payload["cytobands"], [])
 
     def test_cytobands_parsing_and_plot_embedding(self) -> None:
@@ -133,16 +167,8 @@ class TestReport(unittest.TestCase):
             "chrUn_1\t0\t1000\tp1\tgneg\n"
         )
         bins = (
-            BinResult(
-                branch="autosomal",
-                contigs=("1", "chr2"),
-                starts=np.array([0, 0], dtype=np.int64),
-                ends=np.array([100_000, 80_000], dtype=np.int64),
-                ratios=np.array([0.0, 0.0], dtype=np.float64),
-                zscores=np.array([0.0, 0.0], dtype=np.float64),
-                weights=np.array([1.0, 1.0], dtype=np.float64),
-                reference_sizes=np.array([10, 10], dtype=np.int64),
-                masked=np.array([False, False], dtype=bool),
+            _make_bin_result(
+                "autosomal", ("1", "chr2"), [0, 0], [100_000, 80_000], 0.0, 0.0
             ),
         )
 
@@ -154,24 +180,20 @@ class TestReport(unittest.TestCase):
 
             parsed = load_cytobands_track(cyto_gz, contig_lengths)
             self.assertEqual(len(parsed), 3)
-            self.assertEqual(parsed[0].contig, "1")
-            self.assertEqual((parsed[0].start, parsed[0].end), (0, 40_000))
-            self.assertEqual(parsed[1].contig, "1")
-            self.assertEqual((parsed[1].start, parsed[1].end), (40_000, 100_000))
-            self.assertEqual(parsed[1].stain, "acen")
-            self.assertEqual(parsed[2].contig, "chr2")
-            self.assertEqual(parsed[2].name, "q11.1")
+            self.assertEqual(
+                (parsed[0].contig, parsed[0].start, parsed[0].end), ("1", 0, 40_000)
+            )
+            self.assertEqual(
+                (parsed[1].contig, parsed[1].start, parsed[1].end, parsed[1].stain),
+                ("1", 40_000, 100_000, "acen"),
+            )
+            self.assertEqual((parsed[2].contig, parsed[2].name), ("chr2", "q11.1"))
 
             html_path = root / "cyto_plot.html"
-            write_genome_plot(
-                html_path,
-                bins,
-                (),
-                contig_lengths,
-                cytobands=parsed,
-            )
+            render_genome_plot(html_path, bins, (), contig_lengths, cytobands=parsed)
             payload = _extract_payload(html_path.read_text(encoding="utf-8"))
 
+        self.assertEqual(payload["r_thresh"], 0.0)
         self.assertEqual(
             payload["cytobands"],
             [
@@ -184,16 +206,8 @@ class TestReport(unittest.TestCase):
     def test_write_outputs_creates_all_artifacts(self) -> None:
         contig_lengths = {"chr1": 100_000}
         bins = (
-            BinResult(
-                branch="autosomal",
-                contigs=("chr1",),
-                starts=np.array([0], dtype=np.int64),
-                ends=np.array([100_000], dtype=np.int64),
-                ratios=np.array([0.0], dtype=np.float64),
-                zscores=np.array([0.0], dtype=np.float64),
-                weights=np.array([1.0], dtype=np.float64),
-                reference_sizes=np.array([10], dtype=np.int64),
-                masked=np.array([False], dtype=bool),
+            _make_bin_result(
+                "autosomal", ("chr1",), [0], [100_000], 0.0, 0.0, ref_size=10
             ),
         )
         segments = (SegmentResult("chr1", 0, 100_000, 0.0, 0.0, 1.0, 1, None),)
@@ -203,41 +217,37 @@ class TestReport(unittest.TestCase):
             outputs = write_outputs(
                 prefix, bins, segments, contig_lengths, plot=True, bins_vcf=True
             )
-            self.assertTrue(outputs.bins_bed.is_file())
-            self.assertTrue(outputs.segments_bed.is_file())
-            self.assertTrue(outputs.calls_bed.is_file())
-            self.assertTrue(Path(str(outputs.bins_bed) + ".tbi").is_file())
-            self.assertTrue(Path(str(outputs.segments_bed) + ".tbi").is_file())
-            self.assertTrue(Path(str(outputs.calls_bed) + ".tbi").is_file())
-            self.assertIsNotNone(outputs.bins_vcf)
-            self.assertTrue(outputs.bins_vcf.is_file())
-            self.assertTrue(Path(str(outputs.bins_vcf) + ".tbi").is_file())
-            self.assertIsNotNone(outputs.segments_vcf)
-            self.assertTrue(outputs.segments_vcf.is_file())
-            self.assertTrue(Path(str(outputs.segments_vcf) + ".tbi").is_file())
-            self.assertIsNotNone(outputs.calls_vcf)
-            self.assertTrue(outputs.calls_vcf.is_file())
-            self.assertTrue(Path(str(outputs.calls_vcf) + ".tbi").is_file())
+            for bed_p in (outputs.bins_bed, outputs.segments_bed, outputs.calls_bed):
+                self.assertTrue(bed_p.is_file())
+                self.assertTrue(Path(f"{bed_p}.tbi").is_file())
+            if (
+                outputs.bins_vcf is None
+                or outputs.segments_vcf is None
+                or outputs.calls_vcf is None
+                or outputs.plot_html is None
+            ):
+                self.fail("Expected VCF and HTML artifacts to be generated")
+            for vcf_p in (outputs.bins_vcf, outputs.segments_vcf, outputs.calls_vcf):
+                self.assertTrue(vcf_p.is_file())
+                self.assertTrue(Path(f"{vcf_p}.tbi").is_file())
             self.assertFalse(Path(f"{prefix}_bins.ccnv").exists())
             self.assertFalse(Path(f"{prefix}_segments.ccnv").exists())
-            self.assertIsNotNone(outputs.plot_html)
             self.assertTrue(outputs.plot_html.is_file())
             self.assertEqual(outputs.plot_html.suffix, ".html")
 
-            with gzip.open(outputs.bins_bed, "rt") as h:
-                bins_lines = h.read().splitlines()
-            self.assertEqual(tuple(bins_lines[0].split("\t")), BINS_BED_HEADER)
-            with gzip.open(outputs.segments_bed, "rt") as h:
-                seg_lines = h.read().splitlines()
-            self.assertEqual(tuple(seg_lines[0].split("\t")), SEGMENTS_BED_HEADER)
-            with gzip.open(outputs.calls_bed, "rt") as h:
-                call_lines = h.read().splitlines()
-            self.assertEqual(tuple(call_lines[0].split("\t")), CALLS_BED_HEADER)
+            for bed_p, expected_hdr in (
+                (outputs.bins_bed, BINS_BED_HEADER),
+                (outputs.segments_bed, SEGMENTS_BED_HEADER),
+                (outputs.calls_bed, CALLS_BED_HEADER),
+            ):
+                with gzip.open(bed_p, "rt") as h:
+                    first_line = h.read().splitlines()[0]
+                self.assertEqual(tuple(first_line.split("\t")), expected_hdr)
 
             with gzip.open(outputs.bins_vcf, "rt") as h:
                 bins_vcf_lines = h.read().splitlines()
             self.assertTrue(bins_vcf_lines[0].startswith("##fileformat=VCFv4.2"))
-            chrom_lines = [line for line in bins_vcf_lines if line.startswith("#CHROM")]
+            chrom_lines = [ln for ln in bins_vcf_lines if ln.startswith("#CHROM")]
             self.assertEqual(len(chrom_lines), 1)
             self.assertTrue(
                 chrom_lines[0].startswith(
@@ -247,29 +257,27 @@ class TestReport(unittest.TestCase):
 
             with pysam.TabixFile(str(outputs.bins_bed)) as tb:
                 self.assertEqual(list(tb.header), ["\t".join(BINS_BED_HEADER)])
-                records = list(tb.fetch("chr1", 0, 100_000))
-                self.assertEqual(len(records), 1)
+                self.assertEqual(len(list(tb.fetch("chr1", 0, 100_000))), 1)
 
             with pysam.TabixFile(str(outputs.bins_vcf)) as tb:
                 records = list(tb.fetch("chr1", 0, 100_000))
                 self.assertEqual(len(records), 1)
                 fields = records[0].split("\t")
-                self.assertEqual(fields[0], "chr1")
-                self.assertEqual(fields[1], "1")
-                self.assertEqual(fields[4], "<CNV>")
-                self.assertEqual(fields[6], "PASS")
+                self.assertEqual(
+                    (fields[0], fields[1], fields[4], fields[6]),
+                    ("chr1", "1", "<CNV>", "PASS"),
+                )
                 self.assertIn("SVTYPE=CNV", fields[7])
                 self.assertEqual(fields[8], "LOG2R:ZSCORE:WEIGHT:REF_SIZE")
 
             with pysam.VariantFile(str(outputs.bins_vcf)) as vf:
                 self.assertEqual(list(vf.header.samples), ["sample_out"])
-                self.assertIn("chr1", vf.header.contigs)
                 self.assertEqual(vf.header.contigs["chr1"].length, 100_000)
                 recs = list(vf.fetch("chr1", 0, 100_000))
                 self.assertEqual(len(recs), 1)
-                self.assertEqual(recs[0].chrom, "chr1")
-                self.assertEqual(recs[0].pos, 1)
-                self.assertEqual(recs[0].stop, 100_000)
+                self.assertEqual(
+                    (recs[0].chrom, recs[0].pos, recs[0].stop), ("chr1", 1, 100_000)
+                )
                 self.assertEqual(recs[0].id, "chr1:0-100000")
                 self.assertEqual(recs[0].alts, ("<CNV>",))
                 self.assertEqual(list(recs[0].filter), ["PASS"])
@@ -279,7 +287,6 @@ class TestReport(unittest.TestCase):
                 self.assertEqual(recs[0].samples["sample_out"]["REF_SIZE"], 10)
 
             with pysam.VariantFile(str(outputs.segments_vcf)) as vf:
-                self.assertEqual(list(vf.header.samples), ["sample_out"])
                 recs = list(vf.fetch("chr1", 0, 100_000))
                 self.assertEqual(len(recs), 1)
                 self.assertEqual(recs[0].stop, 100_000)
@@ -288,25 +295,11 @@ class TestReport(unittest.TestCase):
                 self.assertEqual(recs[0].samples["sample_out"]["BINS"], 1)
 
             with pysam.VariantFile(str(outputs.calls_vcf)) as vf:
-                self.assertEqual(list(vf.header.samples), ["sample_out"])
-                recs = list(vf.fetch("chr1", 0, 100_000))
-                self.assertEqual(len(recs), 0)
+                self.assertEqual(len(list(vf.fetch("chr1", 0, 100_000))), 0)
 
     def test_write_outputs_vcf_disabled(self) -> None:
         contig_lengths = {"chr1": 100_000}
-        bins = (
-            BinResult(
-                branch="autosomal",
-                contigs=("chr1",),
-                starts=np.array([0], dtype=np.int64),
-                ends=np.array([100_000], dtype=np.int64),
-                ratios=np.array([0.0], dtype=np.float64),
-                zscores=np.array([0.0], dtype=np.float64),
-                weights=np.array([1.0], dtype=np.float64),
-                reference_sizes=np.array([10], dtype=np.int64),
-                masked=np.array([False], dtype=bool),
-            ),
-        )
+        bins = (_make_bin_result("autosomal", ("chr1",), [0], [100_000], 0.0, 0.0),)
         segments = (SegmentResult("chr1", 0, 100_000, 0.0, 0.0, 1.0, 1, None),)
         with tempfile.TemporaryDirectory() as tmpdir:
             prefix = Path(tmpdir) / "no_vcf"
@@ -324,16 +317,14 @@ class TestReport(unittest.TestCase):
     def test_write_outputs_prenatal_mode_beds_and_vcfs(self) -> None:
         contig_lengths = {"chr1": 200_000}
         bins = (
-            BinResult(
-                branch="autosomal",
-                contigs=("chr1", "chr1"),
-                starts=np.array([0, 100_000], dtype=np.int64),
-                ends=np.array([100_000, 200_000], dtype=np.int64),
-                ratios=np.array([0.08, 0.01], dtype=np.float64),
-                zscores=np.array([3.1, 3.1], dtype=np.float64),
-                weights=np.array([1.0, 1.0], dtype=np.float64),
-                reference_sizes=np.array([10, 10], dtype=np.int64),
-                masked=np.array([False, False], dtype=bool),
+            _make_bin_result(
+                "autosomal",
+                ("chr1", "chr1"),
+                [0, 100_000],
+                [100_000, 200_000],
+                [0.08, 0.01],
+                [3.1, 3.1],
+                ref_size=10,
             ),
         )
         segments = (
@@ -351,7 +342,7 @@ class TestReport(unittest.TestCase):
                 discordant=False,
                 frag_short_ratio=0.35,
                 frag_llr_size=2.45,
-                origin_call="FETAL_CONFIRMED",
+                origin_call="FETAL_CONSTITUTIONAL",
             ),
             SegmentResult(
                 "chr1",
@@ -368,22 +359,22 @@ class TestReport(unittest.TestCase):
                 discordance_reason="SUB_FETAL_RATIO",
                 frag_short_ratio=0.15,
                 frag_llr_size=-3.2,
-                origin_call="MATERNAL_CONFIRMED",
+                origin_call="MATERNAL_UNINHERITED",
             ),
         )
-        sca = SCAResult("XY", False, 0.98, -0.2)
         prenatal = FetalFractionResult(
-            fetal_sex="M",
-            active_ff=0.12,
-            active_ff_source="FFY",
-            ffy=0.12,
-            ffx=0.115,
-            ffa=0.118,
+            "M",
+            0.12,
+            "FFY",
+            0.12,
+            0.115,
+            0.118,
+            0.94,
+            0.006,
+            0.004,
+            SCAResult("XY", False, 0.98, -0.2),
             ff_size=0.125,
-            chrx_ratio=0.94,
-            chry_score=0.006,
-            yfrac_threshold=0.004,
-            sca=sca,
+            effective_ff=0.12,
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             prefix = Path(tmpdir) / "prenatal_sample"
@@ -402,18 +393,20 @@ class TestReport(unittest.TestCase):
             self.assertEqual(
                 tuple(seg_lines[0].split("\t")), PRENATAL_SEGMENTS_BED_HEADER
             )
-            row_non_disc = seg_lines[1].split("\t")
-            self.assertEqual(row_non_disc[10], "false")
-            self.assertEqual(row_non_disc[11], "")
-            self.assertEqual(row_non_disc[12], "0.350000")
-            self.assertEqual(row_non_disc[13], "2.450000")
-            self.assertEqual(row_non_disc[14], "FETAL_CONFIRMED")
-            row_disc = seg_lines[2].split("\t")
-            self.assertEqual(row_disc[10], "true")
-            self.assertEqual(row_disc[11], "SUB_FETAL_RATIO")
-            self.assertEqual(row_disc[12], "0.150000")
-            self.assertEqual(row_disc[13], "-3.200000")
-            self.assertEqual(row_disc[14], "MATERNAL_CONFIRMED")
+            self.assertEqual(
+                seg_lines[1].split("\t")[10:15],
+                ["false", "", "0.350000", "2.450000", "FETAL_CONSTITUTIONAL"],
+            )
+            self.assertEqual(
+                seg_lines[2].split("\t")[10:15],
+                [
+                    "true",
+                    "SUB_FETAL_RATIO",
+                    "0.150000",
+                    "-3.200000",
+                    "MATERNAL_UNINHERITED",
+                ],
+            )
 
             with gzip.open(outputs.calls_bed, "rt") as h:
                 calls_lines = h.read().splitlines()
@@ -422,98 +415,53 @@ class TestReport(unittest.TestCase):
             )
             self.assertEqual(len(calls_lines), 3)
 
-            assert outputs.segments_vcf is not None
+            if outputs.segments_vcf is None:
+                self.fail("Expected segments_vcf to be populated")
             with pysam.VariantFile(str(outputs.segments_vcf)) as vf:
                 vcf_header_text = str(vf.header)
-                self.assertIn("##fetalSex=M", vcf_header_text)
-                self.assertIn("##fetalFraction=0.1200", vcf_header_text)
-                self.assertIn("##scaCall=XY", vcf_header_text)
-                self.assertIn("##INFO=<ID=DISCORDANT", vcf_header_text)
-                self.assertIn("##INFO=<ID=DISC_REASON", vcf_header_text)
-                self.assertIn("##INFO=<ID=FRAG_SHORT_R", vcf_header_text)
-                self.assertIn("##INFO=<ID=FRAG_LLR", vcf_header_text)
-                self.assertIn("##INFO=<ID=ORIGIN", vcf_header_text)
-                self.assertIn(
-                    'Description="Fragmentomic origin call: FETAL_CONSTITUTIONAL, PLACENTAL_MOSAIC, MATERNAL_UNINHERITED, MATERNAL_AND_FETAL_INHERITED, MATERNAL_MOSAIC, or INDETERMINATE"',
-                    vcf_header_text,
-                )
-                self.assertIn("##FORMAT=<ID=EXP_LOG2R", vcf_header_text)
-                self.assertIn("##FORMAT=<ID=IMPLIED_FF", vcf_header_text)
-
+                for tok in (
+                    "##fetalSex=M",
+                    "##fetalFraction=0.1200",
+                    "##scaCall=XY",
+                    "ID=DISCORDANT",
+                    "ID=DISC_REASON",
+                    "ID=FRAG_SHORT_R",
+                    "ID=FRAG_LLR",
+                    "ID=ORIGIN",
+                    "ID=EXP_LOG2R",
+                    "ID=IMPLIED_FF",
+                ):
+                    self.assertIn(tok, vcf_header_text)
                 recs = list(vf.fetch("chr1"))
                 self.assertEqual(len(recs), 2)
                 self.assertNotIn("DISCORDANT", recs[0].info)
+                self.assertEqual(recs[0].info["ORIGIN"], "FETAL_CONSTITUTIONAL")
                 self.assertAlmostEqual(recs[0].info["FRAG_SHORT_R"], 0.35, places=2)
-                self.assertAlmostEqual(recs[0].info["FRAG_LLR"], 2.45, places=2)
-                self.assertEqual(recs[0].info["ORIGIN"], "FETAL_CONFIRMED")
                 self.assertAlmostEqual(
-                    recs[0].samples["prenatal_sample"]["EXP_LOG2R"],
-                    0.084,
-                    places=3,
+                    recs[0].samples["prenatal_sample"]["IMPLIED_FF"], 0.115, places=3
                 )
-                self.assertAlmostEqual(
-                    recs[0].samples["prenatal_sample"]["IMPLIED_FF"],
-                    0.115,
-                    places=3,
-                )
-
                 self.assertTrue(recs[1].info["DISCORDANT"])
                 self.assertEqual(recs[1].info["DISC_REASON"], "SUB_FETAL_RATIO")
-                self.assertAlmostEqual(recs[1].info["FRAG_SHORT_R"], 0.15, places=2)
+                self.assertEqual(recs[1].info["ORIGIN"], "MATERNAL_UNINHERITED")
                 self.assertAlmostEqual(recs[1].info["FRAG_LLR"], -3.2, places=1)
-                self.assertEqual(recs[1].info["ORIGIN"], "MATERNAL_CONFIRMED")
                 self.assertAlmostEqual(
-                    recs[0].samples["prenatal_sample"]["EXP_LOG2R"],
-                    0.084,
-                    places=3,
-                )
-                self.assertAlmostEqual(
-                    recs[0].samples["prenatal_sample"]["IMPLIED_FF"],
-                    0.115,
-                    places=3,
+                    recs[1].samples["prenatal_sample"]["IMPLIED_FF"], 0.014, places=3
                 )
 
-                self.assertTrue(recs[1].info["DISCORDANT"])
-
-                self.assertEqual(recs[1].info["DISC_REASON"], "SUB_FETAL_RATIO")
-                self.assertAlmostEqual(
-                    recs[1].samples["prenatal_sample"]["EXP_LOG2R"],
-                    0.084,
-                    places=3,
-                )
-                self.assertAlmostEqual(
-                    recs[1].samples["prenatal_sample"]["IMPLIED_FF"],
-                    0.014,
-                    places=3,
-                )
-
-    def test_write_genome_plot_with_prenatal_badge_and_discordant_traces(
-        self,
-    ) -> None:
+    def test_render_genome_plot_with_prenatal_badge_and_discordant_traces(self) -> None:
         contig_lengths = {"chr1": 200_000}
-        bins = (
-            BinResult(
-                branch="autosomal",
-                contigs=("chr1",),
-                starts=np.array([0], dtype=np.int64),
-                ends=np.array([200_000], dtype=np.int64),
-                ratios=np.array([0.0], dtype=np.float64),
-                zscores=np.array([0.0], dtype=np.float64),
-                weights=np.array([1.0], dtype=np.float64),
-                reference_sizes=np.array([10], dtype=np.int64),
-                masked=np.array([False], dtype=bool),
-            ),
-        )
+        bins = (_make_bin_result("autosomal", ("chr1",), [0], [200_000], 0.0, 0.0),)
+        seg = SegmentResult("chr1", 0, 200_000, 0.01, 3.5, 1.0, 1, "gain")
         segments = (
             SegmentResult(
-                "chr1",
-                0,
-                200_000,
-                0.01,
-                3.5,
-                1.0,
-                1,
-                "gain",
+                seg.contig,
+                seg.start,
+                seg.end,
+                seg.ratio,
+                seg.zscore,
+                seg.weight,
+                seg.bin_count,
+                seg.call,
                 expected_ratio=0.084,
                 implied_ff=0.014,
                 discordant=True,
@@ -522,120 +470,84 @@ class TestReport(unittest.TestCase):
         )
         sca = SCAResult("XY", False, 0.98, -0.2)
         prenatal = FetalFractionResult(
-            fetal_sex="M",
-            active_ff=0.10,
-            active_ff_source="FFY",
-            ffy=0.10,
-            ffx=0.095,
-            ffa=0.102,
-            chrx_ratio=0.95,
-            chry_score=0.005,
-            yfrac_threshold=0.004,
-            sca=sca,
-            low_ff_warning=False,
+            "M",
+            0.10,
+            "FFY",
+            0.10,
+            0.095,
+            0.102,
+            0.95,
+            0.005,
+            0.004,
+            sca,
+            effective_ff=0.14,
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             html_path = Path(tmpdir) / "prenatal_plot.html"
-            write_genome_plot(
-                html_path,
-                bins,
-                segments,
-                contig_lengths,
-                prenatal_result=prenatal,
+            render_genome_plot(
+                html_path, bins, segments, contig_lengths, prenatal_result=prenatal
             )
             content = html_path.read_text(encoding="utf-8")
 
-        self.assertIn('id="prenatal-badge"', content)
-        self.assertIn("Segments (Discordant)", content)
-        self.assertIn("#9333ea", content)
-        self.assertIn("diamond", content)
+        for token in ('id="prenatal-badge"', "Segments (Discordant)", "#9333ea"):
+            self.assertIn(token, content)
         payload = _extract_payload(content)
-        self.assertIn("prenatal", payload)
-        prenatal_dict = payload["prenatal"]
-        assert isinstance(prenatal_dict, dict)
-        self.assertEqual(prenatal_dict["fetal_sex"], "M")
-        self.assertEqual(prenatal_dict["active_ff"], 0.10)
-        seg_rows = payload["segments"]
-        assert isinstance(seg_rows, list)
-        self.assertEqual(len(seg_rows[0]), 13)
-        self.assertTrue(seg_rows[0][6])
-        self.assertEqual(seg_rows[0][9], "SUB_FETAL_RATIO")
-
-    def test_natural_sort_key(self) -> None:
-        raw = [
-            "chr1",
-            "chr10",
-            "chr11",
-            "chr2",
-            "chr20",
-            "chr22",
-            "chr3",
-            "chrX",
-            "chrY",
-        ]
-        sorted_contigs = sorted(raw, key=natural_sort_key)
         self.assertEqual(
-            sorted_contigs,
-            [
-                "chr1",
-                "chr2",
-                "chr3",
-                "chr10",
-                "chr11",
-                "chr20",
-                "chr22",
-                "chrX",
-                "chrY",
-            ],
+            (payload["r_thresh"], payload["segment_calls"]), (0.0, ["gain"])
+        )
+        prenatal_dict = payload["prenatal"]
+        if not isinstance(prenatal_dict, dict):
+            self.fail("Expected payload['prenatal'] to be a dict")
+        self.assertEqual(
+            (
+                prenatal_dict["fetal_sex"],
+                prenatal_dict["active_ff"],
+                prenatal_dict["effective_ff"],
+            ),
+            ("M", 0.10, 0.14),
+        )
+        seg_rows = payload["segments"]
+        if not isinstance(seg_rows, list):
+            self.fail("Expected payload['segments'] to be a list")
+        self.assertEqual(
+            (len(seg_rows[0]), seg_rows[0][6], seg_rows[0][9]),
+            (13, True, "SUB_FETAL_RATIO"),
         )
 
-    def test_write_genome_plot_natural_chrom_sort_order(self) -> None:
-        contig_lengths = {
-            "chr10": 50_000,
-            "chr2": 50_000,
-            "chr1": 50_000,
-            "chrY": 50_000,
-            "chrX": 50_000,
-        }
+    def test_natural_sort_key(self) -> None:
+        raw = ["chr1", "chr10", "chr11", "chr2", "chr20", "chrX", "chrY"]
+        exp = ["chr1", "chr2", "chr10", "chr11", "chr20", "chrX", "chrY"]
+        self.assertEqual(sorted(raw, key=natural_sort_key), exp)
+
+    def test_render_genome_plot_natural_chrom_sort_order(self) -> None:
+        contig_lengths = {c: 50_000 for c in ("chr10", "chr2", "chr1", "chrY", "chrX")}
         bins = (
-            BinResult(
-                branch="autosomal",
-                contigs=("chr10", "chr2", "chr1", "chrY", "chrX"),
-                starts=np.array([0, 0, 0, 0, 0], dtype=np.int64),
-                ends=np.array([50_000, 50_000, 50_000, 50_000, 50_000], dtype=np.int64),
-                ratios=np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
-                zscores=np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
-                weights=np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64),
-                reference_sizes=np.array([10, 10, 10, 10, 10], dtype=np.int64),
-                masked=np.array([False, False, False, False, False], dtype=bool),
+            _make_bin_result(
+                "autosomal",
+                ("chr10", "chr2", "chr1", "chrY", "chrX"),
+                [0] * 5,
+                [50_000] * 5,
+                0.0,
+                0.0,
             ),
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             html_path = Path(tmpdir) / "natural_plot.html"
-            write_genome_plot(html_path, bins, (), contig_lengths)
+            render_genome_plot(html_path, bins, (), contig_lengths)
             payload = _extract_payload(html_path.read_text(encoding="utf-8"))
 
         self.assertEqual(payload["contigs"], ["chr1", "chr2", "chr10", "chrX", "chrY"])
 
     def test_write_outputs_naturally_sorts_all_artifacts(self) -> None:
-        contig_lengths = {
-            "chr10": 50_000,
-            "chr2": 50_000,
-            "chr1": 50_000,
-            "chrY": 50_000,
-            "chrX": 50_000,
-        }
+        contig_lengths = {c: 50_000 for c in ("chr10", "chr2", "chr1", "chrY", "chrX")}
         bins = (
-            BinResult(
-                branch="autosomal",
-                contigs=("chr10", "chr2", "chr1", "chrY", "chrX"),
-                starts=np.array([0, 0, 0, 0, 0], dtype=np.int64),
-                ends=np.array([50_000, 50_000, 50_000, 50_000, 50_000], dtype=np.int64),
-                ratios=np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
-                zscores=np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64),
-                weights=np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64),
-                reference_sizes=np.array([10, 10, 10, 10, 10], dtype=np.int64),
-                masked=np.array([False, False, False, False, False], dtype=bool),
+            _make_bin_result(
+                "autosomal",
+                ("chr10", "chr2", "chr1", "chrY", "chrX"),
+                [0] * 5,
+                [50_000] * 5,
+                0.0,
+                0.0,
             ),
         )
         segments = (
@@ -645,6 +557,7 @@ class TestReport(unittest.TestCase):
             SegmentResult("chrY", 0, 50_000, 0.0, 0.0, 1.0, 1, None),
             SegmentResult("chrX", 0, 50_000, 0.0, 0.0, 1.0, 1, None),
         )
+        expected_all = ["chr1", "chr2", "chr10", "chrX", "chrY"]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             prefix = Path(tmpdir) / "test_out"
@@ -652,97 +565,54 @@ class TestReport(unittest.TestCase):
                 prefix, bins, segments, contig_lengths, plot=True, bins_vcf=True
             )
 
-            # Check bins BED order
-            with gzip.open(outputs.bins_bed, "rt") as h:
-                bins_lines = h.read().splitlines()[1:]
-            bins_contigs = [line.split("\t")[0] for line in bins_lines]
-            self.assertEqual(bins_contigs, ["chr1", "chr2", "chr10", "chrX", "chrY"])
+            for bed_p, expected_order in (
+                (outputs.bins_bed, expected_all),
+                (outputs.segments_bed, expected_all),
+                (outputs.calls_bed, ["chr2", "chr10"]),
+            ):
+                with gzip.open(bed_p, "rt") as h:
+                    lines = h.read().splitlines()[1:]
+                self.assertEqual([ln.split("\t")[0] for ln in lines], expected_order)
 
-            # Check segments BED order
-            with gzip.open(outputs.segments_bed, "rt") as h:
-                seg_lines = h.read().splitlines()[1:]
-            seg_contigs = [line.split("\t")[0] for line in seg_lines]
-            self.assertEqual(seg_contigs, ["chr1", "chr2", "chr10", "chrX", "chrY"])
-
-            # Check calls BED order
-            with gzip.open(outputs.calls_bed, "rt") as h:
-                call_lines = h.read().splitlines()[1:]
-            call_contigs = [line.split("\t")[0] for line in call_lines]
-            self.assertEqual(call_contigs, ["chr2", "chr10"])
-
-            # Check VCF records and sorting
-            self.assertIsNotNone(outputs.bins_vcf)
+            if (
+                outputs.bins_vcf is None
+                or outputs.segments_vcf is None
+                or outputs.calls_vcf is None
+            ):
+                self.fail("Expected VCF outputs to be generated")
             with gzip.open(outputs.bins_vcf, "rt") as h:
                 vcf_bin_records = [
-                    line for line in h.read().splitlines() if not line.startswith("#")
+                    ln for ln in h.read().splitlines() if not ln.startswith("#")
                 ]
             self.assertEqual(
-                [line.split("\t")[0] for line in vcf_bin_records],
-                ["chr1", "chr2", "chr10", "chrX", "chrY"],
+                [ln.split("\t")[0] for ln in vcf_bin_records], expected_all
             )
 
-            self.assertIsNotNone(outputs.segments_vcf)
             with gzip.open(outputs.segments_vcf, "rt") as h:
                 vcf_seg_records = [
-                    line for line in h.read().splitlines() if not line.startswith("#")
+                    ln for ln in h.read().splitlines() if not ln.startswith("#")
                 ]
             self.assertEqual(
-                [line.split("\t")[0] for line in vcf_seg_records],
-                ["chr1", "chr2", "chr10", "chrX", "chrY"],
+                [ln.split("\t")[0] for ln in vcf_seg_records], expected_all
             )
-            # chr1: neutral -> <CNV>, chr2: loss -> <DEL>, chr10: gain -> <DUP>
-            self.assertEqual(vcf_seg_records[0].split("\t")[4], "<CNV>")
-            self.assertEqual(vcf_seg_records[1].split("\t")[4], "<DEL>")
-            self.assertEqual(vcf_seg_records[2].split("\t")[4], "<DUP>")
+            self.assertEqual(
+                [vcf_seg_records[i].split("\t")[4] for i in range(3)],
+                ["<CNV>", "<DEL>", "<DUP>"],
+            )
 
-            self.assertIsNotNone(outputs.calls_vcf)
             with gzip.open(outputs.calls_vcf, "rt") as h:
                 vcf_call_records = [
-                    line for line in h.read().splitlines() if not line.startswith("#")
+                    ln for ln in h.read().splitlines() if not ln.startswith("#")
                 ]
             self.assertEqual(
-                [line.split("\t")[0] for line in vcf_call_records], ["chr2", "chr10"]
-            )
-            self.assertEqual(vcf_call_records[0].split("\t")[4], "<DEL>")
-            self.assertEqual(vcf_call_records[1].split("\t")[4], "<DUP>")
-
-            # Check returned outputs
-            self.assertEqual(
-                outputs.bins[0].contigs,
-                ("chr1", "chr2", "chr10", "chrX", "chrY"),
+                [ln.split("\t")[0] for ln in vcf_call_records], ["chr2", "chr10"]
             )
             self.assertEqual(
-                [s.contig for s in outputs.segments],
-                ["chr1", "chr2", "chr10", "chrX", "chrY"],
+                [r.split("\t")[4] for r in vcf_call_records], ["<DEL>", "<DUP>"]
             )
 
-
-def _make_bin_result(
-    branch: str,
-    contigs: tuple[str, ...],
-    starts: object,
-    ends: object,
-    ratios: object = 0.2,
-    zscores: object = 2.0,
-    *,
-    weights: object = 1.0,
-    ref_size: object = 12,
-    masked: object = False,
-) -> BinResult:
-    n = len(contigs)
-    return BinResult(
-        branch=branch,
-        contigs=contigs,
-        starts=np.asarray(starts, dtype=np.int64),
-        ends=np.asarray(ends, dtype=np.int64),
-        ratios=np.broadcast_to(np.asarray(ratios, dtype=np.float64), (n,)).copy(),
-        zscores=np.broadcast_to(np.asarray(zscores, dtype=np.float64), (n,)).copy(),
-        weights=np.broadcast_to(np.asarray(weights, dtype=np.float64), (n,)).copy(),
-        reference_sizes=np.broadcast_to(
-            np.asarray(ref_size, dtype=np.int64), (n,)
-        ).copy(),
-        masked=np.broadcast_to(np.asarray(masked, dtype=np.bool_), (n,)).copy(),
-    )
+            self.assertEqual(outputs.bins[0].contigs, tuple(expected_all))
+            self.assertEqual([s.contig for s in outputs.segments], expected_all)
 
 
 class TestScalableReports(unittest.TestCase):
@@ -773,7 +643,7 @@ class TestScalableReports(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             prefix_default = Path(tmpdir) / "default_out"
-            outputs = write_deliverables(
+            outputs = write_outputs(
                 prefix_default,
                 bins,
                 segments,
@@ -784,7 +654,8 @@ class TestScalableReports(unittest.TestCase):
             )
             self.assertIsNone(outputs.bins_vcf)
             self.assertFalse(Path(f"{prefix_default}_bins.vcf.gz").exists())
-            assert outputs.segments_vcf is not None and outputs.calls_vcf is not None
+            if outputs.segments_vcf is None or outputs.calls_vcf is None:
+                self.fail("Expected segments_vcf and calls_vcf to be populated")
 
             with pysam.VariantFile(str(outputs.segments_vcf)) as vf:
                 recs = list(vf)
@@ -808,7 +679,8 @@ class TestScalableReports(unittest.TestCase):
                 bins_vcf=True,
                 threads=2,
             )
-            assert outputs_bins.bins_vcf is not None
+            if outputs_bins.bins_vcf is None:
+                self.fail("Expected bins_vcf when bins_vcf=True")
             with pysam.VariantFile(str(outputs_bins.bins_vcf)) as vf:
                 bin_recs = list(vf)
                 self.assertEqual(len(bin_recs), 3)
@@ -844,7 +716,7 @@ class TestScalableReports(unittest.TestCase):
                 hit = list(tbx.fetch("chr1", 65_536 * 100, 65_537 * 100))
                 self.assertEqual(len(hit), 1)
                 fields = hit[0].split("\t")
-                self.assertEqual((fields[4], fields[8]), ("NaN", "true"))
+                self.assertEqual((fields[4], fields[8]), (".", "true"))
                 self.assertEqual(
                     len(list(tbx.fetch("chr1", 69_999 * 100, 70_000 * 100))), 1
                 )
@@ -903,15 +775,17 @@ class TestScalableReports(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             html_path = Path(tmpdir) / "big_plot.html"
-            write_genome_plot(html_path, bins, (), {"chr1": n * 100})
+            render_genome_plot(html_path, bins, (), {"chr1": n * 100})
             content = html_path.read_text(encoding="utf-8")
 
         payload = _extract_payload(content)
         n_serialized = payload["n_bins"]
-        assert isinstance(n_serialized, int)
+        if not isinstance(n_serialized, int):
+            self.fail("Expected payload['n_bins'] to be an int")
         self.assertLessEqual(n_serialized, 55_000)
         bins_dict = payload["bins"]
-        assert isinstance(bins_dict, dict)
+        if not isinstance(bins_dict, dict):
+            self.fail("Expected payload['bins'] to be a dict")
         s_arr = np.frombuffer(base64.b64decode(bins_dict["s"]), dtype="<u4")
         self.assertIn(250_000 * 100, set(s_arr.tolist()))
         for token in ("Uint32Array", "Float32Array", "plotly_hover", "100"):

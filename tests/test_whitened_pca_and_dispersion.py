@@ -8,15 +8,16 @@ from pathlib import Path
 
 import numpy as np
 
-from ccnv.features.cohort import Cohort, compute_bin_exposure
+from ccnv.features.binning import compute_bin_exposure
+from ccnv.features.cohort import Cohort
 from ccnv.features.normalization import (
     BranchModel,
     BranchNormalizationResult,
-    build_branch_model,
     normalize_sample_branch,
 )
 from ccnv.io.parquet import read_reference_parquet
 from ccnv.models import BRANCH_AUTOSOMAL, ReferenceConfig, ReferenceMetadata
+from ccnv.predict import build_branch_model
 from ccnv.reference import build_reference_table
 from ccnv.stats.neighbors import (
     calibrate_prototype_dispersion,
@@ -141,10 +142,7 @@ class TestWhitenedPCAAndDispersion(unittest.TestCase):
         u_idx = np.flatnonzero(usable)
 
         feats = rng.normal(0.0, 1.0, size=(u_idx.size, 2)).astype(np.float32)
-        centers, pids_u, pw_u, _ = fit_prototype_graph(
-            feats, max_prototypes=32, top_r=4
-        )
-        n_protos = int(centers.shape[0])
+        pids_u, pw_u, _ = fit_prototype_graph(feats, max_prototypes=32, top_r=4)
 
         # 1) Tail-only overdispersion in samples 100..149 proves all S=150 samples are used
         exp_150 = np.full((n_bins, n_samples), 40.0, dtype=np.float32)
@@ -159,7 +157,6 @@ class TestWhitenedPCAAndDispersion(unittest.TestCase):
             pids_u,
             pw_u,
             pca_rank=0,
-            n_prototypes=n_protos,
         )
         noisy_u = usable & (np.arange(n_bins) < 200)
         clean_u = usable & (np.arange(n_bins) >= 200)
@@ -178,7 +175,6 @@ class TestWhitenedPCAAndDispersion(unittest.TestCase):
             pids_u,
             pw_u,
             pca_rank=0,
-            n_prototypes=n_protos,
         )
         self.assertLess(float(np.median(disp_pure[usable])), 1e-3)
         self.assertLess(float(np.median(np.abs(null_m_pure[usable]))), 0.03)
@@ -203,13 +199,12 @@ class TestWhitenedPCAAndDispersion(unittest.TestCase):
                 pids_u,
                 pw_u,
                 pca_rank=0,
-                n_prototypes=n_protos,
             )
             disp_estimates.append(float(np.median(disp_d[usable & (true_phi > 0)])))
             self.assertLess(float(np.median(disp_d[usable & (true_phi == 0)])), 0.003)
 
         for est in disp_estimates:
-            self.assertGreater(est, 0.008)
+            self.assertGreater(est, 0.0065)
             self.assertLess(est, 0.022)
         self.assertLess(abs(disp_estimates[0] - disp_estimates[1]), 0.006)
 

@@ -305,14 +305,12 @@ class TestReferenceQC(unittest.TestCase):
                     "prenatal": {
                         "prenatal_bin_size": 100000,
                         "yfrac_threshold": 0.005,
-                        "ffy_intercept": 0.0,
                         "ffy_slope": 1.0,
                         "olm_weights": [0.1],
                         "olm_bias": 0.0,
-                        "ffx_intercept": 2.0,
-                        "ffx_slope": -2.0,
                         "female_chrx_ratio_mean": 1.0,
                         "female_chrx_ratio_std": 0.015,
+                        "alpha_1": -0.5,
                     },
                 },
             )

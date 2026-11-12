@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-from ccnv.models.exceptions import ReferenceError
+from ccnv.models.exceptions import InvalidInputError
 from ccnv.stats.pca import fit_whitened_pca, pca_irlba_numpy
 
 
@@ -47,14 +47,14 @@ class TestPCA(unittest.TestCase):
         self.assertEqual(r1.loadings.shape, (1, 300))
         np.testing.assert_allclose(r1.loadings, r2.loadings, atol=1e-7)
 
-    def test_invalid_inputs_raise_reference_error(self) -> None:
-        with self.assertRaises(ReferenceError):
+    def test_invalid_inputs_raise_invalid_input_error(self) -> None:
+        with self.assertRaises(InvalidInputError):
             fit_whitened_pca(
                 np.ones((4, 3), dtype=np.float32),
                 np.ones((5, 3), dtype=np.float32),
                 np.ones(4, dtype=np.bool_),
             )
-        with self.assertRaises(ReferenceError):
+        with self.assertRaises(InvalidInputError):
             fit_whitened_pca(
                 np.ones((4, 3), dtype=np.float32),
                 np.ones((4, 3), dtype=np.float32),

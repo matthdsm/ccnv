@@ -6,17 +6,20 @@ import json
 import math
 import unittest
 from dataclasses import asdict
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 from helpers import make_sample_table
 from scipy.stats import norm
 
+import ccnv.features.fragmentomics as ff_mod
 from ccnv._core import FRAG_BAND_EDGES
 from ccnv.features.fragmentomics import (
     apply_prenatal_fisher_weighting,
     extract_sample_fragmentomics,
 )
+from ccnv.features.normalization import BranchModel, normalize_sample_branch
 from ccnv.features.prenatal import (
     _evaluate_sca_and_active_ff,
     fit_prenatal_models,
@@ -29,16 +32,18 @@ from ccnv.features.prenatal_origin import (
 )
 from ccnv.models import (
     NUM_FRAG_BANDS,
+    FragmentomicsMetadata,
+    PrenatalModelMetadata,
     SampleBuffers,
     SamplesheetEntry,
     SegmentResult,
     assemble_reference_table,
 )
-from ccnv.models.schemas import FragmentomicsMetadata, PrenatalModelMetadata
 from ccnv.stats.fragmentomics import (
     FRAG_MAX_LEN,
     FRAG_MIN_LEN,
     FRAG_NUM_BINS,
+    compute_band_fisher_weights,
 )
 
 
@@ -48,12 +53,9 @@ def _make_dummy_prenatal_metadata(
     defaults: dict[str, object] = {
         "prenatal_bin_size": 100000,
         "yfrac_threshold": 0.001,
-        "ffy_intercept": 0.0,
         "ffy_slope": 1.0,
         "olm_weights": [],
         "olm_bias": 0.0,
-        "ffx_intercept": 2.0,
-        "ffx_slope": -2.0,
         "female_chrx_ratio_mean": 1.0,
         "female_chrx_ratio_std": 0.01,
         "ffy_std": 0.01,
@@ -75,18 +77,16 @@ def _make_mock_fragmentomics_metadata(
     rng = np.random.default_rng(seed)
     grid = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
 
-    # Maternal density peaked at 166 bp, Fetal density peaked at 143 bp
     p_mat = norm.pdf(grid, loc=166.0, scale=12.0)
     p_fet = norm.pdf(grid, loc=143.0, scale=10.0)
 
     p_mix = (1.0 - fetal_fraction) * p_mat + fetal_fraction * p_fet
     hist_auto = rng.multinomial(50000, p_mix / np.sum(p_mix)).tolist()
-
-    if is_male:
-        hist_chry = rng.multinomial(1000, p_fet / np.sum(p_fet)).tolist()
-    else:
-        hist_chry = rng.multinomial(20, p_mat / np.sum(p_mat)).tolist()
-
+    hist_chry = (
+        rng.multinomial(1000, p_fet / np.sum(p_fet)).tolist()
+        if is_male
+        else rng.multinomial(20, p_mat / np.sum(p_mat)).tolist()
+    )
     hist_chrx = rng.multinomial(2000, p_mix / np.sum(p_mix)).tolist()
     end_motifs = rng.poisson(100, size=256).tolist()
 
@@ -129,7 +129,6 @@ def _make_mock_sample_table(
     frag_gc_sums: list[float] = []
 
     rng = np.random.default_rng(123)
-
     bin_idx = 0
     for contig in contigs:
         for b in range(n_bins_per_contig):
@@ -177,7 +176,8 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         table = _make_mock_sample_table(["chr1", "chrY"], frag_meta=frag_meta)
 
         extracted = extract_sample_fragmentomics(table.schema.metadata)
-        self.assertIsNotNone(extracted)
+        if extracted is None:
+            self.fail("expected extracted fragmentomics metadata")
         self.assertTrue(extracted.paired_end)
         self.assertEqual(len(extracted.hist_autosomal), FRAG_NUM_BINS)
 
@@ -186,38 +186,33 @@ class TestPrenatalFragmentomics(unittest.TestCase):
             ["chr1", "chr2"], n_bins_per_contig=5, bin_size=5000
         )
         ps = BandPrefixSums.from_sample_table(table)
-        self.assertIsNotNone(ps)
-        assert ps is not None
+        if ps is None:
+            self.fail("expected BandPrefixSums")
 
-        # Bins 0-2 of chr1 -> [0, 15000) -> 3 bins * 100 fragments = 300
         bands = ps.query("chr1", 0, 15000)
         self.assertEqual(bands.shape, (NUM_FRAG_BANDS,))
         self.assertAlmostEqual(float(np.sum(bands)), 300.0)
 
-        # Non-existent contig returns zeros
         empty = ps.query("chrUn", 0, 5000)
         self.assertAlmostEqual(float(np.sum(empty)), 0.0)
 
     def test_fuse_active_fetal_fraction_male_and_female(self) -> None:
         meta = _make_dummy_prenatal_metadata()
 
-        # Male: FFY=0.10, FFA=0.105, FFX=0.098, FF_size=0.102 -> FUSED
         _sca_m, fused_ff, _se_m, source = _evaluate_sca_and_active_ff(
-            "M", 0.10, 0.098, 0.105, 0.95, meta, ff_size=0.102
+            "M", 0.10, 0.01, 0.098, 0.105, 0.95, meta, ff_size=0.102
         )
         self.assertEqual(source, "FUSED")
         self.assertAlmostEqual(fused_ff, 0.10, delta=0.01)
 
-        # Female: FFA=0.08, FF_size=0.082 -> FUSED
         _sca_f, fused_f, _se_f, source_f = _evaluate_sca_and_active_ff(
-            "F", None, 0.0, 0.08, 1.0, meta, ff_size=0.082
+            "F", None, None, 0.0, 0.08, 1.0, meta, ff_size=0.082
         )
         self.assertEqual(source_f, "FUSED")
         self.assertAlmostEqual(fused_f, 0.081, delta=0.005)
 
-        # Female: FF_size is None -> FFA
         _sca_ffa, ffa_only, _se_ffa, source_ffa = _evaluate_sca_and_active_ff(
-            "F", None, 0.0, 0.08, 1.0, meta, ff_size=None
+            "F", None, None, 0.0, 0.08, 1.0, meta, ff_size=None
         )
         self.assertEqual(source_ffa, "FFA")
         self.assertAlmostEqual(ffa_only, 0.08, places=4)
@@ -246,7 +241,6 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         p_m24 /= np.sum(p_m24)
         p0_24 = 0.10 * p_f24 + 0.90 * p_m24
 
-        # Fetal constitutional gain: r_obs = 1.05, band counts follow fetal-shifted mixture
         phi_fc = (1.5 * 0.10) / (0.90 + 1.5 * 0.10)
         k_fc = np.round(5000.0 * (phi_fc * p_f24 + (1.0 - phi_fc) * p_m24))
         call_fc, post_fc, _, _ = classify_segment_origin_5state(
@@ -262,7 +256,6 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         self.assertEqual(call_fc, "FETAL_CONSTITUTIONAL")
         self.assertGreater(post_fc["FETAL_CONSTITUTIONAL"], 0.80)
 
-        # Maternal uninherited gain: r_obs = 1 + 0.5 * 0.90 = 1.45, maternal-shifted bands
         phi_mu = 0.10 / (1.5 * 0.90 + 0.10)
         k_mu = np.round(5000.0 * (phi_mu * p_f24 + (1.0 - phi_mu) * p_m24))
         call_mu, post_mu, _, _ = classify_segment_origin_5state(
@@ -278,14 +271,13 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         self.assertEqual(call_mu, "MATERNAL_UNINHERITED")
         self.assertGreater(post_mu["MATERNAL_UNINHERITED"], 0.80)
 
-        # Zero band counts in BandPrefixSums yields None fragmentomic fields
         empty_tbl = make_sample_table([10], starts=[0], ends=[5000], bin_size=5000)
         seg = SegmentResult("chr1", 0, 5000, math.log2(1.05), 4.0, 10.0, 1, "gain")
         annotated, _lod = annotate_prenatal_origin_and_lod(
             [seg],
             prefix_sums=BandPrefixSums.from_sample_table(empty_tbl),
-            p_fetal_24=p_fet,
-            p_maternal_24=p_mat,
+            p_fetal_density=p_fet,
+            p_maternal_density=p_mat,
             active_ff=0.10,
         )
         self.assertIsNone(annotated[0].frag_short_ratio)
@@ -294,8 +286,8 @@ class TestPrenatalFragmentomics(unittest.TestCase):
 
     def test_fit_and_predict_prenatal_with_fragmentomics(self) -> None:
         contigs = ["chr1", "chr2", "chrX", "chrY"]
-        tables = []
-        entries = []
+        tables: list[pa.Table] = []
+        entries: list[SamplesheetEntry] = []
         for i in range(6):
             is_male = i >= 3
             ff_val = 0.10 if is_male else 0.08
@@ -306,7 +298,6 @@ class TestPrenatalFragmentomics(unittest.TestCase):
                 is_male=is_male,
                 seed=42 + i,
             )
-            # 20 bins * 5000 bp = 100 kb per contig
             table = _make_mock_sample_table(
                 contigs,
                 n_bins_per_contig=20,
@@ -318,79 +309,76 @@ class TestPrenatalFragmentomics(unittest.TestCase):
             tables.append(table)
             entries.append(
                 SamplesheetEntry(
-                    filepath=f"sample_{i}.ccnv",
+                    filepath=Path(f"sample_{i}.ccnv"),
                     sex="M" if is_male else "F",
                     ff=ff_val,
                 )
             )
 
-        auto_fit, ffy_fit, meta, _sexes = fit_prenatal_models(
+        meta, (auto_fit, ffy_fit), _sexes = fit_prenatal_models(
             tables,
             entries,
-            bin_size=5000,
             prenatal_bin_size=100000,
             seed=42,
         )
 
-        self.assertIsNotNone(meta.p_fetal_density)
-        self.assertIsNotNone(meta.p_maternal_density)
-        assert meta.p_fetal_density is not None
-        assert meta.p_maternal_density is not None
+        if meta.p_fetal_density is None or meta.p_maternal_density is None:
+            self.fail("expected deconvolved fetal and maternal densities")
         self.assertEqual(len(meta.p_fetal_density), FRAG_NUM_BINS)
         self.assertEqual(len(meta.p_maternal_density), FRAG_NUM_BINS)
         self.assertAlmostEqual(sum(meta.p_fetal_density), 1.0, delta=1e-3)
         self.assertAlmostEqual(sum(meta.p_maternal_density), 1.0, delta=1e-3)
 
-        self.assertIsNotNone(meta.ff_frag_weights)
-        assert meta.ff_frag_weights is not None
+        if meta.ff_frag_weights is None:
+            self.fail("expected ff_frag_weights")
         self.assertEqual(len(meta.ff_frag_weights), 36)
         self.assertIsNotNone(meta.ff_frag_bias)
 
-        # Predict on male sample (sample 4)
         ref_table = assemble_reference_table([auto_fit, ffy_fit])
-        res_male = predict_prenatal(tables[4], ref_table, meta)
+        res_male = predict_prenatal(
+            SampleBuffers.from_table(tables[4]), ref_table, meta
+        )
         self.assertEqual(res_male.fetal_sex, "M")
         self.assertIsNotNone(res_male.ff_size)
         self.assertEqual(res_male.active_ff_source, "FUSED")
 
-        # Predict on female sample (sample 1)
-        res_female = predict_prenatal(tables[1], ref_table, meta)
+        res_female = predict_prenatal(
+            SampleBuffers.from_table(tables[1]), ref_table, meta
+        )
         self.assertEqual(res_female.fetal_sex, "F")
         self.assertIsNotNone(res_female.ff_size)
         self.assertIn(res_female.active_ff_source, ("FUSED", "FFA"))
 
     def test_apply_prenatal_fisher_weighting_replaces_counts(self) -> None:
-        # 1. No-op when prenatal_meta is None
         sample_tbl = make_sample_table([10, 20], fragment_lengths=[[140, 166], [166]])
-        out_noop = apply_prenatal_fisher_weighting(sample_tbl, None)
+        sample_bufs = SampleBuffers.from_table(sample_tbl)
+        out_noop = apply_prenatal_fisher_weighting(sample_bufs, None)
         self.assertIsInstance(out_noop, SampleBuffers)
         np.testing.assert_allclose(out_noop.count, [10.0, 20.0])
 
-        # 2. Replaces counts when densities provided
         grid = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
         p_mat = norm.pdf(grid, loc=166.0, scale=12.0)
         p_fet = norm.pdf(grid, loc=143.0, scale=10.0)
         p_mat /= np.sum(p_mat)
         p_fet /= np.sum(p_fet)
+        bw, mf, mm = compute_band_fisher_weights(p_fet, p_mat)
 
         meta = _make_dummy_prenatal_metadata(
             p_fetal_density=p_fet.tolist(),
             p_maternal_density=p_mat.tolist(),
+            band_fisher_weights=bw.tolist(),
+            mu_fetal_w=mf,
+            mu_maternal_w=mm,
         )
-        out_weighted = apply_prenatal_fisher_weighting(sample_tbl, meta)
+        out_weighted = apply_prenatal_fisher_weighting(sample_bufs, meta)
         weighted_counts = out_weighted.count
         self.assertEqual(len(weighted_counts), 2)
         self.assertGreater(float(weighted_counts[0]), 0.0)
         self.assertGreater(float(weighted_counts[1]), 0.0)
 
     def test_prenatal_prediction_fisher_weighting_reference_scaling(self) -> None:
-        import ccnv.features.fragmentomics as ff_mod
-        from ccnv.predict import BranchModel, normalize_sample_branch
-
         self.assertFalse(hasattr(ff_mod, "align_reference_to_weighted_sample"))
 
-        # 5 bins with identical unweighted counts (50 reads each) across 3 contigs:
-        # Bins 0..3 are diploid background (166 bp); bin 4 is fetal-enriched (135 bp)
         sample_tbl = make_sample_table(
             [50, 50, 50, 50, 50],
             contigs=["chr1", "chr1", "chr2", "chr2", "chr3"],
@@ -405,19 +393,24 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         p_fet = norm.pdf(grid, loc=143.0, scale=10.0)
         p_mat /= np.sum(p_mat)
         p_fet /= np.sum(p_fet)
+        bw, mf, mm = compute_band_fisher_weights(p_fet, p_mat)
         meta = _make_dummy_prenatal_metadata(
             p_fetal_density=p_fet.tolist(),
             p_maternal_density=p_mat.tolist(),
+            band_fisher_weights=bw.tolist(),
+            mu_fetal_w=mf,
+            mu_maternal_w=mm,
         )
-        weighted_sample = apply_prenatal_fisher_weighting(sample_tbl, meta)
-        self.assertIsNotNone(weighted_sample.kappa_frag)
-        assert weighted_sample.kappa_frag is not None
+        weighted_sample = apply_prenatal_fisher_weighting(
+            SampleBuffers.from_table(sample_tbl), meta
+        )
+        if weighted_sample.kappa_frag is None:
+            self.fail("expected kappa_frag")
 
         w_counts = np.asarray(weighted_sample.count, dtype=np.float64)
         kappa = weighted_sample.kappa_frag
         self.assertTrue(np.all(kappa >= 1.0))
 
-        # Reference baseline is directly in weighted space; off-contig prototype 0 pools diploid bins
         bg_mean = float(np.mean(w_counts[:4]))
         branch_model = BranchModel(
             branch="autosomal",
@@ -444,9 +437,8 @@ class TestPrenatalFragmentomics(unittest.TestCase):
             min_reference_bins=1,
         )
         np.testing.assert_allclose(norm_res.ratios[:4], 0.0, atol=0.05)
-        self.assertGreater(norm_res.ratios[4], 0.5)
+        self.assertGreater(float(norm_res.ratios[4]), 0.5)
 
-        # Confirm unweighted fallback when fragment lengths unavailable
         se_sample = make_sample_table([10, 20], starts=[0, 100], ends=[100, 200])
         se_bufs = SampleBuffers.from_table(se_sample)
         se_weighted = apply_prenatal_fisher_weighting(se_bufs, meta)

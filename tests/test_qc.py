@@ -174,14 +174,17 @@ class TestQCPredict(unittest.TestCase):
     def test_build_predict_qc_payload_germline(self) -> None:
         table = make_sample_table([10, 20, 30], bin_size=100)
         segments = [
-            SegmentResult("chr1", 0, 100, 1, 0.5, 3.2, 0.001, "gain"),
-            SegmentResult("chr1", 100, 300, 2, -0.5, -3.2, 0.001, "loss"),
+            SegmentResult("chr1", 0, 100, 0.5, 3.2, 1.0, 1, "gain"),
+            SegmentResult("chr1", 100, 300, -0.5, -3.2, 2.0, 2, "loss"),
         ]
         payload = build_predict_qc_payload("germline", table, segments)
         self.assertEqual(payload["mode"], "germline")
-        self.assertEqual(payload["cnv_summary"]["total_segments"], 2)
-        self.assertEqual(payload["cnv_summary"]["gain_calls"], 1)
-        self.assertEqual(payload["cnv_summary"]["loss_calls"], 1)
+        cnv_summary = payload["cnv_summary"]
+        if not isinstance(cnv_summary, dict):
+            self.fail("expected cnv_summary dict")
+        self.assertEqual(cnv_summary["total_segments"], 2)
+        self.assertEqual(cnv_summary["gain_calls"], 1)
+        self.assertEqual(cnv_summary["loss_calls"], 1)
         self.assertIsNone(payload["prenatal"])
 
     def test_build_predict_qc_payload_prenatal(self) -> None:
@@ -205,16 +208,17 @@ class TestQCPredict(unittest.TestCase):
             warnings=(),
             active_ff_se=0.008,
             lod_metrics=lod,
+            effective_ff=0.14,
         )
         segments = [
             SegmentResult(
                 "chr1",
                 0,
                 100,
-                1,
                 0.5,
                 3.2,
-                0.001,
+                1.0,
+                1,
                 "gain",
                 origin_call="FETAL_CONSTITUTIONAL",
             ),
@@ -222,10 +226,10 @@ class TestQCPredict(unittest.TestCase):
                 "chr1",
                 100,
                 300,
-                2,
                 -0.5,
                 -3.2,
-                0.001,
+                2.0,
+                2,
                 "loss",
                 origin_call="MATERNAL_UNINHERITED",
             ),
@@ -234,14 +238,17 @@ class TestQCPredict(unittest.TestCase):
             "prenatal", table, segments, prenatal_result=ff_res
         )
         self.assertEqual(payload["mode"], "prenatal")
-        self.assertIsNotNone(payload["prenatal"])
-        self.assertEqual(payload["prenatal"]["fetal_sex"], "M")
-        self.assertEqual(payload["prenatal"]["active_ff"], 0.12)
-        self.assertEqual(payload["prenatal"]["active_ff_se"], 0.008)
-        self.assertEqual(payload["prenatal"]["lod_ff_35mb"], 0.015)
-        self.assertEqual(payload["prenatal"]["lod_ff_3mb"], 0.048)
+        prenatal_payload = payload["prenatal"]
+        if not isinstance(prenatal_payload, dict):
+            self.fail("expected prenatal dict")
+        self.assertEqual(prenatal_payload["fetal_sex"], "M")
+        self.assertEqual(prenatal_payload["active_ff"], 0.12)
+        self.assertEqual(prenatal_payload["effective_ff"], 0.14)
+        self.assertEqual(prenatal_payload["active_ff_se"], 0.008)
+        self.assertEqual(prenatal_payload["lod_ff_35mb"], 0.015)
+        self.assertEqual(prenatal_payload["lod_ff_3mb"], 0.048)
         self.assertEqual(
-            payload["prenatal"]["origin_summary"],
+            prenatal_payload["origin_summary"],
             {"FETAL_CONSTITUTIONAL": 1, "MATERNAL_UNINHERITED": 1},
         )
 

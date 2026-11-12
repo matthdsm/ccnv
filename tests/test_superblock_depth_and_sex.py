@@ -9,19 +9,19 @@ from pathlib import Path
 import numpy as np
 from helpers import make_sample_table
 
+from ccnv.features.binning import compute_bin_exposure
 from ccnv.features.cohort import (
     Cohort,
-    InvalidInputError,
-    compute_bin_exposure,
-    estimate_superblock_size_factors,
-    infer_germline_sex_2d,
+    estimate_size_factors,
     mask_low_coverage_per_contig,
 )
+from ccnv.features.sex import infer_germline_sex_2d
 from ccnv.io.parquet import write_reference_parquet, write_sample_parquet
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
+    InvalidInputError,
     ReferenceConfig,
     ReferenceMetadata,
     SamplesheetEntry,
@@ -81,7 +81,9 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
         counts = rng.poisson(rate_matrix).astype(np.float32)
         counts[~usable, :] = 0.0
 
-        sf = estimate_superblock_size_factors(counts, contig_ids, starts, ends, usable)
+        sf = estimate_size_factors(
+            counts, usable, contigs=contig_ids, starts=starts, ends=ends
+        )
         self.assertEqual(sf.dtype, np.float64)
         self.assertAlmostEqual(float(np.median(sf)), 1.0, places=12)
         self.assertEqual(np.unique(np.round(sf, 6)).size, n_samples)
@@ -91,8 +93,8 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
         )
         self.assertLess(float(np.max(rel_err)), 0.04)
 
-        sf_sub = estimate_superblock_size_factors(
-            counts[:, :8], contig_ids, starts, ends, usable
+        sf_sub = estimate_size_factors(
+            counts[:, :8], usable, contigs=contig_ids, starts=starts, ends=ends
         )
         normed = counts[:, :8] / sf_sub[np.newaxis, :]
         # Must stay on O(lambda) read-count scale (~0.35 reads/bin), never 1e-5 library fraction
@@ -103,7 +105,9 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
         zero_col = counts[:, :4].copy()
         zero_col[:, 2] = 0.0
         with self.assertRaises(InvalidInputError):
-            estimate_superblock_size_factors(zero_col, contig_ids, starts, ends, usable)
+            estimate_size_factors(
+                zero_col, usable, contigs=contig_ids, starts=starts, ends=ends
+            )
 
     def test_per_contig_coverage_mask_preserves_clean_prenatal_chry_at_8pct_ff(
         self,
@@ -272,8 +276,7 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
         self.assertFalse(bool(np.any(sex_inf.quarantined_mask[:20])))
         assert sex_inf.cutoff is not None
         self.assertGreater(sex_inf.cutoff, 0.0)
-        self.assertEqual(sex_inf.chry_cutoff, sex_inf.cutoff)
-        self.assertEqual(sex_inf.sample_sexes, sex_inf.labels)
+        self.assertIsNotNone(sex_inf.labels)
 
         # Verify reference building excludes quarantined samples from sex branches AND persists cutoff when labeled
         labeled_entries = tuple(
@@ -413,9 +416,9 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
         self.assertTrue(sex_inf.passed)
         self.assertFalse(bool(np.any(sex_inf.quarantined_mask[:19])))
         self.assertTrue(bool(sex_inf.quarantined_mask[19]))  # XO
-        self.assertLess(float(np.max(np.asarray(sex_inf.d_y)[:19])), 0.05)
-        assert sex_inf.cutoff is not None
         max_f_frac = float(np.max(np.asarray(sex_inf.fractions)[:19]))
+        self.assertLess(max_f_frac, 0.005)
+        assert sex_inf.cutoff is not None
         self.assertGreater(sex_inf.cutoff, max_f_frac * 2.5)
 
         ref_tbl = build_reference_table(

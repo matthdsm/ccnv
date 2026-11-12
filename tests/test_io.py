@@ -6,17 +6,18 @@ from dataclasses import asdict
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
+from helpers import metadata_for
 
+from ccnv.io import parquet as parquet_io
 from ccnv.io.alignments import (
     alignment_format,
     read_alignment_header,
     validate_alignment_inputs,
 )
 from ccnv.io.parquet import (
-    is_sample_parquet,
     read_reference_parquet,
     read_sample_buffers,
-    read_sample_parquet,
     write_reference_parquet,
     write_sample_parquet,
 )
@@ -37,14 +38,13 @@ from ccnv.models import (
     ExtractError,
     ReadFilters,
     ReferenceError,
-    metadata_for,
+    validate_sample_table,
 )
 from ccnv.models.schemas import (
     NUM_FRAG_BANDS,
     NUM_GC_QUANTILES,
     NUM_PROTOTYPES_PER_BIN,
     SAMPLE_SCHEMA,
-    SampleMetadata,
     build_reference_schema,
     reconstruct_sample_grid,
 )
@@ -112,12 +112,13 @@ class TestParquetIO(unittest.TestCase):
             out = write_sample_parquet(table, path)
             self.assertEqual(out, path)
             self.assertTrue(path.is_file())
+            self.assertFalse(hasattr(parquet_io, "is_sample_parquet"))
+            self.assertFalse(hasattr(parquet_io, "read_sample_parquet"))
 
-            loaded = read_sample_parquet(path)
+            loaded = pq.read_table(path)
             self.assertEqual(loaded.num_rows, 2)
-            _, _, starts, _ = reconstruct_sample_grid(SampleMetadata.from_table(loaded))
+            _, _, starts, _ = reconstruct_sample_grid(validate_sample_table(loaded))
             self.assertEqual(starts.tolist(), [0, 100])
-            self.assertTrue(is_sample_parquet(path))
 
             bufs = read_sample_buffers(path)
             self.assertEqual(bufs.num_rows, 2)

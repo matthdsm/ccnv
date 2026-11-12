@@ -58,7 +58,7 @@ def test_singleton_float16_zero_secondary_weights_preserve_cnv_and_null_variance
             np.array([[5000.0, -5000.0, 5000.0]]),
         ]
     ).astype(np.float32)
-    centers, pids, pweights, _ = fit_prototype_graph(feats, max_prototypes=8, top_r=4)
+    pids, pweights, _ = fit_prototype_graph(feats, max_prototypes=8, top_r=4)
 
     assert pweights[16, 0] == np.float16(1.0)
     np.testing.assert_array_equal(pweights[16, 1:], np.float16(0.0))
@@ -80,7 +80,6 @@ def test_singleton_float16_zero_secondary_weights_preserve_cnv_and_null_variance
         pids,
         pweights,
         pca_rank=0,
-        n_prototypes=int(centers.shape[0]),
     )
     assert np.isfinite(null_mean[16])
     assert bio_disp[16] >= 0.0
@@ -152,7 +151,7 @@ def test_calibrate_prototype_dispersion_small_cohort_dof_scaling() -> None:
     assert expected_scale == pytest.approx(1.45)
 
     feats = rng.normal(size=(n_bins, 2)).astype(np.float32)
-    centers, pids, pw, _ = fit_prototype_graph(feats, max_prototypes=16, top_r=4)
+    pids, pw, _ = fit_prototype_graph(feats, max_prototypes=16, top_r=4)
     contigs = np.array([0] * 100 + [1] * 100, dtype=np.int16)
     usable = np.ones(n_bins, dtype=bool)
 
@@ -170,7 +169,6 @@ def test_calibrate_prototype_dispersion_small_cohort_dof_scaling() -> None:
         pids,
         pw,
         pca_rank=pca_rank,
-        n_prototypes=int(centers.shape[0]),
     )
 
     assert np.mean(disp[usable] > 0.0) > 0.90

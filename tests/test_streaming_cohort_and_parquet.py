@@ -192,20 +192,17 @@ def test_streaming_cohort_rejects_upsampling_mixed_layout_and_corrupt(
 def test_prototype_graph_fitting_edge_cases_and_loco_baseline() -> None:
     rng = np.random.default_rng(0)
     feats = rng.standard_normal((500, 4)).astype(np.float32)
-    centers, pids, pweights, mdist = fit_prototype_graph(
-        feats, max_prototypes=2048, top_r=4
-    )
-    assert centers.shape == (8, 4) and centers.dtype == np.float32
+    pids, pweights, mdist = fit_prototype_graph(feats, max_prototypes=2048, top_r=4)
+    assert int(pids.max()) < 8
     assert pids.shape == (500, 4) and pids.dtype == np.uint16
     assert pweights.shape == (500, 4) and pweights.dtype == np.float16
     assert mdist.shape == (500,) and mdist.dtype == np.float32
     np.testing.assert_allclose(pweights.astype(np.float32).sum(axis=1), 1.0, atol=5e-3)
 
     # Small U < 8 and U < top_r = 4 edge cases
-    c_small, id_small, w_small, d_small = fit_prototype_graph(
+    id_small, w_small, d_small = fit_prototype_graph(
         feats[:2], max_prototypes=2048, top_r=4
     )
-    assert c_small.shape == (2, 4)
     assert id_small.shape == (2, 4) and id_small.dtype == np.uint16
     assert w_small.shape == (2, 4) and w_small.dtype == np.float16
     assert d_small.shape == (2,)
@@ -215,10 +212,9 @@ def test_prototype_graph_fitting_edge_cases_and_loco_baseline() -> None:
         w_small[:, :2].astype(np.float32).sum(axis=1), 1.0, atol=5e-3
     )
 
-    c_empty, id_empty, w_empty, d_empty = fit_prototype_graph(
+    id_empty, w_empty, d_empty = fit_prototype_graph(
         np.empty((0, 3), dtype=np.float32), max_prototypes=2048, top_r=4
     )
-    assert c_empty.shape == (0, 3)
     assert id_empty.shape == (0, 4) and id_empty.dtype == np.uint16
     assert w_empty.shape == (0, 4) and w_empty.dtype == np.float16
     assert d_empty.shape == (0,)
@@ -261,7 +257,7 @@ def test_prototype_graph_fitting_edge_cases_and_loco_baseline() -> None:
             np.array([[200.0, 200.0]]),
         ]
     ).astype(np.float32)
-    _, s_pids, s_weights, _ = fit_prototype_graph(
+    s_pids, s_weights, _ = fit_prototype_graph(
         singleton_feats, max_prototypes=8, top_r=4
     )
     assert s_weights[12, 0] == np.float16(1.0)
@@ -436,7 +432,7 @@ def test_end_to_end_reference_and_parallel_bam_predict(tmp_path: Path) -> None:
     from ccnv.predict import load_inputs
 
     with patch(
-        "ccnv.models.schemas.SampleBuffers.to_table",
+        "ccnv.models.buffers.SampleBuffers.to_table",
         side_effect=AssertionError("must not materialize SAMPLE_SCHEMA table"),
     ):
         direct_inputs = load_inputs(bam_path, ref_path, mode="germline", threads=2)
@@ -469,7 +465,6 @@ def test_extract_for_predict_contig_naming_resolution_and_default_mapq_1(
     tmp_path: Path,
 ) -> None:
     from ccnv._core import scan_alignment_bins as scan_core
-    from ccnv.extract import _filters_from_ref_meta
     from ccnv.models import PredictError, ReadFilters
     from ccnv.predict import load_inputs
 
@@ -480,7 +475,9 @@ def test_extract_for_predict_contig_naming_resolution_and_default_mapq_1(
         branches=(BRANCH_AUTOSOMAL,),
         filters={"exclude_duplicates": True},
     )
-    resolved_filters = _filters_from_ref_meta(ref_partial_filters)
+    resolved_filters = ReadFilters.from_dict(
+        ref_partial_filters.filters or {}, strict=False
+    )
     assert (
         resolved_filters.min_mapping_quality == ReadFilters().min_mapping_quality == 1
     )

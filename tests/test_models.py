@@ -1,6 +1,7 @@
 """Unit tests for domain models, configurations, and result types."""
 
 import unittest
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -10,12 +11,22 @@ from ccnv.models import (
     SamplesheetEntry,
 )
 from ccnv.models.results import (
+    BranchQCStatus,
     FetalFractionResult,
     PredictionOutputs,
+    ReferenceQCOutputs,
     SCACall,
     SCAResult,
     SegmentResult,
 )
+
+
+def _call[T](fn: Callable[..., T], *args: object, **kwargs: object) -> T:
+    return fn(*args, **kwargs)
+
+
+def _set_attr(obj: object, name: str, value: object) -> None:
+    setattr(obj, name, value)
 
 
 class TestSamplesheetEntry(unittest.TestCase):
@@ -26,7 +37,7 @@ class TestSamplesheetEntry(unittest.TestCase):
         self.assertIsNone(entry.ff)
 
     def test_samplesheet_entry_string_path_conversion(self) -> None:
-        entry = SamplesheetEntry(filepath="sample1.ccnv")  # type: ignore[arg-type]
+        entry = _call(SamplesheetEntry, filepath="sample1.ccnv")
         self.assertEqual(entry.filepath, Path("sample1.ccnv"))
         self.assertIsInstance(entry.filepath, Path)
 
@@ -42,7 +53,7 @@ class TestSamplesheetEntry(unittest.TestCase):
 
     def test_samplesheet_entry_invalid_sex(self) -> None:
         with self.assertRaisesRegex(ValueError, "sex must be 'M' or 'F'"):
-            SamplesheetEntry(filepath=Path("sample.ccnv"), sex="X")  # type: ignore[arg-type]
+            _call(SamplesheetEntry, filepath=Path("sample.ccnv"), sex="X")
 
     def test_samplesheet_entry_invalid_ff_out_of_bounds(self) -> None:
         with self.assertRaisesRegex(
@@ -57,7 +68,7 @@ class TestSamplesheetEntry(unittest.TestCase):
     def test_samplesheet_entry_immutability(self) -> None:
         entry = SamplesheetEntry(filepath=Path("sample1.ccnv"), sex="F", ff=0.08)
         with self.assertRaises(FrozenInstanceError):
-            entry.sex = "M"  # type: ignore[misc]
+            _set_attr(entry, "sex", "M")
 
 
 class TestReferenceConfig(unittest.TestCase):
@@ -105,12 +116,12 @@ class TestReferenceConfig(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "mode must be 'germline' or 'prenatal'"
         ):
-            ReferenceConfig(prefix=Path("ref"), mode="invalid")  # type: ignore[arg-type]
+            _call(ReferenceConfig, prefix=Path("ref"), mode="invalid")
 
     def test_reference_config_immutability(self) -> None:
         config = ReferenceConfig(prefix=Path("ref"))
         with self.assertRaises(FrozenInstanceError):
-            config.mode = "prenatal"  # type: ignore[misc]
+            _set_attr(config, "mode", "prenatal")
 
 
 class TestPredictConfig(unittest.TestCase):
@@ -125,7 +136,7 @@ class TestPredictConfig(unittest.TestCase):
         self.assertEqual(config.sex, "autosomal")
         self.assertEqual(config.threads, 1)
         self.assertFalse(config.bins_vcf)
-        self.assertIsNone(config.bin_size)
+        self.assertFalse(hasattr(config, "bin_size"))
 
     def test_predict_config_prenatal_mode(self) -> None:
         config = PredictConfig(
@@ -142,11 +153,12 @@ class TestPredictConfig(unittest.TestCase):
         with self.assertRaisesRegex(
             ValueError, "mode must be 'germline' or 'prenatal'"
         ):
-            PredictConfig(
+            _call(
+                PredictConfig,
                 sample=Path("s"),
                 reference=Path("r"),
                 prefix=Path("o"),
-                mode="other",  # type: ignore[arg-type]
+                mode="other",
             )
         with self.assertRaisesRegex(
             ValueError, "min_fetal_fraction_warning must be between 0.0 and 1.0"
@@ -156,13 +168,6 @@ class TestPredictConfig(unittest.TestCase):
                 reference=Path("r"),
                 prefix=Path("o"),
                 min_fetal_fraction_warning=-0.01,
-            )
-        with self.assertRaisesRegex(ValueError, "bin_size must be a positive integer"):
-            PredictConfig(
-                sample=Path("s"),
-                reference=Path("r"),
-                prefix=Path("o"),
-                bin_size=0,
             )
         with self.assertRaisesRegex(
             ValueError, "min_mappability must be between 0.0 and 1.0"
@@ -188,7 +193,7 @@ class TestPredictConfig(unittest.TestCase):
             prefix=Path("o"),
         )
         with self.assertRaises(FrozenInstanceError):
-            config.mode = "prenatal"  # type: ignore[misc]
+            _set_attr(config, "mode", "prenatal")
 
 
 class TestSegmentResult(unittest.TestCase):
@@ -231,7 +236,7 @@ class TestSegmentResult(unittest.TestCase):
     def test_segment_result_immutability(self) -> None:
         seg = SegmentResult("chr1", 0, 100, 0.0, 0.0, 1.0, 1, None)
         with self.assertRaises(FrozenInstanceError):
-            seg.discordant = True  # type: ignore[misc]
+            _set_attr(seg, "discordant", True)
 
 
 class TestSCAResult(unittest.TestCase):
@@ -267,8 +272,9 @@ class TestSCAResult(unittest.TestCase):
 
     def test_sca_result_invalid_call(self) -> None:
         with self.assertRaisesRegex(ValueError, "invalid SCA call"):
-            SCAResult(
-                call="YY",  # type: ignore[arg-type]
+            _call(
+                SCAResult,
+                call="YY",
                 is_aneuploid=True,
                 confidence=0.5,
                 chrx_zscore=0.0,
@@ -277,7 +283,7 @@ class TestSCAResult(unittest.TestCase):
     def test_sca_result_immutability(self) -> None:
         sca = SCAResult("XX", False, 0.99, 0.1)
         with self.assertRaises(FrozenInstanceError):
-            sca.confidence = 1.0  # type: ignore[misc]
+            _set_attr(sca, "confidence", 1.0)
 
 
 class TestFetalFractionResult(unittest.TestCase):
@@ -312,19 +318,20 @@ class TestFetalFractionResult(unittest.TestCase):
 
     def test_fetal_fraction_result_warnings_tuple_conversion(self) -> None:
         sca = SCAResult("XX", False, 0.99, 0.0)
-        ff_res = FetalFractionResult(
+        ff_res = _call(
+            FetalFractionResult,
             fetal_sex="F",
             active_ff=0.03,
             active_ff_source="FFA",
             ffy=None,
-            ffx=None,
+            ffx=0.03,
             ffa=0.03,
             chrx_ratio=1.0,
             chry_score=0.001,
             yfrac_threshold=0.015,
             sca=sca,
             low_ff_warning=True,
-            warnings=["fetal fraction below threshold", "female fetus"],  # type: ignore[arg-type]
+            warnings=["fetal fraction below threshold", "female fetus"],
         )
         self.assertTrue(ff_res.low_ff_warning)
         self.assertIsInstance(ff_res.warnings, tuple)
@@ -336,12 +343,13 @@ class TestFetalFractionResult(unittest.TestCase):
     def test_fetal_fraction_result_validation(self) -> None:
         sca = SCAResult("XX", False, 0.99, 0.0)
         with self.assertRaisesRegex(ValueError, "fetal_sex must be 'M' or 'F'"):
-            FetalFractionResult(
-                fetal_sex="U",  # type: ignore[arg-type]
+            _call(
+                FetalFractionResult,
+                fetal_sex="U",
                 active_ff=0.1,
                 active_ff_source="FFA",
                 ffy=None,
-                ffx=None,
+                ffx=0.1,
                 ffa=0.1,
                 chrx_ratio=1.0,
                 chry_score=0.0,
@@ -354,7 +362,7 @@ class TestFetalFractionResult(unittest.TestCase):
             active_ff_source="FFX",
             ffy=None,
             ffx=0.09,
-            ffa=None,
+            ffa=0.09,
             chrx_ratio=1.0,
             chry_score=0.0,
             yfrac_threshold=0.01,
@@ -365,12 +373,13 @@ class TestFetalFractionResult(unittest.TestCase):
             ValueError,
             "active_ff_source must be 'FFY', 'FFA', 'FFX', 'FF_SIZE', or 'FUSED'",
         ):
-            FetalFractionResult(
+            _call(
+                FetalFractionResult,
                 fetal_sex="F",
                 active_ff=0.1,
-                active_ff_source="OTHER",  # type: ignore[arg-type]
+                active_ff_source="OTHER",
                 ffy=None,
-                ffx=None,
+                ffx=0.1,
                 ffa=0.1,
                 chrx_ratio=1.0,
                 chry_score=0.0,
@@ -393,7 +402,7 @@ class TestFetalFractionResult(unittest.TestCase):
             sca=sca,
         )
         with self.assertRaises(FrozenInstanceError):
-            ff_res.active_ff = 0.15  # type: ignore[misc]
+            _set_attr(ff_res, "active_ff", 0.15)
 
 
 class TestPredictionOutputsAliasesAndFields(unittest.TestCase):
@@ -442,6 +451,21 @@ class TestPredictionOutputsAliasesAndFields(unittest.TestCase):
         self.assertEqual(outputs.qc_json_path, Path("sample_qc.json"))
         self.assertEqual(outputs.prenatal_result, prenatal)
 
+    def test_branch_qc_status_uses_status_property(self) -> None:
+        branch_qc = BranchQCStatus({"verdict": "WARN", "pca_rank": 3})
+        self.assertEqual(branch_qc.status, "WARN")
+        self.assertFalse(hasattr(branch_qc, "verdict"))
+        self.assertEqual(branch_qc["pca_rank"], 3)
+        self.assertEqual(branch_qc.get("missing", "fallback"), "fallback")
+
+        ref_qc = ReferenceQCOutputs(
+            json_path=Path("ref_qc.json"),
+            overall_verdict="PASS",
+            worst_severity=0,
+            data={"branches": {"autosomal": {"verdict": "PASS"}}},
+        )
+        self.assertEqual(ref_qc.branches["autosomal"].status, "PASS")
+
 
 class TestExceptions(unittest.TestCase):
     def test_exception_hierarchy(self) -> None:
@@ -487,10 +511,14 @@ class TestDomainModels(unittest.TestCase):
     def test_contig_lookup(self) -> None:
         from ccnv.models.domain import ContigLookup
 
-        lookup = ContigLookup.from_names(["chr1", "chrX"])
+        lookup = ContigLookup.from_names(c for c in ["chr1", "chrX"])
         self.assertEqual(lookup.resolve("1"), "chr1")
         self.assertEqual(lookup.resolve("CHRX"), "chrX")
         self.assertIsNone(lookup.resolve("chrY"))
+
+        plain_lookup = ContigLookup.from_names(["1", "2"])
+        self.assertEqual(plain_lookup.resolve("chr1"), "1")
+        self.assertIsNone(plain_lookup.resolve("chrZ"))
 
     def test_cytoband(self) -> None:
         from ccnv.models.domain import Cytoband
@@ -503,14 +531,15 @@ class TestDomainModels(unittest.TestCase):
         self.assertEqual(band.stain, "gneg")
 
     def test_chromosome_helpers(self) -> None:
+        from ccnv.models import domain
         from ccnv.models.domain import (
             is_autosome_name,
             is_canonical_contig,
             normalize_chr,
-            resolve_contig_name,
             select_layout,
         )
 
+        self.assertFalse(hasattr(domain, "resolve_contig_name"))
         self.assertEqual(normalize_chr("chr1"), "1")
         self.assertEqual(normalize_chr("chrX"), "X")
         self.assertEqual(normalize_chr("chrx"), "X")
@@ -526,10 +555,6 @@ class TestDomainModels(unittest.TestCase):
         self.assertTrue(is_canonical_contig("chrX"))
         self.assertTrue(is_canonical_contig("chrY"))
         self.assertFalse(is_canonical_contig("chrM"))
-
-        self.assertEqual(resolve_contig_name("1", ["chr1", "chr2"]), "chr1")
-        self.assertEqual(resolve_contig_name("chr1", ["1", "2"]), "1")
-        self.assertIsNone(resolve_contig_name("chrZ", ["chr1", "chr2"]))
 
         layout = select_layout([("chr1", 1000), ("chrM", 500)], all_contigs=False)
         self.assertEqual(layout, [("chr1", 1000)])
@@ -555,11 +580,13 @@ class TestModelReExports(unittest.TestCase):
             "select_layout",
             "is_canonical_contig",
             "is_autosome_name",
-            "resolve_contig_name",
             "normalize_chr",
             "BinResult",
+            "BranchQCStatus",
             "SegmentResult",
             "SCAResult",
+            "ScanAlignmentResult",
+            "ScanQcCounts",
             "FetalFractionResult",
             "PredictionOutputs",
             "ReferenceQCOutputs",
@@ -579,7 +606,6 @@ class TestModelReExports(unittest.TestCase):
             "BRANCH_PRENATAL_AUTOSOMAL",
             "BRANCH_PRENATAL_FFY",
             "KNOWN_REFERENCE_BRANCHES",
-            "CNV_REFERENCE_BRANCHES",
             "ArtifactKind",
             "SampleBuffers",
             "BranchFitArrays",
@@ -591,10 +617,8 @@ class TestModelReExports(unittest.TestCase):
             "build_reference_schema",
             "reconstruct_sample_grid",
             "decode_metadata",
-            "metadata_for",
             "encode_metadata",
             "validate_metadata",
-            "validate_table",
             "validate_schema",
             "validate_sample_table",
             "validate_reference_table",
@@ -612,6 +636,17 @@ class TestModelReExports(unittest.TestCase):
         for sym in expected_symbols:
             self.assertTrue(
                 hasattr(models, sym), f"ccnv.models missing re-export {sym}"
+            )
+
+        removed_symbols = (
+            "CNV_REFERENCE_BRANCHES",
+            "metadata_for",
+            "resolve_contig_name",
+            "validate_table",
+        )
+        for sym in removed_symbols:
+            self.assertFalse(
+                hasattr(models, sym), f"ccnv.models still exports removed symbol {sym}"
             )
 
 

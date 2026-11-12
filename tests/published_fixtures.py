@@ -81,10 +81,10 @@ def extract_published_samples(root: Path) -> tuple[Path, Path]:
         valid = False
         if cached_sample.is_file() and cached_sample.stat().st_size > 0:
             try:
-                from ccnv.io.parquet import read_sample_parquet
+                from ccnv.io.parquet import read_sample_buffers
                 from ccnv.models.exceptions import CcnvError
 
-                read_sample_parquet(cached_sample)
+                read_sample_buffers(cached_sample)
                 valid = True
             except CcnvError, OSError:
                 valid = False

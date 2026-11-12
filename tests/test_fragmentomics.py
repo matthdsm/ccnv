@@ -1,13 +1,23 @@
 """Unit and property tests for cfDNA fragmentomic mathematical kernels."""
 
+from __future__ import annotations
+
 import unittest
 
 import numpy as np
+from helpers import make_sample_table
 
+import ccnv.features.fragmentomics as ff_mod
 from ccnv._core import FRAG_BAND_EDGES
-from ccnv.models.schemas import (
+from ccnv.features.fragmentomics import (
+    CohortFragmentomicsFit,
+    apply_prenatal_fisher_weighting,
+    fit_cohort_fragmentomics_model,
+)
+from ccnv.models import (
     NUM_FRAG_BANDS,
     FragmentomicsMetadata,
+    InvalidInputError,
     PrenatalModelMetadata,
     SampleBuffers,
 )
@@ -16,6 +26,8 @@ from ccnv.stats.fragmentomics import (
     FRAG_MAX_LEN,
     FRAG_MIN_LEN,
     FRAG_NUM_BINS,
+    FragmentomicLandmarks,
+    LogitEnsembleFit,
     align_histogram,
     build_fragmentomic_feature_vector,
     compute_band_fisher_weights,
@@ -37,7 +49,7 @@ class TestFragmentomicsKernels(unittest.TestCase):
         self.assertEqual(FRAG_NUM_BINS, 571)
         self.assertEqual(CANONICAL_CHROMATOSOME_BP, 166.0)
 
-    def test_encode_kmer_4_forward_and_reverse_complement(self) -> None:
+    def test_encode_kmer_4(self) -> None:
         self.assertEqual(encode_kmer_4("AAAA"), 0)
         self.assertEqual(encode_kmer_4("AAAC"), 1)
         self.assertEqual(encode_kmer_4("AAAG"), 2)
@@ -45,36 +57,26 @@ class TestFragmentomicsKernels(unittest.TestCase):
         self.assertEqual(encode_kmer_4("TTTT"), 255)
         self.assertEqual(encode_kmer_4("CCCA"), 1 * 64 + 1 * 16 + 1 * 4 + 0)
 
-        # Reverse complement: RC of TTTT is AAAA -> 0
-        self.assertEqual(encode_kmer_4("TTTT", reverse_complement=True), 0)
-        # RC of CCCA is TGGG -> 3*64 + 2*16 + 2*4 + 2 = 192 + 32 + 8 + 2 = 234
-        self.assertEqual(encode_kmer_4("CCCA", reverse_complement=True), 234)
-
-        # Invalid characters or lengths return None
         self.assertIsNone(encode_kmer_4("AAAN"))
         self.assertIsNone(encode_kmer_4("AAA"))
         self.assertIsNone(encode_kmer_4("AAAAA"))
         self.assertIsNone(encode_kmer_4("AAAR"))
 
-        # Accepts bytes as well
         self.assertEqual(encode_kmer_4(b"AAAA"), 0)
         self.assertEqual(encode_kmer_4(b"TTTT"), 255)
 
     def test_compute_motif_diversity_score(self) -> None:
-        # Uniform distribution over 256 motifs has MDS = 1.0
         uniform_counts = np.ones(256, dtype=np.float64) * 100.0
         self.assertAlmostEqual(
             compute_motif_diversity_score(uniform_counts), 1.0, places=5
         )
 
-        # Delta distribution (all counts in 1 motif) has MDS = 0.0
         delta_counts = np.zeros(256, dtype=np.float64)
         delta_counts[0] = 5000.0
         self.assertAlmostEqual(
             compute_motif_diversity_score(delta_counts), 0.0, places=5
         )
 
-        # Scale invariance
         scale_1 = np.arange(1, 257, dtype=np.float64)
         scale_2 = scale_1 * 17.5
         self.assertAlmostEqual(
@@ -82,13 +84,10 @@ class TestFragmentomicsKernels(unittest.TestCase):
             compute_motif_diversity_score(scale_2),
             places=6,
         )
-
-        # All zeros returns 0.0
         self.assertEqual(compute_motif_diversity_score(np.zeros(256)), 0.0)
 
     def test_compute_helical_periodicity(self) -> None:
-        lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1)  # 30 to 600
-        # Create a synthetic signal with a pure 10.4 bp oscillation in [80, 155] bp
+        lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1)
         hist = np.ones(FRAG_NUM_BINS, dtype=np.float64) * 1000.0
         mask_sub = (lengths >= 80) & (lengths <= 155)
         hist[mask_sub] += 200.0 * np.cos(2.0 * np.pi * lengths[mask_sub] / 10.4)
@@ -99,68 +98,54 @@ class TestFragmentomicsKernels(unittest.TestCase):
         amp_scaled, _ = compute_helical_periodicity(hist * 10.0)
         self.assertAlmostEqual(amp, amp_scaled, places=6)
 
-        # Flat signal has negligible amplitude
         flat_hist = np.ones(FRAG_NUM_BINS, dtype=np.float64) * 1000.0
         amp_flat, _ = compute_helical_periodicity(flat_hist)
         self.assertLess(amp_flat, 1e-3)
 
     def test_align_histogram_subpixel(self) -> None:
         hist = np.zeros(FRAG_NUM_BINS, dtype=np.float64)
-        # Place a delta at index 136 (corresponding to length 30 + 136 = 166 bp)
         hist[136] = 1000.0
 
-        # Shift by +1.0 bp should shift the peak leftwards (index 135)
         shifted = align_histogram(hist, shift_bp=1.0)
-        self.assertAlmostEqual(shifted[135], 1000.0, places=3)
-        self.assertAlmostEqual(shifted[136], 0.0, places=3)
-        self.assertAlmostEqual(np.sum(shifted), 1000.0, places=3)
+        self.assertAlmostEqual(float(shifted[135]), 1000.0, places=3)
+        self.assertAlmostEqual(float(shifted[136]), 0.0, places=3)
+        self.assertAlmostEqual(float(np.sum(shifted)), 1000.0, places=3)
 
-        # Shift by +0.5 bp should split equally between index 135 and 136
         shifted_half = align_histogram(hist, shift_bp=0.5)
-        self.assertAlmostEqual(shifted_half[135], 500.0, places=3)
-        self.assertAlmostEqual(shifted_half[136], 500.0, places=3)
-        self.assertAlmostEqual(np.sum(shifted_half), 1000.0, places=3)
+        self.assertAlmostEqual(float(shifted_half[135]), 500.0, places=3)
+        self.assertAlmostEqual(float(shifted_half[136]), 500.0, places=3)
+        self.assertAlmostEqual(float(np.sum(shifted_half)), 1000.0, places=3)
 
     def test_estimate_sample_landmarks_paired_and_single_end(self) -> None:
         lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1)
-        # Synthetic cfDNA histogram:
-        # Maternal mode at 166 bp, fetal shoulder at 143 bp
         auto_hist = (
             8000.0 * np.exp(-0.5 * ((lengths - 166.0) / 10.0) ** 2)
             + 2500.0 * np.exp(-0.5 * ((lengths - 143.0) / 8.0) ** 2)
             + 2.0
         ).astype(np.int64)
-
-        chry_hist = np.zeros(FRAG_NUM_BINS, dtype=np.int64)
-        chrx_hist = (auto_hist // 2).astype(np.int64)
         motifs = np.ones(256, dtype=np.int64) * 50
 
-        meta = estimate_sample_landmarks(
+        lm = estimate_sample_landmarks(
             hist_autosomal=auto_hist,
-            hist_chry=chry_hist,
-            hist_chrx=chrx_hist,
             end_motif_counts=motifs,
             paired_end=True,
         )
+        self.assertIsInstance(lm, FragmentomicLandmarks)
+        self.assertTrue(lm.paired_end)
+        self.assertAlmostEqual(lm.chromatosome_mode_bp, 166.0, delta=1.5)
+        self.assertAlmostEqual(lm.sizing_shift_bp, 0.0, delta=1.5)
+        self.assertGreater(lm.self_referenced_peak_ratio, 0.1)
+        self.assertAlmostEqual(lm.motif_diversity_score, 1.0, places=4)
+        self.assertLess(lm.high_mw_fraction, 0.05)
 
-        self.assertTrue(meta.paired_end)
-        self.assertAlmostEqual(meta.chromatosome_mode_bp, 166.0, delta=1.5)
-        self.assertAlmostEqual(meta.sizing_shift_bp, 0.0, delta=1.5)
-        self.assertGreater(meta.self_referenced_peak_ratio, 0.1)
-        self.assertAlmostEqual(meta.motif_diversity_score, 1.0, places=4)
-        self.assertLess(meta.high_mw_fraction, 0.05)
-
-        # Single-end fallback
-        meta_se = estimate_sample_landmarks(
+        lm_se = estimate_sample_landmarks(
             hist_autosomal=np.zeros(FRAG_NUM_BINS, dtype=np.int64),
-            hist_chry=np.zeros(FRAG_NUM_BINS, dtype=np.int64),
-            hist_chrx=np.zeros(FRAG_NUM_BINS, dtype=np.int64),
             end_motif_counts=np.zeros(256, dtype=np.int64),
             paired_end=False,
         )
-        self.assertFalse(meta_se.paired_end)
-        self.assertEqual(meta_se.chromatosome_mode_bp, 166.0)
-        self.assertEqual(meta_se.sizing_shift_bp, 0.0)
+        self.assertFalse(lm_se.paired_end)
+        self.assertEqual(lm_se.chromatosome_mode_bp, 166.0)
+        self.assertEqual(lm_se.sizing_shift_bp, 0.0)
 
     def test_deconvolve_fetal_maternal_densities_and_fisher_weights(self) -> None:
         lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1)
@@ -168,7 +153,6 @@ class TestFragmentomicsKernels(unittest.TestCase):
         male_mask = np.array([True] * 6 + [False] * 4)
         ffy_values = np.array([0.10, 0.12, 0.08, 0.15, 0.09, 0.11, 0.0, 0.0, 0.0, 0.0])
 
-        # Generate synthetic aligned autosomal and chrY histograms
         p_f_true = np.exp(-0.5 * ((lengths - 143.0) / 10.0) ** 2)
         p_f_true /= np.sum(p_f_true)
         p_m_true = np.exp(-0.5 * ((lengths - 166.0) / 12.0) ** 2)
@@ -182,60 +166,46 @@ class TestFragmentomicsKernels(unittest.TestCase):
             mix = f * p_f_true + (1.0 - f) * p_m_true
             aligned_auto[i] = mix * 100_000.0
             if male_mask[i]:
-                aligned_chry[i] = p_f_true * 1_000.0  # chrY is purely fetal in males
+                aligned_chry[i] = p_f_true * 1_000.0
 
         p_f_hat, p_m_hat = deconvolve_fetal_maternal_densities(
-            aligned_auto_hists=aligned_auto,
-            aligned_chry_hists=aligned_chry,
-            male_mask=male_mask,
-            ffy_values=ffy_values,
+            aligned_auto, aligned_chry, ffy_values, male_mask
         )
 
-        # Densities must sum to 1.0 on simplex
-        self.assertAlmostEqual(np.sum(p_f_hat), 1.0, places=5)
-        self.assertAlmostEqual(np.sum(p_m_hat), 1.0, places=5)
+        self.assertAlmostEqual(float(np.sum(p_f_hat)), 1.0, places=5)
+        self.assertAlmostEqual(float(np.sum(p_m_hat)), 1.0, places=5)
         self.assertTrue(np.all(p_f_hat >= 0.0))
         self.assertTrue(np.all(p_m_hat >= 0.0))
 
-        # Peak of p_f_hat should be near 143, p_m_hat near 166
-        mode_f = lengths[np.argmax(p_f_hat)]
-        mode_m = lengths[np.argmax(p_m_hat)]
+        mode_f = int(lengths[np.argmax(p_f_hat)])
+        mode_m = int(lengths[np.argmax(p_m_hat)])
         self.assertTrue(138 <= mode_f <= 148, f"p_f mode was {mode_f}")
         self.assertTrue(162 <= mode_m <= 170, f"p_m mode was {mode_m}")
 
-        # 24-band Fisher-optimal weights
         w_24, mu_f_w, mu_m_w = compute_band_fisher_weights(p_f_hat, p_m_hat, f0=0.10)
         self.assertEqual(len(w_24), NUM_FRAG_BANDS)
         self.assertTrue(np.all(w_24 >= 0.25))
         self.assertTrue(np.all(w_24 <= 3.0))
-
-        # Maternal density normalizes to unit mean weight; fetal density enriches > 1.0
         self.assertAlmostEqual(mu_m_w, 1.0, places=4)
         self.assertGreater(mu_f_w, 1.0)
 
-        # Band containing 143 bp has weight > 1.0; band containing 166 bp has weight < 1.0
         band_143 = int(np.searchsorted(FRAG_BAND_EDGES, 143, side="right") - 1)
         band_166 = int(np.searchsorted(FRAG_BAND_EDGES, 166, side="right") - 1)
-        self.assertGreater(w_24[band_143], 1.0)
-        self.assertLess(w_24[band_166], 1.0)
+        self.assertGreater(float(w_24[band_143]), 1.0)
+        self.assertLess(float(w_24[band_166]), 1.0)
 
     def test_deconvolve_low_male_fallback(self) -> None:
-        # Cohort with 0 males falls back smoothly to parametric templates
         aligned_auto = np.ones((5, FRAG_NUM_BINS), dtype=np.float64) * 100.0
         aligned_chry = np.zeros((5, FRAG_NUM_BINS), dtype=np.float64)
         male_mask = np.zeros(5, dtype=bool)
         ffy_values = np.zeros(5, dtype=np.float64)
 
         p_f_hat, p_m_hat = deconvolve_fetal_maternal_densities(
-            aligned_auto_hists=aligned_auto,
-            aligned_chry_hists=aligned_chry,
-            male_mask=male_mask,
-            ffy_values=ffy_values,
+            aligned_auto, aligned_chry, ffy_values, male_mask
         )
-        self.assertAlmostEqual(np.sum(p_f_hat), 1.0, places=5)
-        self.assertAlmostEqual(np.sum(p_m_hat), 1.0, places=5)
+        self.assertAlmostEqual(float(np.sum(p_f_hat)), 1.0, places=5)
+        self.assertAlmostEqual(float(np.sum(p_m_hat)), 1.0, places=5)
 
-        # Low-FFY (< 0.08) males are excluded from both eligible-male and female pools
         lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
         pure_fetal_peak = np.zeros(FRAG_NUM_BINS, dtype=np.float64)
         pure_fetal_peak[143 - FRAG_MIN_LEN] = 500.0
@@ -254,83 +224,60 @@ class TestFragmentomicsKernels(unittest.TestCase):
         male_mix = np.array([True] * 6 + [False] * 2, dtype=bool)
         ffy_mix = np.array([0.12, 0.11, 0.10, 0.14, 0.09, 0.03, 0.0, 0.0])
         p_f_clean, _ = deconvolve_fetal_maternal_densities(
-            aligned_auto_hists=auto_mix,
-            aligned_chry_hists=chry_mix,
-            male_mask=male_mix,
-            ffy_values=ffy_mix,
+            auto_mix, chry_mix, ffy_mix, male_mix
         )
-        self.assertGreater(p_f_clean[143 - FRAG_MIN_LEN], 0.05)
-        self.assertAlmostEqual(p_f_clean[250 - FRAG_MIN_LEN], 0.0, places=6)
+        self.assertGreater(float(p_f_clean[143 - FRAG_MIN_LEN]), 0.05)
+        self.assertAlmostEqual(float(p_f_clean[250 - FRAG_MIN_LEN]), 0.0, places=6)
 
     def test_feature_vector_and_ensemble_training(self) -> None:
-        meta = FragmentomicsMetadata(
-            paired_end=True,
-            total_paired_fragments=500_000,
+        feat = build_fragmentomic_feature_vector(
+            [100] * FRAG_NUM_BINS,
+            [20] * 256,
             chromatosome_mode_bp=166.0,
-            core_shoulder_bp=143.0,
             sizing_shift_bp=0.0,
-            self_referenced_peak_ratio=0.35,
-            dinucleosome_fraction=0.08,
-            high_mw_fraction=0.01,
-            helical_10bp_amplitude=0.045,
-            helical_10bp_phase=1.2,
-            motif_diversity_score=0.91,
-            hist_autosomal=[100] * 571,
-            hist_chry=[10] * 571,
-            hist_chrx=[50] * 571,
-            end_motif_counts=[20] * 256,
+            helical_10bp_amp=0.045,
+            motif_mds=0.91,
         )
-
-        feat = build_fragmentomic_feature_vector(meta)
         self.assertEqual(len(feat), 36)
         self.assertFalse(np.any(np.isnan(feat)))
         self.assertFalse(np.any(np.isinf(feat)))
 
-        # Train ensemble on small synthetic cohort
+        rng = np.random.default_rng(42)
         n_samples = 25
-        np.random.seed(42)
-        X = np.random.randn(n_samples, 36)
-        # FF targets between 0.04 and 0.22
-        y = 0.04 + 0.18 * (X[:, 0] - X[:, 0].min()) / (
-            X[:, 0].max() - X[:, 0].min() + 1e-6
+        x_mat = rng.standard_normal((n_samples, 36))
+        y = 0.04 + 0.18 * (x_mat[:, 0] - x_mat[:, 0].min()) / (
+            x_mat[:, 0].max() - x_mat[:, 0].min() + 1e-6
         )
 
-        weights, bias, mean, scale, loocv_std = fit_ff_fragmentomics_ensemble(X, y)
-        self.assertEqual(len(weights), 36)
-        self.assertEqual(len(mean), 36)
-        self.assertEqual(len(scale), 36)
-        self.assertGreaterEqual(loocv_std, 0.015)
+        ens = fit_ff_fragmentomics_ensemble(x_mat, y)
+        self.assertIsInstance(ens, LogitEnsembleFit)
+        self.assertEqual(len(ens.weights), 36)
+        self.assertEqual(len(ens.feat_mean), 36)
+        self.assertEqual(len(ens.feat_std), 36)
+        self.assertGreaterEqual(ens.oof_rmse, 0.015)
 
-        with self.assertRaises(ValueError):
-            fit_ff_fragmentomics_ensemble(X[:4], y[:4])
+        with self.assertRaises(InvalidInputError):
+            fit_ff_fragmentomics_ensemble(x_mat[:4], y[:4])
 
-        # Test predict_ff_fragmentomics
-        dummy_model = PrenatalModelMetadata(
-            prenatal_bin_size=100_000,
-            yfrac_threshold=0.004,
-            ffy_intercept=0.0,
-            ffy_slope=1.0,
-            olm_weights=[0.01] * 50,
-            olm_bias=0.0,
-            ffx_intercept=1.0,
-            ffx_slope=-0.5,
-            female_chrx_ratio_mean=1.0,
-            female_chrx_ratio_std=0.01,
-            ff_frag_weights=weights.tolist(),
-            ff_frag_bias=bias,
-            ff_frag_feature_mean=mean.tolist(),
-            ff_frag_feature_scale=scale.tolist(),
-            ff_size_std=loocv_std,
+        pred = predict_ff_fragmentomics(
+            [100] * FRAG_NUM_BINS,
+            [20] * 256,
+            paired_end=True,
+            chromatosome_mode_bp=166.0,
+            sizing_shift_bp=0.0,
+            helical_10bp_amp=0.045,
+            motif_mds=0.91,
+            ff_frag_weights=ens.weights,
+            ff_frag_bias=ens.intercept,
+            ff_frag_feature_mean=ens.feat_mean,
+            ff_frag_feature_scale=ens.feat_std,
         )
-
-        pred = predict_ff_fragmentomics(meta, dummy_model)
         self.assertIsNotNone(pred)
-        assert pred is not None
+        if pred is None:
+            self.fail("expected non-None ff_size prediction")
         self.assertTrue(0.001 < pred < 0.999)
 
     def test_evaluate_band_weighted_counts(self) -> None:
-        from helpers import make_sample_table
-
         table = make_sample_table(
             [2, 0, 1],
             contigs=["chr1", "chr1", "chr1"],
@@ -339,7 +286,8 @@ class TestFragmentomicsKernels(unittest.TestCase):
             fragment_lengths=[[105, 155], [], [205]],
         )
         bufs = SampleBuffers.from_table(table)
-        assert bufs.frag_bands is not None
+        if bufs.frag_bands is None:
+            self.fail("expected frag_bands")
 
         w_24 = np.ones(NUM_FRAG_BANDS, dtype=np.float64)
         band_105 = int(np.searchsorted(FRAG_BAND_EDGES, 105, side="right") - 1)
@@ -353,12 +301,11 @@ class TestFragmentomicsKernels(unittest.TestCase):
             bufs.frag_bands, bufs.count, bufs.paired_count, w_24
         )
         self.assertEqual(len(eff_cov), 3)
-        self.assertAlmostEqual(eff_cov[0], 2.5)
-        self.assertAlmostEqual(eff_cov[1], 0.0)
-        self.assertAlmostEqual(eff_cov[2], 3.0)
+        self.assertAlmostEqual(float(eff_cov[0]), 2.5)
+        self.assertAlmostEqual(float(eff_cov[1]), 0.0)
+        self.assertAlmostEqual(float(eff_cov[2]), 3.0)
         self.assertTrue(np.all(kappa >= 1.0))
 
-        # Single-end / zero-paired fallback preserves unweighted counts
         table_se = make_sample_table(
             [5, 10, 15],
             contigs=["chr1", "chr1", "chr1"],
@@ -377,42 +324,9 @@ class TestFragmentomicsKernels(unittest.TestCase):
         np.testing.assert_allclose(eff_se, [5.0, 10.0, 15.0])
         np.testing.assert_allclose(kappa_se, [1.0, 1.0, 1.0])
 
-    def test_extract_bin_fragmentomic_covariates(self) -> None:
-        from helpers import make_sample_table
-
-        from ccnv.features.fragmentomics import extract_bin_fragmentomic_covariates
-
-        frag_lens = [[120, 140], [], [180]]
-        table = make_sample_table(
-            [2, 0, 1],
-            contigs=["chr1", "chr1", "chr1"],
-            starts=[0, 100, 200],
-            ends=[100, 200, 300],
-            fragment_lengths=frag_lens,
-            endpoint_counts=[4, 0, 2],
-        )
-
-        mean_lens, ep_ratios = extract_bin_fragmentomic_covariates(table)
-        self.assertEqual(len(mean_lens), 3)
-        self.assertEqual(len(ep_ratios), 3)
-
-        # Bin 0: mean(120, 140) = 130.0
-        self.assertAlmostEqual(mean_lens[0], 130.0)
-        # Bin 2: 180.0
-        self.assertAlmostEqual(mean_lens[2], 180.0)
-        # Bin 1 (empty): imputed to median of non-empty bins = median([130, 180]) = 155.0
-        self.assertAlmostEqual(mean_lens[1], 155.0)
-
-        # Endpoint ratios: 4/2 = 2.0, 0/max(0,1) = 0.0, 2/1 = 2.0
-        self.assertAlmostEqual(ep_ratios[0], 2.0)
-        self.assertAlmostEqual(ep_ratios[1], 0.0)
-        self.assertAlmostEqual(ep_ratios[2], 2.0)
-
     def test_fit_cohort_fragmentomics_model_fewer_than_five_samples_skips_ensemble(
         self,
     ) -> None:
-        from ccnv.features.fragmentomics import fit_cohort_fragmentomics_model
-
         meta = FragmentomicsMetadata(
             paired_end=True,
             total_paired_fragments=10_000,
@@ -425,37 +339,32 @@ class TestFragmentomicsKernels(unittest.TestCase):
             helical_10bp_amplitude=0.045,
             helical_10bp_phase=1.2,
             motif_diversity_score=0.91,
-            hist_autosomal=[100] * 571,
-            hist_chry=[10] * 571,
-            hist_chrx=[50] * 571,
+            hist_autosomal=[100] * FRAG_NUM_BINS,
+            hist_chry=[10] * FRAG_NUM_BINS,
+            hist_chrx=[50] * FRAG_NUM_BINS,
             end_motif_counts=[20] * 256,
         )
         frag_metas = [meta, meta, meta]
         is_male = np.array([True, False, True], dtype=bool)
-        final_ffy = np.array([0.10, 0.0, 0.12], dtype=float)
-        target_ffa = np.array([0.10, 0.08, 0.12], dtype=float)
+        ff_targets = np.array([0.10, 0.08, 0.12], dtype=float)
 
-        fit = fit_cohort_fragmentomics_model(frag_metas, is_male, final_ffy, target_ffa)
+        fit = fit_cohort_fragmentomics_model(frag_metas, is_male, ff_targets)
         self.assertIsNotNone(fit)
-        assert fit is not None
-        p_fet, p_mat, w_frag, b_frag, m_frag, s_frag, loocv_std = fit
-        self.assertIsNotNone(p_fet)
-        self.assertEqual(len(p_fet), 571)
-        self.assertIsNotNone(p_mat)
-        self.assertEqual(len(p_mat), 571)
-        self.assertIsNone(w_frag)
-        self.assertIsNone(b_frag)
-        self.assertIsNone(m_frag)
-        self.assertIsNone(s_frag)
-        self.assertEqual(loocv_std, 0.018)
+        if not isinstance(fit, CohortFragmentomicsFit):
+            self.fail("expected CohortFragmentomicsFit")
+        self.assertEqual(len(fit.p_fetal_density), FRAG_NUM_BINS)
+        self.assertEqual(len(fit.p_maternal_density), FRAG_NUM_BINS)
+        self.assertIsNone(fit.ff_frag_weights)
+        self.assertIsNone(fit.ff_frag_bias)
+        self.assertIsNone(fit.ff_frag_feature_mean)
+        self.assertIsNone(fit.ff_frag_feature_scale)
+        self.assertEqual(fit.ff_size_std, 0.018)
 
-    def test_align_reference_to_weighted_sample(self) -> None:
-        from helpers import make_sample_table
-
-        import ccnv.features.fragmentomics as ff_mod
-        from ccnv.features.fragmentomics import apply_prenatal_fisher_weighting
-
+    def test_align_reference_to_weighted_sample_deleted_and_fisher_weighting(
+        self,
+    ) -> None:
         self.assertFalse(hasattr(ff_mod, "align_reference_to_weighted_sample"))
+        self.assertFalse(hasattr(ff_mod, "extract_bin_fragmentomic_covariates"))
 
         sample_tbl = make_sample_table(
             [10, 20],
@@ -467,21 +376,24 @@ class TestFragmentomicsKernels(unittest.TestCase):
         dummy_meta = PrenatalModelMetadata(
             prenatal_bin_size=100_000,
             yfrac_threshold=0.004,
-            ffy_intercept=0.0,
             ffy_slope=1.0,
             olm_weights=[],
             olm_bias=0.0,
-            ffx_intercept=1.0,
-            ffx_slope=-0.5,
             female_chrx_ratio_mean=1.0,
             female_chrx_ratio_std=0.01,
-            p_fetal_density=[1.0 / 571] * 571,
-            p_maternal_density=[1.0 / 571] * 571,
+            p_fetal_density=[1.0 / FRAG_NUM_BINS] * FRAG_NUM_BINS,
+            p_maternal_density=[1.0 / FRAG_NUM_BINS] * FRAG_NUM_BINS,
+            band_fisher_weights=[1.5] * 12 + [0.8] * 12,
+            mu_fetal_w=1.15,
+            mu_maternal_w=1.0,
         )
-        weighted_bufs = apply_prenatal_fisher_weighting(sample_tbl, dummy_meta)
+        weighted_bufs = apply_prenatal_fisher_weighting(
+            SampleBuffers.from_table(sample_tbl), dummy_meta
+        )
         self.assertIsInstance(weighted_bufs, SampleBuffers)
         self.assertIsNotNone(weighted_bufs.kappa_frag)
-        assert weighted_bufs.kappa_frag is not None
+        if weighted_bufs.kappa_frag is None:
+            self.fail("expected kappa_frag")
         self.assertTrue(np.all(weighted_bufs.kappa_frag >= 1.0))
 
 

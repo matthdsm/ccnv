@@ -6,12 +6,12 @@ from pathlib import Path
 
 import numpy as np
 
-from ccnv.features.covariates import (
+from ccnv.models import InvalidInputError
+from ccnv.stats.regression import (
+    _count_distinct_up_to,
     build_exogenous_covariate_basis,
     fit_poisson_covariate_trends,
 )
-from ccnv.models import InvalidInputError
-from ccnv.stats.regression import _has_min_distinct
 
 
 class TestPoissonCovariates(unittest.TestCase):
@@ -214,18 +214,20 @@ class TestPoissonCovariates(unittest.TestCase):
         self.assertLess(err_lo, 0.06)
 
     def test_empty_basis_strided_memmap_and_distinct_value_scan(self) -> None:
-        # _has_min_distinct O(1) short-circuit and chunked fallback
-        self.assertFalse(_has_min_distinct(np.array([1.0, 2.0, 3.0, 4.0]), 5))
-        self.assertTrue(_has_min_distinct(np.array([1.0, 2.0, 3.0, 4.0, 5.0]), 5))
+        # _count_distinct_up_to O(1) short-circuit and chunked fallback
+        self.assertEqual(_count_distinct_up_to(np.array([1.0, 2.0, 3.0, 4.0]), 5), 4)
+        self.assertEqual(
+            _count_distinct_up_to(np.array([1.0, 2.0, 3.0, 4.0, 5.0]), 5), 5
+        )
         with_nan = np.array([1.0, 2.0, 3.0, 4.0, 5.0, np.nan])
-        self.assertFalse(_has_min_distinct(with_nan, 5))
+        self.assertEqual(_count_distinct_up_to(with_nan, 5), 0)
 
         late_distinct = np.zeros(200_000, dtype=np.float64)
         late_distinct[-4:] = [0.1, 0.2, 0.3, 0.4]
-        self.assertTrue(_has_min_distinct(late_distinct, 5))
+        self.assertEqual(_count_distinct_up_to(late_distinct, 5), 5)
 
         two_valued = np.tile([0.5, 1.0], 100_000)
-        self.assertFalse(_has_min_distinct(two_valued, 5))
+        self.assertEqual(_count_distinct_up_to(two_valued, 5), 2)
 
         # Empty basis (K == 0) fallback
         rng = np.random.default_rng(9)

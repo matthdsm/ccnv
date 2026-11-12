@@ -59,60 +59,50 @@ class TestRaySCAAndSelfRefOrigin(unittest.TestCase):
     def test_4d_ray_sca_classifies_xyy_without_ffa_and_xx_at_3pct_ff(self) -> None:
         """4D ray SCA must classify XYY when FFA is missing and classify XX accurately at 3% FF."""
         # XYY at true f=0.12 -> delta_x=-0.06, ffy=0.24, ffa=None, ff_size=0.12
-        call_xyy, post_xyy, f_act, f_se, src_xyy = classify_sca_ray_4d(
-            -0.06, 0.01, 0.24, 0.012, None, 0.03, 0.12, 0.02
-        )
-        self.assertEqual(call_xyy, "XYY")
-        self.assertGreater(post_xyy["XYY"], 0.90)
-        self.assertLess(abs(f_act - 0.12), 0.015)
-        self.assertLess(f_se, 0.02)
-        self.assertIn(src_xyy, ("FUSED", "FFY"))
+        res_xyy = classify_sca_ray_4d(-0.06, 0.01, 0.24, 0.012, None, 0.03, 0.12, 0.02)
+        self.assertEqual(res_xyy.call, "XYY")
+        self.assertGreater(res_xyy.posteriors["XYY"], 0.90)
+        self.assertLess(abs(res_xyy.active_ff - 0.12), 0.015)
+        self.assertLess(res_xyy.active_ff_se, 0.02)
+        self.assertIn(res_xyy.active_ff_source, ("FUSED", "FFY"))
 
         # Euploid XX at f=0.03 -> delta_x=0.0, ffy=0.0, ffa=0.03, ff_size=0.032
-        call_xx, post_xx, f_xx, se_xx, src_xx = classify_sca_ray_4d(
-            0.0, 0.008, 0.0, 0.004, 0.03, 0.025, 0.032, 0.02
-        )
-        self.assertEqual(call_xx, "XX")
-        self.assertGreater(post_xx["XX"], 0.95)
-        self.assertLess(abs(f_xx - 0.031), 0.005)
-        self.assertLess(se_xx, 0.03)
-        self.assertEqual(src_xx, "FUSED")
+        res_xx = classify_sca_ray_4d(0.0, 0.008, 0.0, 0.004, 0.03, 0.025, 0.032, 0.02)
+        self.assertEqual(res_xx.call, "XX")
+        self.assertGreater(res_xx.posteriors["XX"], 0.95)
+        self.assertLess(abs(res_xx.active_ff - 0.031), 0.005)
+        self.assertLess(res_xx.active_ff_se, 0.03)
+        self.assertEqual(res_xx.active_ff_source, "FUSED")
 
     def test_4d_ray_sca_classifies_xxy_xo_xxx_and_discordant_mixed(self) -> None:
         """4D ray SCA covers XXY, XO, XXX, and flags DISCORDANT_MIXED on outliers or maternal mosaicism."""
         # XXY at f=0.10 -> delta_x=0.0, ffy=0.10, ffa=0.10, ff_size=0.10
-        call_xxy, post_xxy, f_xxy, _, _ = classify_sca_ray_4d(
-            0.0, 0.008, 0.10, 0.008, 0.10, 0.015, 0.10, 0.015
-        )
-        self.assertEqual(call_xxy, "XXY")
-        self.assertGreater(post_xxy["XXY"], 0.85)
-        self.assertLess(abs(f_xxy - 0.10), 0.015)
+        res_xxy = classify_sca_ray_4d(0.0, 0.008, 0.10, 0.008, 0.10, 0.015, 0.10, 0.015)
+        self.assertEqual(res_xxy.call, "XXY")
+        self.assertGreater(res_xxy.posteriors["XXY"], 0.85)
+        self.assertLess(abs(res_xxy.active_ff - 0.10), 0.015)
 
         # XO at f=0.10 -> delta_x=-0.05, ffy=0.0, ffa=0.10, ff_size=0.10
-        call_xo, post_xo, _, _, _ = classify_sca_ray_4d(
-            -0.05, 0.008, 0.0, 0.004, 0.10, 0.015, 0.10, 0.015
-        )
-        self.assertEqual(call_xo, "XO")
-        self.assertGreater(post_xo["XO"], 0.85)
+        res_xo = classify_sca_ray_4d(-0.05, 0.008, 0.0, 0.004, 0.10, 0.015, 0.10, 0.015)
+        self.assertEqual(res_xo.call, "XO")
+        self.assertGreater(res_xo.posteriors["XO"], 0.85)
 
         # Maternal 45,X mosaicism fragment gate override
-        call_maternal_xo, _, _, _, _ = classify_sca_ray_4d(
+        res_maternal_xo = classify_sca_ray_4d(
             -0.05, 0.008, 0.0, 0.004, 0.10, 0.015, 0.10, 0.015, chrx_llr_fetal=-2.5
         )
-        self.assertEqual(call_maternal_xo, "DISCORDANT_MIXED")
+        self.assertEqual(res_maternal_xo.call, "DISCORDANT_MIXED")
 
         # XXX at f=0.10 -> delta_x=+0.05, ffy=0.0, ffa=0.10, ff_size=0.10
-        call_xxx, post_xxx, _, _, _ = classify_sca_ray_4d(
-            0.05, 0.008, 0.0, 0.004, 0.10, 0.015, 0.10, 0.015
-        )
-        self.assertEqual(call_xxx, "XXX")
-        self.assertGreater(post_xxx["XXX"], 0.85)
+        res_xxx = classify_sca_ray_4d(0.05, 0.008, 0.0, 0.004, 0.10, 0.015, 0.10, 0.015)
+        self.assertEqual(res_xxx.call, "XXX")
+        self.assertGreater(res_xxx.posteriors["XXX"], 0.85)
 
         # Impossible discordant combination: delta_x=+0.15 (Triple X) with ffy=0.20 (Male)
-        call_disc, _, _, _, _ = classify_sca_ray_4d(
+        res_disc = classify_sca_ray_4d(
             0.15, 0.008, 0.20, 0.008, 0.08, 0.015, 0.08, 0.015
         )
-        self.assertEqual(call_disc, "DISCORDANT_MIXED")
+        self.assertEqual(res_disc.call, "DISCORDANT_MIXED")
 
     def test_student_t4_fusion_robust_against_single_modality_corruption(self) -> None:
         """Student-t4 IRLS must downweight corrupted estimator without pulling active FF."""
@@ -239,7 +229,7 @@ class TestRaySCAAndSelfRefOrigin(unittest.TestCase):
             sample_bands=sample_bands,
             prefix_sums=prefix_sums,
             bin_usable=bin_usable,
-            p_fetal_24=self.p_f_24,
+            p_fetal_density=self.p_f_24,
             mu_fetal_w=1.0,
             mu_maternal_w=1.0,
             active_ff=active_ff,
@@ -247,7 +237,7 @@ class TestRaySCAAndSelfRefOrigin(unittest.TestCase):
             sca_call="XX",
             sample_depth_per_mb=25000.0,
             sys_var_per_mb=0.0001,
-            p_maternal_24=self.p_m_24,
+            p_maternal_density=self.p_m_24,
         )
 
         self.assertEqual(len(annotated), 4)

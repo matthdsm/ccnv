@@ -12,13 +12,15 @@ from time import perf_counter
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import pysam
+from helpers import metadata_for
 
 from ccnv.extract import extract_sample_table
-from ccnv.features.rebinning import rebin_sample_sketch
+from ccnv.features.rebinning import rebin_sample_buffers
 from ccnv.io.parquet import (
     read_reference_parquet,
-    read_sample_parquet,
+    read_sample_buffers,
     write_reference_parquet,
     write_sample_parquet,
 )
@@ -35,22 +37,22 @@ from ccnv.models import (
     SUPPORTED_SCHEMA_VERSIONS,
     ArtifactKind,
     BinCompatibilityError,
+    ContigLookup,
     ExtractConfig,
     PredictConfig,
     PrenatalModelMetadata,
     ReadFilters,
     ReferenceConfig,
     ReferenceMetadata,
+    SampleBuffers,
     SampleMetadata,
     SchemaError,
     SchemaVersionError,
     build_reference_schema,
     decode_metadata,
     encode_metadata,
-    metadata_for,
     parquet_path,
     reconstruct_sample_grid,
-    resolve_contig_name,
     select_layout,
 )
 from ccnv.models.validation import (
@@ -59,6 +61,12 @@ from ccnv.models.validation import (
     validate_sample_table,
     validate_schema,
 )
+
+
+def _rebin_table(table: pa.Table, target_bin_size: int) -> pa.Table:
+    return rebin_sample_buffers(
+        SampleBuffers.from_table(table), target_bin_size
+    ).to_table(base_metadata=table.schema.metadata)
 
 
 def _write_paired_bam(path: Path, contigs: list[tuple[str, int]]) -> None:
@@ -229,10 +237,11 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
         assert ("chrM", 16_000) not in selected
         assert ("chr0", 5_000) not in selected
 
-    def test_resolve_contig_name_handles_single_pass_generator_and_config_preserves_prefix(
+    def test_contig_lookup_handles_single_pass_generator_and_config_preserves_prefix(
         self,
     ) -> None:
-        assert resolve_contig_name("CHR1", (c for c in ["chr1", "chr2"])) == "chr1"
+        lookup = ContigLookup.from_names(c for c in ["chr1", "chr2"])
+        assert lookup.resolve("CHR1") == "chr1"
         cfg = ReferenceConfig(
             samplesheet_path=Path("sheet.yaml"), prefix=Path("out/ref")
         )
@@ -245,18 +254,12 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
         )
         assert p_cfg.threads == 1
         assert p_cfg.bins_vcf is False
+        assert not hasattr(p_cfg, "bin_size")
 
         with self.assertRaises(ValueError):
             ReferenceConfig(prefix=Path("out/ref"), bin_size=0)
         with self.assertRaises(ValueError):
             ReferenceConfig(prefix=Path("out/ref"), min_mappability=1.2)
-        with self.assertRaises(ValueError):
-            PredictConfig(
-                sample=Path("s.bam"),
-                reference=Path("r.ccnv"),
-                prefix=Path("o"),
-                bin_size=0,
-            )
         with self.assertRaises(ValueError):
             PredictConfig(
                 sample=Path("s.bam"),
@@ -303,7 +306,9 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
 
             # Parquet roundtrip and grid reconstruction
             out_pq = write_sample_parquet(table_5k, parquet_path(tmp / "s"))
-            reloaded = read_sample_parquet(out_pq)
+            reloaded_bufs = read_sample_buffers(out_pq)
+            assert reloaded_bufs.num_rows == 50 + 21
+            reloaded = pq.read_table(out_pq)
             meta_5k = validate_sample_table(reloaded)
             assert isinstance(meta_5k, SampleMetadata)
             assert meta_5k.contig_order == ("chr1", "chr2")
@@ -314,7 +319,7 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
             assert codes.size == table_5k.num_rows == 50 + 21
 
             # Nested integer-multiple coarsening preserves all 7 channels & fragmentomics
-            table_100k = rebin_sample_sketch(table_5k, 100_000)
+            table_100k = _rebin_table(table_5k, 100_000)
             meta_100k = validate_sample_table(table_100k)
             assert meta_100k.bin_size == 100_000
             assert table_100k.num_rows == 3 + 2
@@ -350,7 +355,7 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
 
             # Non-nested coarsening redistributes count, nulls frag_bands, clears fragmentomics, logs warning
             with self.assertLogs("ccnv.features.rebinning", level=logging.WARNING):
-                table_12k = rebin_sample_sketch(table_5k, 12_000)
+                table_12k = _rebin_table(table_5k, 12_000)
             validate_sample_table(table_12k)
             assert int(pc.sum(table_12k["count"]).as_py()) == int(
                 pc.sum(table_5k["count"]).as_py()
@@ -361,7 +366,7 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
 
             # Upsampling rejected with BinCompatibilityError
             with self.assertRaises(BinCompatibilityError):
-                rebin_sample_sketch(table_5k, 1_000)
+                _rebin_table(table_5k, 1_000)
 
             # Single-end extraction emits null frag_bands and silent non-nested coarsening when ep_count==0
             se_bam = tmp / "se.bam"
@@ -376,7 +381,7 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
                 pa.array(np.zeros(se_table.num_rows, dtype=np.uint32)),
             )
             with self.assertNoLogs("ccnv.features.rebinning", level=logging.WARNING):
-                se_12k = rebin_sample_sketch(se_zero_ep, 12_000)
+                se_12k = _rebin_table(se_zero_ep, 12_000)
             assert int(pc.sum(se_12k["count"]).as_py()) == int(
                 pc.sum(se_zero_ep["count"]).as_py()
             )
@@ -429,12 +434,21 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
     def test_reference_schema_v2_purged_prenatal_and_fast_vectorized_validation(
         self,
     ) -> None:
-        # Verify dead mlp_*, olm_skew_*, preface_* fields are purged from PrenatalModelMetadata
+        # Verify dead mlp_*, olm_skew_*, preface_*, and duplicate chrX/FFY fields are purged
         prenatal_fields = set(PrenatalModelMetadata.__dataclass_fields__.keys())
         for dead_prefix in ("mlp_", "olm_skew_", "preface_"):
             assert not any(f.startswith(dead_prefix) for f in prenatal_fields)
-        assert not hasattr(PrenatalModelMetadata, "preface_std")
-        assert not hasattr(PrenatalModelMetadata, "preface_logit_mode")
+        for removed_field in (
+            "preface_std",
+            "preface_logit_mode",
+            "ffy_intercept",
+            "ffx_intercept",
+            "ffx_slope",
+            "ffx_std",
+            "alpha_0",
+            "sigma_x_sys",
+        ):
+            assert removed_field not in prenatal_fields
 
         # Validate rank-0 Parquet roundtrip and rank-4 vectorized validation
         ref_r0 = _make_valid_reference_table(20, 10, pca_rank=0)
@@ -578,7 +592,7 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
         with self.assertRaisesRegex(
             SchemaError, "column 'frag_bands' contains null list elements"
         ):
-            rebin_sample_sketch(bad_sample, 10_000)
+            _rebin_table(bad_sample, 10_000)
 
         # Mixed row-level null + inner element null in frag_bands
         mixed_bands = pa.array(
@@ -591,13 +605,13 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
         ):
             validate_sample_table(mixed_sample)
 
-        # Valid row-level null mixed with clean list row coarsens cleanly without NaN cast
+        # Valid row-level null mixed with clean list row coarsens cleanly without NaN coercion
         clean_row_null = pa.array(
             [None, [2] * NUM_FRAG_BANDS],
             type=pa.list_(pa.uint32(), NUM_FRAG_BANDS),
         )
         valid_mixed = bad_sample.set_column(6, "frag_bands", clean_row_null)
-        coarsened = rebin_sample_sketch(valid_mixed, 10_000)
+        coarsened = _rebin_table(valid_mixed, 10_000)
         assert coarsened["frag_bands"][0].as_py() == [2] * NUM_FRAG_BANDS
 
         # Reference FixedSizeList inner nulls (proto_ids and nullable gc_quantiles)
@@ -784,7 +798,7 @@ class TestSchemaV2AndRebinning(unittest.TestCase):
             )
             sliced_chr2 = full_5k.slice(20, 16).replace_schema_metadata(chr2_meta)
             assert sliced_chr2.column("frag_bands").chunk(0).offset == 20
-            coarsened_sliced = rebin_sample_sketch(sliced_chr2, 20_000)
+            coarsened_sliced = _rebin_table(sliced_chr2, 20_000)
             assert coarsened_sliced.num_rows == 4
             expected_bands = fixed_size_list_to_numpy(
                 sliced_chr2.column("frag_bands"), NUM_FRAG_BANDS, np.uint32

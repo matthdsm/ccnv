@@ -13,7 +13,6 @@ from helpers import (
 from typer.testing import CliRunner
 
 from ccnv.cli import app
-from ccnv.reference import DEFAULT_SEX_CONTIGS, DEFAULT_SEX_SIGNAL_CONTIGS
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -87,8 +86,8 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             self.assertEqual(config.samplesheet_path, sheet)
             self.assertEqual(config.mode, "germline")
             self.assertEqual(config.prenatal_bin_size, 100_000)
-            self.assertEqual(config.sex_contigs, DEFAULT_SEX_CONTIGS)
-            self.assertEqual(config.sex_signal_contig, DEFAULT_SEX_SIGNAL_CONTIGS[0])
+            self.assertIsNone(config.sex_contigs)
+            self.assertIsNone(config.sex_signal_contig)
 
     def test_cli_reference_short_samplesheet_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -115,8 +114,9 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             app, ["reference", "--help"], env={"COLUMNS": "200"}
         )
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("chrY]", _cli_text(result.output))
-        self.assertIn("[default: chrY]", _cli_text(result.output))
+        self.assertIn("--sex-contig", _cli_text(result.output))
+        self.assertIn("--sex-signal-contig", _cli_text(result.output))
+        self.assertNotIn("[default: chrY]", _cli_text(result.output))
         self.assertIn("[default: 5]", _cli_text(result.output))
         self.assertNotIn("--nearest-bins", _cli_text(result.output))
         self.assertIn("--samplesheet", _cli_text(result.output))
