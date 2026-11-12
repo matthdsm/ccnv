@@ -1,3 +1,7 @@
+"""Unit tests for zero-inclusive Poisson covariate regression, basis builders, and logit ensembles."""
+
+from __future__ import annotations
+
 import inspect
 import tempfile
 import unittest
@@ -6,11 +10,17 @@ from pathlib import Path
 
 import numpy as np
 
+from ccnv.features.covariates import covariate_features
 from ccnv.models import InvalidInputError
+from ccnv.stats.neighbors import build_whitened_subspace_features
 from ccnv.stats.regression import (
     _count_distinct_up_to,
     build_exogenous_covariate_basis,
+    fit_logit_linear_ensemble,
     fit_poisson_covariate_trends,
+    half_sample_mode,
+    mad_scale,
+    standardize_column,
 )
 
 
@@ -19,7 +29,7 @@ class TestPoissonCovariates(unittest.TestCase):
         rng = np.random.default_rng(42)
         n_bins = 40_000
         usable = np.ones(n_bins, dtype=np.bool_)
-        usable[:200] = False  # Masked telomere/N-gap bins
+        usable[:200] = False
 
         gc = rng.uniform(0.28, 0.68, size=n_bins).astype(np.float32)
         gc[~usable] = np.nan
@@ -50,7 +60,7 @@ class TestPoissonCovariates(unittest.TestCase):
         self.assertEqual(trends.dtype, np.float32)
         self.assertEqual(trends.shape, (n_bins, 2))
         np.testing.assert_array_equal(trends[~usable], 0.0)
-        self.assertTrue(np.all(trends[usable] > 0.0))
+        self.assertTrue(bool(np.all(trends[usable] > 0.0)))
 
         low_gc_bins = usable & (gc < 0.34)
         high_gc_bins = usable & (gc > 0.62)
@@ -70,21 +80,17 @@ class TestPoissonCovariates(unittest.TestCase):
         n_bins = 600
         usable = np.ones(n_bins, dtype=np.bool_)
 
-        # Band midpoints for [0.0, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.65, 1.0]
         band_gc = np.array(
             [0.20, 0.32, 0.375, 0.425, 0.475, 0.525, 0.60, 0.68], dtype=np.float64
         )
-        # Keep band 0 completely empty (zero variance) to test safe simplex standardization
         raw_weights = rng.dirichlet(np.ones(7), size=n_bins)
         gc_q = np.zeros((n_bins, 8), dtype=np.float32)
         gc_q[:, 1:] = raw_weights.astype(np.float32)
 
         bin_a, bin_b = 10, 11
-        # Bin A: unimodal around 0.50 (50% in 0.475 + 50% in 0.525 -> mean GC = 0.50)
         gc_q[bin_a] = np.array(
             [0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0], dtype=np.float32
         )
-        # Bin B: bimodal isochore boundary (50% at 0.32 + 50% at 0.68 -> mean GC = 0.50)
         gc_q[bin_b] = np.array(
             [0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5], dtype=np.float32
         )
@@ -93,7 +99,6 @@ class TestPoissonCovariates(unittest.TestCase):
         self.assertAlmostEqual(float(gc_mean[bin_a]), 0.50, places=6)
         self.assertAlmostEqual(float(gc_mean[bin_b]), 0.50, places=6)
 
-        # Concave 200 bp PCR efficiency curve integrated over sub-window GC distribution
         subwindow_rates = 300.0 * np.exp(-18.0 * np.square(band_gc - 0.50))
         true_bin_rate = gc_q.astype(np.float64) @ subwindow_rates
         exposure = np.ones(n_bins, dtype=np.float32)
@@ -105,8 +110,7 @@ class TestPoissonCovariates(unittest.TestCase):
         basis_500kb = build_exogenous_covariate_basis(
             usable, bin_size=500_000, gc=gc_mean, gc_quantiles=gc_q
         )
-        self.assertTrue(np.all(np.isfinite(basis_500kb)))
-        # Band 0 has zero variance so at most 6 of the first 7 simplex columns are retained
+        self.assertTrue(bool(np.all(np.isfinite(basis_500kb))))
         self.assertEqual(basis_500kb.shape, (n_bins, 6))
 
         trends = fit_poisson_covariate_trends(
@@ -114,7 +118,6 @@ class TestPoissonCovariates(unittest.TestCase):
         )
         self.assertGreater(float(trends[bin_a, 0]), float(trends[bin_b, 0]) * 1.15)
 
-        # Below 25 kb, scalar GC B-splines are used instead of 8-band GC quantiles
         basis_5kb = build_exogenous_covariate_basis(
             usable, bin_size=5_000, gc=gc_mean, gc_quantiles=gc_q
         )
@@ -141,7 +144,6 @@ class TestPoissonCovariates(unittest.TestCase):
         ref_ep_rate = rng.uniform(0.08, 0.16, size=n_bins).astype(np.float32)
         exposure = np.ones(n_bins, dtype=np.float32)
 
-        # True baseline depends on exogenous GC + cohort chromatin fragment length
         baseline = (
             120.0
             * np.exp(-5.0 * np.square(gc.astype(np.float64) - 0.46))
@@ -149,13 +151,7 @@ class TestPoissonCovariates(unittest.TestCase):
             * np.exp(0.015 * (ref_frag_len.astype(np.float64) - 167.0))
         )
         cn_mult = np.ones(n_bins, dtype=np.float64)
-        cn_mult[500:750] = 1.20  # 40% mosaic duplication
-
-        # Sample-level fragment lengths are shorter precisely inside the mosaic gain
-        sample_frag_len = ref_frag_len.copy()
-        sample_frag_len[500:750] -= 14.0
-        sample_ep_ratio = ref_ep_rate.copy()
-        sample_ep_ratio[500:750] += 0.06
+        cn_mult[500:750] = 1.20
 
         counts = rng.poisson(baseline * cn_mult)[:, np.newaxis].astype(np.float32)
         sf = np.array([1.0], dtype=np.float64)
@@ -214,7 +210,6 @@ class TestPoissonCovariates(unittest.TestCase):
         self.assertLess(err_lo, 0.06)
 
     def test_empty_basis_strided_memmap_and_distinct_value_scan(self) -> None:
-        # _count_distinct_up_to O(1) short-circuit and chunked fallback
         self.assertEqual(_count_distinct_up_to(np.array([1.0, 2.0, 3.0, 4.0]), 5), 4)
         self.assertEqual(
             _count_distinct_up_to(np.array([1.0, 2.0, 3.0, 4.0, 5.0]), 5), 5
@@ -229,7 +224,6 @@ class TestPoissonCovariates(unittest.TestCase):
         two_valued = np.tile([0.5, 1.0], 100_000)
         self.assertEqual(_count_distinct_up_to(two_valued, 5), 2)
 
-        # Empty basis (K == 0) fallback
         rng = np.random.default_rng(9)
         n_bins = 1_000
         usable = np.ones(n_bins, dtype=np.bool_)
@@ -240,7 +234,7 @@ class TestPoissonCovariates(unittest.TestCase):
         counts_k0 = rng.poisson(
             exposure[:, np.newaxis] * sf[np.newaxis, :] * true_rates[np.newaxis, :]
         ).astype(np.float32)
-        counts_k0[100:120, 0] = 500.0  # Outlier gain on sample 0
+        counts_k0[100:120, 0] = 500.0
 
         empty_basis = build_exogenous_covariate_basis(
             usable, bin_size=5_000, gc=np.tile([0.4, 0.5], n_bins // 2)
@@ -257,7 +251,6 @@ class TestPoissonCovariates(unittest.TestCase):
             trends_k0[usable, 1] / exposure[usable], 25.0, rtol=0.05
         )
 
-        # Strided memmap + multi-threaded determinism
         with tempfile.TemporaryDirectory() as tmpdir:
             mmap_path = Path(tmpdir) / "counts.mmap"
             b_big, s_big = 70_000, 4
@@ -296,7 +289,6 @@ class TestPoissonCovariates(unittest.TestCase):
             )
             np.testing.assert_array_equal(t_seq, t_par)
 
-        # Input validation checks
         with self.assertRaises(InvalidInputError):
             build_exogenous_covariate_basis(usable, bin_size=0)
         with self.assertRaises(InvalidInputError):
@@ -324,6 +316,226 @@ class TestPoissonCovariates(unittest.TestCase):
             self.assertEqual(list(warnings.filters), filters_before)
         finally:
             warnings.filters[:] = filters_before
+
+
+class TestCovariateRegression(unittest.TestCase):
+    def test_poisson_covariate_trends_removes_wave_and_preserves_cnv(self) -> None:
+        rng = np.random.default_rng(42)
+        n_bins = 200
+        gc = rng.uniform(0.30, 0.65, size=n_bins)
+        mappability = rng.uniform(0.65, 1.0, size=n_bins)
+        usable = np.ones(n_bins, dtype=np.bool_)
+
+        g_centered = (gc - 0.45) / 0.10
+        wave = (
+            1.0 + 0.25 * g_centered - 0.15 * (g_centered**2) + 0.05 * (g_centered**3)
+        ) * (0.7 + 0.3 * mappability)
+
+        true_cn = np.ones(n_bins, dtype=np.float64)
+        true_cn[80:95] = 1.5
+        y = 1000.0 * true_cn * wave
+
+        basis = build_exogenous_covariate_basis(
+            usable, bin_size=100, gc=gc, mappability=mappability
+        )
+        trends = fit_poisson_covariate_trends(
+            y,
+            np.array([1.0], dtype=np.float64),
+            np.ones(n_bins, dtype=np.float64),
+            usable,
+            basis,
+        )
+        corrected = y / np.maximum(trends[:, 0], 1e-12)
+
+        neutral = np.ones(n_bins, dtype=np.bool_)
+        neutral[80:95] = False
+        raw_cv = float(np.std(y[neutral]) / np.mean(y[neutral]))
+        corr_cv = float(np.std(corrected[neutral]) / np.mean(corrected[neutral]))
+        self.assertLess(corr_cv, raw_cv * 0.15)
+
+        gain_ratio = float(np.median(corrected[80:95]) / np.median(corrected[neutral]))
+        self.assertAlmostEqual(gain_ratio, 1.5, delta=0.05)
+
+    def test_covariate_features_standardizes_columns(self) -> None:
+        usable = np.array([True, True, True, False, True])
+        gc = np.array([0.3, 0.4, 0.5, 0.9, 0.6])
+        mappability = np.array([0.7, 0.8, 0.9, 0.1, 1.0])
+        feats = covariate_features(usable, gc=gc, mappability=mappability)
+        self.assertIsNotNone(feats)
+        if feats is None:
+            self.fail("expected non-None covariate features")
+        self.assertEqual(feats.shape, (4, 2))
+        np.testing.assert_allclose(np.mean(feats, axis=0), [0.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(np.std(feats, axis=0), [1.0, 1.0], atol=1e-12)
+
+        ref_frag_len = np.array([162.0, 165.0, 168.0, 199.0, 171.0])
+        ref_ep_rate = np.array([0.09, 0.11, 0.13, 0.50, 0.15])
+        feats_exog = covariate_features(
+            usable,
+            gc=gc,
+            mappability=mappability,
+            ref_frag_len=ref_frag_len,
+            ref_ep_rate=ref_ep_rate,
+        )
+        self.assertIsNotNone(feats_exog)
+        if feats_exog is None:
+            self.fail("expected non-None exogenous covariate features")
+        self.assertEqual(feats_exog.shape, (4, 4))
+        np.testing.assert_allclose(np.mean(feats_exog, axis=0), 0.0, atol=1e-12)
+        np.testing.assert_allclose(np.std(feats_exog, axis=0), 1.0, atol=1e-12)
+
+    def test_exogenous_covariate_basis_captures_gc_mappability_interaction(
+        self,
+    ) -> None:
+        rng = np.random.default_rng(42)
+        n = 200
+        gc = rng.uniform(0.25, 0.75, size=n)
+        mapp = rng.uniform(0.55, 1.0, size=n)
+        usable = np.ones(n, dtype=np.bool_)
+        basis = build_exogenous_covariate_basis(
+            usable, bin_size=100, gc=gc, mappability=mapp
+        )
+        self.assertGreater(basis.shape[1], 0)
+
+        z_gc = (gc - np.mean(gc)) / np.std(gc)
+        z_map = (mapp - np.mean(mapp)) / np.std(mapp)
+        true_bias = np.exp(0.25 * np.sin(z_gc) + 0.15 * z_map + 0.12 * (z_gc * z_map))
+        raw = 100.0 * true_bias
+        raw[:15] *= 2.0
+
+        trends = fit_poisson_covariate_trends(
+            raw,
+            np.array([1.0], dtype=np.float64),
+            np.ones(n, dtype=np.float64),
+            usable,
+            basis,
+        )
+        corrected = raw / np.maximum(trends[:, 0], 1e-12)
+        diploid_cv_before = np.std(raw[15:]) / np.mean(raw[15:])
+        diploid_cv_after = np.std(corrected[15:]) / np.mean(corrected[15:])
+        self.assertLess(diploid_cv_after, diploid_cv_before * 0.25)
+        self.assertAlmostEqual(
+            float(np.median(corrected[:15]) / np.median(corrected[15:])),
+            2.0,
+            delta=0.18,
+        )
+
+    def test_exogenous_covariate_basis_with_fragmentomics(self) -> None:
+        rng = np.random.default_rng(42)
+        n = 500
+        usable = np.ones(n, dtype=bool)
+        gc = rng.uniform(0.3, 0.6, size=n)
+        mappability = rng.uniform(0.7, 1.0, size=n)
+        ref_frag_len = rng.uniform(140.0, 180.0, size=n).astype(np.float32)
+        ref_ep_rate = rng.uniform(0.5, 3.0, size=n).astype(np.float32)
+
+        basis_base = build_exogenous_covariate_basis(
+            usable,
+            bin_size=5_000,
+            gc=gc,
+            mappability=mappability,
+        )
+        n_cols_base = basis_base.shape[1]
+        self.assertGreater(n_cols_base, 0)
+
+        basis_aug = build_exogenous_covariate_basis(
+            usable,
+            bin_size=5_000,
+            gc=gc,
+            mappability=mappability,
+            ref_frag_len=ref_frag_len,
+            ref_ep_rate=ref_ep_rate,
+        )
+        self.assertGreater(basis_aug.shape[1], n_cols_base)
+        self.assertEqual(basis_aug.shape[0], n)
+
+        basis_const = build_exogenous_covariate_basis(
+            usable,
+            bin_size=5_000,
+            gc=gc,
+            mappability=mappability,
+            ref_frag_len=np.full(n, 166.0, dtype=np.float32),
+            ref_ep_rate=np.zeros(n, dtype=np.float32),
+        )
+        self.assertEqual(basis_const.shape[1], n_cols_base)
+
+    def test_covariate_features_and_signal_space_features(self) -> None:
+        rng = np.random.default_rng(42)
+        n = 500
+        usable = np.ones(n, dtype=bool)
+        gc = rng.uniform(0.3, 0.6, size=n)
+        mappability = rng.uniform(0.7, 1.0, size=n)
+        mean_frag_len = rng.uniform(140.0, 180.0, size=n)
+        endpoint_ratio = rng.uniform(0.5, 3.0, size=n)
+
+        cov_mat_4 = covariate_features(
+            usable,
+            gc=gc,
+            mappability=mappability,
+            ref_frag_len=mean_frag_len,
+            ref_ep_rate=endpoint_ratio,
+        )
+        self.assertIsNotNone(cov_mat_4)
+        if cov_mat_4 is None:
+            self.fail("expected non-None 4-column covariate matrix")
+        self.assertEqual(cov_mat_4.shape, (n, 4))
+
+        p_rank = 5
+        pca_loadings = rng.standard_normal((p_rank, n))
+        s_vals = np.linspace(10.0, 1.0, p_rank)
+
+        feats_p4 = build_whitened_subspace_features(
+            pca_loadings,
+            s_vals,
+            0.5,
+            covariate_mat=cov_mat_4,
+        )
+        self.assertEqual(feats_p4.shape, (n, p_rank + 4))
+
+    def test_poisson_covariates_and_robust_stats(self) -> None:
+        rng = np.random.default_rng(7)
+        usable = np.ones(40, dtype=bool)
+        gc_q = np.tile(np.linspace(0.30, 0.65, 8, dtype=np.float32), (40, 1))
+        gc_q[:, 3] = np.linspace(0.35, 0.60, 40, dtype=np.float32)
+        basis = build_exogenous_covariate_basis(
+            usable,
+            bin_size=5000,
+            gc=np.linspace(0.38, 0.55, 40),
+            gc_quantiles=gc_q,
+            mappability=np.linspace(0.7, 1.0, 40),
+        )
+        self.assertEqual(basis.shape[0], 40)
+        self.assertGreater(basis.shape[1], 0)
+
+        counts = rng.poisson(120.0, size=(40, 2)).astype(np.float32)
+        mult = fit_poisson_covariate_trends(
+            counts,
+            np.array([1.0, 1.0], dtype=np.float64),
+            np.ones(40, dtype=np.float64),
+            usable,
+            basis,
+        )
+        self.assertEqual(mult.shape, (40, 2))
+        self.assertTrue(bool(np.all(mult > 0.0)))
+
+        z_col = standardize_column(np.linspace(1.0, 5.0, 20))
+        self.assertIsNotNone(z_col)
+        if z_col is None:
+            self.fail("expected non-None standardized column")
+        self.assertAlmostEqual(float(np.mean(z_col)), 0.0, places=6)
+        self.assertAlmostEqual(
+            half_sample_mode(rng.normal(2.0, 0.01, 50)), 2.0, delta=0.05
+        )
+        self.assertGreater(mad_scale(np.array([1.0, 2.0, 3.0, 4.0])), 0.0)
+
+    def test_fit_logit_linear_ensemble_handles_partial_nan_targets(self) -> None:
+        rng = np.random.default_rng(19)
+        x_mat = rng.normal(size=(12, 3))
+        true_ff = np.clip(0.12 + 0.06 * x_mat[:, 0], 0.02, 0.40)
+        y_partial = true_ff.copy()
+        y_partial[8:] = np.nan
+        fit = fit_logit_linear_ensemble(x_mat, y_partial, standardize=True, seed=0)
+        self.assertGreater(float(np.linalg.norm(fit.weights)), 0.05)
 
 
 if __name__ == "__main__":

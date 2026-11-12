@@ -1,30 +1,47 @@
+from __future__ import annotations
+
 import gzip
 import json
 import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pyarrow as pa
 import pysam
-from helpers import make_reference_table, make_sample_table, metadata_for
-from published_fixtures import CHR21_LENGTH, extract_published_samples
-from typer.testing import CliRunner
+from helpers import (
+    make_reference_table,
+    make_sample_table,
+    metadata_for,
+    write_synthetic_sample,
+)
+from published_fixtures import (
+    PUBLISHED_CRAM,
+    ensure_published_fasta,
+    extract_published_samples,
+)
+from scipy.stats import norm
 
-from ccnv.cli import app
-from ccnv.features.sex import infer_single_sample_sex
+from ccnv._core import scan_alignment_bins as scan_core
+from ccnv.features.fragmentomics import resolve_fragmentomics_compatibility
+from ccnv.features.rebinning import rebin_sample_buffers
 from ccnv.io.parquet import write_reference_parquet, write_sample_parquet
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
-    BRANCH_MALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
+    FRAGMENTOMICS_METADATA_KEY,
     PRENATAL_METADATA_KEY,
+    REFERENCE_SCHEMA,
     ArtifactKind,
+    BinCompatibilityError,
     BinResult,
+    FragmentomicsMetadata,
     PredictConfig,
+    PredictError,
     PrenatalModelMetadata,
     ReadFilters,
     ReferenceConfig,
@@ -33,16 +50,12 @@ from ccnv.models import (
     SampleMetadata,
     SamplesheetEntry,
     SegmentResult,
-    parquet_path,
 )
 from ccnv.predict import (
-    BranchModel,
-    PredictError,
     PredictionInput,
     build_branch_model,
+    extract_for_predict,
     load_inputs,
-    normalize_branch,
-    normalize_sample_branch,
     segment_and_call,
 )
 from ccnv.predict import run as run_predict
@@ -53,13 +66,6 @@ from ccnv.report import (
     SEGMENTS_BED_HEADER,
     write_outputs,
 )
-
-
-def _proto_arrays(n: int) -> tuple[np.ndarray, np.ndarray]:
-    pids = np.zeros((n, 4), dtype=np.uint16)
-    pweights = np.zeros((n, 4), dtype=np.float16)
-    pweights[:, 0] = np.float16(1.0)
-    return pids, pweights
 
 
 def _sample_table(*, include_chr2: bool = True) -> pa.Table:
@@ -109,17 +115,18 @@ def _prenatal_reference_table() -> pa.Table:
         female_chrx_ratio_mean=1.0,
         female_chrx_ratio_std=0.01,
     )
+    branches_list = [
+        BRANCH_AUTOSOMAL,
+        BRANCH_FEMALE_SEX,
+        BRANCH_PRENATAL_AUTOSOMAL,
+        BRANCH_PRENATAL_FFY,
+    ]
     metadata = metadata_for(
         ArtifactKind.REFERENCE,
         contig_lengths=contig_lengths,
         values={
             "model": {
-                "branches": [
-                    BRANCH_AUTOSOMAL,
-                    BRANCH_FEMALE_SEX,
-                    BRANCH_PRENATAL_AUTOSOMAL,
-                    BRANCH_PRENATAL_FFY,
-                ],
+                "branches": branches_list,
                 "bin_size": 100_000,
                 "mode": "prenatal",
                 "prenatal_bin_size": 100_000,
@@ -132,25 +139,14 @@ def _prenatal_reference_table() -> pa.Table:
     )
     metadata[PRENATAL_METADATA_KEY] = prenatal_meta.encode()
 
+    b_auto, b_fem = BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX
+    b_pauto, b_pffy = BRANCH_PRENATAL_AUTOSOMAL, BRANCH_PRENATAL_FFY
+    cs, ss = ("chr1", "chr2"), (0, 100_000)
     rows = [
-        *(
-            (BRANCH_AUTOSOMAL, c, s, s + 100_000, 0.25, [0.0])
-            for c in ("chr1", "chr2")
-            for s in (0, 100_000)
-        ),
-        *(
-            (BRANCH_FEMALE_SEX, "chrX", s, s + 100_000, 0.5, [0.0])
-            for s in (0, 100_000)
-        ),
-        *(
-            (BRANCH_PRENATAL_AUTOSOMAL, c, s, s + 100_000, 0.0, [0.5])
-            for c in ("chr1", "chr2")
-            for s in (0, 100_000)
-        ),
-        *(
-            (BRANCH_PRENATAL_FFY, "chrY", s, s + 100_000, 0.33, [0.0])
-            for s in (0, 100_000, 200_000)
-        ),
+        *((b_auto, c, s, s + 100_000, 0.25, [0.0]) for c in cs for s in ss),
+        *((b_fem, "chrX", s, s + 100_000, 0.5, [0.0]) for s in ss),
+        *((b_pauto, c, s, s + 100_000, 0.0, [0.5]) for c in cs for s in ss),
+        *((b_pffy, "chrY", s, s + 100_000, 0.33, [0.0]) for s in (*ss, 200_000)),
     ]
     branches, contigs, starts, ends, pca_mean, pca_loadings = (
         list(col) for col in zip(*rows, strict=True)
@@ -213,118 +209,6 @@ def _prenatal_sample_table() -> pa.Table:
     return tbl.replace_schema_metadata(meta)
 
 
-class TestNormalization(unittest.TestCase):
-    def test_normalization_produces_aligned_finite_evidence(self) -> None:
-        pids, pweights = _proto_arrays(4)
-        model = BranchModel(
-            branch=BRANCH_AUTOSOMAL,
-            contigs=("chr1", "chr1", "chr2", "chr2"),
-            starts=np.array([0, 100, 0, 100]),
-            ends=np.array([100, 200, 100, 200]),
-            counts=np.array([10.0, 10.0, 10.0, 10.0]),
-            masked=np.zeros(4, dtype=np.bool_),
-            pca_mean=np.full(4, 0.25),
-            pca_loadings=np.zeros((1, 4), dtype=np.float32),
-            proto_ids=pids,
-            proto_weights=pweights,
-            mean_distance=np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
-            null_mean=np.zeros(4, dtype=np.float64),
-            bio_dispersion=np.full(4, 0.01, dtype=np.float64),
-        )
-        config = PredictConfig(
-            Path("sample"),
-            Path("reference"),
-            Path("output"),
-            min_reference_bins=2,
-        )
-
-        result = normalize_branch(model, config)
-
-        self.assertEqual(result.ratios.shape, (4,))
-        self.assertTrue(np.all(np.isfinite(result.ratios)))
-        self.assertTrue(np.all(np.isfinite(result.zscores)))
-        np.testing.assert_allclose(result.ratios, 0.0, atol=1e-6)
-
-    def test_normalize_sample_branch_with_masked_and_empty_active(
-        self,
-    ) -> None:
-        pids, pweights = _proto_arrays(6)
-        counts = np.array([20.0, 30.0, 20.0, 30.0, 25.0, 25.0])
-        model = BranchModel(
-            branch=BRANCH_AUTOSOMAL,
-            contigs=("chr1", "chr1", "chr2", "chr2", "chr3", "chr3"),
-            starts=np.array([0, 100, 0, 100, 0, 100], dtype=np.int64),
-            ends=np.array([100, 200, 100, 200, 100, 200], dtype=np.int64),
-            counts=counts,
-            masked=np.zeros(6, dtype=np.bool_),
-            pca_mean=np.full(6, 1.0),
-            pca_loadings=np.zeros((0, 6), dtype=np.float32),
-            proto_ids=pids,
-            proto_weights=pweights,
-            mean_distance=np.ones(6, dtype=np.float32),
-            null_mean=np.zeros(6, dtype=np.float64),
-            bio_dispersion=np.full(6, 0.01, dtype=np.float64),
-            bin_size=100,
-        )
-
-        n_mask = np.array([True, True, False, False, False, False])
-        norm = normalize_sample_branch(
-            counts,
-            np.ones(6, dtype=np.float32),
-            model,
-            n_mask_override=n_mask,
-            min_reference_bins=1,
-        )
-        np.testing.assert_array_equal(
-            norm.usable, [False, False, True, True, True, True]
-        )
-        self.assertLess(norm.ratios[2], 0.0)
-        self.assertGreater(norm.ratios[3], 0.0)
-
-        all_masked = np.ones(6, dtype=np.bool_)
-        with self.assertRaisesRegex(PredictError, "zero sample coverage"):
-            normalize_sample_branch(
-                counts,
-                np.ones(6, dtype=np.float32),
-                model,
-                n_mask_override=all_masked,
-                min_reference_bins=1,
-            )
-
-    def test_normalize_sample_branch_huber_resists_trisomy_outlier_chromosome(
-        self,
-    ) -> None:
-        loadings = np.linspace(-1.0, 1.0, 20, dtype=np.float32).reshape(1, 20)
-        pca_mean = np.full(20, 1.0)
-        true_c = 0.25
-        counts = 100.0 * pca_mean * np.exp(true_c * loadings.astype(np.float64).ravel())
-        counts[16:] *= 1.8
-
-        pids, pweights = _proto_arrays(20)
-        model = BranchModel(
-            branch=BRANCH_AUTOSOMAL,
-            contigs=("chr1",) * 8 + ("chr2",) * 8 + ("chr21",) * 4,
-            starts=np.tile(np.arange(4, dtype=np.int64) * 100, 5),
-            ends=np.tile(np.arange(1, 5, dtype=np.int64) * 100, 5),
-            counts=counts,
-            masked=np.zeros(20, dtype=np.bool_),
-            pca_mean=pca_mean,
-            pca_loadings=loadings,
-            proto_ids=pids,
-            proto_weights=pweights,
-            mean_distance=np.ones(20, dtype=np.float32),
-            null_mean=np.zeros(20, dtype=np.float64),
-            bio_dispersion=np.full(20, 0.005, dtype=np.float64),
-            bin_size=100,
-        )
-        norm = normalize_sample_branch(
-            counts, np.ones(20, dtype=np.float32), model, min_reference_bins=2
-        )
-        # Diploid bins (0..15) should have near-zero log2 ratios (~0.0), not tilted by chr21
-        self.assertLess(float(np.std(norm.ratios[:16])), 0.08)
-        self.assertGreater(float(np.mean(norm.ratios[16:])), 0.5)
-
-
 class TestCalling(unittest.TestCase):
     def test_calls_symmetric_z_and_ratio_thresholds(self) -> None:
         def _single_seg_call(
@@ -332,15 +216,15 @@ class TestCalling(unittest.TestCase):
         ) -> str | None:
             bins = (
                 BinResult(
-                    branch=BRANCH_AUTOSOMAL,
-                    contigs=("chr1",) * 8,
-                    starts=np.arange(8, dtype=np.int64) * 100,
-                    ends=np.arange(1, 9, dtype=np.int64) * 100,
-                    ratios=np.full(8, ratio, dtype=np.float64),
-                    zscores=np.full(8, z, dtype=np.float64),
-                    weights=np.full(8, 25.0, dtype=np.float64),
-                    reference_sizes=np.full(8, 10, dtype=np.int64),
-                    masked=np.zeros(8, dtype=np.bool_),
+                    BRANCH_AUTOSOMAL,
+                    ("chr1",) * 8,
+                    np.arange(8, dtype=np.int64) * 100,
+                    np.arange(1, 9, dtype=np.int64) * 100,
+                    np.full(8, ratio, dtype=np.float64),
+                    np.full(8, z, dtype=np.float64),
+                    np.full(8, 25.0, dtype=np.float64),
+                    np.full(8, 10, dtype=np.int64),
+                    np.zeros(8, dtype=np.bool_),
                 ),
             )
             segs = segment_and_call(
@@ -360,45 +244,42 @@ class TestCalling(unittest.TestCase):
     def test_segment_and_call_stouffer_zscore_accumulates_evidence_and_corrects_autocorr(
         self,
     ) -> None:
-        # 25 consecutive bins with Z_i = +1.8 (white noise / zero lag-1 autocorr via alternating jitter)
         z = np.full(25, 1.8, dtype=np.float64) + np.tile([0.05, -0.05], 13)[:25]
         bins = (
             BinResult(
-                branch=BRANCH_AUTOSOMAL,
-                contigs=("chr1",) * 25,
-                starts=np.arange(25, dtype=np.int64) * 100,
-                ends=np.arange(1, 26, dtype=np.int64) * 100,
-                ratios=np.full(25, 0.585, dtype=np.float64),
-                zscores=z,
-                weights=np.ones(25, dtype=np.float64),
-                reference_sizes=np.full(25, 10, dtype=np.int64),
-                masked=np.zeros(25, dtype=np.bool_),
+                BRANCH_AUTOSOMAL,
+                ("chr1",) * 25,
+                np.arange(25, dtype=np.int64) * 100,
+                np.arange(1, 26, dtype=np.int64) * 100,
+                np.full(25, 0.585, dtype=np.float64),
+                z,
+                np.ones(25, dtype=np.float64),
+                np.full(25, 10, dtype=np.int64),
+                np.zeros(25, dtype=np.bool_),
             ),
         )
         segs = segment_and_call(
-            bins,
-            {"chr1": 2500},
-            penalty=1.0,
-            z_threshold=3.0,
-            ratio_threshold=None,
+            bins, {"chr1": 2500}, penalty=1.0, z_threshold=3.0, ratio_threshold=None
         )
         self.assertEqual(len(segs), 1)
-        # Mean Z would be ~1.8 (<3.0, missed); BLUE Z is ~1.8 * sqrt(25) = 9.0 (>3.0, called gain)
         self.assertGreater(segs[0].zscore, 8.0)
         self.assertEqual(segs[0].call, "gain")
 
     def test_segment_and_call_preserves_zero_usable_bins_segment(self) -> None:
+        starts = np.arange(8, dtype=np.int64) * 100
+        ends = np.arange(1, 9, dtype=np.int64) * 100
+        ratios = np.array([0.585] * 4 + [0.0] * 4, dtype=np.float64)
         bins_neutral_tail = (
             BinResult(
-                branch=BRANCH_AUTOSOMAL,
-                contigs=("chr1",) * 8,
-                starts=np.arange(8, dtype=np.int64) * 100,
-                ends=np.arange(1, 9, dtype=np.int64) * 100,
-                ratios=np.array([0.585] * 4 + [0.0] * 4, dtype=np.float64),
-                zscores=np.array([3.5] * 4 + [0.0] * 4, dtype=np.float64),
-                weights=np.full(8, 200.0, dtype=np.float64),
-                reference_sizes=np.full(8, 10, dtype=np.int64),
-                masked=np.zeros(8, dtype=np.bool_),
+                BRANCH_AUTOSOMAL,
+                ("chr1",) * 8,
+                starts,
+                ends,
+                ratios,
+                np.array([3.5] * 4 + [0.0] * 4, dtype=np.float64),
+                np.full(8, 200.0, dtype=np.float64),
+                np.full(8, 10, dtype=np.int64),
+                np.zeros(8, dtype=np.bool_),
             ),
         )
         segs = segment_and_call(
@@ -411,15 +292,15 @@ class TestCalling(unittest.TestCase):
 
         bins_nan_tail = (
             BinResult(
-                branch=BRANCH_AUTOSOMAL,
-                contigs=("chr1",) * 8,
-                starts=np.arange(8, dtype=np.int64) * 100,
-                ends=np.arange(1, 9, dtype=np.int64) * 100,
-                ratios=np.array([0.585] * 4 + [0.0] * 4, dtype=np.float64),
-                zscores=np.array([3.5] * 4 + [np.nan] * 4, dtype=np.float64),
-                weights=np.full(8, 200.0, dtype=np.float64),
-                reference_sizes=np.full(8, 10, dtype=np.int64),
-                masked=np.zeros(8, dtype=np.bool_),
+                BRANCH_AUTOSOMAL,
+                ("chr1",) * 8,
+                starts,
+                ends,
+                ratios,
+                np.array([3.5] * 4 + [np.nan] * 4, dtype=np.float64),
+                np.full(8, 200.0, dtype=np.float64),
+                np.full(8, 10, dtype=np.int64),
+                np.zeros(8, dtype=np.bool_),
             ),
         )
         trimmed = segment_and_call(
@@ -433,15 +314,15 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
     def test_bed_is_zero_based_half_open(self) -> None:
         bins = (
             BinResult(
-                branch=BRANCH_AUTOSOMAL,
-                contigs=("chr1", "chr1"),
-                starts=np.array([0, 95]),
-                ends=np.array([95, 100]),
-                ratios=np.array([0.5, np.nan]),
-                zscores=np.array([4.0, np.nan]),
-                weights=np.array([1.0, 0.0]),
-                reference_sizes=np.array([10, 0]),
-                masked=np.array([False, True]),
+                BRANCH_AUTOSOMAL,
+                ("chr1", "chr1"),
+                np.array([0, 95]),
+                np.array([95, 100]),
+                np.array([0.5, np.nan]),
+                np.array([4.0, np.nan]),
+                np.array([1.0, 0.0]),
+                np.array([10, 0]),
+                np.array([False, True]),
             ),
         )
         segments = (
@@ -476,8 +357,7 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
         self.assertEqual(bins_rows[1].split("\t")[:3], ["chr1", "0", "95"])
         self.assertEqual(bins_rows[1].split("\t")[3], "chr1:0-95")
         self.assertEqual(
-            bins_rows[2].split("\t")[:6],
-            ["chr1", "95", "100", "chr1:95-100", ".", "."],
+            bins_rows[2].split("\t")[:6], ["chr1", "95", "100", "chr1:95-100", ".", "."]
         )
         self.assertEqual(bins_rows[2].split("\t")[8:], ["true", BRANCH_AUTOSOMAL])
         self.assertEqual(segment_rows[1].split("\t")[:3], ["chr1", "0", "95"])
@@ -489,18 +369,17 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
     def test_segmentation_clips_partial_contig_end(self) -> None:
         bins = (
             BinResult(
-                branch=BRANCH_AUTOSOMAL,
-                contigs=("chr1", "chr1", "chr1"),
-                starts=np.array([0, 100, 200]),
-                ends=np.array([100, 200, 250]),
-                ratios=np.array([0.0, 0.0, 0.0]),
-                zscores=np.array([0.0, 0.0, 0.0]),
-                weights=np.ones(3),
-                reference_sizes=np.full(3, 10),
-                masked=np.zeros(3, dtype=np.bool_),
+                BRANCH_AUTOSOMAL,
+                ("chr1", "chr1", "chr1"),
+                np.array([0, 100, 200]),
+                np.array([100, 200, 250]),
+                np.zeros(3),
+                np.zeros(3),
+                np.ones(3),
+                np.full(3, 10),
+                np.zeros(3, dtype=np.bool_),
             ),
         )
-
         segments = segment_and_call(
             bins,
             {"chr1": 250},
@@ -509,7 +388,6 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
             ratio_threshold=None,
             max_blacklist_gap=2_000_000,
         )
-
         self.assertEqual((segments[-1].start, segments[-1].end), (0, 250))
 
     def test_missing_reference_contig_is_rejected(self) -> None:
@@ -538,12 +416,10 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
                 bin_size=50,
             )
             write_sample_parquet(sample_50, sample_path)
-            ref_table = _reference_table()
-            write_reference_parquet(ref_table, reference_path)
+            write_reference_parquet(_reference_table(), reference_path)
 
             ref_bytes_before = reference_path.read_bytes()
             ref_mtime_before = reference_path.stat().st_mtime_ns
-
             inputs = load_inputs(sample_path, reference_path)
 
             self.assertEqual(inputs.sample.num_rows, 2)
@@ -576,18 +452,13 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
         ref = _reference_table()
         bad_sample = SampleBuffers.from_table(_sample_table(include_chr2=False))
         inputs = PredictionInput(
-            bad_sample,
-            ref,
-            {"chr1": 100, "chr2": 80},
-            None,
-            (BRANCH_AUTOSOMAL,),
+            bad_sample, ref, {"chr1": 100, "chr2": 80}, None, (BRANCH_AUTOSOMAL,)
         )
         with self.assertRaises(PredictError):
             build_branch_model(inputs, BRANCH_AUTOSOMAL)
 
     def test_sample_buffers_rebin_and_branch_model_without_arrow_table(self) -> None:
-        from ccnv.features.rebinning import rebin_sample_buffers
-
+        z32 = np.zeros(4, dtype=np.uint32)
         bufs_50 = SampleBuffers(
             meta=SampleMetadata(
                 bin_size=50,
@@ -599,10 +470,10 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
                 filters={},
             ),
             count=np.array([5, 5, 6, 4], dtype=np.uint32),
-            paired_count=np.zeros(4, dtype=np.uint32),
+            paired_count=z32,
             frag_len_sum=np.zeros(4, dtype=np.uint64),
-            short_frag_count=np.zeros(4, dtype=np.uint32),
-            endpoint_count=np.zeros(4, dtype=np.uint32),
+            short_frag_count=z32,
+            endpoint_count=z32,
             frag_gc_sum=np.zeros(4, dtype=np.float32),
             frag_bands=None,
         )
@@ -613,14 +484,13 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
             bufs_100.count, np.array([10, 10], dtype=np.uint32)
         )
 
-        ref = _reference_table()
         bm = build_branch_model(
             PredictionInput(
-                sample=bufs_100,
-                reference=ref,
-                contig_lengths={"chr1": 100, "chr2": 80},
-                sex=None,
-                branches=(BRANCH_AUTOSOMAL,),
+                bufs_100,
+                _reference_table(),
+                {"chr1": 100, "chr2": 80},
+                None,
+                (BRANCH_AUTOSOMAL,),
             ),
             BRANCH_AUTOSOMAL,
         )
@@ -638,8 +508,7 @@ class TestModeGuardrails(unittest.TestCase):
 
             expected_msg = (
                 "reference was built in germline mode and lacks prenatal models; "
-                "rebuild reference with --mode prenatal "
-                "or run predict with --mode germline"
+                "rebuild reference with --mode prenatal or run predict with --mode germline"
             )
             with self.assertRaisesRegex(PredictError, expected_msg):
                 load_inputs(sample_path, reference_path, mode="prenatal")
@@ -655,11 +524,12 @@ class TestModeGuardrails(unittest.TestCase):
             with self.assertLogs("ccnv.predict", level="WARNING") as cm:
                 inputs = load_inputs(sample_path, reference_path, mode="germline")
 
-            has_warn = any(
-                "prenatal models are ignored in germline mode" in log
-                for log in cm.output
+            self.assertTrue(
+                any(
+                    "prenatal models are ignored in germline mode" in log
+                    for log in cm.output
+                )
             )
-            self.assertTrue(has_warn)
             self.assertIn(BRANCH_AUTOSOMAL, inputs.branches)
             self.assertNotIn(BRANCH_PRENATAL_AUTOSOMAL, inputs.branches)
             self.assertNotIn(BRANCH_PRENATAL_FFY, inputs.branches)
@@ -671,27 +541,25 @@ class TestPrenatalPredictPipeline(unittest.TestCase):
             directory = Path(tmpdir)
             sample_path = directory / "sample.ccnv"
             reference_path = directory / "reference.ccnv"
-            prefix = directory / "prenatal_out"
             write_sample_parquet(_prenatal_sample_table(), sample_path)
             write_reference_parquet(_prenatal_reference_table(), reference_path)
 
-            config = PredictConfig(
-                sample=sample_path,
-                reference=reference_path,
-                prefix=prefix,
-                mode="prenatal",
-                min_reference_bins=1,
+            outputs = run_predict(
+                PredictConfig(
+                    sample=sample_path,
+                    reference=reference_path,
+                    prefix=directory / "prenatal_out",
+                    mode="prenatal",
+                    min_reference_bins=1,
+                )
             )
-            outputs = run_predict(config)
-
             self.assertIsNotNone(outputs.prenatal_result)
             self.assertIsNotNone(outputs.qc_json_path)
+            if outputs.qc_json_path is None:
+                self.fail("expected qc_json_path")
             self.assertTrue(outputs.qc_json_path.is_file())
 
-            # Read and verify QC JSON
-            with open(outputs.qc_json_path, encoding="utf-8") as f:
-                qc_data = json.load(f)
-
+            qc_data = json.loads(outputs.qc_json_path.read_text(encoding="utf-8"))
             self.assertEqual(qc_data["mode"], "prenatal")
             self.assertIsNotNone(qc_data["prenatal"])
             self.assertEqual(qc_data["prenatal"]["fetal_sex"], "M")
@@ -699,188 +567,318 @@ class TestPrenatalPredictPipeline(unittest.TestCase):
             self.assertIn("read_metrics", qc_data)
             self.assertIn("cnv_summary", qc_data)
 
-            # Segments have prenatal annotations
             for seg in outputs.segments:
                 self.assertIsNotNone(seg.expected_ratio)
                 self.assertIsNotNone(seg.implied_ff)
                 self.assertIsInstance(seg.discordant, bool)
 
 
-class TestPredictPublishedCrams(unittest.TestCase):
-    def test_cli_predicts_published_sample_against_two_sample_reference(self) -> None:
-        runner = CliRunner()
+class TestPredictAlignmentInputs(unittest.TestCase):
+    def test_load_inputs_polymorphic_cram(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            sample_a, sample_b = extract_published_samples(root)
-            reference_prefix = root / "reference"
+            s1, s2 = extract_published_samples(root)
+            ref_path = root / "cohort_ref.ccnv"
             build_reference(
                 ReferenceConfig(
-                    entries=(
-                        SamplesheetEntry(filepath=sample_a),
-                        SamplesheetEntry(filepath=sample_b),
-                    ),
-                    prefix=reference_prefix,
-                    pca_components=1,
+                    entries=tuple(SamplesheetEntry(filepath=p) for p in (s1, s2)),
+                    prefix=root / "cohort_ref",
+                    bin_size=100000,
                     min_cohort_size=2,
                 )
             )
-            predict_prefix = root / "prediction"
-            result = runner.invoke(
-                app,
-                [
-                    "predict",
-                    str(sample_a),
-                    str(parquet_path(reference_prefix)),
-                    "--prefix",
-                    str(predict_prefix),
-                ],
-            )
-            self.assertEqual(result.exit_code, 0, result.output)
-
-            expected_files = (
-                f"{predict_prefix}_bins.bed.gz",
-                f"{predict_prefix}_bins.bed.gz.tbi",
-                f"{predict_prefix}_segments.bed.gz",
-                f"{predict_prefix}_segments.bed.gz.tbi",
-                f"{predict_prefix}_calls.bed.gz",
-                f"{predict_prefix}_calls.bed.gz.tbi",
-                f"{predict_prefix}_segments.vcf.gz",
-                f"{predict_prefix}_segments.vcf.gz.tbi",
-                f"{predict_prefix}_calls.vcf.gz",
-                f"{predict_prefix}_calls.vcf.gz.tbi",
-                f"{predict_prefix}_plot.html",
-                f"{predict_prefix}_qc.json",
-            )
-            for p_str in expected_files:
-                self.assertTrue(Path(p_str).is_file(), p_str)
-            for absent_suffix in (
-                "_bins.vcf.gz",
-                "_bins.vcf.gz.tbi",
-                "_bins.ccnv",
-                "_segments.ccnv",
+            fasta = ensure_published_fasta()
+            with patch.object(
+                SampleBuffers,
+                "to_table",
+                side_effect=AssertionError("must not materialize SAMPLE_SCHEMA table"),
             ):
-                self.assertFalse(Path(f"{predict_prefix}{absent_suffix}").exists())
+                inputs = load_inputs(
+                    PUBLISHED_CRAM,
+                    ref_path,
+                    sex="autosomal",
+                    mode="germline",
+                    fasta=fasta,
+                )
+            self.assertIsInstance(inputs.sample, SampleBuffers)
+            self.assertIsNone(inputs.sample.frag_bands)
+            self.assertIsNotNone(inputs.sample.meta.fragmentomics)
+            self.assertGreater(inputs.sample.num_rows, 0)
 
-            with open(f"{predict_prefix}_qc.json", encoding="utf-8") as f:
-                qc_data = json.load(f)
-            self.assertEqual(qc_data["mode"], "germline")
-            self.assertEqual(qc_data["schema_version"], "2.0.0")
+    def test_fragmentomics_compatibility_and_observed_qc_counts(self) -> None:
+        ref_meta_obj = ReferenceMetadata(
+            bin_size=10000,
+            contig_lengths={"chr1": 20000},
+            branches=(BRANCH_AUTOSOMAL,),
+            fragmentomics_corrected=True,
+        )
+        restored_meta = ReferenceMetadata.from_schema(
+            REFERENCE_SCHEMA.with_metadata(ref_meta_obj.build_arrow_metadata())
+        )
+        self.assertTrue(restored_meta.fragmentomics_corrected)
 
-            with gzip.open(f"{predict_prefix}_bins.bed.gz", "rt") as h:
-                bin_lines = h.read().splitlines()
-            self.assertEqual(tuple(bin_lines[0].split("\t")), BINS_BED_HEADER)
-            self.assertEqual(len(bin_lines) - 1, 468)
-            self.assertEqual(bin_lines[1].split("\t")[0], "chr21")
-            self.assertEqual(int(bin_lines[1].split("\t")[1]), 0)
-            self.assertEqual(int(bin_lines[-1].split("\t")[2]), CHR21_LENGTH)
+        se_sample = make_sample_table(
+            [100, 120],
+            contigs=["chr1", "chr1"],
+            starts=[0, 10000],
+            ends=[10000, 20000],
+            contig_lengths={"chr1": 20000},
+            bin_size=10000,
+            endpoint_counts=[50, 60],
+        )
+        pe_frag_meta = FragmentomicsMetadata(
+            True,
+            220,
+            166.0,
+            143.0,
+            0.0,
+            0.35,
+            0.05,
+            0.01,
+            0.04,
+            1.0,
+            0.90,
+            [1] * 571,
+            [0] * 571,
+            [0] * 571,
+            [1] * 256,
+        )
+        pe_sample = make_sample_table(
+            [100, 120],
+            contigs=["chr1", "chr1"],
+            starts=[0, 10000],
+            ends=[10000, 20000],
+            contig_lengths={"chr1": 20000},
+            bin_size=10000,
+            fragment_lengths=[[135] * 100, [135] * 120],
+            endpoint_counts=[50, 60],
+        )
+        pe_meta_dict = dict(pe_sample.schema.metadata or {})
+        pe_meta_dict[FRAGMENTOMICS_METADATA_KEY] = json.dumps(
+            asdict(pe_frag_meta)
+        ).encode()
+        pe_sample = pe_sample.replace_schema_metadata(pe_meta_dict)
 
-            with gzip.open(f"{predict_prefix}_segments.bed.gz", "rt") as h:
-                seg_lines = h.read().splitlines()
-            self.assertEqual(tuple(seg_lines[0].split("\t")), SEGMENTS_BED_HEADER)
-
-            with gzip.open(f"{predict_prefix}_calls.bed.gz", "rt") as h:
-                call_lines = h.read().splitlines()
-            self.assertEqual(tuple(call_lines[0].split("\t")), CALLS_BED_HEADER)
-            self.assertGreater(Path(f"{predict_prefix}_plot.html").stat().st_size, 0)
-
-            opt_in_prefix = root / "prediction_with_bins"
-            result_bins = runner.invoke(
-                app,
-                [
-                    "predict",
-                    str(sample_a),
-                    str(parquet_path(reference_prefix)),
-                    "--prefix",
-                    str(opt_in_prefix),
-                    "--bins-vcf",
-                    "--no-plot",
-                ],
+        def _make_ref(model_dict: dict[str, object]) -> pa.Table:
+            return make_reference_table(
+                branches=[BRANCH_AUTOSOMAL, BRANCH_AUTOSOMAL],
+                contigs=["chr1", "chr1"],
+                starts=[0, 10000],
+                ends=[10000, 20000],
+                contig_lengths={"chr1": 20000},
+                pca_mean=[100.0, 120.0],
+                mean_distance=[0.5, 0.5],
+                null_mean=[0.0, 0.0],
+                bio_dispersion=[0.0025, 0.0025],
+                model=model_dict,
+                sample_identities=["s1"],
             )
-            self.assertEqual(result_bins.exit_code, 0, result_bins.output)
-            opt_in_bins_vcf = Path(f"{opt_in_prefix}_bins.vcf.gz")
-            self.assertTrue(opt_in_bins_vcf.is_file())
-            self.assertTrue(Path(f"{opt_in_bins_vcf}.tbi").is_file())
-            with pysam.TabixFile(str(opt_in_bins_vcf)) as tb:
-                self.assertEqual(len(list(tb.fetch("chr21", 0, CHR21_LENGTH))), 468)
 
-    def test_normalize_branch_zero_bio_dispersion(self) -> None:
-        pids, pweights = _proto_arrays(4)
-        model = BranchModel(
-            branch=BRANCH_AUTOSOMAL,
-            contigs=("chr1", "chr1", "chr2", "chr2"),
-            starts=np.array([0, 100, 0, 100], dtype=np.int64),
-            ends=np.array([100, 200, 100, 200], dtype=np.int64),
-            counts=np.array([20.0, 30.0, 40.0, 50.0]),
-            masked=np.zeros(4, dtype=np.bool_),
-            pca_mean=np.full(4, 0.25),
-            pca_loadings=np.zeros((1, 4), dtype=np.float32),
-            proto_ids=pids,
-            proto_weights=pweights,
-            mean_distance=np.ones(4, dtype=np.float32),
-            null_mean=np.zeros(4, dtype=np.float64),
-            bio_dispersion=np.zeros(4, dtype=np.float64),
-        )
-        cfg = PredictConfig(
-            Path("sample"), Path("reference"), Path("output"), min_reference_bins=2
-        )
-        result = normalize_branch(model, cfg)
-        self.assertEqual(result.ratios.shape, (4,))
-        self.assertTrue(np.all(np.isfinite(result.zscores)))
+        legacy_ref = _make_ref({"bin_size": 10000})
+        se_ref = _make_ref({"bin_size": 10000, "fragmentomics_corrected": False})
+        pe_ref = _make_ref({"bin_size": 10000, "fragmentomics_corrected": True})
+        flat_ref = _make_ref({"bin_size": 10000, "flat": True})
 
-    def test_normalize_branch_flat_diploid_with_outlier_bin(self) -> None:
-        pids, pweights = _proto_arrays(6)
-        model = BranchModel(
-            branch=BRANCH_AUTOSOMAL,
-            contigs=("chr1", "chr1", "chr1", "chr2", "chr2", "chr2"),
-            starts=np.array([0, 100, 200, 0, 100, 200], dtype=np.int64),
-            ends=np.array([100, 200, 300, 100, 200, 300], dtype=np.int64),
-            counts=np.array([20.0, 20.0, 20.0, 20.0, 20.0, 80.0]),
-            masked=np.zeros(6, dtype=np.bool_),
-            pca_mean=np.full(6, 0.25),
-            pca_loadings=np.zeros((1, 6), dtype=np.float32),
-            proto_ids=pids,
-            proto_weights=pweights,
-            mean_distance=np.ones(6, dtype=np.float32),
-            null_mean=np.zeros(6, dtype=np.float64),
-            bio_dispersion=np.zeros(6, dtype=np.float64),
-        )
-        cfg = PredictConfig(
-            Path("sample"), Path("reference"), Path("output"), min_reference_bins=2
-        )
-        result = normalize_branch(model, cfg)
-        self.assertEqual(result.ratios.shape, (6,))
-        self.assertTrue(np.all(np.isfinite(result.zscores)))
-        self.assertGreater(result.zscores[5], 2.0)
-
-    def test_resolve_sample_sex_inferences_and_validations(self) -> None:
-        sample = SampleBuffers.from_table(
-            make_sample_table(
-                [90, 10],
-                contigs=["chr1", "chrY"],
-                starts=[0, 0],
-                ends=[100, 100],
-                contig_lengths={"chr1": 100, "chrY": 100},
-                bin_size=100,
-            )
-        )
-        c_lens = {"chr1": 100, "chrY": 100}
-        sex_br = (BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX)
-        auto_only = ReferenceMetadata(100, c_lens, (BRANCH_AUTOSOMAL,))
-        no_cut = ReferenceMetadata(100, c_lens, sex_br)
-        low_cut = ReferenceMetadata(
-            100, c_lens, sex_br, sex_signal_contig="chrY", sex_cutoff=0.05
-        )
-        high_cut = ReferenceMetadata(
-            100, c_lens, sex_br, sex_signal_contig="chrY", sex_cutoff=0.15
-        )
-
-        self.assertEqual(infer_single_sample_sex(sample, auto_only, "female"), "female")
-        self.assertEqual(infer_single_sample_sex(sample, auto_only, "male"), "male")
-        self.assertIsNone(infer_single_sample_sex(sample, auto_only))
+        self.assertFalse(resolve_fragmentomics_compatibility(se_sample, legacy_ref))
+        self.assertFalse(resolve_fragmentomics_compatibility(se_sample, se_ref))
         with self.assertRaises(PredictError):
-            infer_single_sample_sex(sample, no_cut)
-        self.assertEqual(infer_single_sample_sex(sample, low_cut), "male")
-        self.assertEqual(infer_single_sample_sex(sample, high_cut), "female")
+            resolve_fragmentomics_compatibility(pe_sample, legacy_ref)
+        with self.assertRaises(PredictError):
+            resolve_fragmentomics_compatibility(pe_sample, se_ref)
+
+        self.assertTrue(resolve_fragmentomics_compatibility(pe_sample, pe_ref))
+        with self.assertRaises(PredictError):
+            resolve_fragmentomics_compatibility(se_sample, pe_ref)
+
+        self.assertFalse(resolve_fragmentomics_compatibility(se_sample, flat_ref))
+        self.assertTrue(resolve_fragmentomics_compatibility(pe_sample, flat_ref))
+
+        se_in = PredictionInput(
+            SampleBuffers.from_table(se_sample),
+            se_ref,
+            {"chr1": 20000},
+            None,
+            (BRANCH_AUTOSOMAL,),
+        )
+        se_bm = build_branch_model(se_in, BRANCH_AUTOSOMAL)
+        self.assertIsNone(se_bm.ref_frag_len)
+        self.assertIsNone(se_bm.ref_ep_rate)
+
+        grid = np.arange(30, 601, dtype=np.float64)
+        p_fet = norm.pdf(grid, loc=143.0, scale=10.0)
+        p_fet /= np.sum(p_fet)
+        p_mat = norm.pdf(grid, loc=166.0, scale=12.0)
+        p_mat /= np.sum(p_mat)
+        prenatal_meta = PrenatalModelMetadata(
+            20000,
+            0.005,
+            1.0,
+            [0.0],
+            -2.0,
+            1.0,
+            0.01,
+            p_fetal_density=p_fet.tolist(),
+            p_maternal_density=p_mat.tolist(),
+        )
+        p_branches = [BRANCH_AUTOSOMAL, BRANCH_PRENATAL_AUTOSOMAL, BRANCH_PRENATAL_FFY]
+        p_ranks = {
+            BRANCH_AUTOSOMAL: 0,
+            BRANCH_PRENATAL_AUTOSOMAL: 1,
+            BRANCH_PRENATAL_FFY: 1,
+        }
+        prenatal_rows = make_reference_table(
+            branches=[BRANCH_AUTOSOMAL, *p_branches, BRANCH_PRENATAL_FFY],
+            contigs=["chr1", "chr1", "chr1", "chrY", "chrY"],
+            starts=[0, 10000, 0, 0, 10000],
+            ends=[10000, 20000, 20000, 10000, 20000],
+            contig_lengths={"chr1": 20000, "chrY": 20000},
+            pca_mean=[100.0, 120.0, 220.0, 1.0, 1.0],
+            pca_loadings=[[], [], [1.0], [0.5], [0.5]],
+            mean_distance=[0.5, 0.5, 0.0, 0.0, 0.0],
+            null_mean=[0.0] * 5,
+            bio_dispersion=[0.0025, 0.0025, 0.0, 0.0, 0.0],
+            model={
+                "branches": p_branches,
+                "bin_size": 10000,
+                "mode": "prenatal",
+                "prenatal_bin_size": 20000,
+                "fragmentomics_corrected": True,
+                "branch_pca_ranks": p_ranks,
+            },
+            sample_identities=["s1"],
+            extra_metadata={"prenatal": prenatal_meta.to_dict()},
+        )
+        pe_prenatal_sample = make_sample_table(
+            counts=[100, 120, 0, 0],
+            contigs=["chr1", "chr1", "chrY", "chrY"],
+            starts=[0, 10000, 0, 10000],
+            ends=[10000, 20000, 10000, 20000],
+            contig_lengths={"chr1": 20000, "chrY": 20000},
+            bin_size=10000,
+            fragment_lengths=[[135] * 100, [135] * 120, [], []],
+            endpoint_counts=[50, 60, 0, 0],
+        )
+        pe_prenatal_meta = dict(pe_prenatal_sample.schema.metadata or {})
+        pe_prenatal_meta[FRAGMENTOMICS_METADATA_KEY] = json.dumps(
+            asdict(pe_frag_meta)
+        ).encode()
+        pe_prenatal_sample = pe_prenatal_sample.replace_schema_metadata(
+            pe_prenatal_meta
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sm_path = root / "pe_sample.ccnv"
+            rf_path = root / "pe_ref.ccnv"
+            write_sample_parquet(pe_prenatal_sample, sm_path)
+            write_reference_parquet(prenatal_rows, rf_path)
+            outputs = run_predict(
+                PredictConfig(
+                    sample=sm_path,
+                    reference=rf_path,
+                    prefix=root / "out",
+                    mode="prenatal",
+                    plot=False,
+                )
+            )
+            self.assertIsNotNone(outputs.qc_json_path)
+            if outputs.qc_json_path is None:
+                self.fail("expected qc_json_path")
+            qc_payload = json.loads(outputs.qc_json_path.read_text(encoding="utf-8"))
+            self.assertAlmostEqual(
+                qc_payload["read_metrics"]["mean_bin_count"], 55.0, places=4
+            )
+            self.assertAlmostEqual(
+                qc_payload["read_metrics"]["median_bin_count"], 50.0, places=4
+            )
+
+    def test_extract_for_predict_contig_naming_resolution_and_default_mapq_1(
+        self,
+    ) -> None:
+        ref_partial_filters = ReferenceMetadata(
+            bin_size=200,
+            contig_lengths={"1": 1200, "2": 1200, "X": 800, "Y": 800},
+            branches=(BRANCH_AUTOSOMAL,),
+            filters={"exclude_duplicates": True},
+        )
+        resolved_filters = ReadFilters.from_dict(
+            ref_partial_filters.filters or {}, strict=False
+        )
+        self.assertEqual(resolved_filters.min_mapping_quality, 1)
+        self.assertEqual(ReadFilters().min_mapping_quality, 1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            ucsc_bam = tmp_path / "ucsc_mapq5.bam"
+            header = {
+                "HD": {"VN": "1.6", "SO": "coordinate"},
+                "SQ": [
+                    {"SN": "chr1", "LN": 1200},
+                    {"SN": "chr2", "LN": 1200},
+                    {"SN": "chrX", "LN": 800},
+                    {"SN": "chrY", "LN": 800},
+                ],
+            }
+            with pysam.AlignmentFile(str(ucsc_bam), "wb", header=header) as outf:
+                for tid in (0, 1, 2):
+                    a = pysam.AlignedSegment(outf.header)
+                    a.query_name = f"mq5_{tid}"
+                    a.query_sequence = "ACGT" * 12 + "AC"
+                    a.flag = 99
+                    a.reference_id = tid
+                    a.reference_start = 50
+                    a.mapping_quality = 5
+                    a.cigar = ((0, 50),)
+                    a.next_reference_id = tid
+                    a.next_reference_start = 160
+                    a.template_length = 160
+                    a.query_qualities = pysam.qualitystring_to_array("I" * 50)
+                    outf.write(a)
+            pysam.index(str(ucsc_bam))
+
+            core_default = scan_core(str(ucsc_bam), [("1", 1200)], 200)
+            self.assertEqual(int(np.sum(np.asarray(core_default["count"]))), 1)
+
+            extracted = extract_for_predict(ucsc_bam, ref_partial_filters, threads=1)
+            self.assertEqual(list(extracted.meta.contig_order), ["1", "2", "X", "Y"])
+            self.assertEqual(int(np.sum(extracted.count)), 3)
+
+            cohort_paths: list[Path] = []
+            for idx in range(4):
+                p = tmp_path / f"ens_{idx}.ccnv"
+                write_synthetic_sample(
+                    p,
+                    [35 + idx] * 12,
+                    contigs=["1"] * 6 + ["2"] * 6,
+                    starts=[0, 200, 400, 600, 800, 1000] * 2,
+                    ends=[200, 400, 600, 800, 1000, 1200] * 2,
+                    contig_lengths={"1": 1200, "2": 1200},
+                    bin_size=200,
+                    fragment_lengths=[[160] * (35 + idx)] * 12,
+                    endpoint_counts=[4] * 12,
+                )
+                cohort_paths.append(p)
+            ens_ref_path = build_reference(
+                ReferenceConfig(
+                    entries=tuple(SamplesheetEntry(filepath=p) for p in cohort_paths),
+                    prefix=tmp_path / "ens_ref",
+                    bin_size=200,
+                    min_cohort_size=4,
+                    sex_contigs=(),
+                )
+            )
+            inputs = load_inputs(ucsc_bam, ens_ref_path, mode="germline", threads=2)
+            self.assertEqual(inputs.contig_lengths, {"1": 1200, "2": 1200})
+
+            bad_len_meta = ReferenceMetadata(
+                bin_size=200, contig_lengths={"1": 1400}, branches=(BRANCH_AUTOSOMAL,)
+            )
+            with self.assertRaisesRegex(
+                BinCompatibilityError, "contig length mismatch"
+            ):
+                extract_for_predict(ucsc_bam, bad_len_meta)
+            with self.assertRaisesRegex(PredictError, "contig length mismatch"):
+                extract_for_predict(ucsc_bam, bad_len_meta)
 
 
 if __name__ == "__main__":

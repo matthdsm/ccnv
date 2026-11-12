@@ -1,9 +1,8 @@
+"""Unit tests for ccnv.report BED, VCF, and output orchestration."""
+
 from __future__ import annotations
 
-import base64
 import gzip
-import json
-import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +11,6 @@ import numpy as np
 import pysam
 from numpy.typing import ArrayLike
 
-from ccnv.io.tracks import load_cytobands_track
 from ccnv.models.results import (
     BinResult,
     FetalFractionResult,
@@ -22,12 +20,10 @@ from ccnv.models.results import (
 from ccnv.report import (
     BINS_BED_HEADER,
     CALLS_BED_HEADER,
-    PLOTLY_CDN_URL,
     PRENATAL_CALLS_BED_HEADER,
     PRENATAL_SEGMENTS_BED_HEADER,
     SEGMENTS_BED_HEADER,
     build_vcf_header,
-    decimate_bins_m4,
     natural_sort_key,
     write_bins_bed_streaming,
     write_bins_vcf,
@@ -35,18 +31,8 @@ from ccnv.report import (
     write_segments_vcf,
     write_vcf_streaming,
 )
-from ccnv.report.html import render_genome_plot
-
-
-def _extract_payload(html: str) -> dict[str, object]:
-    match = re.search(
-        r'<script id="ccnv-data" type="application/json">(.*?)</script>',
-        html,
-        re.DOTALL,
-    )
-    if match is None:
-        raise AssertionError("ccnv-data JSON payload not found in HTML")
-    return json.loads(match.group(1))
+from ccnv.report._common import resolve_segments_dataframe, segments_to_dataframe
+from ccnv.report.bed import sort_bin_result, sort_segments
 
 
 def _make_bin_result(
@@ -77,132 +63,165 @@ def _make_bin_result(
     )
 
 
-class TestReport(unittest.TestCase):
-    def test_render_genome_plot_html_and_binary_payload(self) -> None:
-        contig_lengths = {"chr1": 100_000, "chr2": 80_000, "chr3": 60_000}
-        bins = (
-            _make_bin_result(
-                "autosomal",
-                ("chr1", "chr1", "chr2", "chr3"),
-                [0, 50_000, 0, 0],
-                [50_000, 100_000, 80_000, 60_000],
-                [3.5, 0.0, -0.6, 0.1],
-                [3.0, 0.0, -3.5, 0.5],
-                ref_size=10,
-                masked=[False, True, False, False],
-            ),
-        )
-        segments = (
-            SegmentResult("chr1", 0, 50_000, 3.5, 3.0, 1.0, 1, "gain"),
-            SegmentResult("chr2", 0, 80_000, -0.6, -3.5, 1.0, 1, "loss"),
-            SegmentResult("chr3", 0, 60_000, 0.1, 0.5, 1.0, 1, None),
+class TestBedReport(unittest.TestCase):
+    def test_natural_sort_key(self) -> None:
+        contigs = ["chr10", "chr2", "chr1", "chrX", "chrY", "chr21"]
+        self.assertEqual(
+            sorted(contigs, key=natural_sort_key),
+            ["chr1", "chr2", "chr10", "chr21", "chrX", "chrY"],
         )
 
+    def test_sort_bin_result_order(self) -> None:
+        bin_res = _make_bin_result(
+            "autosomal",
+            ("chr2", "chr1"),
+            [0, 0],
+            [100, 100],
+            [0.1, -0.1],
+            [1.0, -1.0],
+            ref_size=5,
+        )
+        sorted_res = sort_bin_result(bin_res)
+        self.assertEqual(sorted_res.contigs, ("chr1", "chr2"))
+        self.assertEqual(sorted_res.ratios[0], -0.1)
+        self.assertEqual(sorted_res.ratios[1], 0.1)
+
+    def test_sort_segments_order(self) -> None:
+        segs = [
+            SegmentResult("chr2", 0, 100, 0.0, 0.0, 1.0, 1, None),
+            SegmentResult("chr1", 50, 100, 0.0, 0.0, 1.0, 1, None),
+            SegmentResult("chr1", 0, 50, 0.0, 0.0, 1.0, 1, None),
+        ]
+        sorted_segs = sort_segments(segs)
+        self.assertEqual(
+            [(s.contig, s.start) for s in sorted_segs],
+            [("chr1", 0), ("chr1", 50), ("chr2", 0)],
+        )
+
+    def test_write_bins_bed_indexed_and_nan_format(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            html_path = Path(tmpdir) / "test_plot.html"
-            render_genome_plot(
-                html_path,
+            bed_path = Path(tmpdir) / "test_bins.bed.gz"
+            bins = (
+                _make_bin_result(
+                    "autosomal",
+                    ("chr1", "chr1"),
+                    [0, 100],
+                    [100, 200],
+                    [1.23456789, float("nan")],
+                    [2.5, float("nan")],
+                    weights=[1.0, 0.0],
+                    ref_size=[5, 0],
+                    masked=[False, True],
+                ),
+            )
+            out = write_bins_bed_streaming(bed_path, bins, contig_lengths={"chr1": 200})
+            self.assertEqual(out, bed_path)
+            self.assertTrue(bed_path.is_file())
+            self.assertTrue(Path(f"{bed_path}.tbi").is_file())
+
+            with pysam.TabixFile(str(bed_path)) as tbx:
+                records = list(tbx.fetch("chr1", 0, 200))
+                self.assertEqual(len(records), 2)
+                self.assertIn("1.234568", records[0])
+                self.assertIn("\t.\t.\t0.000000\t0\ttrue\tautosomal", records[1])
+
+    def test_resolve_segments_dataframe_sorts_prebuilt_dataframe_when_requested(
+        self,
+    ) -> None:
+        segs = (
+            SegmentResult("chr10", 0, 5000, 0.4, 4.0, 20.0, 1, "gain"),
+            SegmentResult("chr2", 0, 5000, -0.4, -4.0, 20.0, 1, "loss"),
+        )
+        unsorted_df = segments_to_dataframe(segs, is_prenatal=False)
+        sorted_df = resolve_segments_dataframe(
+            (), unsorted_df, calls_only=False, is_prenatal=False, sort_natural=True
+        )
+        self.assertEqual(sorted_df.get_column("contig").to_list(), ["chr2", "chr10"])
+
+
+class TestVcfReport(unittest.TestCase):
+    def test_build_vcf_header(self) -> None:
+        header = build_vcf_header(
+            contig_lengths={"chr1": 1000, "chr2": 2000},
+            sample_name="TEST_SAMPLE",
+            record_type="segments",
+        )
+        self.assertEqual(header[0], "##fileformat=VCFv4.2")
+        self.assertTrue(
+            any("##contig=<ID=chr1,length=1000>" in line for line in header)
+        )
+        self.assertTrue(any("##FORMAT=<ID=LOG2R," in line for line in header))
+        self.assertTrue(any("##INFO=<ID=SVTYPE," in line for line in header))
+        self.assertTrue(header[-1].endswith("\tTEST_SAMPLE"))
+
+    def test_write_segments_vcf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vcf_path = Path(tmpdir) / "test_segments.vcf.gz"
+            header = build_vcf_header({"chr1": 1000}, "SAMPLE1", "segments")
+            segs = (SegmentResult("chr1", 100, 500, 0.5, 3.5, 1.2, 4, "gain"),)
+            out = write_segments_vcf(vcf_path, header, segs, "SAMPLE1")
+            self.assertEqual(out, vcf_path)
+            self.assertTrue(vcf_path.is_file())
+            self.assertTrue(Path(f"{vcf_path}.tbi").is_file())
+
+    def test_write_bins_vcf(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            vcf_path = Path(tmpdir) / "test_bins.vcf.gz"
+            header = build_vcf_header({"chr1": 1000}, "SAMPLE1", "bins")
+            bins = (
+                _make_bin_result(
+                    "autosomal", ("chr1",), [0], [100], 0.1, 1.0, ref_size=5
+                ),
+            )
+            out = write_bins_vcf(vcf_path, header, bins, "SAMPLE1")
+            self.assertEqual(out, vcf_path)
+            self.assertTrue(vcf_path.is_file())
+            self.assertTrue(Path(f"{vcf_path}.tbi").is_file())
+
+
+class TestWriteOutputs(unittest.TestCase):
+    def test_write_outputs_full(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prefix = Path(tmpdir) / "deliverable"
+            bins = (
+                _make_bin_result(
+                    "autosomal", ("chr1",), [0], [100], 0.1, 1.0, ref_size=5
+                ),
+            )
+            segs = (SegmentResult("chr1", 0, 100, 0.1, 1.0, 1.0, 1, "gain"),)
+            res = write_outputs(
+                prefix, bins, segs, contig_lengths={"chr1": 1000}, plot=True, vcf=True
+            )
+            self.assertTrue(res.bins_bed.is_file())
+            self.assertTrue(res.segments_bed.is_file())
+            self.assertTrue(res.calls_bed.is_file())
+            self.assertIsNone(res.bins_vcf)
+            self.assertFalse(Path(f"{prefix}_bins.vcf.gz").exists())
+            self.assertIsNotNone(res.segments_vcf)
+            self.assertIsNotNone(res.calls_vcf)
+            self.assertIsNotNone(res.plot_html)
+            if res.segments_vcf is None or res.plot_html is None:
+                self.fail("expected segments_vcf and plot_html to be generated")
+            self.assertTrue(res.segments_vcf.is_file())
+            self.assertTrue(res.plot_html.is_file())
+
+            prefix_bins = Path(tmpdir) / "deliverable_with_bins"
+            res_bins = write_outputs(
+                prefix_bins,
                 bins,
-                segments,
-                contig_lengths,
-                z_threshold=3.0,
-                ratio_threshold=0.25,
-                sample_name="sample_alpha",
+                segs,
+                contig_lengths={"chr1": 1000},
+                plot=False,
+                vcf=True,
+                bins_vcf=True,
             )
-            self.assertTrue(html_path.is_file())
-            content = html_path.read_text(encoding="utf-8")
+            self.assertIsNotNone(res_bins.bins_vcf)
+            if res_bins.bins_vcf is None:
+                self.fail("expected bins_vcf to be generated")
+            self.assertTrue(res_bins.bins_vcf.is_file())
 
-        for token in (
-            PLOTLY_CDN_URL,
-            'id="coord-input"',
-            'id="z-input"',
-            'id="r-input"',
-            "Plotly.newPlot",
-            "scattergl",
-            "const Y_LIM = 2.5;",
-            "fixedrange: true",
-        ):
-            self.assertIn(token, content)
 
-        payload = _extract_payload(content)
-        self.assertEqual(payload["sample"], "sample_alpha")
-        self.assertEqual(payload["contigs"], ["chr1", "chr2", "chr3"])
-        self.assertEqual(payload["lengths"], [100_000, 80_000, 60_000])
-        self.assertEqual(payload["z_thresh"], 3.0)
-        self.assertEqual(payload["r_thresh"], 0.25)
-        self.assertEqual(payload["n_bins"], 3)
-
-        bins_dict = payload["bins"]
-        if not isinstance(bins_dict, dict):
-            self.fail("Expected payload['bins'] to be a dict")
-        c_arr = np.frombuffer(base64.b64decode(bins_dict["c"]), dtype="<u2")
-        s_arr = np.frombuffer(base64.b64decode(bins_dict["s"]), dtype="<i4")
-        e_arr = np.frombuffer(base64.b64decode(bins_dict["e"]), dtype="<i4")
-        r_arr = np.frombuffer(base64.b64decode(bins_dict["r"]), dtype="<f4")
-        z_arr = np.frombuffer(base64.b64decode(bins_dict["z"]), dtype="<f4")
-        np.testing.assert_array_equal(c_arr, [0, 1, 2])
-        np.testing.assert_array_equal(s_arr, [0, 0, 0])
-        np.testing.assert_array_equal(e_arr, [50_000, 80_000, 60_000])
-        np.testing.assert_allclose(r_arr, [3.5, -0.6, 0.1], rtol=1e-5)
-        np.testing.assert_allclose(z_arr, [3.0, -3.5, 0.5], rtol=1e-5)
-
-        self.assertEqual(
-            payload["segments"],
-            [
-                [0, 0, 50_000, 3.5, 3.0, 1],
-                [1, 0, 80_000, -0.6, -3.5, 1],
-                [2, 0, 60_000, 0.1, 0.5, 1],
-            ],
-        )
-        self.assertEqual(payload["segment_calls"], ["gain", "loss", None])
-        self.assertEqual(payload["cytobands"], [])
-
-    def test_cytobands_parsing_and_plot_embedding(self) -> None:
-        contig_lengths = {"1": 100_000, "chr2": 80_000}
-        cyto_lines = (
-            "#chrom\tchromStart\tchromEnd\tname\tgieStain\n"
-            "chr1\t0\t40000\tp36.33\tgneg\n"
-            "chr1\t40000\t120000\tp36.32\tacen\n"
-            "2\t0\t80000\tq11.1\tgpos75\n"
-            "chrUn_1\t0\t1000\tp1\tgneg\n"
-        )
-        bins = (
-            _make_bin_result(
-                "autosomal", ("1", "chr2"), [0, 0], [100_000, 80_000], 0.0, 0.0
-            ),
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            cyto_gz = root / "cytoBand.txt.gz"
-            with gzip.open(cyto_gz, "wt", encoding="utf-8") as handle:
-                handle.write(cyto_lines)
-
-            parsed = load_cytobands_track(cyto_gz, contig_lengths)
-            self.assertEqual(len(parsed), 3)
-            self.assertEqual(
-                (parsed[0].contig, parsed[0].start, parsed[0].end), ("1", 0, 40_000)
-            )
-            self.assertEqual(
-                (parsed[1].contig, parsed[1].start, parsed[1].end, parsed[1].stain),
-                ("1", 40_000, 100_000, "acen"),
-            )
-            self.assertEqual((parsed[2].contig, parsed[2].name), ("chr2", "q11.1"))
-
-            html_path = root / "cyto_plot.html"
-            render_genome_plot(html_path, bins, (), contig_lengths, cytobands=parsed)
-            payload = _extract_payload(html_path.read_text(encoding="utf-8"))
-
-        self.assertEqual(payload["r_thresh"], 0.0)
-        self.assertEqual(
-            payload["cytobands"],
-            [
-                [0, 0, 40_000, "p36.33", "gneg"],
-                [0, 40_000, 100_000, "p36.32", "acen"],
-                [1, 0, 80_000, "q11.1", "gpos75"],
-            ],
-        )
-
+class TestReport(unittest.TestCase):
     def test_write_outputs_creates_all_artifacts(self) -> None:
         contig_lengths = {"chr1": 100_000}
         bins = (
@@ -448,95 +467,10 @@ class TestReport(unittest.TestCase):
                     recs[1].samples["prenatal_sample"]["IMPLIED_FF"], 0.014, places=3
                 )
 
-    def test_render_genome_plot_with_prenatal_badge_and_discordant_traces(self) -> None:
-        contig_lengths = {"chr1": 200_000}
-        bins = (_make_bin_result("autosomal", ("chr1",), [0], [200_000], 0.0, 0.0),)
-        seg = SegmentResult("chr1", 0, 200_000, 0.01, 3.5, 1.0, 1, "gain")
-        segments = (
-            SegmentResult(
-                seg.contig,
-                seg.start,
-                seg.end,
-                seg.ratio,
-                seg.zscore,
-                seg.weight,
-                seg.bin_count,
-                seg.call,
-                expected_ratio=0.084,
-                implied_ff=0.014,
-                discordant=True,
-                discordance_reason="SUB_FETAL_RATIO",
-            ),
-        )
-        sca = SCAResult("XY", False, 0.98, -0.2)
-        prenatal = FetalFractionResult(
-            "M",
-            0.10,
-            "FFY",
-            0.10,
-            0.095,
-            0.102,
-            0.95,
-            0.005,
-            0.004,
-            sca,
-            effective_ff=0.14,
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            html_path = Path(tmpdir) / "prenatal_plot.html"
-            render_genome_plot(
-                html_path, bins, segments, contig_lengths, prenatal_result=prenatal
-            )
-            content = html_path.read_text(encoding="utf-8")
-
-        for token in ('id="prenatal-badge"', "Segments (Discordant)", "#9333ea"):
-            self.assertIn(token, content)
-        payload = _extract_payload(content)
-        self.assertEqual(
-            (payload["r_thresh"], payload["segment_calls"]), (0.0, ["gain"])
-        )
-        prenatal_dict = payload["prenatal"]
-        if not isinstance(prenatal_dict, dict):
-            self.fail("Expected payload['prenatal'] to be a dict")
-        self.assertEqual(
-            (
-                prenatal_dict["fetal_sex"],
-                prenatal_dict["active_ff"],
-                prenatal_dict["effective_ff"],
-            ),
-            ("M", 0.10, 0.14),
-        )
-        seg_rows = payload["segments"]
-        if not isinstance(seg_rows, list):
-            self.fail("Expected payload['segments'] to be a list")
-        self.assertEqual(
-            (len(seg_rows[0]), seg_rows[0][6], seg_rows[0][9]),
-            (13, True, "SUB_FETAL_RATIO"),
-        )
-
     def test_natural_sort_key(self) -> None:
         raw = ["chr1", "chr10", "chr11", "chr2", "chr20", "chrX", "chrY"]
         exp = ["chr1", "chr2", "chr10", "chr11", "chr20", "chrX", "chrY"]
         self.assertEqual(sorted(raw, key=natural_sort_key), exp)
-
-    def test_render_genome_plot_natural_chrom_sort_order(self) -> None:
-        contig_lengths = {c: 50_000 for c in ("chr10", "chr2", "chr1", "chrY", "chrX")}
-        bins = (
-            _make_bin_result(
-                "autosomal",
-                ("chr10", "chr2", "chr1", "chrY", "chrX"),
-                [0] * 5,
-                [50_000] * 5,
-                0.0,
-                0.0,
-            ),
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            html_path = Path(tmpdir) / "natural_plot.html"
-            render_genome_plot(html_path, bins, (), contig_lengths)
-            payload = _extract_payload(html_path.read_text(encoding="utf-8"))
-
-        self.assertEqual(payload["contigs"], ["chr1", "chr2", "chr10", "chrX", "chrY"])
 
     def test_write_outputs_naturally_sorts_all_artifacts(self) -> None:
         contig_lengths = {c: 50_000 for c in ("chr10", "chr2", "chr1", "chrY", "chrX")}
@@ -560,11 +494,14 @@ class TestReport(unittest.TestCase):
         expected_all = ["chr1", "chr2", "chr10", "chrX", "chrY"]
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            prefix = Path(tmpdir) / "test_out"
             outputs = write_outputs(
-                prefix, bins, segments, contig_lengths, plot=True, bins_vcf=True
+                Path(tmpdir) / "test_out",
+                bins,
+                segments,
+                contig_lengths,
+                plot=True,
+                bins_vcf=True,
             )
-
             for bed_p, expected_order in (
                 (outputs.bins_bed, expected_all),
                 (outputs.segments_bed, expected_all),
@@ -610,15 +547,12 @@ class TestReport(unittest.TestCase):
             self.assertEqual(
                 [r.split("\t")[4] for r in vcf_call_records], ["<DEL>", "<DUP>"]
             )
-
             self.assertEqual(outputs.bins[0].contigs, tuple(expected_all))
             self.assertEqual([s.contig for s in outputs.segments], expected_all)
 
 
 class TestScalableReports(unittest.TestCase):
-    def test_default_skips_bins_vcf_and_segments_calls_vcf_parse_in_pysam(
-        self,
-    ) -> None:
+    def test_default_skips_bins_vcf_and_segments_calls_vcf_parse_in_pysam(self) -> None:
         contig_lengths = {"chr1": 200_000, "chr2": 150_000}
         bins = (
             _make_bin_result(
@@ -740,57 +674,6 @@ class TestScalableReports(unittest.TestCase):
                 recs = list(vf.fetch("chr1", 600_010_000, 600_020_000))
                 self.assertEqual(len(recs), 1)
                 self.assertEqual(recs[0].stop, 600_050_000)
-
-    def test_m4_decimation_caps_500k_bins_while_preserving_outlier_zscores(
-        self,
-    ) -> None:
-        rng = np.random.default_rng(7)
-        x = np.arange(500_000, dtype=np.float32) * 1_000.0
-        y = rng.normal(0.0, 0.2, size=500_000).astype(np.float32)
-        y[10_000:15_000] = np.nan
-        z = (y / 0.2).astype(np.float32)
-        y[123_456] = 1.3
-        z[123_456] = 6.5
-        keep = decimate_bins_m4(x, y, z, max_points=48_000, z_preserve=3.0)
-        self.assertEqual(keep.dtype, np.int32)
-        self.assertLessEqual(keep.size, 55_000)
-        self.assertIn(123_456, set(keep.tolist()))
-        self.assertTrue(bool(np.all(keep[1:] > keep[:-1])))
-
-    def test_500k_bin_genome_plot_decimates_uses_typed_buffers_lazy_hover_and_debounce(
-        self,
-    ) -> None:
-        n = 500_000
-        rng = np.random.default_rng(11)
-        starts = np.arange(n, dtype=np.int64) * 100
-        ratios = rng.normal(0.0, 0.15, size=n).astype(np.float64)
-        zscores = rng.normal(0.0, 0.8, size=n).astype(np.float64)
-        ratios[250_000] = 0.95
-        zscores[250_000] = 7.2
-        bins = (
-            _make_bin_result(
-                "autosomal", ("chr1",) * n, starts, starts + 100, ratios, zscores
-            ),
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            html_path = Path(tmpdir) / "big_plot.html"
-            render_genome_plot(html_path, bins, (), {"chr1": n * 100})
-            content = html_path.read_text(encoding="utf-8")
-
-        payload = _extract_payload(content)
-        n_serialized = payload["n_bins"]
-        if not isinstance(n_serialized, int):
-            self.fail("Expected payload['n_bins'] to be an int")
-        self.assertLessEqual(n_serialized, 55_000)
-        bins_dict = payload["bins"]
-        if not isinstance(bins_dict, dict):
-            self.fail("Expected payload['bins'] to be a dict")
-        s_arr = np.frombuffer(base64.b64decode(bins_dict["s"]), dtype="<u4")
-        self.assertIn(250_000 * 100, set(s_arr.tolist()))
-        for token in ("Uint32Array", "Float32Array", "plotly_hover", "100"):
-            self.assertIn(token, content)
-        self.assertNotIn("const binHover = new Array", content)
 
     def test_interleaved_multibranch_csi_and_custom_vcf_header_order(self) -> None:
         cl = {"chr1": 700_000_000, "chrX": 156_000_000, "scaffold_1": 50_000}

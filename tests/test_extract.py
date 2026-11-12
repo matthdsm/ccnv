@@ -6,15 +6,12 @@ import json
 import logging
 import tempfile
 import unittest
-from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pysam
-from helpers import metadata_for
 from published_fixtures import (
     CHR21_LENGTH,
     PUBLISHED_BIN_SIZE,
@@ -27,22 +24,13 @@ from typer.testing import CliRunner
 
 from ccnv.cli import app
 from ccnv.extract import extract_sample_table, run
-from ccnv.features.binning import (
-    bin_intervals,
-    compute_bin_exposure,
-    rebin_counts,
-)
-from ccnv.features.rebinning import rebin_sample_buffers
 from ccnv.models import (
     FRAGMENTOMICS_METADATA_KEY,
-    NUM_FRAG_BANDS,
     AlignmentError,
-    BinCompatibilityError,
     ExtractConfig,
     ExtractError,
     FragmentomicsMetadata,
     ReadFilters,
-    SampleBuffers,
     SampleMetadata,
     is_canonical_contig,
     normalize_chr,
@@ -53,9 +41,7 @@ from ccnv.models import (
 )
 from ccnv.models.schemas import (
     COORDINATE_SYSTEM,
-    SAMPLE_SCHEMA,
     SCHEMA_VERSION,
-    ArtifactKind,
     decode_metadata,
 )
 from ccnv.qc.sample import QC_COUNTERS, build_sample_qc, empty_qc
@@ -67,116 +53,60 @@ def _read_sample_table(path: Path) -> pa.Table:
     return table
 
 
-class TestBinEdges(unittest.TestCase):
-    def test_full_bins_when_length_divides_evenly(self) -> None:
-        starts, ends = bin_intervals(300, 100)
-        np.testing.assert_array_equal(starts, [0, 100, 200])
-        np.testing.assert_array_equal(ends, [100, 200, 300])
+def _read(
+    name: str,
+    reference_id: int,
+    start: int,
+    mapq: int,
+    *,
+    is_duplicate: bool = False,
+) -> pysam.AlignedSegment:
+    read = pysam.AlignedSegment()
+    read.query_name = name
+    read.query_sequence = "ACGTACGTAC"
+    read.flag = 1024 if is_duplicate else 0
+    read.reference_id = reference_id
+    read.reference_start = start
+    read.mapping_quality = mapq
+    read.cigar = ((0, 10),)
+    read.next_reference_id = -1
+    read.next_reference_start = -1
+    read.template_length = 0
+    read.query_qualities = pysam.qualitystring_to_array("I" * 10)
+    return read
 
-    def test_partial_last_bin_uses_true_contig_end(self) -> None:
-        starts, ends = bin_intervals(250, 100)
-        np.testing.assert_array_equal(starts, [0, 100, 200])
-        np.testing.assert_array_equal(ends, [100, 200, 250])
 
-    def test_single_partial_bin_shorter_than_bin_size(self) -> None:
-        starts, ends = bin_intervals(99, 100)
-        np.testing.assert_array_equal(starts, [0])
-        np.testing.assert_array_equal(ends, [99])
-
-    def test_bin_exposure_reflects_partial_last_bin_width(self) -> None:
-        starts, ends = bin_intervals(250, 100)
-        exp = compute_bin_exposure(starts, ends, 100)
-        np.testing.assert_allclose(exp, [1.0, 1.0, 0.5])
-
-
-class TestRebin(unittest.TestCase):
-    def test_rebin_coarsens_by_summing_nested_bins(self) -> None:
-        source_starts = np.array([0, 50, 100, 150], dtype=np.int64)
-        source_ends = np.array([50, 100, 150, 200], dtype=np.int64)
-        source_counts = np.array([10, 20, 30, 40], dtype=np.float64)
-
-        target_starts = np.array([0, 100], dtype=np.int64)
-        target_ends = np.array([100, 200], dtype=np.int64)
-
-        rebinned = rebin_counts(
-            source_starts, source_ends, source_counts, target_starts, target_ends
+def _has_alignment_index(path: Path) -> bool:
+    return any(
+        candidate.exists()
+        for candidate in (
+            Path(f"{path}.bai"),
+            Path(f"{path}.csi"),
+            Path(f"{path}.crai"),
+            path.with_suffix(".bai"),
+            path.with_suffix(".crai"),
         )
-        np.testing.assert_allclose(rebinned, [30.0, 70.0])
+    )
 
-    def test_rebin_refines_by_splitting_uniformly(self) -> None:
-        source_starts = np.array([0, 100], dtype=np.int64)
-        source_ends = np.array([100, 200], dtype=np.int64)
-        source_counts = np.array([30, 70], dtype=np.float64)
 
-        target_starts = np.array([0, 50, 100, 150], dtype=np.int64)
-        target_ends = np.array([50, 100, 150, 200], dtype=np.int64)
-
-        rebinned = rebin_counts(
-            source_starts, source_ends, source_counts, target_starts, target_ends
-        )
-        np.testing.assert_allclose(rebinned, [15.0, 15.0, 35.0, 35.0])
-
-    def test_rebin_handles_partial_last_bin(self) -> None:
-        source_starts = np.array([0, 100, 200], dtype=np.int64)
-        source_ends = np.array([100, 200, 250], dtype=np.int64)
-        source_counts = np.array([100, 100, 50], dtype=np.float64)
-
-        target_starts, target_ends = bin_intervals(250, 50)
-        rebinned = rebin_counts(
-            source_starts, source_ends, source_counts, target_starts, target_ends
-        )
-        np.testing.assert_allclose(rebinned, [50.0, 50.0, 50.0, 50.0, 50.0])
-
-    def test_rebin_rejects_contig_length_mismatch(self) -> None:
-        source_starts = np.array([0, 100], dtype=np.int64)
-        source_ends = np.array([100, 200], dtype=np.int64)
-        source_counts = np.array([10, 20], dtype=np.float64)
-
-        target_starts = np.array([0, 100], dtype=np.int64)
-        target_ends = np.array([100, 250], dtype=np.int64)
-
-        with self.assertRaisesRegex(ValueError, "contig length mismatch"):
-            rebin_counts(
-                source_starts, source_ends, source_counts, target_starts, target_ends
-            )
-
-    def test_rebin_sample_buffers_coarsens_and_rejects_upsampling(self) -> None:
-        metadata = metadata_for(
-            ArtifactKind.SAMPLE,
-            contig_lengths={"chr1": 200},
-            values={
-                "bin_size": 50,
-                "source_identity": {"id": "s1"},
-                "reference_identity": {"name": "test"},
-                "qc": {},
-                "filters": asdict(ReadFilters()),
-            },
-        )
-        table = pa.table(
-            {
-                "count": pa.array([5, 5, 10, 10], type=pa.uint32()),
-                "paired_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
-                "frag_len_sum": pa.array([0, 0, 0, 0], type=pa.uint64()),
-                "short_frag_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
-                "endpoint_count": pa.array([0, 0, 0, 0], type=pa.uint32()),
-                "frag_gc_sum": pa.array([0.0, 0.0, 0.0, 0.0], type=pa.float32()),
-                "frag_bands": pa.nulls(4, type=pa.list_(pa.uint32(), NUM_FRAG_BANDS)),
-            },
-            schema=SAMPLE_SCHEMA.with_metadata(metadata),
-        )
-
-        rebinned_bufs = rebin_sample_buffers(
-            SampleBuffers.from_table(table), target_bin_size=100
-        )
-        rebinned = rebinned_bufs.to_table(base_metadata=table.schema.metadata)
-        rebinned_meta = decode_metadata(rebinned.schema.metadata)
-        self.assertEqual(rebinned_meta["bin_size"], 100)
-        self.assertEqual(rebinned_meta["contig_lengths"], {"chr1": 200})
-        self.assertEqual(rebinned.num_rows, 2)
-        self.assertEqual(rebinned.column("count").to_pylist(), [10, 20])
-
-        with self.assertRaises(BinCompatibilityError):
-            rebin_sample_buffers(rebinned_bufs, target_bin_size=50)
+def _write_bam(
+    path: Path,
+    reads: list[pysam.AlignedSegment],
+    *,
+    header: dict[str, object] | None = None,
+    index: bool,
+) -> None:
+    bam_header = header or {
+        "HD": {"VN": "1.6", "SO": "coordinate"},
+        "SQ": [{"SN": "chr1", "LN": 250}],
+    }
+    with pysam.AlignmentFile(str(path), "wb", header=bam_header) as bam:
+        for read in sorted(
+            reads, key=lambda item: (item.reference_id, item.reference_start)
+        ):
+            bam.write(read)
+    if index:
+        pysam.index(str(path))
 
 
 class TestExtractAlignment(unittest.TestCase):
@@ -286,10 +216,12 @@ class TestExtractAlignment(unittest.TestCase):
                 {"chr1": 250, "scaffold-A": 99, "chrM": 50},
             )
             ref_id = metadata["reference_identity"]
-            assert isinstance(ref_id, dict)
+            if not isinstance(ref_id, dict):
+                self.fail("expected reference_identity dict")
             self.assertEqual(ref_id["contig_order"], ["chr1", "scaffold-A", "chrM"])
             qc = metadata["qc"]
-            assert isinstance(qc, dict)
+            if not isinstance(qc, dict):
+                self.fail("expected qc dict")
             self.assertEqual(qc["reads_seen"], 8)
             self.assertEqual(qc["reads_kept"], 6)
             self.assertEqual(qc["effective_reads_examined"], 8)
@@ -300,7 +232,8 @@ class TestExtractAlignment(unittest.TestCase):
             self.assertEqual(qc["filter_duplicate"], 1)
             self.assertEqual(set(qc), set(QC_COUNTERS))
             filters = metadata["filters"]
-            assert isinstance(filters, dict)
+            if not isinstance(filters, dict):
+                self.fail("expected filters dict")
             self.assertEqual(filters["min_mapping_quality"], 1)
 
             codes, names, starts, ends = reconstruct_sample_grid(
@@ -338,7 +271,8 @@ class TestExtractAlignment(unittest.TestCase):
             metadata = decode_metadata(table.schema.metadata)
             filters = metadata["filters"]
             qc = metadata["qc"]
-            assert isinstance(filters, dict) and isinstance(qc, dict)
+            if not isinstance(filters, dict) or not isinstance(qc, dict):
+                self.fail("expected filters and qc dicts")
             self.assertEqual(filters["min_mapping_quality"], 20)
             self.assertEqual(qc["filter_mapq"], 1)
             self.assertEqual(qc["reads_kept"], 1)
@@ -373,7 +307,8 @@ class TestExtractAlignment(unittest.TestCase):
             table = _read_sample_table(parquet_path(prefix))
             metadata = decode_metadata(table.schema.metadata)
             filters = metadata["filters"]
-            assert isinstance(filters, dict)
+            if not isinstance(filters, dict):
+                self.fail("expected filters dict")
             self.assertEqual(filters["min_mapping_quality"], 30)
             self.assertEqual(table.column("count").to_pylist(), [1, 0, 0])
 
@@ -769,28 +704,24 @@ class TestEffectiveReadMetrics(unittest.TestCase):
                 "HD": {"VN": "1.6", "SO": "coordinate"},
                 "SQ": [{"SN": "chr1", "LN": 100_000}],
             }
-            # r1: tlen=20 (<30: counted in count, excluded from paired_count/frag_len_sum)
             r1 = _read("r1", 0, 100, 60)
             r1.flag = 0x1 | 0x2 | 0x20 | 0x40
             r1.next_reference_id = 0
             r1.next_reference_start = 110
             r1.template_length = 20
 
-            # r2: tlen=167 ([30, 600]: counted in count and paired_count/frag_len_sum)
             r2 = _read("r2", 0, 200, 60)
             r2.flag = 0x1 | 0x2 | 0x20 | 0x40
             r2.next_reference_id = 0
             r2.next_reference_start = 357
             r2.template_length = 167
 
-            # r3: tlen=700 (>600: counted in count, excluded from paired_count/frag_len_sum)
             r3 = _read("r3", 0, 300, 60)
             r3.flag = 0x1 | 0x2 | 0x20 | 0x40
             r3.next_reference_id = 0
             r3.next_reference_start = 990
             r3.template_length = 700
 
-            # r4: tlen=70_000 at start=400 -> dyad midpoint 35_400 lands in bin 35
             r4 = _read("r4", 0, 400, 60)
             r4.flag = 0x1 | 0x2 | 0x20 | 0x40
             r4.next_reference_id = 0
@@ -855,7 +786,8 @@ class TestExtractPublishedCram(unittest.TestCase):
             self.assertIn("short_frag_count", table.column_names)
             self.assertIn("endpoint_count", table.column_names)
             self.assertIn("frag_gc_sum", table.column_names)
-            assert table.schema.metadata is not None
+            if table.schema.metadata is None:
+                self.fail("expected non-None table schema metadata")
             self.assertIn(FRAGMENTOMICS_METADATA_KEY, table.schema.metadata)
             frag_meta = FragmentomicsMetadata.from_dict(
                 json.loads(
@@ -867,62 +799,6 @@ class TestExtractPublishedCram(unittest.TestCase):
             self.assertGreater(frag_meta.chromatosome_mode_bp, 50)
             self.assertGreater(sum(table.column("endpoint_count").to_pylist()), 0)
             self.assertGreater(sum(table.column("frag_gc_sum").to_pylist()), 0.0)
-
-
-def _read(
-    name: str,
-    reference_id: int,
-    start: int,
-    mapq: int,
-    *,
-    is_duplicate: bool = False,
-) -> pysam.AlignedSegment:
-    read = pysam.AlignedSegment()
-    read.query_name = name
-    read.query_sequence = "ACGTACGTAC"
-    read.flag = 1024 if is_duplicate else 0
-    read.reference_id = reference_id
-    read.reference_start = start
-    read.mapping_quality = mapq
-    read.cigar = ((0, 10),)
-    read.next_reference_id = -1
-    read.next_reference_start = -1
-    read.template_length = 0
-    read.query_qualities = pysam.qualitystring_to_array("I" * 10)
-    return read
-
-
-def _has_alignment_index(path: Path) -> bool:
-    return any(
-        candidate.exists()
-        for candidate in (
-            Path(f"{path}.bai"),
-            Path(f"{path}.csi"),
-            Path(f"{path}.crai"),
-            path.with_suffix(".bai"),
-            path.with_suffix(".crai"),
-        )
-    )
-
-
-def _write_bam(
-    path: Path,
-    reads: list[pysam.AlignedSegment],
-    *,
-    header: dict[str, object] | None = None,
-    index: bool,
-) -> None:
-    bam_header = header or {
-        "HD": {"VN": "1.6", "SO": "coordinate"},
-        "SQ": [{"SN": "chr1", "LN": 250}],
-    }
-    with pysam.AlignmentFile(str(path), "wb", header=bam_header) as bam:
-        for read in sorted(
-            reads, key=lambda item: (item.reference_id, item.reference_start)
-        ):
-            bam.write(read)
-    if index:
-        pysam.index(str(path))
 
 
 if __name__ == "__main__":

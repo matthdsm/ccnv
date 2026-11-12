@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ccnv.models import (
     PredictConfig,
+    PrenatalModelMetadata,
     ReferenceConfig,
     SamplesheetEntry,
 )
@@ -19,6 +20,7 @@ from ccnv.models.results import (
     SCAResult,
     SegmentResult,
 )
+from ccnv.stats.prenatal_math import classify_sca_ray_4d
 
 
 def _call[T](fn: Callable[..., T], *args: object, **kwargs: object) -> T:
@@ -122,6 +124,12 @@ class TestReferenceConfig(unittest.TestCase):
         config = ReferenceConfig(prefix=Path("ref"))
         with self.assertRaises(FrozenInstanceError):
             _set_attr(config, "mode", "prenatal")
+
+    def test_reference_config_threads_validation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
+            ReferenceConfig(threads=0)
+        with self.assertRaisesRegex(ValueError, "threads must be a positive integer"):
+            ReferenceConfig(threads=-1)
 
 
 class TestPredictConfig(unittest.TestCase):
@@ -404,6 +412,56 @@ class TestFetalFractionResult(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             _set_attr(ff_res, "active_ff", 0.15)
 
+    def test_defect3_fetal_fraction_result_accepts_ffx_and_ffa_logit_default(
+        self,
+    ) -> None:
+        sca_cls = classify_sca_ray_4d(
+            delta_x=-0.06,
+            sigma_x=0.01,
+            ffy=0.0,
+            sigma_ffy=0.01,
+            ffa=None,
+            sigma_ffa=0.02,
+            ff_size=None,
+            sigma_size=0.02,
+            clinical_priors={
+                "XX": 0.90,
+                "XO": 0.05,
+                "XXX": 0.05,
+                "XY": 1e-6,
+                "XXY": 1e-6,
+                "XYY": 1e-6,
+            },
+        )
+        self.assertEqual(sca_cls.call, "XO")
+        self.assertEqual(sca_cls.active_ff_source, "FFX")
+        ff_res = FetalFractionResult(
+            fetal_sex="F",
+            active_ff=sca_cls.active_ff,
+            active_ff_source=sca_cls.active_ff_source,
+            ffy=None,
+            ffx=sca_cls.active_ff,
+            ffa=0.0,
+            chrx_ratio=0.94,
+            chry_score=0.0,
+            yfrac_threshold=0.005,
+            sca=SCAResult("XO", True, 0.95, -6.0, None),
+            active_ff_se=sca_cls.active_ff_se,
+        )
+        self.assertEqual(ff_res.active_ff_source, "FFX")
+
+        raw_meta: dict[str, object] = {
+            "prenatal_bin_size": 100_000,
+            "yfrac_threshold": 0.005,
+            "ffy_slope": 1.0,
+            "olm_weights": [0.2],
+            "olm_bias": -2.0,
+            "female_chrx_ratio_mean": 1.0,
+            "female_chrx_ratio_std": 0.01,
+        }
+        parsed = PrenatalModelMetadata.from_dict(raw_meta)
+        self.assertTrue(parsed.ffa_logit_mode)
+
 
 class TestPredictionOutputsAliasesAndFields(unittest.TestCase):
     def test_prediction_outputs_optional_qc_and_prenatal(self) -> None:
@@ -558,6 +616,46 @@ class TestDomainModels(unittest.TestCase):
 
         layout = select_layout([("chr1", 1000), ("chrM", 500)], all_contigs=False)
         self.assertEqual(layout, [("chr1", 1000)])
+
+    def test_contig_lookup_handles_single_pass_generator_and_config_preserves_prefix(
+        self,
+    ) -> None:
+        from ccnv.models.domain import ContigLookup
+
+        lookup = ContigLookup.from_names(c for c in ["chr1", "chr2"])
+        self.assertEqual(lookup.resolve("CHR1"), "chr1")
+        cfg = ReferenceConfig(
+            samplesheet_path=Path("sheet.yaml"), prefix=Path("out/ref")
+        )
+        self.assertEqual(cfg.prefix, Path("out/ref"))
+
+        p_cfg = PredictConfig(
+            sample=Path("s.bam"),
+            reference=Path("ref.ccnv"),
+            prefix=Path("out/pred"),
+        )
+        self.assertEqual(p_cfg.threads, 1)
+        self.assertFalse(p_cfg.bins_vcf)
+        self.assertFalse(hasattr(p_cfg, "bin_size"))
+
+        with self.assertRaises(ValueError):
+            ReferenceConfig(prefix=Path("out/ref"), bin_size=0)
+        with self.assertRaises(ValueError):
+            ReferenceConfig(prefix=Path("out/ref"), min_mappability=1.2)
+        with self.assertRaises(ValueError):
+            PredictConfig(
+                sample=Path("s.bam"),
+                reference=Path("r.ccnv"),
+                prefix=Path("o"),
+                min_mappability=-0.1,
+            )
+        with self.assertRaises(ValueError):
+            PredictConfig(
+                sample=Path("s.bam"),
+                reference=Path("r.ccnv"),
+                prefix=Path("o"),
+                threads=0,
+            )
 
 
 class TestModelReExports(unittest.TestCase):

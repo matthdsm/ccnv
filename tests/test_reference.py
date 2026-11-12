@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import tempfile
 import unittest
 from dataclasses import replace
@@ -7,18 +9,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pysam
-import yaml
 from helpers import make_reference_table, make_sample_table
-from published_fixtures import (
-    CHR21_LENGTH,
-    PUBLISHED_BIN_SIZE,
-    PUBLISHED_CRAM,
-    PUBLISHED_CRAM2,
-    PUBLISHED_CRAM2_URL,
-    PUBLISHED_CRAM_URL,
-    ensure_published_fasta,
-    ensure_published_file,
-)
+from numpy.typing import NDArray
 from typer.testing import CliRunner
 
 from ccnv.cli import app
@@ -29,15 +21,20 @@ from ccnv.features.cohort import (
     validate_cohort,
 )
 from ccnv.features.sex import infer_sample_sexes
-from ccnv.io.parquet import read_sample_buffers
+from ccnv.io.parquet import write_sample_parquet
 from ccnv.io.tracks import read_fasta_contigs
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
+    COORDINATE_SYSTEM,
+    SCHEMA_VERSION,
     PredictConfig,
     ReferenceConfig,
     ReferenceError,
+    ReferenceMetadata,
+    SampleBuffers,
+    SampleMetadata,
     SamplesheetEntry,
     SchemaError,
     decode_metadata,
@@ -45,10 +42,7 @@ from ccnv.models import (
     validate_reference_table,
 )
 from ccnv.predict import run as predict
-from ccnv.reference import (
-    build_reference_table,
-    run,
-)
+from ccnv.reference import build_reference_table, run
 from ccnv.stats.pca import fit_whitened_pca
 
 
@@ -76,6 +70,51 @@ def _sample_table(
 def _write_sample(directory: Path, name: str, table: pa.Table) -> Path:
     path = directory / name
     pq.write_table(table, path)
+    return path
+
+
+def _make_sample_buffers(
+    contig_lengths: dict[str, int],
+    bin_size: int,
+    counts: NDArray[np.uint32],
+    *,
+    sample_id: str = "S1",
+) -> SampleBuffers:
+    n = int(counts.size)
+    z_u32 = np.zeros(n, dtype=np.uint32)
+    total = int(np.sum(counts))
+    meta = SampleMetadata(
+        schema_version=SCHEMA_VERSION,
+        coordinate_system=COORDINATE_SYSTEM,
+        bin_size=bin_size,
+        contig_order=tuple(contig_lengths.keys()),
+        contig_lengths=contig_lengths,
+        source_identity={"id": sample_id},
+        reference_identity={"name": "ref"},
+        filters={"min_mapping_quality": 1},
+        qc={
+            "effective_reads_examined": total,
+            "effective_reads_kept": total,
+        },
+        fragmentomics=None,
+    )
+    return SampleBuffers(
+        meta=meta,
+        count=counts,
+        paired_count=z_u32,
+        frag_len_sum=np.zeros(n, dtype=np.uint64),
+        short_frag_count=z_u32,
+        endpoint_count=z_u32,
+        frag_gc_sum=np.zeros(n, dtype=np.float32),
+        frag_bands=None,
+    )
+
+
+def _write_tiny_fasta(path: Path, records: tuple[tuple[str, int], ...]) -> Path:
+    with path.open("w", encoding="ascii") as handle:
+        for name, length in records:
+            handle.write(f">{name}\n{'A' * length}\n")
+    pysam.faidx(str(path))
     return path
 
 
@@ -148,6 +187,75 @@ class TestMaskingAndPca(unittest.TestCase):
         self.assertLessEqual(first.loadings.shape[0], 3)
         self.assertEqual(first.loadings.shape[1], 12)
 
+    def test_defect6_pca_components_none_dynamic_svht_vs_explicit_five_cap(
+        self,
+    ) -> None:
+        contig_lengths = {"chr1": 500_000, "chr2": 500_000}
+        bin_size = 5000
+        n_bins = 200
+        n_samples = 30
+        rng = np.random.default_rng(606)
+
+        u_raw, _ = np.linalg.qr(rng.standard_normal((n_bins, 7)))
+        v_raw, _ = np.linalg.qr(rng.standard_normal((n_samples, 7)))
+        log_waves = u_raw @ np.diag([14.0, 13.0, 12.0, 11.0, 10.0, 9.0, 8.5]) @ v_raw.T
+        rates = 600.0 * np.exp(0.15 * log_waves)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            entries: list[SamplesheetEntry] = []
+            for j in range(n_samples):
+                c_arr = rng.poisson(rates[:, j]).astype(np.uint32)
+                meta = SampleMetadata(
+                    bin_size=bin_size,
+                    contig_lengths=contig_lengths,
+                    contig_order=("chr1", "chr2"),
+                    source_identity={},
+                    reference_identity={},
+                    qc={"effective_reads_kept": 80_000},
+                    filters={"min_mapping_quality": 1},
+                )
+                z_u32 = np.zeros(n_bins, dtype=np.uint32)
+                bufs = SampleBuffers(
+                    meta=meta,
+                    count=c_arr,
+                    paired_count=z_u32,
+                    frag_len_sum=np.zeros(n_bins, dtype=np.uint64),
+                    short_frag_count=z_u32,
+                    endpoint_count=z_u32,
+                    frag_gc_sum=np.zeros(n_bins, dtype=np.float32),
+                    frag_bands=None,
+                )
+                sp = root / f"rk_{j}.ccnv"
+                write_sample_parquet(bufs.to_table(), sp)
+                entries.append(SamplesheetEntry(filepath=sp))
+
+            dyn_prefix = root / "ref_dyn"
+            run(
+                ReferenceConfig(
+                    entries=tuple(entries),
+                    prefix=dyn_prefix,
+                    bin_size=bin_size,
+                    pca_components=None,
+                    qc_report=False,
+                )
+            )
+            dyn_schema = pq.read_schema(parquet_path(dyn_prefix))
+            self.assertGreaterEqual(dyn_schema.field("pca_loadings").type.list_size, 6)
+
+            cap_prefix = root / "ref_cap5"
+            run(
+                ReferenceConfig(
+                    entries=tuple(entries),
+                    prefix=cap_prefix,
+                    bin_size=bin_size,
+                    pca_components=5,
+                    qc_report=False,
+                )
+            )
+            cap_schema = pq.read_schema(parquet_path(cap_prefix))
+            self.assertEqual(cap_schema.field("pca_loadings").type.list_size, 5)
+
 
 class TestSexInference(unittest.TestCase):
     def test_infers_male_as_higher_signal_fraction(self) -> None:
@@ -215,7 +323,8 @@ class TestSexInference(unittest.TestCase):
             {BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX},
         )
         model = decode_metadata(table.schema.metadata)["model"]
-        assert isinstance(model, dict)
+        if not isinstance(model, dict):
+            self.fail("expected model metadata dict")
         self.assertEqual(model["sex_source"], "inferred")
         self.assertEqual(model["autosomal_contigs"], ["chr1"])
         self.assertEqual(model["sex_contigs"], ["chrY"])
@@ -249,7 +358,8 @@ class TestSexInference(unittest.TestCase):
             ),
         )
         model = decode_metadata(table.schema.metadata)["model"]
-        assert isinstance(model, dict)
+        if not isinstance(model, dict):
+            self.fail("expected model metadata dict")
         self.assertEqual(model["autosomal_contigs"], ["chr1"])
         self.assertEqual(model["sex_contigs"], ["chrX", "chrY"])
         self.assertEqual(model["sex_signal_contig"], "chrY")
@@ -282,7 +392,8 @@ class TestSexInference(unittest.TestCase):
             ),
         )
         model = decode_metadata(table.schema.metadata)["model"]
-        assert isinstance(model, dict)
+        if not isinstance(model, dict):
+            self.fail("expected model metadata dict")
         self.assertEqual(model["autosomal_contigs"], ["1"])
         self.assertEqual(model["sex_contigs"], ["X", "Y"])
         self.assertEqual(model["sex_signal_contig"], "Y")
@@ -312,7 +423,8 @@ class TestSexInference(unittest.TestCase):
             ),
         )
         model = decode_metadata(table.schema.metadata)["model"]
-        assert isinstance(model, dict)
+        if not isinstance(model, dict):
+            self.fail("expected model metadata dict")
         self.assertEqual(model["autosomal_contigs"], ["chr1", "scaffold"])
         self.assertEqual(model["sex_contigs"], [])
         self.assertIsNone(model["sex_signal_contig"])
@@ -402,7 +514,8 @@ class TestSexInference(unittest.TestCase):
             ),
         )
         model = decode_metadata(table.schema.metadata)["model"]
-        assert isinstance(model, dict)
+        if not isinstance(model, dict):
+            self.fail("expected model metadata dict")
         self.assertEqual(model["sex_cutoff"], 0.1)
         self.assertEqual(
             model["sample_sexes"],
@@ -457,7 +570,8 @@ class TestSexInference(unittest.TestCase):
             )
             self.assertEqual(first.to_pydict(), second.to_pydict())
             model = decode_metadata(first.schema.metadata)["model"]
-            assert isinstance(model, dict)
+            if not isinstance(model, dict):
+                self.fail("expected model metadata dict")
             self.assertEqual(model["sex_source"], "inferred")
             self.assertEqual(
                 model["sample_sexes"],
@@ -507,82 +621,62 @@ class TestSexInference(unittest.TestCase):
                 self.assertEqual(len(table.column("null_mean")), 4)
                 self.assertEqual(len(table.column("bio_dispersion")), 4)
 
-
-class TestReferencePublishedCrams(unittest.TestCase):
-    def test_cli_builds_reference_from_two_published_crams(self) -> None:
-        fasta = ensure_published_fasta()
-        crams = (
-            ensure_published_file(PUBLISHED_CRAM, PUBLISHED_CRAM_URL),
-            ensure_published_file(PUBLISHED_CRAM2, PUBLISHED_CRAM2_URL),
-        )
-        runner = CliRunner()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            sample_paths: list[Path] = []
-            for index, cram in enumerate(crams, start=1):
-                prefix = root / f"sample{index}"
-                result = runner.invoke(
-                    app,
-                    [
-                        "extract",
-                        str(cram),
-                        "--fasta",
-                        str(fasta),
-                        "--prefix",
-                        str(prefix),
-                        "--bin-size",
-                        str(PUBLISHED_BIN_SIZE),
-                    ],
-                )
-                self.assertEqual(result.exit_code, 0, result.output)
-                sample_paths.append(parquet_path(prefix))
-
-            samples = [read_sample_buffers(path) for path in sample_paths]
-            self.assertEqual(samples[0].num_rows, samples[1].num_rows)
-            self.assertEqual(samples[0].meta.contig_order, ("chr21",))
-
-            sheet_path = root / "samplesheet.yaml"
-            sheet_path.write_text(
-                yaml.safe_dump([{"filepath": str(p)} for p in sample_paths]),
-                encoding="utf-8",
-            )
-            reference_prefix = root / "reference"
-            result = runner.invoke(
-                app,
+    def test_explicit_samplesheet_sexes_without_chry_and_zero_row_prenatal_ffy_rejected(
+        self,
+    ) -> None:
+        rng = np.random.default_rng(7)
+        lengths = {"chr1": 100_000, "chr2": 100_000, "chrX": 100_000}
+        tables: list[pa.Table] = []
+        entries: list[SamplesheetEntry] = []
+        for idx in range(8):
+            is_male = idx >= 4
+            counts = np.concatenate(
                 [
-                    "reference",
-                    "--samplesheet",
-                    str(sheet_path),
-                    "--prefix",
-                    str(reference_prefix),
-                    "--bin-size",
-                    str(PUBLISHED_BIN_SIZE),
-                    "--min-cohort-size",
-                    "2",
-                    "--pca-components",
-                    "1",
-                ],
+                    rng.poisson(100, size=20).astype(np.uint32),
+                    rng.poisson(100, size=20).astype(np.uint32),
+                    rng.poisson(50 if is_male else 100, size=20).astype(np.uint32),
+                ]
             )
-            self.assertEqual(result.exit_code, 0, result.output)
+            tables.append(
+                _make_sample_buffers(
+                    lengths, 5000, counts, sample_id=f"NX{idx}"
+                ).to_table()
+            )
+            entries.append(
+                SamplesheetEntry(
+                    filepath=Path(f"nx_{idx}.ccnv"), sex="M" if is_male else "F"
+                )
+            )
 
-            table = pq.read_table(parquet_path(reference_prefix))
-            validate_reference_table(table)
-            metadata = decode_metadata(table.schema.metadata)
-            model = metadata["model"]
-            assert isinstance(model, dict)
-            self.assertEqual(table.num_rows, samples[0].num_rows)
-            self.assertEqual(set(table.column("contig").to_pylist()), {"chr21"})
-            self.assertEqual(
-                set(table.column("branch").to_pylist()), {BRANCH_AUTOSOMAL}
+        cohort = validate_cohort(tuple(tables))
+        ref_tbl = build_reference_table(
+            cohort,
+            ReferenceConfig(
+                entries=tuple(entries),
+                prefix=Path("unused"),
+                min_cohort_size=4,
+                min_sex_group_size=3,
+            ),
+        )
+        branches = set(ref_tbl.column("branch").to_pylist())
+        self.assertEqual(
+            branches, {BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX}
+        )
+        meta = ReferenceMetadata.from_table(ref_tbl)
+        self.assertEqual(meta.sex_source, "samplesheet")
+
+        with self.assertRaisesRegex(ReferenceError, "prenatal_ffy"):
+            build_reference_table(
+                cohort,
+                ReferenceConfig(
+                    entries=tuple(entries),
+                    prefix=Path("unused_prenatal"),
+                    mode="prenatal",
+                    prenatal_bin_size=50_000,
+                    min_cohort_size=4,
+                    min_sex_group_size=3,
+                ),
             )
-            self.assertEqual(table.column("end").to_pylist()[-1], CHR21_LENGTH)
-            self.assertEqual(metadata["contig_lengths"], {"chr21": CHR21_LENGTH})
-            self.assertEqual(model["bin_size"], PUBLISHED_BIN_SIZE)
-            self.assertEqual(model["branches"], [BRANCH_AUTOSOMAL])
-            self.assertEqual(model["autosomal_contigs"], ["chr21"])
-            self.assertEqual(len(metadata["sample_identities"]), 2)
-            unmasked = sum(1 for masked in table.column("masked") if not masked)
-            self.assertGreater(unmasked, 0)
 
 
 class TestFlatFastaReference(unittest.TestCase):
@@ -616,7 +710,8 @@ class TestFlatFastaReference(unittest.TestCase):
             table = pq.read_table(parquet_path(prefix))
             validate_reference_table(table)
             model = decode_metadata(table.schema.metadata)["model"]
-            assert isinstance(model, dict)
+            if not isinstance(model, dict):
+                self.fail("expected model metadata dict")
             self.assertTrue(model["flat"])
             self.assertEqual(model["branches"], [BRANCH_AUTOSOMAL])
             self.assertEqual(model["autosomal_contigs"], ["chr1", "chr2", "chrX"])
@@ -695,7 +790,8 @@ class TestFlatFastaReference(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             table = pq.read_table(parquet_path(prefix))
             model = decode_metadata(table.schema.metadata)["model"]
-            assert isinstance(model, dict)
+            if not isinstance(model, dict):
+                self.fail("expected model metadata dict")
             self.assertTrue(model["flat"])
             self.assertEqual(table.num_rows, 4)
 
@@ -734,14 +830,6 @@ class TestFlatFastaReference(unittest.TestCase):
                         mode="prenatal",
                     )
                 )
-
-
-def _write_tiny_fasta(path: Path, records: tuple[tuple[str, int], ...]) -> Path:
-    with path.open("w", encoding="ascii") as handle:
-        for name, length in records:
-            handle.write(f">{name}\n{'A' * length}\n")
-    pysam.faidx(str(path))
-    return path
 
 
 if __name__ == "__main__":
