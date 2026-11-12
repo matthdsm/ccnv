@@ -5,8 +5,23 @@ from collections.abc import Iterable, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
+from ccnv.models.results import ScanAlignmentResult, ScanQcCounts
+
 FRAG_BAND_EDGES: tuple[int, ...]
 GC_QUANTILE_EDGES: tuple[float, ...]
+
+__all__ = [
+    "FRAG_BAND_EDGES",
+    "GC_QUANTILE_EDGES",
+    "ScanAlignmentResult",
+    "ScanQcCounts",
+    "read_alignment_header",
+    "read_fasta_contigs_core",
+    "scan_alignment_bins",
+    "scan_bigwig_means",
+    "scan_fasta_gc_quantiles",
+    "write_bgzf_indexed",
+]
 
 def read_alignment_header(
     path: str,
@@ -27,7 +42,7 @@ def scan_alignment_bins(
     exclude_secondary: bool = True,
     exclude_supplementary: bool = True,
     exclude_unmapped: bool = True,
-) -> dict[str, object]: ...
+) -> ScanAlignmentResult: ...
 def read_fasta_contigs_core(fasta_path: str) -> list[tuple[str, int]]: ...
 def scan_fasta_gc_quantiles(
     fasta_path: str,

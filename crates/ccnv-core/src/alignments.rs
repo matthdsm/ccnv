@@ -1,6 +1,7 @@
 mod accumulator;
 mod record;
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -22,8 +23,8 @@ use self::accumulator::{
     FilterSpec, GlobalScanOutput, NUM_FRAG_BANDS, TargetContig, TileAccumulator, build_lpt_tiles,
     classify_contig_role, reduce_tile_accumulators,
 };
-use self::record::{process_bam_record, process_record_buf};
-use crate::{alignment_error, resolve_contig_index};
+use self::record::{AlignmentRecord, process_record};
+use crate::{ContigLookup, alignment_error};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AlignmentKind {
@@ -91,6 +92,18 @@ fn build_fasta_repository(fasta_path: &Path) -> Result<fasta::Repository, String
     }
 }
 
+fn open_bam_reader(
+    path: &Path,
+) -> Result<(bam::io::Reader<bgzf::io::Reader<File>>, sam::Header), String> {
+    let mut reader = bam::io::reader::Builder
+        .build_from_path(path)
+        .map_err(|e| format!("failed to open BAM {}: {e}", path.display()))?;
+    let header = reader
+        .read_header()
+        .map_err(|e| format!("failed to read BAM header {}: {e}", path.display()))?;
+    Ok((reader, header))
+}
+
 fn read_sam_header(
     path: &Path,
     kind: AlignmentKind,
@@ -100,26 +113,26 @@ fn read_sam_header(
         return Err(format!("alignment not found: {}", path.display()));
     }
     match kind {
-        AlignmentKind::Bam => {
-            let mut reader = bam::io::reader::Builder
-                .build_from_path(path)
-                .map_err(|e| format!("failed to open BAM {}: {e}", path.display()))?;
-            let header = reader
-                .read_header()
-                .map_err(|e| format!("failed to read BAM header {}: {e}", path.display()))?;
-            Ok(header)
-        }
+        AlignmentKind::Bam => Ok(open_bam_reader(path)?.1),
         AlignmentKind::Cram => {
             let _fa = validate_cram_fasta_path(path, fasta_path)?;
             let mut reader = cram::io::reader::Builder::default()
                 .build_from_path(path)
                 .map_err(|e| format!("failed to open CRAM {}: {e}", path.display()))?;
-            let header = reader
+            reader
                 .read_header()
-                .map_err(|e| format!("failed to read CRAM header {}: {e}", path.display()))?;
-            Ok(header)
+                .map_err(|e| format!("failed to read CRAM header {}: {e}", path.display()))
         }
     }
+}
+
+fn find_index_candidate(path: &Path, ext: &str) -> Option<PathBuf> {
+    let appended = PathBuf::from(format!("{}.{ext}", path.display()));
+    if appended.is_file() {
+        return Some(appended);
+    }
+    let replaced = path.with_extension("").with_extension(ext);
+    replaced.is_file().then_some(replaced)
 }
 
 enum BamIndexData {
@@ -144,354 +157,370 @@ impl BamIndexData {
     }
 }
 
-fn load_bam_index(path: &Path, threads: usize) -> Result<BamIndexData, String> {
-    let p_str = path.display().to_string();
-    let stem = path.with_extension("");
-    let bai_candidates = [
-        PathBuf::from(format!("{p_str}.bai")),
-        stem.with_extension("bai"),
-    ];
-    for cand in &bai_candidates {
-        if cand.is_file() {
-            return bam::bai::fs::read(cand)
+struct CraiLandmark {
+    span: Option<(usize, usize)>,
+    offset: u64,
+}
+
+struct CramIndexData {
+    by_ref: HashMap<usize, Vec<CraiLandmark>>,
+}
+
+impl CramIndexData {
+    fn from_crai(crai: &[cram::crai::Record]) -> Self {
+        let mut by_ref: HashMap<usize, Vec<CraiLandmark>> = HashMap::new();
+        for entry in crai {
+            let Some(rid) = entry.reference_sequence_id() else {
+                continue;
+            };
+            let span = entry.alignment_start().map(|s_pos| {
+                let s0 = usize::from(s_pos) - 1;
+                (s0, s0.saturating_add(entry.alignment_span().max(1)))
+            });
+            by_ref.entry(rid).or_default().push(CraiLandmark {
+                span,
+                offset: entry.offset(),
+            });
+        }
+        Self { by_ref }
+    }
+
+    fn container_offsets_for_tile(
+        &self,
+        ref_id: usize,
+        tile_start: usize,
+        tile_end: usize,
+    ) -> Vec<u64> {
+        let mut offsets: Vec<u64> = self
+            .by_ref
+            .get(&ref_id)
+            .into_iter()
+            .flatten()
+            .filter(|lm| match lm.span {
+                Some((s0, e0)) => s0 < tile_end && e0 > tile_start,
+                None => tile_start == 0,
+            })
+            .map(|lm| lm.offset)
+            .collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        offsets
+    }
+}
+
+trait AlignmentBackend: Sync {
+    type Record: AlignmentRecord;
+    type TileState;
+    type Index: Sync;
+
+    fn for_each_sequential(
+        &self,
+        path: &Path,
+        on_record: impl FnMut(usize, &Self::Record) -> Result<(), String>,
+    ) -> Result<(), String>;
+
+    fn load_index(&self, path: &Path, threads: usize) -> Result<Self::Index, String>;
+
+    fn open_tile_state(&self, path: &Path) -> Result<Self::TileState, String>;
+
+    fn for_each_in_tile(
+        &self,
+        state: &mut Self::TileState,
+        index: &Self::Index,
+        ref_id: usize,
+        tile_start: usize,
+        tile_end: usize,
+        on_record: impl FnMut(&Self::Record) -> Result<(), String>,
+    ) -> Result<(), String>;
+}
+
+#[inline(always)]
+fn bam_ref_id(record: &bam::Record) -> Result<Option<usize>, String> {
+    record
+        .reference_sequence_id()
+        .transpose()
+        .map_err(|e| format!("invalid BAM reference id: {e}"))
+}
+
+struct BamBackend;
+
+impl AlignmentBackend for BamBackend {
+    type Record = bam::Record;
+    type TileState = (bam::io::Reader<bgzf::io::Reader<File>>, bam::Record);
+    type Index = BamIndexData;
+
+    #[inline(always)]
+    fn for_each_sequential(
+        &self,
+        path: &Path,
+        mut on_record: impl FnMut(usize, &Self::Record) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let (mut reader, _) = open_bam_reader(path)?;
+        let mut record = bam::Record::default();
+        loop {
+            let n = reader
+                .read_record(&mut record)
+                .map_err(|e| format!("BAM read error in {}: {e}", path.display()))?;
+            if n == 0 {
+                return Ok(());
+            }
+            if let Some(ref_id) = bam_ref_id(&record)? {
+                on_record(ref_id, &record)?;
+            }
+        }
+    }
+
+    fn load_index(&self, path: &Path, threads: usize) -> Result<Self::Index, String> {
+        if let Some(cand) = find_index_candidate(path, "bai") {
+            return bam::bai::fs::read(&cand)
                 .map(BamIndexData::Bai)
                 .map_err(|e| format!("failed to read BAM index {}: {e}", cand.display()));
         }
-    }
-    let csi_candidates = [
-        PathBuf::from(format!("{p_str}.csi")),
-        stem.with_extension("csi"),
-    ];
-    for cand in &csi_candidates {
-        if cand.is_file() {
-            return csi::fs::read(cand)
+        if let Some(cand) = find_index_candidate(path, "csi") {
+            return csi::fs::read(&cand)
                 .map(BamIndexData::Csi)
                 .map_err(|e| format!("failed to read CSI index {}: {e}", cand.display()));
         }
+        Err(format!(
+            "multi-threaded BAM scan (threads={threads}) requires an existing .bai or .csi index for {}; \
+             index the alignment first (e.g. samtools index) or pass --threads 1",
+            path.display()
+        ))
     }
-    Err(format!(
-        "multi-threaded BAM scan (threads={threads}) requires an existing .bai or .csi index for {}; \
-         index the alignment first (e.g. samtools index) or pass --threads 1",
-        path.display()
-    ))
+
+    fn open_tile_state(&self, path: &Path) -> Result<Self::TileState, String> {
+        let (reader, _) = open_bam_reader(path)?;
+        Ok((reader, bam::Record::default()))
+    }
+
+    #[inline(always)]
+    fn for_each_in_tile(
+        &self,
+        (reader, record): &mut Self::TileState,
+        index: &Self::Index,
+        ref_id: usize,
+        tile_start: usize,
+        tile_end: usize,
+        mut on_record: impl FnMut(&Self::Record) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let start_pos = Position::try_from(tile_start + 1)
+            .map_err(|e| format!("invalid tile start position: {e}"))?;
+        let end_pos =
+            Position::try_from(tile_end).map_err(|e| format!("invalid tile end position: {e}"))?;
+        for chunk in index.query(ref_id, Interval::from(start_pos..=end_pos))? {
+            reader
+                .get_mut()
+                .seek(chunk.start())
+                .map_err(|e| format!("BAM BGZF seek error: {e}"))?;
+            while reader.get_ref().virtual_position() < chunk.end() {
+                let n = reader
+                    .read_record(record)
+                    .map_err(|e| format!("BAM tile read error: {e}"))?;
+                if n == 0 {
+                    break;
+                }
+                if bam_ref_id(record)? == Some(ref_id) {
+                    on_record(record)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
-fn load_cram_index(path: &Path, threads: usize) -> Result<cram::crai::Index, String> {
-    let p_str = path.display().to_string();
-    let stem = path.with_extension("");
-    let candidates = [
-        PathBuf::from(format!("{p_str}.crai")),
-        stem.with_extension("crai"),
-    ];
-    for cand in &candidates {
-        if cand.is_file() {
-            return cram::crai::fs::read(cand)
-                .map_err(|e| format!("failed to read CRAM index {}: {e}", cand.display()));
-        }
-    }
-    Err(format!(
-        "multi-threaded CRAM scan (threads={threads}) requires an existing .crai index for {}; \
-         index the alignment first (e.g. samtools index) or pass --threads 1",
-        path.display()
-    ))
+struct CramBackend<'a> {
+    header: &'a sam::Header,
+    repo: fasta::Repository,
 }
 
-fn scan_sequential_bam(
-    path: &Path,
-    ref_to_target: &[Option<usize>],
-    targets: &[TargetContig],
-    total_bins: usize,
-    bin_size: usize,
-    filters: FilterSpec,
-) -> Result<GlobalScanOutput, String> {
-    let mut reader = bam::io::reader::Builder
-        .build_from_path(path)
-        .map_err(|e| format!("failed to open BAM {}: {e}", path.display()))?;
-    let _header = reader
-        .read_header()
-        .map_err(|e| format!("failed to read BAM header {}: {e}", path.display()))?;
-
-    let mut acc = TileAccumulator::new(0, 0, total_bins, filters.collect_bands);
-    let mut record = bam::Record::default();
-    loop {
-        let bytes_read = reader
-            .read_record(&mut record)
-            .map_err(|e| format!("BAM read error in {}: {e}", path.display()))?;
-        if bytes_read == 0 {
-            break;
-        }
-        let Some(ref_id_res) = record.reference_sequence_id() else {
-            continue;
-        };
-        let ref_id = ref_id_res.map_err(|e| format!("invalid BAM reference id: {e}"))?;
-        let Some(Some(t_idx)) = ref_to_target.get(ref_id) else {
-            continue;
-        };
-        process_bam_record(&record, &targets[*t_idx], bin_size, filters, None, &mut acc)?;
+impl CramBackend<'_> {
+    fn open_cram_reader(&self, path: &Path) -> Result<cram::io::Reader<File>, String> {
+        let mut reader = cram::io::reader::Builder::default()
+            .set_reference_sequence_repository(self.repo.clone())
+            .build_from_path(path)
+            .map_err(|e| format!("failed to open CRAM {}: {e}", path.display()))?;
+        reader
+            .read_header()
+            .map_err(|e| format!("failed to read CRAM header {}: {e}", path.display()))?;
+        Ok(reader)
     }
-    Ok(reduce_tile_accumulators(
-        vec![acc],
-        total_bins,
-        filters.collect_bands,
-    ))
+}
+
+impl AlignmentBackend for CramBackend<'_> {
+    type Record = sam::alignment::RecordBuf;
+    type TileState = (
+        cram::io::Reader<File>,
+        cram::io::reader::Container,
+        sam::alignment::RecordBuf,
+    );
+    type Index = CramIndexData;
+
+    #[inline(always)]
+    fn for_each_sequential(
+        &self,
+        path: &Path,
+        mut on_record: impl FnMut(usize, &Self::Record) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut reader = cram::io::BufReader::new(self.open_cram_reader(path)?);
+        let mut record = sam::alignment::RecordBuf::default();
+        loop {
+            let n = reader
+                .read_record_buf(self.header, &mut record)
+                .map_err(|e| format!("CRAM read error in {}: {e}", path.display()))?;
+            if n == 0 {
+                return Ok(());
+            }
+            if let Some(ref_id) = record.reference_sequence_id() {
+                on_record(ref_id, &record)?;
+            }
+        }
+    }
+
+    fn load_index(&self, path: &Path, threads: usize) -> Result<Self::Index, String> {
+        if let Some(cand) = find_index_candidate(path, "crai") {
+            let crai = cram::crai::fs::read(&cand)
+                .map_err(|e| format!("failed to read CRAM index {}: {e}", cand.display()))?;
+            return Ok(CramIndexData::from_crai(&crai));
+        }
+        Err(format!(
+            "multi-threaded CRAM scan (threads={threads}) requires an existing .crai index for {}; \
+             index the alignment first (e.g. samtools index) or pass --threads 1",
+            path.display()
+        ))
+    }
+
+    fn open_tile_state(&self, path: &Path) -> Result<Self::TileState, String> {
+        Ok((
+            self.open_cram_reader(path)?,
+            cram::io::reader::Container::default(),
+            sam::alignment::RecordBuf::default(),
+        ))
+    }
+
+    #[inline(always)]
+    fn for_each_in_tile(
+        &self,
+        (reader, container, rec_buf): &mut Self::TileState,
+        index: &Self::Index,
+        ref_id: usize,
+        tile_start: usize,
+        tile_end: usize,
+        mut on_record: impl FnMut(&Self::Record) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for offset in index.container_offsets_for_tile(ref_id, tile_start, tile_end) {
+            reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| format!("CRAM seek error: {e}"))?;
+            if reader
+                .read_container(container)
+                .map_err(|e| format!("CRAM container read error: {e}"))?
+                == 0
+            {
+                continue;
+            }
+            let compression_header = container
+                .compression_header()
+                .map_err(|e| format!("CRAM compression header error: {e}"))?;
+            for slice_res in container.slices() {
+                let slice = slice_res.map_err(|e| format!("CRAM slice error: {e}"))?;
+                let (core_data_src, external_data_srcs) = slice
+                    .decode_blocks()
+                    .map_err(|e| format!("CRAM slice block decode error: {e}"))?;
+                let records = slice
+                    .records(
+                        self.repo.clone(),
+                        self.header,
+                        &compression_header,
+                        &core_data_src,
+                        &external_data_srcs,
+                    )
+                    .map_err(|e| format!("CRAM slice decode error: {e}"))?;
+                for rec in records {
+                    rec_buf
+                        .try_clone_from_alignment_record(self.header, &rec)
+                        .map_err(|e| format!("CRAM record conversion error: {e}"))?;
+                    if rec_buf.reference_sequence_id() == Some(ref_id) {
+                        on_record(rec_buf)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn scan_sequential_cram(
+fn run_backend<B: AlignmentBackend>(
+    backend: &B,
     path: &Path,
-    header: &sam::Header,
-    repo: fasta::Repository,
     ref_to_target: &[Option<usize>],
-    targets: &[TargetContig],
-    total_bins: usize,
-    bin_size: usize,
-    filters: FilterSpec,
-) -> Result<GlobalScanOutput, String> {
-    let inner = cram::io::reader::Builder::default()
-        .set_reference_sequence_repository(repo)
-        .build_from_path(path)
-        .map_err(|e| format!("failed to open CRAM {}: {e}", path.display()))?;
-    let mut reader = cram::io::BufReader::new(inner);
-    reader
-        .get_mut()
-        .read_header()
-        .map_err(|e| format!("failed to read CRAM header {}: {e}", path.display()))?;
-
-    let mut acc = TileAccumulator::new(0, 0, total_bins, filters.collect_bands);
-    let mut record = sam::alignment::RecordBuf::default();
-    loop {
-        let n = reader
-            .read_record_buf(header, &mut record)
-            .map_err(|e| format!("CRAM read error in {}: {e}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        let Some(ref_id) = record.reference_sequence_id() else {
-            continue;
-        };
-        let Some(Some(t_idx)) = ref_to_target.get(ref_id) else {
-            continue;
-        };
-        process_record_buf(&record, &targets[*t_idx], bin_size, filters, None, &mut acc)?;
-    }
-    Ok(reduce_tile_accumulators(
-        vec![acc],
-        total_bins,
-        filters.collect_bands,
-    ))
-}
-
-fn scan_tiled_bam(
-    path: &Path,
     targets: &[TargetContig],
     total_bins: usize,
     bin_size: usize,
     threads: usize,
     filters: FilterSpec,
 ) -> Result<GlobalScanOutput, String> {
-    let index = load_bam_index(path, threads)?;
-    let tiles = build_lpt_tiles(targets, bin_size);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .map_err(|e| format!("failed to build rayon thread pool: {e}"))?;
+    if threads == 1 {
+        let mut acc = TileAccumulator::new(0, 0, total_bins, filters.collect_bands);
+        backend.for_each_sequential(path, |ref_id, record| {
+            if let Some(&Some(t_idx)) = ref_to_target.get(ref_id) {
+                process_record(record, &targets[t_idx], bin_size, filters, None, &mut acc)?;
+            }
+            Ok(())
+        })?;
+        Ok(reduce_tile_accumulators(
+            vec![acc],
+            total_bins,
+            filters.collect_bands,
+        ))
+    } else {
+        let index = backend.load_index(path, threads)?;
+        let tiles = build_lpt_tiles(targets, bin_size);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|e| format!("failed to build rayon thread pool: {e}"))?;
 
-    let tile_results: Result<Vec<TileAccumulator>, String> = pool.install(|| {
-        tiles
-            .par_iter()
-            .map_init(
-                || -> Option<(bam::io::Reader<bgzf::io::Reader<File>>, bam::Record)> { None },
-                |state, tile| {
-                    if state.is_none() {
-                        let mut r = bam::io::reader::Builder
-                            .build_from_path(path)
-                            .map_err(|e| format!("failed to open BAM {}: {e}", path.display()))?;
-                        r.read_header().map_err(|e| {
-                            format!("failed to read BAM header {}: {e}", path.display())
-                        })?;
-                        *state = Some((r, bam::Record::default()));
-                    }
-                    let (reader, record) = state.as_mut().unwrap();
-                    let target = &targets[tile.target_idx];
-                    let start_pos = Position::try_from(tile.tile_start + 1)
-                        .map_err(|e| format!("invalid tile start position: {e}"))?;
-                    let end_pos = Position::try_from(tile.tile_end)
-                        .map_err(|e| format!("invalid tile end position: {e}"))?;
-                    let interval = Interval::from(start_pos..=end_pos);
-                    let chunks = index.query(target.header_ref_id, interval)?;
-
-                    let mut acc = TileAccumulator::new(
-                        tile.tile_idx,
-                        tile.local_bin_start,
-                        tile.local_n_bins,
-                        filters.collect_bands,
-                    );
-                    for chunk in chunks {
-                        reader
-                            .get_mut()
-                            .seek(chunk.start())
-                            .map_err(|e| format!("BAM BGZF seek error: {e}"))?;
-                        while reader.get_ref().virtual_position() < chunk.end() {
-                            let n = reader
-                                .read_record(record)
-                                .map_err(|e| format!("BAM tile read error: {e}"))?;
-                            if n == 0 {
-                                break;
-                            }
-                            let Some(ref_res) = record.reference_sequence_id() else {
-                                continue;
-                            };
-                            let ref_id =
-                                ref_res.map_err(|e| format!("invalid BAM reference id: {e}"))?;
-                            if ref_id != target.header_ref_id {
-                                continue;
-                            }
-                            process_bam_record(
-                                record,
-                                target,
-                                bin_size,
-                                filters,
-                                Some((tile.tile_start, tile.tile_end)),
-                                &mut acc,
-                            )?;
-                        }
-                    }
-                    Ok(acc)
-                },
-            )
-            .collect()
-    });
-
-    Ok(reduce_tile_accumulators(
-        tile_results?,
-        total_bins,
-        filters.collect_bands,
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_tiled_cram(
-    path: &Path,
-    header: &sam::Header,
-    repo: fasta::Repository,
-    targets: &[TargetContig],
-    total_bins: usize,
-    bin_size: usize,
-    threads: usize,
-    filters: FilterSpec,
-) -> Result<GlobalScanOutput, String> {
-    let crai = load_cram_index(path, threads)?;
-    let tiles = build_lpt_tiles(targets, bin_size);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .map_err(|e| format!("failed to build rayon thread pool: {e}"))?;
-
-    let tile_results: Result<Vec<TileAccumulator>, String> = pool.install(|| {
-        tiles
-            .par_iter()
-            .map_init(
-                || -> Option<cram::io::Reader<File>> { None },
-                |state, tile| {
-                    if state.is_none() {
-                        let mut r = cram::io::reader::Builder::default()
-                            .set_reference_sequence_repository(repo.clone())
-                            .build_from_path(path)
-                            .map_err(|e| format!("failed to open CRAM {}: {e}", path.display()))?;
-                        r.read_header().map_err(|e| {
-                            format!("failed to read CRAM header {}: {e}", path.display())
-                        })?;
-                        *state = Some(r);
-                    }
-                    let reader = state.as_mut().unwrap();
-                    let target = &targets[tile.target_idx];
-
-                    let mut container_offsets: Vec<u64> = Vec::new();
-                    for entry in &crai {
-                        let matches_tile = match entry.reference_sequence_id() {
-                            Some(rid) if rid == target.header_ref_id => {
-                                if let Some(s_pos) = entry.alignment_start() {
-                                    let s0 = usize::from(s_pos) - 1;
-                                    let span = entry.alignment_span().max(1);
-                                    let e0 = s0.saturating_add(span);
-                                    s0 < tile.tile_end && e0 > tile.tile_start
-                                } else {
-                                    tile.tile_start == 0
-                                }
-                            }
-                            _ => false,
+        let tile_results: Result<Vec<TileAccumulator>, String> = pool.install(|| {
+            tiles
+                .par_iter()
+                .map_init(
+                    || -> Option<B::TileState> { None },
+                    |state_opt, tile| {
+                        let state = match state_opt {
+                            Some(s) => s,
+                            None => state_opt.insert(backend.open_tile_state(path)?),
                         };
-                        if matches_tile && container_offsets.last() != Some(&entry.offset()) {
-                            container_offsets.push(entry.offset());
-                        }
-                    }
-                    container_offsets.sort_unstable();
-                    container_offsets.dedup();
+                        let target = &targets[tile.target_idx];
+                        let bounds = Some((tile.tile_start, tile.tile_end));
+                        let mut acc = TileAccumulator::new(
+                            tile.tile_idx,
+                            tile.local_bin_start,
+                            tile.local_n_bins,
+                            filters.collect_bands,
+                        );
+                        backend.for_each_in_tile(
+                            state,
+                            &index,
+                            target.header_ref_id,
+                            tile.tile_start,
+                            tile.tile_end,
+                            |record| {
+                                process_record(record, target, bin_size, filters, bounds, &mut acc)
+                            },
+                        )?;
+                        Ok(acc)
+                    },
+                )
+                .collect()
+        });
 
-                    let mut acc = TileAccumulator::new(
-                        tile.tile_idx,
-                        tile.local_bin_start,
-                        tile.local_n_bins,
-                        filters.collect_bands,
-                    );
-                    let mut container = cram::io::reader::Container::default();
-                    let mut rec_buf = sam::alignment::RecordBuf::default();
-                    for offset in container_offsets {
-                        reader
-                            .seek(SeekFrom::Start(offset))
-                            .map_err(|e| format!("CRAM seek error: {e}"))?;
-                        let bytes = reader
-                            .read_container(&mut container)
-                            .map_err(|e| format!("CRAM container read error: {e}"))?;
-                        if bytes == 0 {
-                            continue;
-                        }
-                        let compression_header = container
-                            .compression_header()
-                            .map_err(|e| format!("CRAM compression header error: {e}"))?;
-                        for slice_res in container.slices() {
-                            let slice = slice_res.map_err(|e| format!("CRAM slice error: {e}"))?;
-                            let (core_data_src, external_data_srcs) = slice
-                                .decode_blocks()
-                                .map_err(|e| format!("CRAM slice block decode error: {e}"))?;
-                            let records = slice
-                                .records(
-                                    repo.clone(),
-                                    header,
-                                    &compression_header,
-                                    &core_data_src,
-                                    &external_data_srcs,
-                                )
-                                .map_err(|e| format!("CRAM slice decode error: {e}"))?;
-                            for rec in records {
-                                rec_buf
-                                    .try_clone_from_alignment_record(header, &rec)
-                                    .map_err(|e| format!("CRAM record conversion error: {e}"))?;
-                                if rec_buf.reference_sequence_id() != Some(target.header_ref_id) {
-                                    continue;
-                                }
-                                process_record_buf(
-                                    &rec_buf,
-                                    target,
-                                    bin_size,
-                                    filters,
-                                    Some((tile.tile_start, tile.tile_end)),
-                                    &mut acc,
-                                )?;
-                            }
-                        }
-                    }
-                    Ok(acc)
-                },
-            )
-            .collect()
-    });
-
-    Ok(reduce_tile_accumulators(
-        tile_results?,
-        total_bins,
-        filters.collect_bands,
-    ))
+        Ok(reduce_tile_accumulators(
+            tile_results?,
+            total_bins,
+            filters.collect_bands,
+        ))
+    }
 }
 
 #[pyfunction]
@@ -579,6 +608,7 @@ pub(crate) fn scan_alignment_bins<'py>(
                 .keys()
                 .map(|k| k.to_string())
                 .collect();
+            let lookup = ContigLookup::new(&header_names);
 
             let mut targets = Vec::with_capacity(contigs.len());
             let mut ref_to_target: Vec<Option<usize>> = vec![None; header_names.len()];
@@ -588,7 +618,7 @@ pub(crate) fn scan_alignment_bins<'py>(
                 if *clen == 0 {
                     return Err(format!("contig {cname} length must be positive"));
                 }
-                let Some(ref_id) = resolve_contig_index(cname, &header_names) else {
+                let Some(ref_id) = lookup.resolve(cname) else {
                     return Err(format!(
                         "contig {cname} not found in alignment header of {}",
                         p.display()
@@ -613,39 +643,33 @@ pub(crate) fn scan_alignment_bins<'py>(
             }
 
             match kind {
-                AlignmentKind::Bam => {
-                    if threads == 1 {
-                        scan_sequential_bam(
-                            &p,
-                            &ref_to_target,
-                            &targets,
-                            total_bins,
-                            bin_size,
-                            filters,
-                        )
-                    } else {
-                        scan_tiled_bam(&p, &targets, total_bins, bin_size, threads, filters)
-                    }
-                }
+                AlignmentKind::Bam => run_backend(
+                    &BamBackend,
+                    &p,
+                    &ref_to_target,
+                    &targets,
+                    total_bins,
+                    bin_size,
+                    threads,
+                    filters,
+                ),
                 AlignmentKind::Cram => {
                     let fa_path = validate_cram_fasta_path(&p, fa.as_deref())?;
                     let repo = build_fasta_repository(fa_path)?;
-                    if threads == 1 {
-                        scan_sequential_cram(
-                            &p,
-                            &header,
-                            repo,
-                            &ref_to_target,
-                            &targets,
-                            total_bins,
-                            bin_size,
-                            filters,
-                        )
-                    } else {
-                        scan_tiled_cram(
-                            &p, &header, repo, &targets, total_bins, bin_size, threads, filters,
-                        )
-                    }
+                    let backend = CramBackend {
+                        header: &header,
+                        repo,
+                    };
+                    run_backend(
+                        &backend,
+                        &p,
+                        &ref_to_target,
+                        &targets,
+                        total_bins,
+                        bin_size,
+                        threads,
+                        filters,
+                    )
                 }
             }
         })
@@ -703,4 +727,32 @@ pub(crate) fn scan_alignment_bins<'py>(
     dict.set_item("qc_counts", qc_dict)?;
 
     Ok(dict)
+}
+
+#[cfg(test)]
+mod tests {
+    use noodles::core::Position;
+    use noodles::cram::crai;
+
+    use super::CramIndexData;
+
+    #[test]
+    fn crai_pregrouping_preserves_overlap_and_dedup_semantics() {
+        let records = vec![
+            crai::Record::new(Some(0), Position::new(101), 50, 300, 10, 100),
+            crai::Record::new(Some(0), Position::new(140), 0, 200, 10, 100),
+            crai::Record::new(Some(0), None, 0, 150, 10, 100),
+            crai::Record::new(Some(0), Position::new(101), 50, 300, 20, 100),
+            crai::Record::new(Some(1), Position::new(1), 500, 900, 10, 100),
+            crai::Record::new(None, None, 0, 999, 10, 100),
+        ];
+        let idx = CramIndexData::from_crai(&records);
+
+        assert_eq!(idx.container_offsets_for_tile(0, 0, 100), vec![150]);
+        assert_eq!(idx.container_offsets_for_tile(0, 100, 140), vec![200, 300]);
+        assert_eq!(idx.container_offsets_for_tile(0, 140, 200), vec![300]);
+        assert!(idx.container_offsets_for_tile(0, 200, 300).is_empty());
+        assert_eq!(idx.container_offsets_for_tile(1, 0, 100), vec![900]);
+        assert!(idx.container_offsets_for_tile(2, 0, 100).is_empty());
+    }
 }

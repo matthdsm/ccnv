@@ -38,6 +38,12 @@ impl IndexPreset {
             ))),
         }
     }
+    fn header_builder(preset: Self) -> HeaderBuilder {
+        match preset {
+            Self::Bed => HeaderBuilder::bed(),
+            Self::Vcf => HeaderBuilder::vcf(),
+        }
+    }
 }
 
 enum IndexSink {
@@ -51,12 +57,8 @@ enum IndexSink {
 impl IndexSink {
     fn new(preset: IndexPreset, contig_names: &[String], max_contig_len: usize) -> PyResult<Self> {
         if max_contig_len <= TBI_MAX_CONTIG_LEN {
-            let header = match preset {
-                IndexPreset::Bed => HeaderBuilder::bed().build(),
-                IndexPreset::Vcf => HeaderBuilder::vcf().build(),
-            };
             let mut indexer = tabix::index::Indexer::default();
-            indexer.set_header(header);
+            indexer.set_header(IndexPreset::header_builder(preset).build());
             Ok(Self::Tabix(indexer))
         } else {
             let mut depth: u8 = 5;
@@ -119,14 +121,9 @@ impl IndexSink {
             Self::Csi { indexer, ref_names } => {
                 let idx_path = format!("{gz_path}.csi");
                 let n_refs = ref_names.len();
-                let header = match preset {
-                    IndexPreset::Bed => HeaderBuilder::bed()
-                        .set_reference_sequence_names(ref_names)
-                        .build(),
-                    IndexPreset::Vcf => HeaderBuilder::vcf()
-                        .set_reference_sequence_names(ref_names)
-                        .build(),
-                };
+                let header = IndexPreset::header_builder(preset)
+                    .set_reference_sequence_names(ref_names)
+                    .build();
                 let index = indexer.set_header(header).build(n_refs);
                 csi::fs::write(&idx_path, &index).map_err(|e| {
                     PyIOError::new_err(format!("failed to write CSI index {idx_path}: {e}"))
@@ -391,6 +388,43 @@ impl ParallelBgzfBatcher {
     }
 }
 
+fn feed_chunk_lines<E>(
+    mut slice: &[u8],
+    line_rem: &mut Vec<u8>,
+    on_line: &mut impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), E> {
+    while let Some(nl_pos) = slice.iter().position(|&b| b == b'\n') {
+        if line_rem.is_empty() {
+            on_line(&slice[..nl_pos])?;
+        } else {
+            line_rem.extend_from_slice(&slice[..nl_pos]);
+            on_line(line_rem)?;
+            line_rem.clear();
+        }
+        slice = &slice[nl_pos + 1..];
+    }
+    if !slice.is_empty() {
+        line_rem.extend_from_slice(slice);
+    }
+    Ok(())
+}
+
+fn try_for_each_line(
+    chunks: &Bound<'_, PyAny>,
+    mut on_line: impl FnMut(&[u8]) -> PyResult<()>,
+) -> PyResult<()> {
+    let mut line_rem: Vec<u8> = Vec::new();
+    for item_res in chunks.try_iter()? {
+        let item = item_res?;
+        let py_bytes = item.cast::<PyBytes>()?;
+        feed_chunk_lines(py_bytes.as_bytes(), &mut line_rem, &mut on_line)?;
+    }
+    if !line_rem.is_empty() {
+        on_line(&line_rem)?;
+    }
+    Ok(())
+}
+
 #[pyfunction]
 #[pyo3(signature = (gz_path, preset, contig_names, max_contig_len, chunks, threads=1))]
 pub(crate) fn write_bgzf_indexed(
@@ -422,44 +456,18 @@ pub(crate) fn write_bgzf_indexed(
     let buf_out = BufWriter::with_capacity(256 * 1024, file);
 
     let mut sink = IndexSink::new(idx_preset, &contig_names, max_contig_len)?;
-    let mut line_rem: Vec<u8> = Vec::new();
-    let iter = chunks.try_iter()?;
 
-    if threads == 1 {
+    if threads <= 1 {
         let mut writer = bgzf::io::Writer::new(buf_out);
-        let emit_line = |raw_line: &[u8],
-                         w: &mut bgzf::io::Writer<BufWriter<File>>,
-                         s: &mut IndexSink|
-         -> PyResult<()> {
-            let vp_start = w.virtual_position();
-            w.write_all(raw_line)
-                .and_then(|()| w.write_all(b"\n"))
+        try_for_each_line(chunks, |raw_line| {
+            let vp_start = writer.virtual_position();
+            writer
+                .write_all(raw_line)
+                .and_then(|()| writer.write_all(b"\n"))
                 .map_err(|e| PyIOError::new_err(format!("BGZF write error: {e}")))?;
-            let vp_end = w.virtual_position();
-            s.add_line(idx_preset, raw_line, Chunk::new(vp_start, vp_end))
-        };
-
-        for item_res in iter {
-            let item = item_res?;
-            let py_bytes = item.cast::<PyBytes>()?;
-            let mut slice = py_bytes.as_bytes();
-            while let Some(nl_pos) = slice.iter().position(|&b| b == b'\n') {
-                if line_rem.is_empty() {
-                    emit_line(&slice[..nl_pos], &mut writer, &mut sink)?;
-                } else {
-                    line_rem.extend_from_slice(&slice[..nl_pos]);
-                    emit_line(&line_rem, &mut writer, &mut sink)?;
-                    line_rem.clear();
-                }
-                slice = &slice[nl_pos + 1..];
-            }
-            if !slice.is_empty() {
-                line_rem.extend_from_slice(slice);
-            }
-        }
-        if !line_rem.is_empty() {
-            emit_line(&line_rem, &mut writer, &mut sink)?;
-        }
+            let vp_end = writer.virtual_position();
+            sink.add_line(idx_preset, raw_line, Chunk::new(vp_start, vp_end))
+        })?;
         let mut inner = writer
             .finish()
             .map_err(|e| PyIOError::new_err(format!("BGZF finish error: {e}")))?;
@@ -468,30 +476,43 @@ pub(crate) fn write_bgzf_indexed(
             .map_err(|e| PyIOError::new_err(format!("BGZF flush error: {e}")))?;
     } else {
         let mut batcher = ParallelBgzfBatcher::new(buf_out, threads)?;
-        for item_res in iter {
-            let item = item_res?;
-            let py_bytes = item.cast::<PyBytes>()?;
-            let mut slice = py_bytes.as_bytes();
-            while let Some(nl_pos) = slice.iter().position(|&b| b == b'\n') {
-                if line_rem.is_empty() {
-                    batcher.write_line(&slice[..nl_pos]);
-                } else {
-                    line_rem.extend_from_slice(&slice[..nl_pos]);
-                    batcher.write_line(&line_rem);
-                    line_rem.clear();
-                }
-                slice = &slice[nl_pos + 1..];
-                batcher.maybe_flush_batch(py, idx_preset, &mut sink)?;
-            }
-            if !slice.is_empty() {
-                line_rem.extend_from_slice(slice);
-            }
-        }
-        if !line_rem.is_empty() {
-            batcher.write_line(&line_rem);
-        }
+        try_for_each_line(chunks, |raw_line| {
+            batcher.write_line(raw_line);
+            batcher.maybe_flush_batch(py, idx_preset, &mut sink)
+        })?;
         batcher.finish(py, idx_preset, &mut sink)?;
     }
 
     sink.write(gz_path, idx_preset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::feed_chunk_lines;
+
+    #[test]
+    fn chunk_line_framing_handles_splits_and_trailing_bytes() {
+        let chunks: &[&[u8]] = &[b"chr1\t0\t1", b"00\nchr1\t100\t200\n\nchr2", b"\t0\t50"];
+        let mut rem = Vec::new();
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        for &c in chunks {
+            feed_chunk_lines::<()>(c, &mut rem, &mut |line| {
+                lines.push(line.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        }
+        if !rem.is_empty() {
+            lines.push(rem);
+        }
+        assert_eq!(
+            lines,
+            vec![
+                b"chr1\t0\t100".to_vec(),
+                b"chr1\t100\t200".to_vec(),
+                b"".to_vec(),
+                b"chr2\t0\t50".to_vec(),
+            ]
+        );
+    }
 }
