@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from ccnv.stats.neighbors import (
+    calibrate_prototype_dispersion,
     compute_prototype_null_models,
     evaluate_loco_prototype_baseline,
     fit_prototype_graph,
@@ -136,3 +137,60 @@ def test_single_contig_branch_excludes_self_singleton() -> None:
     )
     assert b_multi[4] == pytest.approx(1.0)
     assert s_multi[4] == 4
+
+
+def test_calibrate_prototype_dispersion_small_cohort_dof_scaling() -> None:
+    """Verify residual DoF variance rescaling (d_eb = S - 1 - P) on small cohorts."""
+    rng = np.random.default_rng(42)
+    n_bins = 200
+    n_samples = 10
+    pca_rank = 3
+    d_eb = n_samples - 1 - pca_rank  # 6
+    ddof = 1.0 + pca_rank / n_samples  # 1.3
+    expected_scale = (n_samples - ddof) / d_eb  # 8.7 / 6.0 = 1.45
+    assert expected_scale == pytest.approx(1.45)
+
+    feats = rng.normal(size=(n_bins, 2)).astype(np.float32)
+    centers, pids, pw, _ = fit_prototype_graph(feats, max_prototypes=16, top_r=4)
+    contigs = np.array([0] * 100 + [1] * 100, dtype=np.int16)
+    usable = np.ones(n_bins, dtype=bool)
+
+    true_phi = 0.04
+    lam = 100.0
+    eta = rng.normal(-0.5 * true_phi, np.sqrt(true_phi), size=(n_bins, n_samples))
+    exp = np.full((n_bins, n_samples), lam, dtype=np.float32)
+    counts = rng.poisson(exp * np.exp(eta)).astype(np.float32)
+
+    null_mean, disp = calibrate_prototype_dispersion(
+        counts,
+        exp,
+        contigs,
+        usable,
+        pids,
+        pw,
+        pca_rank=pca_rank,
+        n_prototypes=int(centers.shape[0]),
+    )
+
+    # Overdispersion is non-zero across almost all bins (> 90%)
+    assert np.mean(disp[usable] > 0.0) > 0.90
+    # Overdispersion estimate is unbiased around true_phi = 0.04
+    med_disp = float(np.median(disp[usable]))
+    assert 0.025 < med_disp < 0.080
+    assert float(np.median(np.abs(null_mean[usable]))) < 0.15
+
+
+def test_hsm_biweight_mode_finite_guard_and_empty() -> None:
+    """Verify _hsm_biweight_mode safely handles NaNs, infinities, and empty inputs."""
+    from ccnv.features.normalization import _hsm_biweight_mode
+
+    assert _hsm_biweight_mode(np.array([], dtype=np.float64)) == 0.0
+    assert _hsm_biweight_mode(np.array([np.nan, np.nan], dtype=np.float64)) == 0.0
+    assert _hsm_biweight_mode(np.array([np.inf, -np.inf], dtype=np.float64)) == 0.0
+
+    vals = np.array(
+        [np.nan, 1.0, 1.02, 0.98, 1.01, 0.99, 1.0, np.nan, 5.0], dtype=np.float64
+    )
+    weights = np.ones_like(vals)
+    m = _hsm_biweight_mode(vals, weights)
+    assert 0.98 < m < 1.02

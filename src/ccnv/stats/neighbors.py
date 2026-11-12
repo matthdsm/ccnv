@@ -674,31 +674,37 @@ def calibrate_prototype_dispersion(
                 mode="w+",
                 shape=(u_count, n_samples),
             )
-        _populate_ratios(r_store)
-        if isinstance(r_store, np.memmap):
-            r_store.flush()
-        mean_lam_u = np.where(shot_cnt > 0, lam_sum / np.maximum(shot_cnt, 1), 1.0)
-        for c0 in range(0, u_count, _DISPERSION_ROW_CHUNK):
-            c1 = min(u_count, c0 + _DISPERSION_ROW_CHUNK)
-            m_c, v_c = _winsorized_anscombe_mean_and_var(
-                np.asarray(r_store[c0:c1], dtype=np.float64),
-                mean_lam_u[c0:c1],
-                ddof,
-            )
-            mean_u[c0:c1] = m_c
-            obs_var_u[c0:c1] = v_c
+        try:
+            _populate_ratios(r_store)
+            if isinstance(r_store, np.memmap):
+                r_store.flush()
+            mean_lam_u = np.where(shot_cnt > 0, lam_sum / np.maximum(shot_cnt, 1), 1.0)
+            for c0 in range(0, u_count, _DISPERSION_ROW_CHUNK):
+                c1 = min(u_count, c0 + _DISPERSION_ROW_CHUNK)
+                m_c, v_c = _winsorized_anscombe_mean_and_var(
+                    np.asarray(r_store[c0:c1], dtype=np.float64),
+                    mean_lam_u[c0:c1],
+                    ddof,
+                )
+                mean_u[c0:c1] = m_c
+                obs_var_u[c0:c1] = v_c
+        finally:
+            del r_store
 
     has_support = (shot_cnt > 0) & (last_sup > 0)
     null_mean[u_idx] = np.where(has_support, mean_u, 0.0).astype(np.float32)
     if n_samples <= 1:
         return null_mean, bio_disp
 
+    d_eb = float(max(1, n_samples - 1 - max(0, pca_rank)))
+    if n_samples > 1 and pca_rank > 0:
+        obs_var_u = obs_var_u * (float(n_samples) - ddof) / float(d_eb)
+
     f_loco = compute_kish_loco_inflation(c_ids_u, pids_u, pw_u, last_sup)
     v_shot = np.where(shot_cnt > 0, shot_sum / np.maximum(shot_cnt, 1), 0.0)
     v_tot = obs_var_u / f_loco
     raw_phi = np.where(has_support, _LN2_SQ * np.maximum(0.0, v_tot - v_shot), 0.0)
 
-    d_eb = float(max(1, n_samples - 1 - max(0, pca_rank)))
     pos_bins = has_support & (raw_phi > 1e-12)
     disp_u = np.zeros(u_count, dtype=np.float64)
     if u_count >= 10 and int(np.count_nonzero(pos_bins)) >= 2:
