@@ -19,6 +19,7 @@ nav = [
   { "Overview" = "index.md" },
   { "Pipeline Architecture" = "pipeline.md" },
   { "CLI Reference" = "cli.md" },
+  { "API Reference" = "api.md" },
   { "Methodology" = "methodology.md" },
 ]
 

@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Compiled Rust I/O kernel (`crates/ccnv-core`, `ccnv._core`) wrapping `noodles` (`bam`, `cram`, `fasta`, `bgzf`, `tabix`, `csi`) and `bigtools` (BigWig) for high-performance multi-threaded tile streaming and single-pass BGZF/tabix/CSI writing without runtime dependencies on `pysam` or `pybigwig`.
+- API documentation page (`docs/api.md`) with Mermaid call-graph DAGs and function-level reference across all `ccnv` Python modules and `ccnv._core`, registered in `zensical.toml`, cross-linked from `docs/index.md` and `README.md`, and enforced via bidirectional AST, signature, and call-graph contract tests (`tests/test_docs_markdown.py`) and pre-commit hooks (`.pre-commit-config.yaml`).
 - Apache Arrow Schema `2.0.0` (`SCHEMA_VERSION = "2.0.0"`) storing 7 coordinate-free per-bin sample columns (`count`, `paired_count`, `frag_len_sum`, `short_frag_count`, `endpoint_count`, `frag_gc_sum`, and 24 fixed fragment-length bands `frag_bands: list<uint32>[24]`) for compact $`O(B)`$ memory footprint.
 - Compact Prototype Graph ($`M \le 2{,}048`$) constructed via `MiniBatchKMeans` with $`k=4`$ soft-weighted nearest off-contig prototypes, eliminating $`O(U^2)`$ pairwise distance calculations.
 - Depth-decomposed biological overdispersion (`bio_dispersion`) separating Poisson shot noise from technical dispersion using Smyth Empirical Bayes shrinkage (`squeeze_var`).

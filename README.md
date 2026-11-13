@@ -80,6 +80,7 @@ Visit the [documentation site](https://matthdsm.github.io/copynumber-cnv/) for d
 
 - [Pipeline Architecture](https://matthdsm.github.io/copynumber-cnv/pipeline/): 4-stage execution model and storage contracts.
 - [CLI Reference](https://matthdsm.github.io/copynumber-cnv/cli/): Flag specification, inputs, outputs, and exit codes.
+- [API Reference](https://matthdsm.github.io/copynumber-cnv/api/): Module-by-module function reference and call-graph DAGs.
 - [Mathematical Methodology](https://matthdsm.github.io/copynumber-cnv/methodology/): Statistical formulations, models, and citations.
 
 ---

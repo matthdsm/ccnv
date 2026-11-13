@@ -83,11 +83,12 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 ### Code Changes and Versioning
 
 - **Code Changes:** All changes should be made through a pull request. Each pull request needs to be recorded in `CHANGELOG.md`, following best practices found [here](https://keepachangelog.com/en/1.1.0/#how).
+- **API Reference Synchronization:** Any relevant code change under `src/ccnv/` or `crates/ccnv-core/`—adding, removing, moving, or renaming modules, classes, public or internal (`_`) functions, methods, properties, or `ccnv._core` bindings, altering parameter signatures or return/behavioral contracts, or modifying cross-module call-graph edges—must be reflected in `docs/api.md` (both the module symbol reference and the Section 1 Mermaid call-graph DAGs) in the same pull request.
 - **Versioning:** Follow semantic versioning for releases, updating the version in `pyproject.toml` and `src/ccnv/__init__.py` accordingly.
 
 ### Testing Guidelines
 
-- **Contract Tests:** When adding features that change how data is stored or processed, update the contract tests in `tests/`.
+- **Contract Tests:** When adding features that change how data is stored or processed, or when modifying modules, callables, signatures, or call graphs, update the contract tests in `tests/` (`tests/test_contracts.py` and `tests/test_docs_markdown.py`, which enforces bidirectional AST module, symbol, parameter-signature, and Mermaid DAG parity with `docs/api.md`).
 - **Functional Tests:** Aim for high coverage of the computational logic.
 - **Pipeline Tests:** Keep BAM and CRAM end-to-end coverage in `tests/test_pipeline.py`.
 
@@ -96,7 +97,7 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 - **Environment Awareness:** Always prefer `pixi run <command>` over direct execution if a pixi task exists.
 - **GitHub Actions:** Ensure github actions are using the latest version at all times, updating the workflow files as needed. Reverting to older versions is strictly forbidden.
 - **Surgical Updates:** When fixing bugs, prioritize small, targeted changes and adding a corresponding test case.
-- **Documentation:** Update this document, `README.md`, and the documentation site in `docs/` if you make changes that affect the overall architecture, CLI, or development workflow. All documentation amendments must be integrated into the site (`docs/`), registered in `zensical.toml` navigation where appropriate, and verified for strict Zensical build compatibility (`pixi run docs-build` or `pixi run -e docs zensical build --clean --strict`) and Markdown contract compliance (`tests/test_docs_markdown.py`).
+- **Documentation:** Update this document, `README.md`, `docs/api.md`, and the documentation site in `docs/` whenever you make changes that affect modules, functions, classes, signatures, call graphs, architecture, CLI, or development workflow. All documentation amendments must be integrated into the site (`docs/`), registered in `zensical.toml` navigation where appropriate, and verified for strict Zensical build compatibility (`pixi run docs-build` or `pixi run -e docs zensical build --clean --strict`) and Markdown/API contract compliance (`tests/test_docs_markdown.py`).
 - **Markdown Formatting & Dual-Target Rendering Rules:** Markdown files in this repository target two distinct renderers enforced by `tests/test_docs_markdown.py`:
   - **Shared Rules (All `.md` Files):**
     - Do not hard-wrap lines in Markdown files; rely on editor soft-wrapping for line length. Keep paragraphs and list items on a single logical line.

@@ -1,7 +1,99 @@
+import ast
+import itertools
 import re
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
+
+_SKIPPED_TIER_TOKENS: frozenset[str] = frozenset(
+    {"Typer commands", "lazy aliases", "Rust PyO3: noodles + bigtools"}
+)
+_LAZY_ROOT_ALIASES: dict[str, str] = {
+    "run_extract": "extract.run",
+    "run_reference": "reference.run",
+    "run_reference_qc": "ref_qc.run_reference_qc",
+    "run_predict": "predict.run",
+}
+
+
+def _is_overload(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for dec in fn.decorator_list:
+        if isinstance(dec, ast.Name) and dec.id == "overload":
+            return True
+        if isinstance(dec, ast.Attribute) and dec.attr == "overload":
+            return True
+    return False
+
+
+def _is_property(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    return any(
+        isinstance(dec, ast.Name) and dec.id == "property" for dec in fn.decorator_list
+    )
+
+
+def _param_tokens(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef, *, is_method: bool = False
+) -> tuple[str, ...]:
+    posonly = list(fn.args.posonlyargs)
+    regular = list(fn.args.args)
+    if is_method and regular and regular[0].arg in {"self", "cls"}:
+        regular = regular[1:]
+    elif is_method and posonly and posonly[0].arg in {"self", "cls"}:
+        posonly = posonly[1:]
+    parts = [arg.arg for arg in posonly]
+    if posonly:
+        parts.append("/")
+    parts.extend(arg.arg for arg in regular)
+    if fn.args.vararg is not None:
+        parts.append(f"*{fn.args.vararg.arg}")
+    elif fn.args.kwonlyargs:
+        parts.append("*")
+    parts.extend(arg.arg for arg in fn.args.kwonlyargs)
+    if fn.args.kwarg is not None:
+        parts.append(f"**{fn.args.kwarg.arg}")
+    return tuple(parts)
+
+
+def _find_matching_paren(text: str, open_idx: int) -> int:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for idx in range(open_idx, len(text)):
+        ch = text[idx]
+        if escaped:
+            escaped = False
+            continue
+        if quote is not None:
+            if ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in {'"', "'"}:
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+    raise ValueError(f"Unbalanced parentheses in signature span: {text!r}")
+
+
+def _parse_doc_call_params(span: str) -> tuple[str, tuple[str, ...] | None]:
+    stripped = span.strip()
+    if "(" not in stripped:
+        return stripped, None
+    open_idx = stripped.index("(")
+    close_idx = _find_matching_paren(stripped, open_idx)
+    raw_name = stripped[:open_idx].strip()
+    inner = stripped[open_idx + 1 : close_idx]
+    parsed = ast.parse(f"def _sig({inner}):\n    pass\n")
+    fn = parsed.body[0]
+    if not isinstance(fn, ast.FunctionDef):
+        raise TypeError(f"Expected FunctionDef parsing {span!r}")
+    return raw_name, _param_tokens(fn, is_method=False)
 
 
 class TestDocsMarkdown(unittest.TestCase):
@@ -415,3 +507,369 @@ class TestDocsMarkdown(unittest.TestCase):
                     text,
                     f"Stale v1 token {token!r} found in {path.relative_to(self.repo_root)}",
                 )
+
+    def test_api_doc_bidirectional_symbol_and_signature_sync(self) -> None:
+        """Verify docs/api.md stays bidirectionally synchronized with src/ccnv symbols and signatures."""
+        api_path = self.repo_root / "docs" / "api.md"
+        self.assertTrue(api_path.exists(), "docs/api.md must exist")
+        api_text = api_path.read_text(encoding="utf-8")
+
+        zensical_cfg = tomllib.loads(
+            (self.repo_root / "zensical.toml").read_text(encoding="utf-8")
+        )
+        nav_entries = (
+            zensical_cfg.get("project", {}).get("nav") or zensical_cfg.get("nav") or []
+        )
+        nav_targets = [
+            target
+            for item in nav_entries
+            if isinstance(item, dict)
+            for target in item.values()
+        ]
+        self.assertIn(
+            "api.md", nav_targets, "api.md must be registered in zensical.toml nav"
+        )
+
+        prose_without_fences = re.sub(r"```.*?```", "", api_text, flags=re.DOTALL)
+        for cited_path in re.findall(
+            r"`((?:src|crates)/[A-Za-z0-9_./-]+)`", prose_without_fences
+        ):
+            self.assertTrue(
+                (self.repo_root / cited_path).exists(),
+                f"Cited source path in docs/api.md does not exist: {cited_path}",
+            )
+
+        section_matches = list(
+            re.finditer(r"^### `([^`]+)` \((.+?)\)\s*$", api_text, flags=re.MULTILINE)
+        )
+        sections_by_path: dict[str, str] = {}
+        for match in section_matches:
+            start = match.end()
+            next_heading = re.search(r"^#{2,3} ", api_text[start:], flags=re.MULTILINE)
+            end = start + next_heading.start() if next_heading else len(api_text)
+            body = api_text[start:end]
+            for path_str in re.findall(r"`([^`]+)`", match.group(2)):
+                if path_str.endswith((".py", ".pyi")):
+                    sections_by_path[path_str] = body
+
+        source_paths = sorted((self.repo_root / "src" / "ccnv").rglob("*.py"))
+        core_stub = self.repo_root / "src" / "ccnv" / "_core.pyi"
+        if core_stub.exists():
+            source_paths.append(core_stub)
+
+        for src_path in source_paths:
+            rel = src_path.relative_to(self.repo_root).as_posix()
+            tree = ast.parse(
+                src_path.read_text(encoding="utf-8"), filename=str(src_path)
+            )
+            ast_symbols: set[str] = set()
+            required_symbols: set[str] = set()
+            required_call_params: dict[str, tuple[str, ...]] = {}
+            all_call_params: dict[str, tuple[str, ...]] = {}
+
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if _is_overload(node):
+                        continue
+                    params = _param_tokens(node, is_method=False)
+                    ast_symbols.add(node.name)
+                    all_call_params[node.name] = params
+                    if not node.name.startswith("_") or node.name == "__getattr__":
+                        required_symbols.add(node.name)
+                        required_call_params[node.name] = params
+                elif isinstance(node, ast.ClassDef):
+                    ast_symbols.add(node.name)
+                    if not node.name.startswith("_"):
+                        required_symbols.add(node.name)
+                    for member in node.body:
+                        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            if _is_overload(member):
+                                continue
+                            qual_member = f"{node.name}.{member.name}"
+                            ast_symbols.add(member.name)
+                            ast_symbols.add(qual_member)
+                            params = _param_tokens(member, is_method=True)
+                            if not _is_property(member):
+                                all_call_params[member.name] = params
+                                all_call_params[qual_member] = params
+                            if not node.name.startswith("_") and (
+                                not member.name.startswith("_")
+                                or member.name == "__getitem__"
+                            ):
+                                required_symbols.add(member.name)
+                                if not _is_property(member):
+                                    required_call_params[qual_member] = params
+                elif src_path == core_stub:
+                    target_id: str | None = None
+                    if isinstance(node, ast.AnnAssign) and isinstance(
+                        node.target, ast.Name
+                    ):
+                        target_id = node.target.id
+                    elif (
+                        isinstance(node, ast.Assign)
+                        and len(node.targets) == 1
+                        and isinstance(node.targets[0], ast.Name)
+                    ):
+                        target_id = node.targets[0].id
+                    if target_id is not None and target_id.isupper():
+                        ast_symbols.add(target_id)
+                        required_symbols.add(target_id)
+
+            if rel == "src/ccnv/__init__.py":
+                for alias in _LAZY_ROOT_ALIASES:
+                    ast_symbols.add(alias)
+                    required_symbols.add(alias)
+
+            if not required_symbols:
+                self.assertIn(
+                    f"`{rel}`",
+                    prose_without_fences,
+                    f"Re-export module must be referenced in docs/api.md: {rel}",
+                )
+                continue
+
+            self.assertIn(
+                rel,
+                sections_by_path,
+                f"Module must have a dedicated ### section in docs/api.md: {rel}",
+            )
+            section_body = sections_by_path[rel]
+            section_no_fences = re.sub(r"```.*?```", "", section_body, flags=re.DOTALL)
+
+            section_tokens: set[str] = set()
+            for span in re.findall(r"`([^`]+)`", section_no_fences):
+                section_tokens.update(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", span))
+
+            missing_symbols = sorted(required_symbols - section_tokens)
+            self.assertEqual(
+                missing_symbols,
+                [],
+                f"Undocumented required symbols in {rel}: {missing_symbols}",
+            )
+
+            documented_params: dict[str, tuple[str, ...]] = {}
+            for line in section_no_fences.splitlines():
+                internal_match = re.match(
+                    r"^\s*-\s+\*\*Internal\b.*?\*\*\s+—\s+(.*)$", line
+                )
+                if internal_match:
+                    for helper in re.findall(
+                        r"`(_[A-Za-z0-9_]+)`", internal_match.group(1)
+                    ):
+                        self.assertIn(
+                            helper,
+                            ast_symbols,
+                            f"Stale internal helper `{helper}` documented in {rel}",
+                        )
+                    continue
+
+                bullet_match = re.match(r"^\s*-\s+\*\*`([^`]+)`\*\*", line)
+                if bullet_match:
+                    doc_name, parsed_params = _parse_doc_call_params(
+                        bullet_match.group(1)
+                    )
+                    short_name = doc_name.split(".")[-1]
+                    self.assertTrue(
+                        doc_name in ast_symbols or short_name in ast_symbols,
+                        f"Stale or mislocated symbol `{doc_name}` documented under {rel}",
+                    )
+                    if parsed_params is not None:
+                        expected_params = all_call_params.get(
+                            doc_name
+                        ) or all_call_params.get(short_name)
+                        self.assertIsNotNone(
+                            expected_params,
+                            f"Callable signature `{bullet_match.group(1)}` does not match a function/method in {rel}",
+                        )
+                        self.assertEqual(
+                            parsed_params,
+                            expected_params,
+                            f"Parameter signature drift for `{doc_name}` in {rel}",
+                        )
+                        documented_params[doc_name] = parsed_params
+                        documented_params[short_name] = parsed_params
+
+            for callable_name, expected_params in required_call_params.items():
+                short_name = callable_name.split(".")[-1]
+                doc_sig = documented_params.get(callable_name) or documented_params.get(
+                    short_name
+                )
+                self.assertEqual(
+                    doc_sig,
+                    expected_params,
+                    f"Missing or mismatched explicit parameter signature for `{callable_name}` in {rel}",
+                )
+
+    def test_api_doc_mermaid_dags_match_codebase_call_graph(self) -> None:
+        """Verify Mermaid tier and pipeline DAGs in docs/api.md match actual codebase modules and calls."""
+        api_text = (self.repo_root / "docs" / "api.md").read_text(encoding="utf-8")
+        mermaid_blocks = re.findall(
+            r"```mermaid\nflowchart\b[^\n]*\n(.*?)```", api_text, flags=re.DOTALL
+        )
+        self.assertGreaterEqual(
+            len(mermaid_blocks),
+            5,
+            "docs/api.md must contain all 5 architecture and pipeline Mermaid DAGs",
+        )
+
+        src_root = self.repo_root / "src" / "ccnv"
+        existing_modules: set[str] = set()
+        for path in src_root.rglob("*.py"):
+            rel_mod = (
+                path.relative_to(self.repo_root / "src").with_suffix("").as_posix()
+            )
+            dot_mod = rel_mod.replace("/", ".")
+            existing_modules.add(dot_mod.removesuffix(".__init__"))
+            existing_modules.add(dot_mod)
+        existing_modules.add("ccnv._core")
+
+        tier_block = mermaid_blocks[0]
+        for label in re.findall(r'\["([^"]+)"\]', tier_block):
+            head = label.split("(", 1)[0].strip()
+            if head.startswith("ccnv.") and head not in existing_modules:
+                self.fail(f"Tier DAG references missing package/module {head!r}")
+            paren_match = re.search(r"\(([^)]+)\)", label)
+            if not paren_match:
+                continue
+            paren_text = paren_match.group(1).strip()
+            if paren_text in _SKIPPED_TIER_TOKENS:
+                continue
+            base_pkg = head if head.startswith("ccnv.") else "ccnv"
+            for mod_name in (item.strip() for item in paren_text.split(",")):
+                target = f"{base_pkg}.{mod_name}"
+                self.assertIn(
+                    target,
+                    existing_modules,
+                    f"Tier DAG references non-existent module {target!r}",
+                )
+
+        calls_by_qual: dict[str, set[str]] = {}
+        short_to_quals: dict[str, set[str]] = {}
+        source_paths = sorted(src_root.rglob("*.py")) + [src_root / "_core.pyi"]
+        for src_path in source_paths:
+            mod = (
+                src_path.relative_to(self.repo_root / "src")
+                .with_suffix("")
+                .as_posix()
+                .replace("/", ".")
+                .removesuffix(".__init__")
+            )
+            tree = ast.parse(
+                src_path.read_text(encoding="utf-8"), filename=str(src_path)
+            )
+            alias_map: dict[str, str] = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    for imported in node.names:
+                        if imported.asname:
+                            alias_map[imported.asname] = (
+                                f"{node.module}.{imported.name}"
+                            )
+
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    qual = f"{mod}.{node.name}"
+                    for key in (
+                        node.name,
+                        f"{src_path.stem}.{node.name}",
+                        qual,
+                        qual.removeprefix("ccnv."),
+                    ):
+                        short_to_quals.setdefault(key, set()).add(qual)
+                    called: set[str] = set()
+                    for sub in ast.walk(node):
+                        if isinstance(sub, ast.Call):
+                            if isinstance(sub.func, ast.Name):
+                                name = sub.func.id
+                                called.add(
+                                    _LAZY_ROOT_ALIASES.get(
+                                        name, alias_map.get(name, name)
+                                    )
+                                )
+                            elif isinstance(sub.func, ast.Attribute):
+                                called.add(sub.func.attr)
+                    calls_by_qual[qual] = called
+                elif isinstance(node, ast.ClassDef):
+                    for member in node.body:
+                        if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            qual = f"{mod}.{node.name}.{member.name}"
+                            for key in (
+                                member.name,
+                                f"{node.name}.{member.name}",
+                                qual,
+                                qual.removeprefix("ccnv."),
+                            ):
+                                short_to_quals.setdefault(key, set()).add(qual)
+                            called = set()
+                            for sub in ast.walk(member):
+                                if isinstance(sub, ast.Call):
+                                    if isinstance(sub.func, ast.Name):
+                                        name = sub.func.id
+                                        called.add(
+                                            _LAZY_ROOT_ALIASES.get(
+                                                name, alias_map.get(name, name)
+                                            )
+                                        )
+                                    elif isinstance(sub.func, ast.Attribute):
+                                        called.add(sub.func.attr)
+                            calls_by_qual[qual] = called
+
+        def is_reachable(src_label: str, dst_label: str) -> bool:
+            srcs: set[str] = set()
+            for part in (p.strip() for p in src_label.split("/")):
+                srcs.update(short_to_quals.get(part, set()))
+            dsts: set[str] = set()
+            for part in (p.strip() for p in dst_label.split("/")):
+                dsts.update(short_to_quals.get(part, set()))
+            if not srcs or not dsts:
+                return False
+            visited = set(srcs)
+            stack = list(srcs)
+            while stack:
+                current = stack.pop()
+                if current in dsts:
+                    return True
+                for callee_tok in calls_by_qual.get(current, ()):
+                    for next_qual in short_to_quals.get(callee_tok, ()):
+                        if next_qual not in visited:
+                            visited.add(next_qual)
+                            stack.append(next_qual)
+            return False
+
+        for dag_idx, dag_block in enumerate(mermaid_blocks[1:], start=2):
+            node_labels: dict[str, str] = {}
+            for raw_line in dag_block.splitlines():
+                stripped = raw_line.strip()
+                if stripped.startswith("subgraph "):
+                    continue
+                for node_id, node_label in re.findall(
+                    r'([A-Za-z0-9_]+)\["([^"]+)"\]', stripped
+                ):
+                    node_labels[node_id] = node_label
+                    for part in (p.strip() for p in node_label.split("/")):
+                        self.assertIn(
+                            part,
+                            short_to_quals,
+                            f"DAG 1.{dag_idx} node {node_id}[{node_label!r}] unresolved in codebase AST",
+                        )
+
+            for raw_line in dag_block.splitlines():
+                stripped = raw_line.strip()
+                if "-->" not in stripped:
+                    continue
+                chain_ids: list[str] = []
+                for segment in stripped.split("-->"):
+                    id_match = re.match(r"^\s*([A-Za-z0-9_]+)", segment)
+                    self.assertIsNotNone(
+                        id_match,
+                        f"Malformed Mermaid edge in DAG 1.{dag_idx}: {stripped}",
+                    )
+                    if id_match is not None:
+                        chain_ids.append(id_match.group(1))
+                for src_id, dst_id in itertools.pairwise(chain_ids):
+                    src_label = node_labels[src_id]
+                    dst_label = node_labels[dst_id]
+                    self.assertTrue(
+                        is_reachable(src_label, dst_label),
+                        f"DAG 1.{dag_idx} edge {src_label!r} --> {dst_label!r} has no path in codebase AST",
+                    )

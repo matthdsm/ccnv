@@ -12,3 +12,9 @@ repos:
         entry: ruff format
         language: system
         types_or: [python, pyi]
+      - id: docs-markdown-contracts
+        name: docs and API markdown contracts
+        entry: pytest -q tests/test_docs_markdown.py
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi, markdown, toml]
