@@ -1,10 +1,10 @@
-# Copynumber-CNV Agent Guidelines
+# `ccnv` Agent Guidelines
 
-This document provides project-specific instructions and architectural context for agents working on the Copynumber-CNV (`ccnv`) codebase.
+This document provides project-specific instructions and architectural context for agents working on the `ccnv` codebase.
 
 ## Project Overview
 
-Copynumber-CNV (`ccnv`) is an independent Python bioinformatics toolkit for Copy Number Variation (CNV) analysis in shallow whole-genome sequencing data, building on published within-sample reference normalization methodology (Straver et al., 2014; Raman et al., 2019).
+`ccnv` is an independent Python bioinformatics toolkit for Copy Number Variation (CNV) analysis in whole-genome sequencing (WGS) data at any coverage, building on published within-sample reference normalization methodology (Straver et al., 2014; Raman et al., 2019).
 
 ### Core Stack
 
@@ -60,7 +60,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs lint, tests, and hooks on every
 - A push to `master` builds the Docker image and pushes it to GHCR tagged with the commit SHA and `latest`.
 - A published GitHub Release builds multi-platform Python `abi3` wheels (`ubuntu-latest`, `ubuntu-24.04-arm`, `macos-latest`) and `sdist`, attaches them to that release, and pushes the image tagged with the commit SHA, the version (release tag with a leading `v` stripped), and `stable`.
 
-Images live at `ghcr.io/<owner>/<repo>` (currently `ghcr.io/matthdsm/copynumber-cnv`) as a multi-platform manifest for `linux/amd64` and `linux/arm64`. The Dockerfile compiles the Rust extension inside the `build` stage and installs the `prod` Pixi environment with `pixi install --locked` (stripping compiler artifacts like `rustlib`), so the runtime image is slim and free of `rustc`, `pysam`, or `pybigwig`. The image `ENTRYPOINT` is `/app/entrypoint.sh` (which activates the `prod` Pixi environment) with default `CMD ["ccnv"]`.
+Images live at `ghcr.io/<owner>/<repo>` (currently `ghcr.io/matthdsm/ccnv`) as a multi-platform manifest for `linux/amd64` and `linux/arm64`. The Dockerfile compiles the Rust extension inside the `build` stage and installs the `prod` Pixi environment with `pixi install --locked` (stripping compiler artifacts like `rustlib`), so the runtime image is slim and free of `rustc`, `pysam`, or `pybigwig`. The image `ENTRYPOINT` is `/app/entrypoint.sh` (which activates the `prod` Pixi environment) with default `CMD ["ccnv"]`.
 
 ### Pixi Tasks
 
@@ -70,7 +70,7 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 - `pixi run format`: Format code with Ruff.
 - `pixi run test`: Run the test suite.
 - `pixi run hooks`: Run pre-commit hooks (managed by `prek`).
-- `pixi run docker-build`: Build the local `linux/amd64` Docker image (`ghcr.io/matthdsm/copynumber-cnv:dev`).
+- `pixi run docker-build`: Build the local `linux/amd64` Docker image (`ghcr.io/matthdsm/ccnv:dev`).
 - `pixi run docs-build`: Build the documentation site in the `docs` environment with Zensical (`pixi run -e docs zensical build --clean --strict`).
 - `pixi run docs-serve`: Serve the documentation site locally in the `docs` environment with Zensical (`pixi run -e docs zensical serve`).
 

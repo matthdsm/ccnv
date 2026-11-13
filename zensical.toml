@@ -1,13 +1,13 @@
 [project]
-site_url = "https://matthdsm.github.io/copynumber-cnv/"
+site_url = "https://matthdsm.github.io/ccnv/"
 site_name = "ccnv"
-site_description = "Copy-number analysis for shallow whole-genome sequencing"
+site_description = "Copy-number analysis for whole-genome sequencing"
 site_author = "Matthias De Smet"
 
 copyright = "Copyright &copy; 2026 Matthias De Smet"
 
-repo_url = "https://github.com/matthdsm/copynumber-cnv"
-repo_name = "matthdsm/copynumber-cnv"
+repo_url = "https://github.com/matthdsm/ccnv"
+repo_name = "matthdsm/ccnv"
 edit_uri = "edit/master/docs/"
 
 exclude_docs = """
@@ -68,7 +68,7 @@ toggle.name = "Switch to system preference"
 
 [[project.extra.social]]
 icon = "fontawesome/brands/github"
-link = "https://github.com/matthdsm/copynumber-cnv"
+link = "https://github.com/matthdsm/ccnv"
 
 [project.markdown_extensions]
 abbr = {}

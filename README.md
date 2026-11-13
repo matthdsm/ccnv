@@ -1,11 +1,11 @@
-# Copynumber-CNV (`ccnv`)
+# `ccnv`
 
-`ccnv` is an independent Python 3.14+ bioinformatics toolkit for copy-number variation (CNV) detection in shallow whole-genome sequencing (sWGS) data, building on published within-sample reference normalization methodology (Straver et al., *Nucleic Acids Research*, 2014; Raman et al., *Nucleic Acids Research*, 2019).
+`ccnv` is an independent Python 3.14+ bioinformatics toolkit for copy-number variation (CNV) detection in whole-genome sequencing (WGS) data at any coverage, building on published within-sample reference normalization methodology (Straver et al., *Nucleic Acids Research*, 2014; Raman et al., *Nucleic Acids Research*, 2019).
 
 > [!NOTE]
-> Copynumber-CNV (`ccnv`) is in active pre-1.0 alpha development (`0.1.0dev`). CLI interfaces, data models, and schemas may evolve before the initial stable release.
+> `ccnv` is in active pre-1.0 alpha development (`0.1.0dev`). CLI interfaces, data models, and schemas may evolve before the initial stable release.
 
-Complete documentation, architecture diagrams, and methodology are available at [https://matthdsm.github.io/copynumber-cnv/](https://matthdsm.github.io/copynumber-cnv/).
+Complete documentation, architecture diagrams, and methodology are available at [https://matthdsm.github.io/ccnv/](https://matthdsm.github.io/ccnv/).
 
 ---
 
@@ -39,8 +39,8 @@ pixi run ccnv --help
 Multi-platform container images (`linux/amd64` and `linux/arm64`) are published to GHCR:
 
 ```console
-docker pull ghcr.io/matthdsm/copynumber-cnv:latest
-docker run --rm ghcr.io/matthdsm/copynumber-cnv:latest ccnv --help
+docker pull ghcr.io/matthdsm/ccnv:latest
+docker run --rm ghcr.io/matthdsm/ccnv:latest ccnv --help
 ```
 
 ---
@@ -76,12 +76,12 @@ Outputs include bgzipped/indexed BED tables, VCFv4.2 files, interactive Plotly H
 
 ## Documentation
 
-Visit the [documentation site](https://matthdsm.github.io/copynumber-cnv/) for detailed guides:
+Visit the [documentation site](https://matthdsm.github.io/ccnv/) for detailed guides:
 
-- [Pipeline Architecture](https://matthdsm.github.io/copynumber-cnv/pipeline/): 4-stage execution model and storage contracts.
-- [CLI Reference](https://matthdsm.github.io/copynumber-cnv/cli/): Flag specification, inputs, outputs, and exit codes.
-- [API Reference](https://matthdsm.github.io/copynumber-cnv/api/): Module-by-module function reference and call-graph DAGs.
-- [Mathematical Methodology](https://matthdsm.github.io/copynumber-cnv/methodology/): Statistical formulations, models, and citations.
+- [Pipeline Architecture](https://matthdsm.github.io/ccnv/pipeline/): 4-stage execution model and storage contracts.
+- [CLI Reference](https://matthdsm.github.io/ccnv/cli/): Flag specification, inputs, outputs, and exit codes.
+- [API Reference](https://matthdsm.github.io/ccnv/api/): Module-by-module function reference and call-graph DAGs.
+- [Mathematical Methodology](https://matthdsm.github.io/ccnv/methodology/): Statistical formulations, models, and citations.
 
 ---
 

@@ -1,10 +1,10 @@
-# Copynumber-CNV (`ccnv`)
+# `ccnv`
 
-Copynumber-CNV (`ccnv`) is an independent Python 3.14+ bioinformatics toolkit for copy-number variation (CNV) detection in shallow whole-genome sequencing (sWGS) data, building on published within-sample reference normalization methodology (Straver et al., *Nucleic Acids Research*, 2014; Raman et al., *Nucleic Acids Research*, 2019).
+`ccnv` is an independent Python 3.14+ bioinformatics toolkit for copy-number variation (CNV) detection in whole-genome sequencing (WGS) data at any coverage, building on published within-sample reference normalization methodology (Straver et al., *Nucleic Acids Research*, 2014; Raman et al., *Nucleic Acids Research*, 2019).
 
 !!! note
 
-    Copynumber-CNV (`ccnv`) is in active pre-1.0 alpha development (`0.1.0dev`). CLI interfaces, data models, and schemas may evolve before the initial stable release.
+    `ccnv` is in active pre-1.0 alpha development (`0.1.0dev`). CLI interfaces, data models, and schemas may evolve before the initial stable release.
 
 ---
 
@@ -19,7 +19,7 @@ Copynumber-CNV (`ccnv`) is an independent Python 3.14+ bioinformatics toolkit fo
 
 ## Pipeline Overview
 
-The pipeline structures CNV identification across shallow whole-genome sequencing datasets into four stages: alignment ingestion and binning (`extract`), cohort or FASTA reference construction with Prototype Graph modeling (`reference`), reference usability verification (`ref-qc`), and single-sample projection, calibrated Pelt segmentation, and copy-number calling (`predict`).
+The pipeline structures CNV identification across whole-genome sequencing datasets of any coverage into four stages: alignment ingestion and binning (`extract`), cohort or FASTA reference construction with Prototype Graph modeling (`reference`), reference usability verification (`ref-qc`), and single-sample projection, calibrated Pelt segmentation, and copy-number calling (`predict`).
 
 ```mermaid
 flowchart LR

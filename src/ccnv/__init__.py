@@ -1,4 +1,4 @@
-"""Copy-number variation analysis for shallow whole-genome sequencing."""
+"""Copy-number variation analysis for whole-genome sequencing."""
 
 from __future__ import annotations
 

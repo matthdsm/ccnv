@@ -1,6 +1,6 @@
 # API Reference
 
-This document maps the Python and compiled Rust (`ccnv._core`) API of Copynumber-CNV (`ccnv`), covering package entry points, typed domain models, I/O readers and writers, statistical kernels, feature-engineering pipelines, QC evaluators, report generators, and module-level call-graph DAGs. For architectural overviews, CLI flags, and statistical equations, see [Pipeline Architecture](pipeline.md), [CLI Reference](cli.md), and [Mathematical Methodology](methodology.md).
+This document maps the Python and compiled Rust (`ccnv._core`) API of `ccnv`, covering package entry points, typed domain models, I/O readers and writers, statistical kernels, feature-engineering pipelines, QC evaluators, report generators, and module-level call-graph DAGs. For architectural overviews, CLI flags, and statistical equations, see [Pipeline Architecture](pipeline.md), [CLI Reference](cli.md), and [Mathematical Methodology](methodology.md).
 
 !!! note
     Top-level aliases (`ccnv.run_extract`, `ccnv.run_reference`, `ccnv.run_reference_qc`, `ccnv.run_predict`) are loaded lazily via `__getattr__` so CLI startup and lightweight metadata checks avoid importing NumPy, SciPy, scikit-learn, and PyArrow until an execution stage begins. This page is contract-tested against the live `src/ccnv` AST (`tests/test_docs_markdown.py`): any relevant code change adding, removing, moving, or renaming modules, symbols, parameter signatures, or call-graph edges must update the corresponding section and DAGs in lockstep.

@@ -9,7 +9,7 @@ Every constant, threshold, and model hyperparameter in `ccnv` is classified into
 - **Tier 1 (Statistical & Mathematical Theory)**: Derived analytically from probability distributions, asymptotic statistical efficiency, or numerical analysis (e.g., Gaussian quantile functions, Bessel's correction, Huber M-estimation efficiency, Student-$t_4$ IRLS forecast fusion, erfc Gaussian mixture ray marginalization).
 - **Tier 2 (Published Literature & Reference Methodology)**: Adopted from peer-reviewed bioinformatics algorithms, primarily within-sample reference normalization (Straver et al., 2014; Raman et al., 2019a), DESeq2 median-of-ratios (Anders & Huber, 2010; Love et al., 2014), SeqFF (Kim et al., 2015), PREFACE (Raman et al., 2019b), limma Empirical Bayes (Smyth, 2004), Gavish-Donoho SVHT (Gavish & Donoho, 2014), Stouffer precision pooling (Stouffer et al., 1949; Whitlock, 2005), and calibrated PELT change-point detection (Killick et al., 2012; Zhang & Siegmund, 2007).
 - **Tier 3 (Genomic Biology & Assembly Coordinates)**: Grounded in human cytogenetics, chromosome structure, or reference genome coordinates (e.g., pseudoautosomal boundaries, heterochromatic satellite blocks, centromeric gaps, and fetal-maternal cell-free DNA stoichiometry).
-- **Tier 4 (Empirical Engineering & Numerical Guardrails)**: Tuned for floating-point stability, solver convergence, memory bounding, or outlier clamping in shallow whole-genome sequencing ($0.1\times\text{–}1.0\times$ coverage).
+- **Tier 4 (Empirical Engineering & Numerical Guardrails)**: Tuned for floating-point stability, solver convergence, memory bounding, or outlier clamping across whole-genome sequencing of any coverage.
 
 ```mermaid
 flowchart TD
@@ -67,7 +67,7 @@ General interval count redistribution (`rebin_counts`, `rebin_counts_matrix`) pr
 
 ### 1.4 Constants & Hyperparameters
 
-- `DEFAULT_BIN_SIZE = 5000` (`src/ccnv/models/config.py`): Default $5\text{ kb}$ bin width (**Tier 2** / **Tier 4**). Balances Poisson counting noise at $0.1\times\text{–}0.5\times$ sWGS coverage ($\sim 150\text{–}750$ reads/bin) against spatial breakpoint resolution; coarsened in memory to $100\text{ kb}$ (`prenatal_bin_size = 100000`) for prenatal autosomal and `chrX` models.
+- `DEFAULT_BIN_SIZE = 5000` (`src/ccnv/models/config.py`): Default $5\text{ kb}$ bin width (**Tier 2** / **Tier 4**). Balances bin-level Poisson counting noise against spatial breakpoint resolution across WGS coverages; coarsened in memory to $100\text{ kb}$ (`prenatal_bin_size = 100000`) for prenatal autosomal and `chrX` models.
 - `min_mapping_quality = 1`, `require_proper_pair = True` (`src/ccnv/models/config.py:ReadFilters`): Default minimum Phred-scaled MAPQ and paired-end proper-pair requirement (**Tier 2**). Excludes multi-mapping reads ($\text{MAPQ} = 0$) and discordant chimeric pairs.
 
 ---
@@ -127,7 +127,7 @@ Multiplicative trend $\hat{t}_i = a_i \exp(\mathbf{x}_i^{\top}\hat{\boldsymbol{\
 
 ### 2.3 Model & Function Selection Rationale
 
-- **DESeq2 Super-Blocks vs. Single-Bin Ratios**: Aggregating into $1\text{ Mb}$ super-blocks stabilizes ratio medians against single-bin zero counts in shallow sequencing while preserving high breakdown bounds.
+- **DESeq2 Super-Blocks vs. Single-Bin Ratios**: Aggregating into $1\text{ Mb}$ super-blocks stabilizes ratio medians against single-bin zero counts at low sequencing depths while preserving high breakdown bounds.
 - **PoissonRegressor vs. Gaussian WLS**: The log-link Poisson model guarantees strictly positive multiplicative predictions $\hat{t}_i \gt 0$ across all bins and naturally handles discrete counts.
 
 ### 2.4 Constants & Hyperparameters
@@ -332,7 +332,7 @@ Verdict escalation follows severity ordering $\texttt{PASS} (0) \lt \texttt{WARN
 
 | Constant / Parameter | Value | Source Location | Tier | Mathematical / Biological Rationale |
 | :--- | :--- | :--- | :--- | :--- |
-| `DEFAULT_BIN_SIZE` | `5000` bp | `src/ccnv/models/config.py` | Tier 2 / Tier 4 | Standard sWGS bin width balancing Poisson count noise vs. spatial resolution |
+| `DEFAULT_BIN_SIZE` | `5000` bp | `src/ccnv/models/config.py` | Tier 2 / Tier 4 | Default WGS bin width balancing Poisson count noise vs. spatial resolution |
 | `prenatal_bin_size` | `100000` bp | `src/ccnv/models/config.py` | Tier 2 | 20x coarsened resolution for `FFA` and `FFX` |
 | `min_mapping_quality` | `1` | `src/ccnv/models/config.py` | Tier 2 | Excludes multi-mapping reads ($\text{MAPQ}=0$) |
 | `DEFAULT_MIN_MAPPABILITY` | `0.5` | `src/ccnv/models/config.py` | Tier 2 / Tier 3 | Requires $\ge 50$% uniquely mappable $k$-mers per bin |

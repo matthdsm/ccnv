@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `src` directory hosts the top-level Python namespace and implementation packages for the `copynumber-cnv` toolkit. Source modules under this root enforce 0-based half-open coordinate contracts, versioned Apache Arrow/Parquet (`2.0.0`) storage specifications, and deterministic bioinformatic pipelines.
+The `src` directory hosts the top-level Python namespace and implementation packages for the `ccnv` toolkit. Source modules under this root enforce 0-based half-open coordinate contracts, versioned Apache Arrow/Parquet (`2.0.0`) storage specifications, and deterministic bioinformatic pipelines.
 
 ## Subdirectories & Boundaries
 
