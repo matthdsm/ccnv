@@ -14,12 +14,14 @@ from helpers import make_reference_table, make_sample_table, metadata_for
 
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
+    BRANCH_FEMALE_SEX,
     BRANCH_MALE_SEX,
     NUM_FRAG_BANDS,
     NUM_PROTOTYPES_PER_BIN,
     SAMPLE_SCHEMA,
     SCHEMA_VERSION,
     ArtifactKind,
+    BinResult,
     BranchFitArrays,
     FetalFractionResult,
     PrenatalLoDMetrics,
@@ -652,6 +654,7 @@ class TestQCPredict(unittest.TestCase):
         self.assertEqual(payload["schema_version"], SCHEMA_VERSION)
         self.assertEqual(payload["mode"], "germline")
         self.assertEqual(payload["sample"], "test_sample")
+        self.assertIsNone(payload["sex"])
         self.assertIsNone(payload["prenatal"])
 
         read_metrics = payload["read_metrics"]
@@ -717,6 +720,7 @@ class TestQCPredict(unittest.TestCase):
             "prenatal", table, segments, prenatal_result=prenatal_result
         )
         self.assertEqual(payload["mode"], "prenatal")
+        self.assertEqual(payload["sex"], "male")
         cnv_summary = payload["cnv_summary"]
         if not isinstance(cnv_summary, dict):
             self.fail("expected cnv_summary dict")
@@ -749,9 +753,87 @@ class TestQCPredict(unittest.TestCase):
         self.assertFalse(sca_dict["is_aneuploid"])
         self.assertEqual(sca_dict["confidence"], 0.98)
 
+    def test_build_predict_qc_payload_sex_resolution(self) -> None:
+        table = _make_predict_sample_table()
+        zeros = np.zeros(1, dtype=np.float64)
+        ones = np.ones(1, dtype=np.float64)
+        unmasked = np.zeros(1, dtype=np.bool_)
+        ref_sz = np.ones(1, dtype=np.int64)
+
+        def _bin(branch: str, contig: str) -> BinResult:
+            return BinResult(
+                branch,
+                (contig,),
+                np.array([0], dtype=np.int64),
+                np.array([100], dtype=np.int64),
+                zeros,
+                zeros,
+                ones,
+                ref_sz,
+                unmasked,
+            )
+
+        self.assertEqual(
+            build_predict_qc_payload("germline", table, (), sex="female")["sex"],
+            "female",
+        )
+        self.assertEqual(
+            build_predict_qc_payload("germline", table, (), sex="male")["sex"],
+            "male",
+        )
+        self.assertEqual(
+            build_predict_qc_payload(
+                "germline",
+                table,
+                (),
+                bin_results=(
+                    _bin(BRANCH_AUTOSOMAL, "chr1"),
+                    _bin(BRANCH_FEMALE_SEX, "chrX"),
+                ),
+            )["sex"],
+            "female",
+        )
+        self.assertEqual(
+            build_predict_qc_payload(
+                "germline",
+                table,
+                (),
+                bin_results=(
+                    _bin(BRANCH_AUTOSOMAL, "chr1"),
+                    _bin(BRANCH_MALE_SEX, "chrY"),
+                ),
+            )["sex"],
+            "male",
+        )
+        self.assertIsNone(
+            build_predict_qc_payload(
+                "germline", table, (), bin_results=(_bin(BRANCH_AUTOSOMAL, "chr1"),)
+            )["sex"]
+        )
+
+        sca_xx = SCAResult("XX", False, 0.99, 0.0)
+        prenatal_f = FetalFractionResult(
+            "F", 0.10, "FFA", None, 0.10, 0.10, 1.0, 0.0, 0.004, sca_xx
+        )
+        self.assertEqual(
+            build_predict_qc_payload(
+                "prenatal",
+                table,
+                (),
+                prenatal_result=prenatal_f,
+                bin_results=(_bin(BRANCH_FEMALE_SEX, "chrX"),),
+            )["sex"],
+            "female",
+        )
+        self.assertIsNone(build_predict_qc_payload("prenatal", table, ())["sex"])
+
+        bad_kwargs: dict[str, object] = {"sex": "autosomal"}
+        with self.assertRaisesRegex(ValueError, "sex must be 'female' or 'male'"):
+            build_predict_qc_payload("germline", table, (), **bad_kwargs)
+
     def test_write_predict_qc_json(self) -> None:
         table = _make_predict_sample_table()
-        payload = build_predict_qc_payload("germline", table, ())
+        payload = build_predict_qc_payload("germline", table, (), sex="female")
         payload["float_val"] = np.float64(0.123456789)
         payload["int_val"] = np.int64(42)
         payload["bool_val"] = np.bool_(True)
@@ -766,6 +848,7 @@ class TestQCPredict(unittest.TestCase):
             self.assertEqual(loaded["schema_version"], SCHEMA_VERSION)
             self.assertEqual(loaded["mode"], "germline")
             self.assertEqual(loaded["sample"], "test_sample")
+            self.assertEqual(loaded["sex"], "female")
             self.assertIn("read_metrics", loaded)
             self.assertIn("cnv_summary", loaded)
             self.assertEqual(loaded["float_val"], 0.123457)

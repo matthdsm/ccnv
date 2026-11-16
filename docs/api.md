@@ -670,7 +670,7 @@ Stage 2/3 reference branch quality auditing and `PASS`/`WARN`/`FAIL` verdict esc
 
 Stage 4 single-sample prediction QC payload assembly.
 
-- **`build_predict_qc_payload(mode, sample_table, segments, prenatal_result, bin_results)`** — Aggregates depth metrics, MAD/MAPD noise, call counts, germline sex or prenatal `FetalFractionResult`, `SCAResult`, `PrenatalLoDMetrics`, fragmentomic metrics, and diagnostic warnings.
+- **`build_predict_qc_payload(mode, sample_table, segments, prenatal_result, bin_results, sex)`** — Aggregates predicted sample `sex` (`"female"`, `"male"`, or `None`), depth metrics, `lambda_gc`, call counts, prenatal `FetalFractionResult`, `SCAResult`, `PrenatalLoDMetrics`, fragmentomic metrics, and diagnostic warnings.
 - **`write_predict_qc_json(path, payload)`** — Writes sanitized prediction QC JSON files atomically.
 - **`_int_metric(mapping, key, *, fallback_key)`** — Internal helper safely casting nullable integer counts for JSON serialization.
 

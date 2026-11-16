@@ -31,6 +31,7 @@ from ccnv.io.parquet import write_reference_parquet, write_sample_parquet
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     BRANCH_FEMALE_SEX,
+    BRANCH_MALE_SEX,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
     FRAGMENTOMICS_METADATA_KEY,
@@ -561,6 +562,7 @@ class TestPrenatalPredictPipeline(unittest.TestCase):
 
             qc_data = json.loads(outputs.qc_json_path.read_text(encoding="utf-8"))
             self.assertEqual(qc_data["mode"], "prenatal")
+            self.assertEqual(qc_data["sex"], "male")
             self.assertIsNotNone(qc_data["prenatal"])
             self.assertEqual(qc_data["prenatal"]["fetal_sex"], "M")
             self.assertGreater(qc_data["prenatal"]["active_ff"], 0.0)
@@ -571,6 +573,89 @@ class TestPrenatalPredictPipeline(unittest.TestCase):
                 self.assertIsNotNone(seg.expected_ratio)
                 self.assertIsNotNone(seg.implied_ff)
                 self.assertIsInstance(seg.discordant, bool)
+
+    def test_predict_germline_qc_records_inferred_and_null_sex(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            auto_sample = root / "auto_sample.ccnv"
+            auto_ref = root / "auto_ref.ccnv"
+            write_sample_parquet(_sample_table(), auto_sample)
+            write_reference_parquet(_reference_table(), auto_ref)
+            auto_out = run_predict(
+                PredictConfig(
+                    sample=auto_sample,
+                    reference=auto_ref,
+                    prefix=root / "auto_pred",
+                    min_reference_bins=1,
+                    plot=False,
+                    vcf=False,
+                )
+            )
+            if auto_out.qc_json_path is None:
+                self.fail("expected qc_json_path")
+            auto_qc = json.loads(auto_out.qc_json_path.read_text(encoding="utf-8"))
+            self.assertIsNone(auto_qc["sex"])
+
+            lengths = {"chr1": 200, "chr2": 200, "chrX": 100, "chrY": 100}
+            rows = [
+                (BRANCH_AUTOSOMAL, "chr1", 0, 100),
+                (BRANCH_AUTOSOMAL, "chr1", 100, 200),
+                (BRANCH_AUTOSOMAL, "chr2", 0, 100),
+                (BRANCH_AUTOSOMAL, "chr2", 100, 200),
+                (BRANCH_FEMALE_SEX, "chrX", 0, 100),
+                (BRANCH_MALE_SEX, "chrX", 0, 100),
+                (BRANCH_MALE_SEX, "chrY", 0, 100),
+            ]
+            branches, contigs, starts, ends = (
+                list(col) for col in zip(*rows, strict=True)
+            )
+            n_r = len(rows)
+            sex_ref_tbl = make_reference_table(
+                branches=branches,
+                contigs=contigs,
+                starts=starts,
+                ends=ends,
+                contig_lengths=lengths,
+                pca_mean=[0.2] * n_r,
+                pca_loadings=[[0.0]] * n_r,
+                mean_distance=[1.0] * n_r,
+                null_mean=[0.0] * n_r,
+                bio_dispersion=[0.02] * n_r,
+                model={
+                    "branches": [BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX],
+                    "bin_size": 100,
+                    "sex_signal_contig": "chrY",
+                    "sex_cutoff": 0.05,
+                },
+            )
+            sex_ref = root / "sex_ref.ccnv"
+            write_reference_parquet(sex_ref_tbl, sex_ref)
+
+            for expected_sex, y_cnt in (("female", 0), ("male", 40)):
+                s_tbl = make_sample_table(
+                    [50, 50, 50, 50, 50 if expected_sex == "female" else 25, y_cnt],
+                    contigs=["chr1", "chr1", "chr2", "chr2", "chrX", "chrY"],
+                    starts=[0, 100, 0, 100, 0, 0],
+                    ends=[100, 200, 100, 200, 100, 100],
+                    contig_lengths=lengths,
+                    bin_size=100,
+                )
+                s_path = root / f"{expected_sex}.ccnv"
+                write_sample_parquet(s_tbl, s_path)
+                out = run_predict(
+                    PredictConfig(
+                        sample=s_path,
+                        reference=sex_ref,
+                        prefix=root / f"pred_{expected_sex}",
+                        min_reference_bins=1,
+                        plot=False,
+                        vcf=False,
+                    )
+                )
+                if out.qc_json_path is None:
+                    self.fail("expected qc_json_path")
+                qc = json.loads(out.qc_json_path.read_text(encoding="utf-8"))
+                self.assertEqual(qc["sex"], expected_sex)
 
 
 class TestPredictAlignmentInputs(unittest.TestCase):

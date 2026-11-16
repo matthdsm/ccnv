@@ -309,8 +309,8 @@ def run(config: PredictConfig) -> PredictionOutputs:
             weighted_sample = apply_prenatal_fisher_weighting(raw_sample, prenatal_meta)
         except (SchemaError, ValueError) as err:
             raise PredictError(str(err)) from err
-        if weighted_sample is not raw_sample:
-            inputs = replace(inputs, sample=weighted_sample)
+        fetal_sex: Sex = "male" if prenatal_result.fetal_sex == "M" else "female"
+        inputs = replace(inputs, sample=weighted_sample, sex=fetal_sex)
 
     bin_results = _normalize_branches_once(
         inputs,
@@ -356,6 +356,7 @@ def run(config: PredictConfig) -> PredictionOutputs:
                 segments=segments,
                 prenatal_result=prenatal_result,
                 bin_results=bin_results,
+                sex=inputs.sex,
             ),
         )
         return write_outputs(

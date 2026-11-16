@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pyarrow as pa
 
 from ccnv.models import (
+    BRANCH_FEMALE_SEX,
+    BRANCH_MALE_SEX,
     SCHEMA_VERSION,
     AnalysisMode,
     BinResult,
@@ -41,13 +44,29 @@ def _int_metric(
 
 
 def build_predict_qc_payload(
-    mode: AnalysisMode,
+    mode: AnalysisMode | Literal["germline", "prenatal"],
     sample_table: SampleBuffers | pa.Table,
     segments: Sequence[SegmentResult],
     prenatal_result: FetalFractionResult | None = None,
     bin_results: Sequence[BinResult] | None = None,
+    sex: Literal["female", "male"] | None = None,
 ) -> dict[str, object]:
     """Construct structured QC metrics for a prediction invocation."""
+    resolved_sex: Literal["female", "male"] | None = None
+    if sex is not None:
+        if sex not in ("female", "male"):
+            raise ValueError(f"sex must be 'female' or 'male', got {sex!r}")
+        resolved_sex = sex
+    elif mode == "prenatal":
+        if prenatal_result is not None:
+            resolved_sex = "male" if prenatal_result.fetal_sex == "M" else "female"
+    elif bin_results:
+        branches = {b.branch for b in bin_results}
+        if BRANCH_MALE_SEX in branches:
+            resolved_sex = "male"
+        elif BRANCH_FEMALE_SEX in branches:
+            resolved_sex = "female"
+
     bufs = SampleBuffers.coerce(sample_table)
     qc_meta: Mapping[str, object] = bufs.meta.qc or {}
     counts = np.asarray(bufs.count, dtype=np.float64)
@@ -214,6 +233,7 @@ def build_predict_qc_payload(
         "schema_version": SCHEMA_VERSION,
         "mode": str(mode),
         "sample": sample_name,
+        "sex": resolved_sex,
         "read_metrics": read_metrics,
         "cnv_summary": cnv_summary,
         "fragmentomics": frag_data,
