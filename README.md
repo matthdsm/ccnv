@@ -80,6 +80,7 @@ Visit the [documentation site](https://matthdsm.github.io/ccnv/) for detailed gu
 
 - [Pipeline Architecture](https://matthdsm.github.io/ccnv/pipeline/): 4-stage execution model and storage contracts.
 - [CLI Reference](https://matthdsm.github.io/ccnv/cli/): Flag specification, inputs, outputs, and exit codes.
+- [Visualization Overview](https://matthdsm.github.io/ccnv/visualization/): Interactive HTML genome viewer tracks, controls, icons, and color legends.
 - [API Reference](https://matthdsm.github.io/ccnv/api/): Module-by-module function reference and call-graph DAGs.
 - [Mathematical Methodology](https://matthdsm.github.io/ccnv/methodology/): Statistical formulations, models, and citations.
 

@@ -51,6 +51,7 @@ flowchart LR
 
 - [Pipeline Architecture](pipeline.md): Data flow, coordinate contracts, and algorithmic stages.
 - [CLI Reference](cli.md): Command-line options, defaults, input requirements, deliverables, and exit codes.
+- [Visualization Overview](visualization.md): Interactive HTML genome viewer tracks, controls, icons, and color legends.
 - [API Reference](api.md): Module-by-module function reference and architectural call-graph DAGs.
 - [Mathematical Methodology](methodology.md): Mathematical formulations, statistical assumptions, model selections, and constant provenance.
 
