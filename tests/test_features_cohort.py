@@ -678,18 +678,75 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
         self.assertNotIn(FRAGMENTOMICS_METADATA_KEY, rebinned.schema.metadata or {})
 
     def test_cohort_rejects_mixed_single_and_paired_end(self) -> None:
-        s1 = make_sample_table(
+        pe_table = make_sample_table(
             [10, 20],
             contig_lengths={"chr1": 200},
             bin_size=100,
             fragment_lengths=[[150], [150]],
         )
-        s2 = make_sample_table([10, 20], contig_lengths={"chr1": 200}, bin_size=100)
-        with self.assertRaisesRegex(
-            ReferenceError,
-            "mixed single-end and paired-end cohort controls are not supported",
-        ):
-            validate_cohort([s1, s2])
+        se_table = make_sample_table(
+            [10, 20], contig_lengths={"chr1": 200}, bin_size=100
+        )
+
+        with self.assertRaises(ReferenceError) as tie_ctx:
+            validate_cohort(
+                [pe_table, se_table],
+                paths=[Path("pe.ccnv"), Path("se.ccnv")],
+            )
+        self.assertIn(
+            "mixed single-end and paired-end cohort controls are not supported: "
+            "paired-end files (1/2): pe.ccnv; single-end files (1/2): se.ccnv",
+            str(tie_ctx.exception),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            se_first = write_synthetic_sample(
+                tmp_path / "se_first.ccnv",
+                [10, 20],
+                contig_lengths={"chr1": 200},
+                bin_size=100,
+            )
+            pe_files = [
+                write_synthetic_sample(
+                    tmp_path / f"pe_{i}.ccnv",
+                    [10, 20],
+                    contig_lengths={"chr1": 200},
+                    bin_size=100,
+                    fragment_lengths=[[150], [150]],
+                )
+                for i in range(1, 4)
+            ]
+            se_last = write_synthetic_sample(
+                tmp_path / "se_last.ccnv",
+                [10, 20],
+                contig_lengths={"chr1": 200},
+                bin_size=100,
+            )
+            entries = [SamplesheetEntry(p) for p in (se_first, *pe_files, se_last)]
+            with self.assertRaises(ReferenceError) as pe_ctx:
+                load_and_assemble_cohort(entries, target_bin_size=100)
+            pe_msg = str(pe_ctx.exception)
+            self.assertIn("cohort is paired-end (3/5), single-end files (2/5):", pe_msg)
+            self.assertIn(str(se_first), pe_msg)
+            self.assertIn(str(se_last), pe_msg)
+            self.assertNotIn("pe_1.ccnv", pe_msg)
+
+        with self.assertRaises(ReferenceError) as se_ctx:
+            validate_cohort(
+                [se_table, pe_table, se_table],
+                paths=[
+                    Path("/tmp/se_1.ccnv"),
+                    Path("/tmp/pe_bad.ccnv"),
+                    Path("/tmp/se_2.ccnv"),
+                ],
+            )
+        se_msg = str(se_ctx.exception)
+        self.assertIn(
+            "cohort is single-end (2/3), paired-end files (1/3): /tmp/pe_bad.ccnv",
+            se_msg,
+        )
+        self.assertNotIn("se_1.ccnv", se_msg)
 
     def test_read_sample_buffers_and_extract_cram(self) -> None:
         table = make_sample_table([5, 10], contig_lengths={"chr1": 200}, bin_size=100)

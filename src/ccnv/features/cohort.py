@@ -318,14 +318,11 @@ class _CohortAccumulator:
         self.sum_ep = np.zeros(n_bins, dtype=np.float64)
         self.raw_metas: list[dict[str, object]] = [{} for _ in range(n_samples)]
         self.identities: list[object] = [None for _ in range(n_samples)]
+        self.is_paired: list[bool] = [False for _ in range(n_samples)]
         self.record(first)
 
     def record(self, sample: _StreamedSample) -> None:
         first, sm, fm = self.first, sample.sample_meta, self.first.sample_meta
-        if sample.is_paired != first.is_paired:
-            raise ReferenceError(
-                "mixed single-end and paired-end cohort controls are not supported"
-            )
         if sm.contig_lengths != fm.contig_lengths:
             raise ReferenceError(
                 f"{sample.path}: contig_lengths do not match the cohort"
@@ -355,6 +352,7 @@ class _CohortAccumulator:
         self.identities[idx] = sample.raw_meta.get(
             "source_identity", {"path": str(sample.path)}
         )
+        self.is_paired[idx] = sample.is_paired
 
     def finalize(
         self,
@@ -362,6 +360,40 @@ class _CohortAccumulator:
         *,
         in_memory_tables: Sequence[SampleBuffers] = (),
     ) -> Cohort:
+        paired_paths = [
+            str(p) for p, paired in zip(paths, self.is_paired, strict=True) if paired
+        ]
+        single_paths = [
+            str(p)
+            for p, paired in zip(paths, self.is_paired, strict=True)
+            if not paired
+        ]
+        if paired_paths and single_paths:
+            total = len(paths)
+            n_paired, n_single = len(paired_paths), len(single_paths)
+            if n_paired > n_single:
+                detail = (
+                    f"cohort is paired-end ({n_paired}/{total}), "
+                    f"single-end files ({n_single}/{total}): "
+                    f"{', '.join(single_paths)}"
+                )
+            elif n_single > n_paired:
+                detail = (
+                    f"cohort is single-end ({n_single}/{total}), "
+                    f"paired-end files ({n_paired}/{total}): "
+                    f"{', '.join(paired_paths)}"
+                )
+            else:
+                detail = (
+                    f"paired-end files ({n_paired}/{total}): "
+                    f"{', '.join(paired_paths)}; "
+                    f"single-end files ({n_single}/{total}): "
+                    f"{', '.join(single_paths)}"
+                )
+            raise ReferenceError(
+                "mixed single-end and paired-end cohort controls are not supported: "
+                f"{detail}"
+            )
         codes, names, starts_u32, ends_u32 = reconstruct_sample_grid(
             self.first.sample_meta
         )
