@@ -5,7 +5,7 @@
 ```mermaid
 flowchart LR
     BINS["BinResult arrays (unmasked, M4-decimated)"] -->|Scattergl + base64| HTML["<prefix>_plot.html"]
-    SEGS["SegmentResult calls & BLUE Z-scores"] -->|"Step lines & discordant overlays"| HTML
+    SEGS["SegmentResult calls & BLUE Z-scores"] -->|"Scattergl step lines & discordant overlays"| HTML
     CYTO["Cytoband track (--cytobands, optional)"] -->|"Top Giemsa ideogram (yaxis2)"| HTML
     PRE["FetalFractionResult (--mode prenatal, optional)"] -->|"Banner badge & FF reference lines"| HTML
 ```
@@ -20,7 +20,7 @@ Contigs present across bins, segments, and cytobands (with positive length in `c
 
 ### 1.2 $\log_2$ Ratio Scale & Extreme Value Clamping
 
-The vertical axis plots normalized copy-number $\log_2$ ratios ($\log_2 R$) across a fixed viewport range of $[-2.5, +2.5]$ (`fixedrange: true`) with a solid `#64748b` neutral reference line at $\log_2 R = 0.0$ and `#f1f5f9` horizontal grid lines. Any bin or segment whose true $\log_2 R$ falls below $-2.5$ (such as deep homozygous deletions) or above $+2.5$ (such as high-copy amplifications) is visually clamped to the $\pm 2.5$ boundary with segment `cliponaxis: false` so extreme events remain visible on the canvas while hover tooltips continue to report the exact unclamped values.
+The vertical axis plots normalized copy-number $\log_2$ ratios ($\log_2 R$) across a fixed viewport range of $[-2.5, +2.5]$ (`fixedrange: true`) with a solid `#64748b` neutral reference line at $\log_2 R = 0.0$ and `#f1f5f9` horizontal grid lines. Any bin or segment whose true $\log_2 R$ falls below $-2.5$ (such as deep homozygous deletions) or above $+2.5$ (such as high-copy amplifications) is visually clamped to the $\pm 2.5$ boundary so extreme events remain visible on the canvas while hover tooltips continue to report the exact unclamped values.
 
 ### 1.3 Bin Cloud & Outlier-Preserving M4 Decimation
 
@@ -28,7 +28,7 @@ Every unmasked bin (`masked == False` and finite `ratio`) is plotted at its geno
 
 ### 1.4 Segment Tracks & Initial vs. Live Threshold Calling
 
-Contiguous change-point segments from `SegmentResult` are drawn as horizontal step lines spanning exact $[\text{offset}_c + \text{start}, \text{offset}_c + \text{end}]$ interval coordinates at their segment $\log_2 R$:
+Contiguous change-point segments from `SegmentResult` are drawn on the WebGL `scattergl` layer after all bin traces so horizontal step lines spanning exact $[\text{offset}_c + \text{start}, \text{offset}_c + \text{end}]$ interval coordinates at their segment $\log_2 R$ render in the top layer above bin dots:
 
 - **Initial Render (Backend Calls)**: When the toolbar thresholds match the run's configured `z_threshold` and `ratio_threshold`, non-discordant segments render using the exact backend calls stored in `segment_calls` (reflecting dyadic BLUE Z-scores, BH-FDR $q \le 0.05$, and discrete integer copy-number Bayes factors $\ln \mathrm{BF} \gt 2.0$ in germline mode, as detailed in [Mathematical Methodology](methodology.md)).
 - **Interactive Recalculation**: Adjusting `|Z| >=` or `|Log2R| >=` in the top toolbar triggers a `100 ms` debounced client-side reclassification of both bin markers and non-discordant segments using **Gain** ($\vert Z \vert \ge z_T$, $\vert \log_2 R \vert \ge r_T$, $\log_2 R \gt 0$, $Z \ge 0$), **Loss** ($\vert Z \vert \ge z_T$, $\vert \log_2 R \vert \ge r_T$, $\log_2 R \lt 0$, $Z \le 0$), or **Neutral** otherwise.

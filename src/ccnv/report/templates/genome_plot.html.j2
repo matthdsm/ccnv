@@ -354,7 +354,7 @@
     showlegend: false
   });
   const mkLines = (name, x, y, text, color, width) => ({
-    type: "scatter",
+    type: "scattergl",
     mode: "lines",
     name,
     x,
@@ -362,7 +362,6 @@
     text,
     hoverinfo: "text",
     line: { color, width },
-    cliponaxis: false,
     showlegend: false
   });
 
@@ -491,7 +490,7 @@
       mkLines("Segments (Gain)", segBuckets.gain.x, segBuckets.gain.y, segBuckets.gain.t, "#c43c39", 3),
       mkLines("Segments (Loss)", segBuckets.loss.x, segBuckets.loss.y, segBuckets.loss.t, "#3c8c5a", 3),
       {
-        type: "scatter",
+        type: "scattergl",
         mode: "lines+markers",
         name: "Segments (Discordant)",
         x: segBuckets.disc.x,
@@ -500,7 +499,6 @@
         hoverinfo: "text",
         line: { color: "#9333ea", width: 6.0 },
         marker: { symbol: "diamond", size: 7, color: "#9333ea" },
-        cliponaxis: false,
         showlegend: false
       }
     ];

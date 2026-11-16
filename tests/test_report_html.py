@@ -6,6 +6,8 @@ import base64
 import gzip
 import json
 import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -15,7 +17,7 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 from ccnv.io.tracks import load_cytobands_track
-from ccnv.models import BRANCH_AUTOSOMAL
+from ccnv.models import BRANCH_AUTOSOMAL, Cytoband
 from ccnv.models.results import (
     BinResult,
     FetalFractionResult,
@@ -497,6 +499,172 @@ class TestHtmlReport(unittest.TestCase):
             self.assertIsNone(parsed["prenatal"]["active_ff"])
             self.assertIsNone(parsed["prenatal"]["ffx"])
             self.assertIsNone(parsed["prenatal"]["ff_size"])
+
+    def test_segment_traces_render_on_scattergl_top_layer_above_bin_dots(self) -> None:
+        bins = (
+            _make_bin_result(
+                "autosomal",
+                ("chr1", "chr1", "chr1"),
+                [0, 50_000, 100_000],
+                [50_000, 100_000, 150_000],
+                [0.0, 0.55, -0.55],
+                [0.1, 4.2, -4.2],
+            ),
+        )
+        disc_seg = replace(
+            SegmentResult("chr1", 100_000, 150_000, 0.25, 3.8, 1.0, 1, "gain"),
+            discordant=True,
+            discordance_reason="SUPER_FETAL_RATIO",
+        )
+        segments = (
+            SegmentResult("chr1", 0, 50_000, 0.0, 0.1, 1.0, 1, None),
+            SegmentResult("chr1", 50_000, 100_000, 0.55, 4.2, 1.0, 1, "gain"),
+            SegmentResult("chr1", 50_000, 100_000, -0.55, -4.2, 1.0, 1, "loss"),
+            disc_seg,
+        )
+        prenatal = FetalFractionResult(
+            "M",
+            0.10,
+            "FFY",
+            0.10,
+            0.10,
+            0.10,
+            0.95,
+            0.01,
+            0.004,
+            SCAResult("XY", False, 0.99, 0.0),
+            effective_ff=0.10,
+        )
+        cytobands = (Cytoband("chr1", 0, 150_000, "p11.1", "gneg"),)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html_path = Path(tmpdir) / "layer_order_plot.html"
+            render_genome_plot(
+                html_path,
+                bins,
+                segments,
+                {"chr1": 150_000},
+                cytobands=cytobands,
+                z_threshold=3.0,
+                ratio_threshold=0.2,
+                prenatal_result=prenatal,
+            )
+            html = html_path.read_text(encoding="utf-8")
+
+        expected_order = [
+            "Bins (Neutral)",
+            "Bins (Gain)",
+            "Bins (Loss)",
+            "Segments (Neutral)",
+            "Segments (Gain)",
+            "Segments (Loss)",
+            "Segments (Discordant)",
+        ]
+        node_bin = shutil.which("node")
+        if node_bin is None:
+            mk_lines_match = re.search(
+                r"const mkLines\s*=\s*\([^)]*\)\s*=>\s*\(\{(.*?)\}\);",
+                html,
+                re.DOTALL,
+            )
+            if mk_lines_match is None:
+                self.fail("mkLines trace factory not found in rendered HTML")
+            self.assertIn('type: "scattergl"', mk_lines_match.group(1))
+            self.assertNotIn("cliponaxis", mk_lines_match.group(1))
+
+            disc_match = re.search(
+                r"\{[^{}]*name:\s*\"Segments \(Discordant\)\"[^{}]*\}",
+                html,
+                re.DOTALL,
+            )
+            if disc_match is None:
+                self.fail(
+                    "Segments (Discordant) trace literal not found in rendered HTML"
+                )
+            self.assertIn('type: "scattergl"', disc_match.group(0))
+            self.assertNotIn("cliponaxis", disc_match.group(0))
+
+            positions = [html.index(f'"{name}"') for name in expected_order]
+            self.assertEqual(positions, sorted(positions))
+            return
+
+        payload_match = re.search(
+            r'<script id="ccnv-data" type="application/json">(.*?)</script>',
+            html,
+            re.DOTALL,
+        )
+        script_matches = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)
+        if payload_match is None or not script_matches:
+            self.fail("Expected payload and inline script in rendered HTML")
+        harness = """
+const fs = require("fs");
+const vm = require("vm");
+const input = JSON.parse(fs.readFileSync(0, "utf8"));
+const elements = new Map();
+const mkEl = (id, textContent = "") => ({
+  id, value: "", textContent, innerHTML: "", className: "", style: {},
+  layout: { xaxis: { range: [0, 1] } }, listeners: {},
+  addEventListener(ev, fn) { (this.listeners[ev] ||= []).push(fn); },
+  on() {},
+});
+elements.set("ccnv-data", mkEl("ccnv-data", input.payload));
+for (const id of [
+  "z-input", "r-input", "prenatal-badge", "disc-legend",
+  "plot", "bin-tooltip", "search-err", "search-form", "coord-input", "reset-btn",
+]) elements.set(id, mkEl(id));
+const calls = [];
+const snap = traces => traces.map(t => ({
+  name: t.name || null,
+  type: t.type,
+  yaxis: t.yaxis || "y",
+  hasClip: Object.prototype.hasOwnProperty.call(t, "cliponaxis"),
+  nPts: t.x ? t.x.length : 0,
+}));
+vm.runInNewContext(input.script, {
+  Buffer, Uint8Array, Uint16Array, Uint32Array, Int8Array, Float32Array, Float64Array,
+  Math, Number, String, Boolean, Array, Map, Object, JSON, parseFloat, isNaN,
+  atob: s => Buffer.from(s, "base64").toString("binary"),
+  setTimeout: fn => { fn(); return 1; },
+  clearTimeout: () => {},
+  document: { getElementById: id => elements.get(id) || mkEl(id) },
+  Plotly: {
+    newPlot(el, traces, layout) {
+      el.layout = layout;
+      calls.push(snap(traces));
+      return { then: fn => fn && fn() };
+    },
+    react(_el, traces) { calls.push(snap(traces)); },
+    relayout() {},
+  },
+});
+elements.get("z-input").value = "4.0";
+for (const fn of elements.get("z-input").listeners.input || []) fn();
+process.stdout.write(JSON.stringify(calls));
+"""
+        proc = subprocess.run(
+            [node_bin, "-e", harness],
+            input=json.dumps(
+                {
+                    "payload": payload_match.group(1),
+                    "script": script_matches[-1],
+                }
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        recorded_calls = json.loads(proc.stdout)
+        self.assertEqual(len(recorded_calls), 2)
+        for call_traces in recorded_calls:
+            xy_traces = [t for t in call_traces if t["yaxis"] == "y"]
+            self.assertEqual([t["name"] for t in xy_traces], expected_order)
+            for trace in xy_traces:
+                self.assertEqual(trace["type"], "scattergl")
+                self.assertFalse(trace["hasClip"])
+            cyto_traces = [t for t in call_traces if t["yaxis"] == "y2"]
+            self.assertEqual(len(cyto_traces), 1)
+        for trace in recorded_calls[0][:7]:
+            self.assertGreater(trace["nPts"], 0)
 
 
 if __name__ == "__main__":
