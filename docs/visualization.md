@@ -1,12 +1,12 @@
 # Visualization Overview
 
-`ccnv predict` generates a self-contained, interactive WebGL/SVG genome copy-number profile at `<prefix>_plot.html` (enabled by default via `--plot`, disabled with `--no-plot`, and optionally enriched with cytogenetic bands via `--cytobands`). Rendered by `render_genome_plot` ([API Reference](api.md)) using Plotly.js (`2.35.2`), the viewer embeds sample coordinates, copy-number signals, segment calls, and optional prenatal metrics as base64-encoded binary arrays inside the HTML file so it can be opened offline in any modern browser.
+`ccnv predict` generates a self-contained, interactive WebGL/SVG genome copy-number profile at `<prefix>_plot.html` (enabled by default via `--plot`, disabled with `--no-plot`, and enriched with cytogenetic bands automatically on GRCh38/`hg38` samples or via `--cytobands`). Rendered by `render_genome_plot` ([API Reference](api.md)) using Plotly.js (`2.35.2`), the viewer embeds sample coordinates, copy-number signals, segment calls, and optional prenatal metrics as base64-encoded binary arrays inside the HTML file so it can be opened offline in any modern browser.
 
 ```mermaid
 flowchart LR
     BINS["BinResult arrays (unmasked, M4-decimated)"] -->|Scattergl + base64| HTML["<prefix>_plot.html"]
     SEGS["SegmentResult calls & BLUE Z-scores"] -->|"Scattergl step lines & discordant overlays"| HTML
-    CYTO["Cytoband track (--cytobands, optional)"] -->|"Top Giemsa ideogram (yaxis2)"| HTML
+    CYTO["Cytoband track (bundled hg38 or --cytobands)"] -->|"Top Giemsa ideogram (yaxis2)"| HTML
     PRE["FetalFractionResult (--mode prenatal, optional)"] -->|"Banner badge & FF reference lines"| HTML
 ```
 
@@ -16,7 +16,7 @@ flowchart LR
 
 ### 1.1 Multi-Chromosome Axis & Alternating Contig Canvas
 
-Contigs present across bins, segments, and cytobands (with positive length in `contig_lengths`) are arranged left-to-right in natural sort order (`natural_sort_key`, e.g., `chr1`–`chr22`, `chrX`, `chrY`, or organism-specific header contigs). Each contig occupies its proportional physical length across a unified $[0, \text{totalLen}]$ horizontal axis with $45^{\circ}$-angled contig names centered on each chromosome, alternating white (`#ffffff`) and pale slate (`#f8fafc`) background bands on odd-indexed contigs, and crisp $1\text{ px}$ `#e2e8f0` vertical chromosome boundaries.
+Modeled contigs present across bins and segments (falling back to cytoband contigs only when both bins and segments are empty, filtered to positive length in `contig_lengths`) are arranged left-to-right in natural sort order (`natural_sort_key`, e.g., `chr1`–`chr22`, `chrX`, `chrY`, or organism-specific header contigs). Each contig occupies its proportional physical length across a unified $[0, \text{totalLen}]$ horizontal axis with $45^{\circ}$-angled contig names centered on each chromosome, alternating white (`#ffffff`) and pale slate (`#f8fafc`) background bands on odd-indexed contigs, and crisp $1\text{ px}$ `#e2e8f0` vertical chromosome boundaries.
 
 Sex-chromosome axis behavior follows the modeled prediction branches: `chrX` is plotted across germline female (`female_sex`), germline male (`male_sex`), and prenatal (`female_sex` diploid `XX` baseline) modes; `chrY` is plotted in germline male (`male_sex`) and prenatal male-fetus (`fetal_sex == "M"`, normalized on `prenatal_ffy` against a $5\text{ kb}$ FF-calibrated 1-copy MSY baseline where euploid `XY` centers at $\log_2 R = 0$, sufficient-statistic `47,XYY` segment ratios shift to $\approx +1.0$ with a purple `SCA_DISCORDANT` highlight, and focal MSY deletions shift negative, while individual $5\text{ kb}$ bin dots reflect `+0.5` pseudocount regularization at low-pass depth), and omitted when unmodeled (germline female or prenatal `fetal_sex == "F"`).
 
@@ -47,9 +47,9 @@ $$
 y_{+} = \log_2\left(1 + \frac{1}{2} f_{\text{eff}}\right), \qquad y_{-} = \log_2\left(\max\left(10^{-4}, 1 - \frac{1}{2} f_{\text{eff}}\right)\right)
 $$
 
-### 1.6 Optional Cytoband Ideogram Track (`--cytobands`)
+### 1.6 Cytoband Ideogram Track (Bundled GRCh38 & `--cytobands`)
 
-Supplying `--cytobands` allocates the top 8% of the canvas (`yaxis2`, domain `[0.92, 1.00]`) above the copy-number panel (`yaxis`, domain `[0.00, 0.90]`) to a synchronized cytogenetic band strip labeled `Band`. Each cytoband draws as a colored rectangle (`y0 = 0.15` to `y1 = 0.85`) colored by Giemsa stain intensity, with invisible midpoint hover targets revealing band coordinates and stain codes.
+When canonical chromosome names (`chr1`–`chr22`, `chrX`, `chrY` or `1`–`22`, `X`, `Y`) match exact GRCh38 (`hg38`) base-pair lengths without conflicting canonical contigs (or when a custom track is supplied via `--cytobands`), and at least one cytoband overlaps the modeled plot contigs, the viewer allocates the top 8% of the canvas (`yaxis2`, domain `[0.92, 1.00]`) above the copy-number panel (`yaxis`, domain `[0.00, 0.90]`) to a synchronized cytogenetic band strip labeled `Band` scoped strictly to modeled plot contigs. Each cytoband draws as a colored rectangle (`y0 = 0.15` to `y1 = 0.85`) colored by Giemsa stain intensity, with invisible midpoint hover targets revealing band coordinates and stain codes.
 
 ---
 
@@ -57,7 +57,7 @@ Supplying `--cytobands` allocates the top 8% of the canvas (`yaxis2`, domain `[0
 
 The top control bar and Plotly WebGL canvas provide fast exploratory inspection without re-running `ccnv predict`:
 
-- **Genomic Coordinate & Cytoband Search (`Go`)**: Accepts contig names (`chr21` or `21`), intervals (`chr21:13.1m-46.7m`, supporting commas and `k`/`kb`/`m`/`mb` suffixes), single positions (`chr21:15m`, which zooms to a $100\text{ kb}$ window), or cytoband names (`21q22.11`, `chr21q22`) when `--cytobands` was provided. Pressing `Enter` or clicking `Go` zooms the x-axis directly; `Whole Genome` resets to `[0, totalLen]`.
+- **Genomic Coordinate & Cytoband Search (`Go`)**: Accepts contig names (`chr21` or `21`), intervals (`chr21:13.1m-46.7m`, supporting commas and `k`/`kb`/`m`/`mb` suffixes), single positions (`chr21:15m`, which zooms to a $100\text{ kb}$ window), or cytoband names (`21q22.11`, `chr21q22`) whenever cytobands are active (bundled `hg38` or `--cytobands`). Pressing `Enter` or clicking `Go` zooms the x-axis directly; `Whole Genome` resets to `[0, totalLen]`.
 - **Threshold Filters (`|Z| >=` and `|Log2R| >=`)**: Live numeric controls that re-bin and re-color neutral, gain, and loss clouds and segments after `100 ms` without resetting your current horizontal zoom window.
 - **Bin Hover Card**: Hovering over any `scattergl` bin dot opens a dark floating tooltip displaying `<contig>:<start>-<end>` alongside unclamped `Log2R` (3 decimals) and `Z` (2 decimals).
 - **Segment & Cytoband Hover Text**: Hovering over a segment line reports `<contig>:<start>-<end> (<N> bins)`, `Segment Log2R | Z`, and in prenatal mode appends `Short Frag` percentage, `LLR_size`, `origin_call` (or `Origin: <call>`), and discordant diagnostics (`Discordant: <reason>`, `Expected`, and `Implied FF`). Hovering over the top `Band` strip reports `<contig><band> (<start>-<end>, <stain>)`.

@@ -14,16 +14,28 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+from helpers import (
+    make_reference_table,
+    write_synthetic_reference,
+    write_synthetic_sample,
+)
 from numpy.typing import ArrayLike
 
 from ccnv.io.tracks import load_cytobands_track
-from ccnv.models import BRANCH_AUTOSOMAL, Cytoband
+from ccnv.models import (
+    BRANCH_AUTOSOMAL,
+    BRANCH_FEMALE_SEX,
+    BRANCH_MALE_SEX,
+    Cytoband,
+    PredictConfig,
+)
 from ccnv.models.results import (
     BinResult,
     FetalFractionResult,
     SCAResult,
     SegmentResult,
 )
+from ccnv.predict import run as run_predict
 from ccnv.report import (
     PLOTLY_CDN_URL,
     decimate_bins_m4,
@@ -665,6 +677,166 @@ process.stdout.write(JSON.stringify(calls));
             self.assertEqual(len(cyto_traces), 1)
         for trace in recorded_calls[0][:7]:
             self.assertGreater(trace["nPts"], 0)
+
+    def test_cytobands_do_not_leak_unmodeled_contigs_unless_empty(self) -> None:
+        contig_lengths = {"chr1": 100_000, "chrX": 80_000, "chrY": 50_000}
+        bins = (
+            _make_bin_result(
+                "autosomal",
+                ("chr1", "chrX"),
+                [0, 0],
+                [100_000, 80_000],
+                0.0,
+                0.0,
+            ),
+        )
+        cytobands = (
+            Cytoband("chr1", 0, 100_000, "p11", "gneg"),
+            Cytoband("chrX", 0, 80_000, "p11", "gpos50"),
+            Cytoband("chrY", 0, 50_000, "q11", "gpos100"),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            female_html = root / "female_plot.html"
+            render_genome_plot(
+                female_html, bins, (), contig_lengths, cytobands=cytobands
+            )
+            female_payload = _extract_payload(female_html.read_text(encoding="utf-8"))
+            self.assertEqual(female_payload["contigs"], ["chr1", "chrX"])
+            cyto_rows = female_payload["cytobands"]
+            if not isinstance(cyto_rows, list):
+                self.fail("Expected list of cytoband rows")
+            self.assertEqual(len(cyto_rows), 2)
+
+            empty_html = root / "cyto_only_plot.html"
+            render_genome_plot(empty_html, (), (), contig_lengths, cytobands=cytobands)
+            empty_payload = _extract_payload(empty_html.read_text(encoding="utf-8"))
+            self.assertEqual(empty_payload["contigs"], ["chr1", "chrX", "chrY"])
+
+    def test_predict_run_auto_applies_hg38_cytobands_and_respects_override(
+        self,
+    ) -> None:
+        bin_size = 5_000_000
+        contig_lengths = {
+            "chr21": 46_709_983,
+            "chr22": 50_818_468,
+            "chrX": 156_040_895,
+            "chrY": 57_227_415,
+        }
+        s_contigs: list[str] = []
+        s_starts: list[int] = []
+        s_ends: list[int] = []
+        for c_name, c_len in contig_lengths.items():
+            for st in range(0, c_len, bin_size):
+                s_contigs.append(c_name)
+                s_starts.append(st)
+                s_ends.append(min(st + bin_size, c_len))
+
+        ref_branches: list[str] = []
+        ref_contigs: list[str] = []
+        ref_starts: list[int] = []
+        ref_ends: list[int] = []
+        ref_pids: list[list[int]] = []
+        ref_pweights: list[list[float]] = []
+
+        n_c21 = sum(1 for c in s_contigs if c == "chr21")
+        for c_name, st, en in zip(s_contigs, s_starts, s_ends, strict=True):
+            if c_name in {"chr21", "chr22"}:
+                ref_branches.append(BRANCH_AUTOSOMAL)
+                pids = (
+                    [n_c21, n_c21 + 1, n_c21 + 2, n_c21 + 3]
+                    if c_name == "chr21"
+                    else [0, 1, 2, 3]
+                )
+            elif c_name == "chrX":
+                ref_branches.append(BRANCH_FEMALE_SEX)
+                pids = [0, 1, 2, 3]
+            else:
+                ref_branches.append(BRANCH_MALE_SEX)
+                pids = [0, 1, 2, 3]
+            ref_contigs.append(c_name)
+            ref_starts.append(st)
+            ref_ends.append(en)
+            ref_pids.append(pids)
+            ref_pweights.append([0.25, 0.25, 0.25, 0.25])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample_counts = [0 if c == "chrY" else 200 for c in s_contigs]
+            sample_path = write_synthetic_sample(
+                root / "sample.ccnv",
+                sample_counts,
+                contigs=s_contigs,
+                starts=s_starts,
+                ends=s_ends,
+                contig_lengths=contig_lengths,
+                bin_size=bin_size,
+            )
+            ref_table = make_reference_table(
+                branches=ref_branches,
+                contigs=ref_contigs,
+                starts=ref_starts,
+                ends=ref_ends,
+                contig_lengths=contig_lengths,
+                proto_ids=ref_pids,
+                proto_weights=ref_pweights,
+                model={
+                    "bin_size": bin_size,
+                    "branches": [
+                        BRANCH_AUTOSOMAL,
+                        BRANCH_FEMALE_SEX,
+                        BRANCH_MALE_SEX,
+                    ],
+                },
+            )
+            ref_path = write_synthetic_reference(root / "ref.ccnv", ref_table)
+
+            auto_out = run_predict(
+                PredictConfig(
+                    sample=sample_path,
+                    reference=ref_path,
+                    prefix=root / "auto_hg38",
+                    sex="female",
+                    vcf=False,
+                    plot=True,
+                )
+            )
+            if auto_out.plot_html is None:
+                self.fail("expected HTML plot output")
+            auto_payload = _extract_payload(
+                auto_out.plot_html.read_text(encoding="utf-8")
+            )
+            self.assertEqual(auto_payload["contigs"], ["chr21", "chr22", "chrX"])
+            auto_cyto = auto_payload["cytobands"]
+            if not isinstance(auto_cyto, list):
+                self.fail("expected cytobands list")
+            self.assertEqual(len(auto_cyto), 14 + 16 + 40)
+
+            custom_cyto_path = root / "custom_cyto.txt"
+            custom_cyto_path.write_text(
+                "chr21\t0\t10000000\tp11.1\tgneg\nchrY\t0\t10000000\tq11.1\tgpos100\n",
+                encoding="utf-8",
+            )
+            ovr_out = run_predict(
+                PredictConfig(
+                    sample=sample_path,
+                    reference=ref_path,
+                    prefix=root / "ovr_hg38",
+                    sex="female",
+                    cytobands=custom_cyto_path,
+                    vcf=False,
+                    plot=True,
+                )
+            )
+            if ovr_out.plot_html is None:
+                self.fail("expected HTML plot output")
+            ovr_payload = _extract_payload(
+                ovr_out.plot_html.read_text(encoding="utf-8")
+            )
+            self.assertEqual(ovr_payload["contigs"], ["chr21", "chr22", "chrX"])
+            self.assertEqual(
+                ovr_payload["cytobands"], [[0, 0, 10_000_000, "p11.1", "gneg"]]
+            )
 
 
 if __name__ == "__main__":

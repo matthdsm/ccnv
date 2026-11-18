@@ -537,7 +537,10 @@ def predict(
             file_okay=True,
             dir_okay=False,
             readable=True,
-            help="Cytoband BED/TSV file (.txt/.bed/.gz) to visualize above the plot",
+            help=(
+                "Cytoband BED/TSV file (.txt/.bed/.gz) to visualize above the plot "
+                "(overrides bundled GRCh38 cytobands)"
+            ),
         ),
     ] = None,
     vcf: Annotated[

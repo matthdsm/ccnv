@@ -19,6 +19,7 @@ from ccnv.io.samplesheet import (
 )
 from ccnv.io.tracks import (
     load_cytobands_track,
+    load_default_cytobands_track,
     load_gc_track,
     load_mappability_track,
     read_fasta_contigs,
@@ -29,6 +30,7 @@ __all__ = [
     "alignment_format",
     "filter_reference_branches",
     "load_cytobands_track",
+    "load_default_cytobands_track",
     "load_gc_track",
     "load_mappability_track",
     "load_samplesheet",

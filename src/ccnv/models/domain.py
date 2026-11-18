@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
 
 
@@ -59,7 +60,7 @@ class ContigLookup:
     """Pre-indexed contig resolver handling chr-prefix and case-insensitive matching."""
 
     exact: frozenset[str]
-    lower_normalized: dict[str, str]
+    lower_normalized: Mapping[str, str]
 
     @classmethod
     def from_names(cls, available: Iterable[str]) -> ContigLookup:
@@ -69,7 +70,7 @@ class ContigLookup:
         for name in names:
             key = normalize_chr(name).lower()
             lower_map.setdefault(key, name)
-        return cls(exact=frozenset(names), lower_normalized=lower_map)
+        return cls(exact=frozenset(names), lower_normalized=MappingProxyType(lower_map))
 
     def resolve(self, contig: str) -> str | None:
         """Resolve a contig name against the indexed contig vocabulary."""

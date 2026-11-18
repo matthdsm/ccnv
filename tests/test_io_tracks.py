@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 import pysam
@@ -23,7 +24,9 @@ from ccnv.features import covariates as covariates_mod
 from ccnv.features.covariates import mask_covariates, validate_min_mappability
 from ccnv.io.tracks import (
     _bin_weighted_mean,
+    _load_bundled_hg38_cytobands,
     load_cytobands_track,
+    load_default_cytobands_track,
     load_gc_track,
     load_mappability_track,
 )
@@ -55,6 +58,82 @@ class TestTracksIO(unittest.TestCase):
             self.assertEqual(bands[0].end, 2_300_000)
             self.assertEqual(bands[0].name, "p36.33")
             self.assertEqual(bands[0].stain, "gneg")
+
+    def test_load_default_cytobands_track_hg38_detection_and_scoping(self) -> None:
+        _, hg38_lengths, _ = _load_bundled_hg38_cytobands()
+        canon_ucsc = {
+            f"chr{k}": hg38_lengths[f"chr{k}"] for k in (*range(1, 23), "X", "Y")
+        }
+        ucsc_bands = load_default_cytobands_track(canon_ucsc)
+        if ucsc_bands is None:
+            self.fail("expected bundled hg38 cytobands for canonical UCSC lengths")
+        self.assertEqual(len(ucsc_bands), 862)
+        self.assertEqual(ucsc_bands[0].contig, "chr1")
+        self.assertEqual(ucsc_bands[-1].contig, "chrY")
+
+        canon_ensembl = {k.removeprefix("chr"): v for k, v in canon_ucsc.items()}
+        ens_bands = load_default_cytobands_track(canon_ensembl)
+        if ens_bands is None:
+            self.fail("expected bundled hg38 cytobands for Ensembl contig aliases")
+        self.assertEqual(len(ens_bands), 862)
+        self.assertEqual(ens_bands[0].contig, "1")
+        self.assertEqual(ens_bands[-1].contig, "Y")
+
+        subset_bands = load_default_cytobands_track({"chr21": 46_709_983})
+        if subset_bands is None:
+            self.fail("expected bundled hg38 cytobands for chr21 subset")
+        self.assertEqual(len(subset_bands), 14)
+        self.assertTrue(all(b.contig == "chr21" for b in subset_bands))
+
+        scoped_bands = load_default_cytobands_track(
+            canon_ucsc, target_contigs=("chr21", "chrX")
+        )
+        if scoped_bands is None:
+            self.fail("expected scoped hg38 cytobands")
+        self.assertEqual({b.contig for b in scoped_bands}, {"chr21", "chrX"})
+
+        all_contigs_bands = load_default_cytobands_track(
+            {
+                "chr21": 46_709_983,
+                "chrM": 16_569,
+                "chr1_KI270706v1_random": hg38_lengths["chr1_KI270706v1_random"],
+                "chrEBV": 171_823,
+            }
+        )
+        if all_contigs_bands is None:
+            self.fail("expected hg38 cytobands when unannotated decoy contigs exist")
+        self.assertEqual(
+            {b.contig for b in all_contigs_bands},
+            {"chr21", "chrM", "chr1_KI270706v1_random"},
+        )
+
+        for non_hg38 in (
+            {},
+            {"chr1": 249_250_621},
+            {"chr1": 248_387_328},
+            {"chr21": 46_709_983, "chr23": 50_000_000},
+            {"chr21": 46_709_983, "chr22": 999_999},
+            {"chrM": 16_569, "chrEBV": 171_823},
+            {"chr1": 100_000},
+        ):
+            with self.subTest(non_hg38=non_hg38):
+                self.assertIsNone(load_default_cytobands_track(non_hg38))
+
+        with self.assertRaises(TypeError):
+            load_default_cytobands_track(canon_ensembl, target_contigs="21")
+
+        by_contig, frozen_lengths, lookup = _load_bundled_hg38_cytobands()
+        self.assertIsInstance(by_contig, MappingProxyType)
+        self.assertIsInstance(frozen_lengths, MappingProxyType)
+        self.assertIsInstance(lookup.lower_normalized, MappingProxyType)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bad_deflate = Path(tmpdir) / "corrupt_deflate.txt.gz"
+            valid_gz = bytearray(gzip.compress(b"chr1\t0\t1000\tp11\tgneg\n"))
+            valid_gz[10] = 0xFF
+            bad_deflate.write_bytes(bytes(valid_gz))
+            with self.assertRaises(CovariateError):
+                load_cytobands_track(bad_deflate, {"chr1": 1000})
 
 
 class TestTrackLoadingAndMasking(unittest.TestCase):

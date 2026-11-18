@@ -37,6 +37,7 @@ from ccnv.io.parquet import (
 )
 from ccnv.io.tracks import (
     load_cytobands_track,
+    load_default_cytobands_track,
     load_gc_track,
     load_mappability_track,
 )
@@ -53,6 +54,7 @@ from ccnv.models import (
     CcnvError,
     ContigLookup,
     CovariateError,
+    Cytoband,
     FetalFractionResult,
     InvalidInputError,
     PredictConfig,
@@ -264,14 +266,16 @@ def run(config: PredictConfig) -> PredictionOutputs:
         fasta=config.fasta,
         threads=config.threads,
     )
-    try:
-        cytobands_track = (
-            load_cytobands_track(config.cytobands, inputs.contig_lengths)
-            if (config.plot and config.cytobands is not None)
-            else None
-        )
-    except CovariateError as err:
-        raise PredictError(str(err)) from err
+    cytobands_track: tuple[Cytoband, ...] | None = None
+    if config.plot:
+        try:
+            cytobands_track = (
+                load_cytobands_track(config.cytobands, inputs.contig_lengths)
+                if config.cytobands is not None
+                else load_default_cytobands_track(inputs.contig_lengths)
+            )
+        except CovariateError as err:
+            raise PredictError(str(err)) from err
 
     raw_sample = inputs.sample
     sample_gc, sample_gc_q, sample_n_mask, sample_map = _preload_sample_track_overrides(

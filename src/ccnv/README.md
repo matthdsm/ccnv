@@ -58,7 +58,7 @@ Contigs are pre-split at masked gaps $`\gt 2\text{ Mb}`$ into contiguous euchrom
 ### Subpackages & Contracts
 
 - `features`: [features/README.md](./features/README.md) - Binning, dynamic rebinning, 1 Mb super-block DESeq2 cohort normalization, covariate masking, sex inference, fragmentomics feature transforms, and prenatal inference workflows.
-- `io`: [io/README.md](./io/README.md) - High-performance tile streaming via `ccnv._core`, external track ingestion (FASTA, BigWig, BED/WIG/TSV, cytobands), samplesheet validation, and versioned Parquet I/O.
+- `io`: [io/README.md](./io/README.md) - High-performance tile streaming via `ccnv._core`, external track ingestion (FASTA, BigWig, BED/WIG/TSV, custom and bundled GRCh38 cytobands), samplesheet validation, and versioned Parquet I/O.
 - `models`: [models/README.md](./models/README.md) - Domain types, configuration containers, result dataclasses, zero-copy `SampleBuffers` and `BranchFitArrays`, Arrow `2.0.0` schemas, metadata models, validation routines, and exceptions.
 - `qc`: [qc/README.md](./qc/README.md) - Sample read accounting, reference usability auditing (`PASS`/`WARN`/`FAIL`), and atomic JSON QC payload writers.
 - `report`: [report/README.md](./report/README.md) - Single-pass atomic bgzipped/tabix BED and VCFv4.2 serializers via `ccnv._core` and interactive Plotly HTML genome viewer.

@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import functools
 import gzip
+import importlib.resources
 import logging
 import math
-from collections.abc import Mapping, Sequence
+import zlib
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Final
 
 import numpy as np
@@ -24,6 +28,7 @@ from ccnv.models import (
     CovariateError,
     Cytoband,
     ReferenceError,
+    is_canonical_contig,
     natural_sort_key,
     select_layout,
 )
@@ -32,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "load_cytobands_track",
+    "load_default_cytobands_track",
     "load_gc_track",
     "load_mappability_track",
     "read_fasta_contigs",
@@ -499,6 +505,59 @@ def load_gc_track(
     return gc, n_mask, gc_quantiles
 
 
+def _parse_cytoband_lines(
+    lines: Iterable[str],
+    contig_lengths: Mapping[str, int] | None = None,
+) -> tuple[Cytoband, ...]:
+    """Parse UCSC cytoband lines, optionally clamping and aligning to target contigs."""
+    lookup = (
+        ContigLookup.from_names(contig_lengths.keys())
+        if contig_lengths is not None
+        else None
+    )
+    bands: list[Cytoband] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith(("#", "track", "browser")):
+            continue
+        fields = line.split("\t") if "\t" in line else line.split()
+        if len(fields) < 4:
+            continue
+        if lookup is not None and contig_lengths is not None:
+            canonical = lookup.resolve(fields[0])
+            if canonical is None:
+                continue
+        else:
+            canonical = fields[0]
+        try:
+            start = int(fields[1])
+            end = int(fields[2])
+        except ValueError:
+            continue
+        if contig_lengths is not None:
+            max_len = contig_lengths[canonical]
+            start = max(0, min(start, max_len))
+            end = max(0, min(end, max_len))
+        else:
+            start = max(0, start)
+        if end <= start:
+            continue
+        name = fields[3]
+        stain = fields[4] if len(fields) >= 5 else "gneg"
+        bands.append(
+            Cytoband(
+                contig=canonical,
+                start=start,
+                end=end,
+                name=name,
+                stain=stain,
+            )
+        )
+    return tuple(
+        sorted(bands, key=lambda b: (natural_sort_key(b.contig), b.start, b.end))
+    )
+
+
 def load_cytobands_track(
     path: Path, contig_lengths: Mapping[str, int]
 ) -> tuple[Cytoband, ...]:
@@ -507,44 +566,96 @@ def load_cytobands_track(
     if not resolved.is_file():
         raise CovariateError(f"cytobands file not found: {resolved}")
 
-    lookup = ContigLookup.from_names(contig_lengths.keys())
     open_fn = gzip.open if resolved.suffix.lower() == ".gz" else open
-    bands: list[Cytoband] = []
     try:
         with open_fn(resolved, "rt", encoding="utf-8") as handle:
-            for raw_line in handle:
-                line = raw_line.strip()
-                if not line or line.startswith(("#", "track", "browser")):
-                    continue
-                fields = line.split("\t") if "\t" in line else line.split()
-                if len(fields) < 4:
-                    continue
-                canonical = lookup.resolve(fields[0])
-                if canonical is None:
-                    continue
-                try:
-                    start = int(fields[1])
-                    end = int(fields[2])
-                except ValueError:
-                    continue
-                max_len = contig_lengths[canonical]
-                start = max(0, min(start, max_len))
-                end = max(0, min(end, max_len))
-                if end <= start:
-                    continue
-                name = fields[3]
-                stain = fields[4] if len(fields) >= 5 else "gneg"
-                bands.append(
-                    Cytoband(
-                        contig=canonical,
-                        start=start,
-                        end=end,
-                        name=name,
-                        stain=stain,
-                    )
-                )
-    except (OSError, EOFError, UnicodeDecodeError) as error:
+            return _parse_cytoband_lines(handle, contig_lengths)
+    except (OSError, EOFError, UnicodeDecodeError, zlib.error) as error:
         raise CovariateError(f"failed to read cytobands {resolved}: {error}") from error
+
+
+@functools.cache
+def _load_bundled_hg38_cytobands() -> tuple[
+    Mapping[str, tuple[Cytoband, ...]], Mapping[str, int], ContigLookup
+]:
+    """Load and index the bundled UCSC GRCh38 cytoband table once per process."""
+    resource = importlib.resources.files("ccnv.io").joinpath("cytoBand_hg38.gz")
+    try:
+        with (
+            resource.open("rb") as raw_stream,
+            gzip.open(raw_stream, "rt", encoding="utf-8") as handle,
+        ):
+            parsed = _parse_cytoband_lines(handle)
+    except (OSError, EOFError, UnicodeDecodeError, zlib.error) as error:
+        raise CovariateError(
+            f"failed to read bundled GRCh38 cytobands: {error}"
+        ) from error
+
+    if not parsed:
+        raise CovariateError("bundled GRCh38 cytobands table is empty")
+
+    grouped: dict[str, list[Cytoband]] = {}
+    lengths: dict[str, int] = {}
+    for band in parsed:
+        grouped.setdefault(band.contig, []).append(band)
+        prev_end = lengths.get(band.contig, 0)
+        if band.end > prev_end:
+            lengths[band.contig] = band.end
+
+    by_contig = MappingProxyType(
+        {contig: tuple(items) for contig, items in grouped.items()}
+    )
+    frozen_lengths = MappingProxyType(lengths)
+    return by_contig, frozen_lengths, ContigLookup.from_names(frozen_lengths.keys())
+
+
+def load_default_cytobands_track(
+    contig_lengths: Mapping[str, int],
+    *,
+    target_contigs: Iterable[str] | None = None,
+) -> tuple[Cytoband, ...] | None:
+    """Return bundled GRCh38 cytobands when canonical contigs match hg38 lengths."""
+    if isinstance(target_contigs, (str, bytes)):
+        raise TypeError("target_contigs must be an iterable of contig names, not str")
+    if not contig_lengths:
+        return None
+
+    by_contig, hg38_lengths, hg38_lookup = _load_bundled_hg38_cytobands()
+    canonical_matches = 0
+    for name, length in contig_lengths.items():
+        if not is_canonical_contig(name):
+            continue
+        resolved = hg38_lookup.resolve(name)
+        if (
+            resolved is None
+            or not is_canonical_contig(resolved)
+            or length != hg38_lengths.get(resolved)
+        ):
+            return None
+        canonical_matches += 1
+
+    if canonical_matches == 0:
+        return None
+
+    emit_names = (
+        tuple(dict.fromkeys(target_contigs))
+        if target_contigs is not None
+        else tuple(contig_lengths.keys())
+    )
+    bands: list[Cytoband] = []
+    for sample_contig in emit_names:
+        sample_len = contig_lengths.get(sample_contig, 0)
+        if sample_len <= 0:
+            continue
+        resolved = hg38_lookup.resolve(sample_contig)
+        if resolved is None or hg38_lengths.get(resolved) != sample_len:
+            continue
+        for band in by_contig[resolved]:
+            bands.append(
+                band
+                if band.contig == sample_contig
+                else replace(band, contig=sample_contig)
+            )
 
     return tuple(
         sorted(bands, key=lambda b: (natural_sort_key(b.contig), b.start, b.end))

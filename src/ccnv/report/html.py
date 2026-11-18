@@ -224,8 +224,9 @@ def render_genome_plot(
             raw_contigs[contig] = None
     for item in segments:
         raw_contigs[item.contig] = None
-    for band in parsed_bands:
-        raw_contigs[band.contig] = None
+    if not raw_contigs:
+        for band in parsed_bands:
+            raw_contigs[band.contig] = None
 
     ordered = tuple(
         sorted(

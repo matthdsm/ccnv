@@ -162,6 +162,7 @@ flowchart TB
     R_PRD --> PO_ANN["prenatal_origin.annotate_sample_prenatal_segments"]
     PO_ANN --> PO_LOD["prenatal_origin.annotate_prenatal_origin_and_lod"]
     PO_LOD --> PO_5S["prenatal_origin.classify_segment_origin_5state"]
+    R_PRD --> TR_CYTO["tracks.load_cytobands_track / tracks.load_default_cytobands_track"]
     R_PRD --> R_OUT["report.write_outputs"]
     R_OUT --> R_BED["bed.write_bins_bed_streaming / bed.write_segments_bed_streaming"]
     R_OUT --> R_VCF["vcf.write_bins_vcf / vcf.write_segments_vcf"]
@@ -418,13 +419,14 @@ YAML/JSON root-list samplesheet ingestion and JSON Schema validation.
 
 ### `ccnv.io.tracks` (`src/ccnv/io/tracks.py`)
 
-Ingestion of reference FASTA GC quantiles, BigWig mappability tracks, BED GC tracks, and UCSC cytobands.
+Ingestion of reference FASTA GC quantiles, BigWig mappability tracks, BED GC tracks, and UCSC cytobands (including bundled GRCh38 `cytoBand_hg38.gz`).
 
 - **`load_mappability_track(path, contigs, starts, ends)`** — Loads per-bin mean mappability from a BigWig file (via `_core.scan_bigwig_means`) or interval track onto target reference bin coordinates.
 - **`load_gc_track(path, contigs, starts, ends)`** — Loads per-bin GC and valid-base fractions from a FASTA reference (computing 8-quantile GC bins via `_core.scan_fasta_gc_quantiles`), BigWig, or BED track.
 - **`load_cytobands_track(path, contig_lengths)`** — Parses standard UCSC cytoband BED/TSV files into ordered `Cytoband` records mapped to reference contigs.
+- **`load_default_cytobands_track(contig_lengths, *, target_contigs)`** — Returns bundled GRCh38 `Cytoband` records (optionally scoped to `target_contigs`) when at least one canonical chromosome matches exact GRCh38 base-pair length and zero canonical chromosomes conflict.
 - **`read_fasta_contigs(fasta_path, *, all_contigs)`** — Returns ordered `(contig, length)` tuples from `ccnv._core.read_fasta_contigs_core` filtered by canonical layout rules unless `all_contigs` is set.
-- **Internal track helpers** — `_bin_weighted_mean`, `_extract_contig_grid`, `_load_bigwig_intervals`, `_compute_fasta_gc`, `_load_bed_gc`, and `_classify_gc_source` handle interval weighting and track format dispatch.
+- **Internal track helpers** — `_bin_weighted_mean`, `_extract_contig_grid`, `_load_bigwig_intervals`, `_compute_fasta_gc`, `_load_bed_gc`, `_classify_gc_source`, `_parse_cytoband_lines`, and `_load_bundled_hg38_cytobands` handle interval weighting, track format dispatch, and cached bundled cytoband loading.
 
 ## 5. Statistical Kernels (`ccnv.stats`)
 

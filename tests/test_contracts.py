@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ast
+import importlib.resources
 import io
+import shutil
+import subprocess
 import tokenize
 import tomllib
 import unittest
@@ -14,7 +17,8 @@ import ccnv.features.fragmentomics as ff_mod
 import ccnv.predict as pred_mod
 from ccnv import stats
 from ccnv._core import FRAG_BAND_EDGES, GC_QUANTILE_EDGES
-from ccnv.models import PrenatalModelMetadata
+from ccnv.io.tracks import _load_bundled_hg38_cytobands
+from ccnv.models import PrenatalModelMetadata, is_canonical_contig
 
 
 class TestPackagingContracts(unittest.TestCase):
@@ -55,6 +59,24 @@ class TestPackagingContracts(unittest.TestCase):
         self.assertIn("maturin build --release", ci)
         self.assertIn("maturin sdist", ci)
         self.assertIn("pixi run docs-build", ci)
+
+    def test_bundled_hg38_cytobands_resource_packaged_inside_ccnv_io(self) -> None:
+        resource = importlib.resources.files("ccnv.io").joinpath("cytoBand_hg38.gz")
+        self.assertTrue(resource.is_file())
+        self.assertEqual(len(resource.read_bytes()), 12_118)
+        self.assertFalse((self.repo_root / "cytoBand_hg38.gz").exists())
+        by_contig, hg38_lengths, _ = _load_bundled_hg38_cytobands()
+        self.assertEqual(len(by_contig), 711)
+        self.assertEqual(sum(len(v) for v in by_contig.values()), 1_549)
+        self.assertEqual(sum(1 for c in hg38_lengths if is_canonical_contig(c)), 24)
+        git_bin = shutil.which("git")
+        if git_bin is not None and (self.repo_root / ".git").exists():
+            proc = subprocess.run(
+                [git_bin, "check-ignore", "-q", "src/ccnv/io/cytoBand_hg38.gz"],
+                cwd=self.repo_root,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 1)
 
 
 class TestRepositoryCodebaseContracts(unittest.TestCase):
