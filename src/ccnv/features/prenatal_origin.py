@@ -269,8 +269,8 @@ def classify_segment_origin_5state(
 
     cand_ffs: tuple[float, ...] = (f_bio,)
     if twin_min_ff is not None and twin_min_ff > 0.0:
-        f_1 = float(np.clip(twin_min_ff, 0.001, f_bio))
-        f_2 = float(np.clip(f_bio - f_1, 0.001, f_bio))
+        f_1 = float(np.clip(twin_min_ff, 1e-4, f_bio))
+        f_2 = float(np.clip(f_bio - f_1, 1e-4, f_bio))
         cand_ffs = (f_bio, f_1, f_2)
 
     ll_fc = -math.inf
@@ -403,10 +403,10 @@ def annotate_prenatal_origin_and_lod(
     v_sys = max(float(sys_var_per_mb), 0.0)
     sig_35mb = math.sqrt(1.0 / (d_mb * 35.0) + v_sys / 35.0)
     sig_3mb = math.sqrt(1.0 / (d_mb * 3.0) + v_sys / 3.0)
-    lod_ff_35mb = float(np.clip(2.0 * z_target * sig_35mb * lod_scale, 0.005, 0.49))
-    lod_ff_3mb = float(
-        np.clip(2.0 * z_target * sig_3mb * lod_scale, lod_ff_35mb + 0.001, 0.499)
-    )
+    base_35mb = float(np.clip(2.0 * z_target * sig_35mb, 0.005, 0.49))
+    base_3mb = float(np.clip(2.0 * z_target * sig_3mb, base_35mb + 0.001, 0.499))
+    lod_ff_35mb = base_35mb * lod_scale
+    lod_ff_3mb = base_3mb * lod_scale
     lod_metrics = PrenatalLoDMetrics(lod_ff_35mb=lod_ff_35mb, lod_ff_3mb=lod_ff_3mb)
 
     uniform_24 = np.full(NUM_FRAG_BANDS, 1.0 / NUM_FRAG_BANDS, dtype=np.float64)
@@ -588,9 +588,11 @@ def annotate_sample_prenatal_segments(
             and prenatal_result.male_ff is not None
             and prenatal_result.female_ff is not None
         ):
-            f_twin_min = max(
-                float(min(prenatal_result.male_ff, prenatal_result.female_ff)),
-                min(0.01, 0.5 * float(prenatal_result.active_ff)),
+            raw_min = float(min(prenatal_result.male_ff, prenatal_result.female_ff))
+            f_twin_min = (
+                max(raw_min, 1e-4)
+                if raw_min > 0.0
+                else min(0.01, 0.5 * float(prenatal_result.active_ff))
             )
         else:
             f_twin_min = 0.5 * float(prenatal_result.active_ff)

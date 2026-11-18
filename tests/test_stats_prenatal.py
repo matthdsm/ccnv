@@ -543,156 +543,23 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
         sigma_x = 0.5 * 0.009393 / 0.398684
 
         empirical_twins = [
-            (
-                "sample1",
-                "FM",
-                ("F", "M"),
-                "M",
-                0.154,
-                0.133,
-                0.102,
-                0.352,
-                0.351,
-                0.00025,
-            ),
-            (
-                "sample2",
-                "MM",
-                ("M", "M"),
-                "M",
-                0.173,
-                0.156,
-                0.102,
-                0.174,
-                0.171,
-                0.00028,
-            ),
-            (
-                "sample3",
-                "MM",
-                ("M", "M"),
-                "M",
-                0.244,
-                0.284,
-                0.102,
-                0.196,
-                0.177,
-                0.00039,
-            ),
-            (
-                "sample4",
-                "FF",
-                ("F", "F"),
-                "F",
-                None,
-                0.044,
-                0.103,
-                0.305,
-                0.294,
-                0.00000,
-            ),
-            (
-                "sample5",
-                "MM",
-                ("M", "M"),
-                "M",
-                0.119,
-                0.085,
-                0.100,
-                0.084,
-                0.116,
-                0.00019,
-            ),
-            (
-                "sample6",
-                "FM",
-                ("F", "M"),
-                "M",
-                0.143,
-                0.154,
-                0.102,
-                0.218,
-                0.144,
-                0.00023,
-            ),
-            (
-                "sample7",
-                "FF",
-                ("F", "F"),
-                "F",
-                None,
-                -0.010,
-                0.101,
-                0.093,
-                0.096,
-                0.00000,
-            ),
-            (
-                "sample8",
-                "FM",
-                ("F", "M"),
-                "M",
-                0.094,
-                0.134,
-                0.097,
-                0.128,
-                0.096,
-                0.00015,
-            ),
-            (
-                "sample9",
-                "MM",
-                ("M", "M"),
-                "M",
-                0.127,
-                0.131,
-                0.100,
-                0.069,
-                0.126,
-                0.00021,
-            ),
-            (
-                "sample10",
-                "MM",
-                ("M", "M"),
-                "M",
-                0.176,
-                0.145,
-                0.103,
-                0.181,
-                0.174,
-                0.00028,
-            ),
-            (
-                "sample11",
-                "FF",
-                ("F", "F"),
-                "F",
-                None,
-                -0.015,
-                0.103,
-                0.082,
-                0.088,
-                0.00000,
-            ),
-            (
-                "sample12",
-                "FM",
-                ("F", "M"),
-                "M",
-                0.075,
-                0.073,
-                0.100,
-                0.177,
-                0.159,
-                0.00012,
-            ),
+            ("sample1", "FM", "M", 0.154, 0.133, 0.102, 0.352, 0.351, 0.00025),
+            ("sample2", "MM", "M", 0.173, 0.156, 0.102, 0.174, 0.171, 0.00028),
+            ("sample3", "MM", "M", 0.244, 0.284, 0.102, 0.196, 0.177, 0.00039),
+            ("sample4", "FF", "F", None, 0.044, 0.103, 0.305, 0.294, 0.00000),
+            ("sample5", "MM", "M", 0.119, 0.085, 0.100, 0.084, 0.116, 0.00019),
+            ("sample6", "FM", "M", 0.143, 0.154, 0.102, 0.218, 0.144, 0.00023),
+            ("sample7", "FF", "F", None, -0.010, 0.101, 0.093, 0.096, 0.00000),
+            ("sample8", "FM", "M", 0.094, 0.134, 0.097, 0.128, 0.096, 0.00015),
+            ("sample9", "MM", "M", 0.127, 0.131, 0.100, 0.069, 0.126, 0.00021),
+            ("sample10", "MM", "M", 0.176, 0.145, 0.103, 0.181, 0.174, 0.00028),
+            ("sample11", "FF", "F", None, -0.015, 0.103, 0.082, 0.088, 0.00000),
+            ("sample12", "FM", "M", 0.075, 0.073, 0.100, 0.177, 0.159, 0.00012),
         ]
 
         for (
             sid,
             truth_call,
-            truth_sexes,
             sex,
             ffy,
             ffx,
@@ -701,6 +568,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
             act_ff,
             chry_sc,
         ) in empirical_twins:
+            truth_sexes = (truth_call[0], truth_call[1])
             delta_x = -0.5 * ffx
             cls = classify_twin_pregnancy(
                 fetal_sex="F" if sex == "F" else "M",
@@ -829,9 +697,9 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
             active_ff_source="FUSED",
             twins=False,
         )
-        self.assertEqual(ff_high.gestation, "twin")
-        self.assertTrue(ff_high.twin.is_twin)
-        self.assertEqual(ff_high.fetal_sexes, ("F", "F"))
+        self.assertEqual(ff_high.gestation, "singleton")
+        self.assertFalse(ff_high.twin.is_twin)
+        self.assertIsNone(ff_high.fetal_sexes)
         self.assertGreater(ff_high.twin.twin_probability, 0.80)
 
         xy_single = classify_twin_pregnancy(
@@ -963,6 +831,29 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
         self.assertEqual(missing_ffy_male.gestation, "singleton")
         self.assertEqual(missing_ffy_male.twin.call, "MM")
         self.assertAlmostEqual(missing_ffy_male.twin.male_ff, 0.12, places=5)
+        self.assertLess(missing_ffy_male.twin.confidence, 0.55)
+
+        missing_ffy_fm_twin = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00020,
+            yfrac_threshold=0.000043,
+            ffy=None,
+            sigma_ffy=0.005,
+            delta_x=-0.055,
+            sigma_x=0.005,
+            ffa=0.22,
+            sigma_ffa=0.005,
+            ff_size=None,
+            sigma_size=0.02,
+            active_ff=0.22,
+            active_ff_se=0.005,
+            active_ff_source="FFA",
+            twins=True,
+        )
+        self.assertEqual(missing_ffy_fm_twin.gestation, "twin")
+        self.assertEqual(missing_ffy_fm_twin.twin.call, "FM")
+        self.assertAlmostEqual(missing_ffy_fm_twin.male_ff or 0.0, 0.11, places=3)
+        self.assertAlmostEqual(missing_ffy_fm_twin.female_ff or 0.0, 0.11, places=3)
 
         unequal_fm = classify_twin_pregnancy(
             fetal_sex="M",

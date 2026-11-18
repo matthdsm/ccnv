@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
+from html.parser import HTMLParser
 from pathlib import Path
 
 import numpy as np
@@ -61,6 +62,17 @@ def _extract_payload(html: str) -> dict[str, object]:
     return loaded
 
 
+class _LiveIdParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ids: list[str] = []
+
+    def handle_starttag(self, _tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for k, v in attrs:
+            if k == "id" and v:
+                self.ids.append(v)
+
+
 def _run_plot_script_in_node(html: str) -> dict[str, object] | None:
     node_bin = shutil.which("node")
     if node_bin is None:
@@ -73,6 +85,8 @@ def _run_plot_script_in_node(html: str) -> dict[str, object] | None:
     script_matches = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)
     if payload_match is None or not script_matches:
         raise AssertionError("Expected payload and inline script in rendered HTML")
+    parser = _LiveIdParser()
+    parser.feed(html)
     harness = """
 const fs = require("fs");
 const vm = require("vm");
@@ -84,11 +98,8 @@ const mkEl = (id, textContent = "") => ({
   addEventListener(ev, fn) { (this.listeners[ev] ||= []).push(fn); },
   on() {},
 });
-elements.set("ccnv-data", mkEl("ccnv-data", input.payload));
-for (const id of [
-  "z-input", "r-input", "prenatal-badge", "disc-legend",
-  "plot", "bin-tooltip", "search-err", "search-form", "coord-input", "reset-btn",
-]) elements.set(id, mkEl(id));
+for (const id of input.ids) elements.set(id, mkEl(id));
+if (elements.has("ccnv-data")) elements.get("ccnv-data").textContent = input.payload;
 const calls = [];
 const snap = traces => traces.map(t => ({
   name: t.name || null,
@@ -103,7 +114,7 @@ vm.runInNewContext(input.script, {
   atob: s => Buffer.from(s, "base64").toString("binary"),
   setTimeout: fn => { fn(); return 1; },
   clearTimeout: () => {},
-  document: { getElementById: id => elements.get(id) || mkEl(id) },
+  document: { getElementById: id => elements.get(id) || null },
   Plotly: {
     newPlot(el, traces, layout) {
       el.layout = layout;
@@ -119,14 +130,18 @@ for (const fn of elements.get("z-input").listeners.input || []) fn();
 const badge = elements.get("prenatal-badge");
 process.stdout.write(JSON.stringify({
   calls,
-  badgeDisplay: badge.style.display || "",
-  badgeHtml: badge.innerHTML || "",
+  badgeDisplay: badge ? (badge.style.display || "") : "",
+  badgeHtml: badge ? (badge.innerHTML || "") : "",
 }));
 """
     proc = subprocess.run(
         [node_bin, "-e", harness],
         input=json.dumps(
-            {"payload": payload_match.group(1), "script": script_matches[-1]}
+            {
+                "ids": parser.ids,
+                "payload": payload_match.group(1),
+                "script": script_matches[-1],
+            }
         ),
         text=True,
         capture_output=True,

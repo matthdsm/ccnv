@@ -508,6 +508,43 @@ class TestFetalFractionResult(unittest.TestCase):
         self.assertAlmostEqual(ff_res.male_ff or 0.0, 0.14)
         self.assertAlmostEqual(ff_res.female_ff or 0.0, 0.08)
         self.assertAlmostEqual(ff_res.twin_confidence or 0.0, 0.97)
+        ff_explicit_twin = FetalFractionResult(
+            fetal_sex="M",
+            active_ff=0.22,
+            active_ff_source="FF_SIZE",
+            ffy=0.14,
+            ffx=0.15,
+            ffa=0.10,
+            chrx_ratio=0.81,
+            chry_score=0.00023,
+            yfrac_threshold=0.000043,
+            sca=SCAResult(
+                call="XY", is_aneuploid=False, confidence=0.99, chrx_zscore=-6.5
+            ),
+            gestation="twin",
+            twin=twin,
+        )
+        self.assertEqual(ff_explicit_twin.fetal_sexes, ("F", "M"))
+        self.assertAlmostEqual(ff_explicit_twin.male_ff or 0.0, 0.14)
+        self.assertAlmostEqual(ff_explicit_twin.female_ff or 0.0, 0.08)
+        self.assertAlmostEqual(ff_explicit_twin.twin_confidence or 0.0, 0.97)
+        with self.assertRaisesRegex(ValueError, "conflicts with twin.fetal_sexes"):
+            _call(
+                FetalFractionResult,
+                fetal_sex="M",
+                active_ff=0.22,
+                active_ff_source="FF_SIZE",
+                ffy=0.14,
+                ffx=0.15,
+                ffa=0.10,
+                chrx_ratio=0.81,
+                chry_score=0.00023,
+                yfrac_threshold=0.000043,
+                sca=SCAResult("XY", False, 0.99, -6.5),
+                gestation="twin",
+                fetal_sexes=("M", "M"),
+                twin=twin,
+            )
         with self.assertRaisesRegex(ValueError, "conflicts with twin.is_twin"):
             _call(
                 FetalFractionResult,

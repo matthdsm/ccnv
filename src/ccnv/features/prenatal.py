@@ -761,21 +761,29 @@ def predict_prenatal(
         twins=twins,
         olm_norm=olm_norm,
     )
-    z_x_fm = (delta_x_val + 0.5 * float(ffy or 0.0)) / math.hypot(
-        sigma_x_val, 0.5 * sigma_y_val
-    )
     if (
         twin_cls.gestation == "twin"
         and twin_cls.fetal_sexes == ("F", "M")
         and sca_res.call == "DISCORDANT_MIXED"
-        and abs(z_x_fm) <= 3.5
     ):
+        sca_2d = classify_sca_ray_4d(
+            delta_x_val,
+            sigma_x_val,
+            float(ffy or 0.0),
+            sigma_y_val,
+            None,
+            sigma_y_val,
+            None,
+            sigma_y_val,
+            chrx_llr_fetal=chrx_llr_fetal,
+            clinical_priors=_MALE_SCA_PRIORS,
+        )
         sca_res = SCAResult(
-            call="XY",
-            is_aneuploid=False,
-            confidence=float(np.clip(twin_cls.twin.confidence, 0.5, 1.0)),
-            chrx_zscore=sca_res.chrx_zscore,
-            ff_delta=sca_res.ff_delta,
+            sca_2d.call,
+            sca_2d.call not in ("XX", "XY"),
+            float(np.clip(sca_2d.posterior, 0.5, 1.0)),
+            sca_res.chrx_zscore,
+            sca_res.ff_delta,
         )
     active_ff, active_ff_se, active_ff_source = (
         twin_cls.active_ff,
@@ -905,7 +913,10 @@ def normalize_prenatal_chry(
             f_eff, bg_scale = f_anchor, 1.0
         else:
             mu_f, mu_m = resolve_fisher_moment_weights(bufs, pm)
-            f_tot = float(np.clip(prenatal_result.active_ff, 0.0, 1.0))
+            is_fm = prenatal_result.fetal_sexes == ("F", "M")
+            f_tot = float(
+                np.clip(prenatal_result.active_ff if is_fm else f_anchor, 0.0, 1.0)
+            )
             w_mix = (1.0 - f_tot) * mu_m + f_tot * mu_f
             f_eff = max((f_anchor * mu_f / w_mix) if w_mix > 0.0 else f_anchor, 1e-4)
             bg_scale = (mu_m / w_mix) if w_mix > 0.0 else 1.0

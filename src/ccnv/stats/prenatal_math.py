@@ -762,7 +762,7 @@ def classify_twin_pregnancy(
             else 0.0
         )
         twin_prob = 1.0 if twins else float(np.clip(p_high, 1e-4, 0.999))
-        is_twin = bool(twins or (has_sample_auto and x_euploid_f and f_auto >= 0.25))
+        is_twin = bool(twins)
         conf = (
             p_ff
             if twins
@@ -777,11 +777,21 @@ def classify_twin_pregnancy(
         call: TwinSexPair = "FF"
         sexes: tuple[FetalSex, FetalSex] = ("F", "F")
         m_ff, f_ff = 0.0, out_act_ff
+        has_sex_split = True
     else:
         has_ffy = ffy is not None and math.isfinite(ffy)
-        hat_fy = max(0.0, float(ffy)) if (has_ffy and ffy is not None) else out_act_ff
-        sig_y = max(float(sigma_ffy), 0.005)
         sig_x = max(float(sigma_x), 0.005)
+        has_x_male = (not has_ffy) and (float(delta_x) < -1.5 * sig_x)
+        has_male_meas = bool(has_ffy or has_x_male)
+        if has_ffy and ffy is not None:
+            hat_fy = max(0.0, float(ffy))
+            sig_y = max(float(sigma_ffy), 0.005)
+        elif has_x_male:
+            hat_fy = max(0.0, -2.0 * float(delta_x))
+            sig_y = 2.0 * sig_x
+        else:
+            hat_fy = out_act_ff
+            sig_y = max(float(sigma_ffy), 0.005)
         sig_tot = math.hypot(sig_y, sigma_auto)
         z_x_fm = (float(delta_x) + 0.5 * hat_fy) / math.hypot(sig_x, 0.5 * sig_y)
         x_concordant = bool(
@@ -806,11 +816,14 @@ def classify_twin_pregnancy(
         ll_fm = float(
             np.logaddexp(math.log(0.75) + ll_fm_mid, math.log(0.25) + ll_fm_unif)
         )
-        p_fm_cond = (
-            float(scipy.special.expit(ll_fm - ll_mm + math.log(0.55 / 0.45)))
-            if (has_ffy and (twins or x_concordant))
-            else 0.0
-        )
+        if has_male_meas and (twins or x_concordant):
+            p_fm_cond = float(
+                scipy.special.expit(ll_fm - ll_mm + math.log(0.55 / 0.45))
+            )
+        elif not has_male_meas:
+            p_fm_cond = 0.49
+        else:
+            p_fm_cond = 0.0
         p_ff = 1e-4
         posteriors = {
             "FF": p_ff,
@@ -822,7 +835,7 @@ def classify_twin_pregnancy(
 
         p_fm_auto = (
             float(scipy.special.expit(ll_fm - ll_mm + math.log(0.25 / 0.75)))
-            if (has_ffy and x_concordant and 0.25 * f_auto <= hat_fy < f_auto)
+            if (has_male_meas and x_concordant and 0.25 * f_auto <= hat_fy < f_auto)
             else 0.0
         )
         p_high = (
@@ -838,15 +851,8 @@ def classify_twin_pregnancy(
             1.0 if twins else float(np.clip(max(p_fm_auto, p_high), 1e-4, 0.999))
         )
         is_fm_auto = bool(p_fm_auto > 0.80 and call == "FM")
-        is_mm_auto = bool(
-            not is_fm_auto
-            and has_ffy
-            and has_sample_auto
-            and x_concordant
-            and call == "MM"
-            and min(hat_fy, f_auto) >= 0.25
-        )
-        is_twin = bool(twins or is_fm_auto or is_mm_auto)
+        is_twin = bool(twins or is_fm_auto)
+        has_sex_split = has_male_meas
 
         if call == "FM":
             if is_twin:
@@ -896,8 +902,8 @@ def classify_twin_pregnancy(
         twin=twin_res,
         gestation="twin" if is_twin else "singleton",
         fetal_sexes=sexes if is_twin else None,
-        male_ff=m_ff if is_twin else None,
-        female_ff=f_ff if is_twin else None,
+        male_ff=m_ff if (is_twin and has_sex_split) else None,
+        female_ff=f_ff if (is_twin and has_sex_split) else None,
         twin_confidence=conf if is_twin else None,
         active_ff=out_act_ff,
         active_ff_se=out_se,

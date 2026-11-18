@@ -782,14 +782,28 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
                 ffy_gc_fit,
             ]
         )
-        res_shifted_xx = predict_prenatal(
+        meta_fixed = replace(meta_gc, female_chrx_ratio_mean=0.95)
+        nmask_0 = np.zeros(180, dtype=np.bool_)
+        nmask_1 = np.zeros(180, dtype=np.bool_)
+        nmask_1[80] = True
+        res_unmasked = predict_prenatal(
             xo_bufs,
             ref_unmasked_tbl,
-            replace(meta_gc, female_chrx_ratio_mean=0.95),
+            meta_fixed,
+            sample_n_mask_override=nmask_0,
             twins=False,
         )
-        self.assertEqual(res_shifted_xx.sca.call, "XX")
-        self.assertFalse(res_shifted_xx.sca.is_aneuploid)
+        res_masked_one = predict_prenatal(
+            xo_bufs,
+            ref_unmasked_tbl,
+            meta_fixed,
+            sample_n_mask_override=nmask_1,
+            twins=False,
+        )
+        self.assertAlmostEqual(
+            res_unmasked.chrx_ratio, res_masked_one.chrx_ratio, places=5
+        )
+        self.assertAlmostEqual(res_unmasked.ffx, res_masked_one.ffx, places=5)
 
         chry_unw = normalize_prenatal_chry(fm_bufs, ref_tbl, fm_meta, res_fm_explicit)
         if chry_unw is None:

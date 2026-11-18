@@ -381,9 +381,8 @@ def compute_covariate_chrx_ratio(
     if not np.any(u_x) or not np.any(u_a):
         return None
     rx_cov = float(np.median(cts[u_x] / e0[u_x]) / np.median(cts[u_a] / e0[u_a]))
-    mu_x0 = 1.0 if np.any(ref_masked[is_x]) else float(pm.female_chrx_ratio_mean)
     return float(
-        pm.female_chrx_ratio_mean + (rx_cov - mu_x0) * (-2.0 * float(pm.alpha_1))
+        pm.female_chrx_ratio_mean + (rx_cov - 1.0) * (-2.0 * float(pm.alpha_1))
     )
 
 
@@ -657,11 +656,10 @@ def resolve_chry_anchor_ff(
         and prenatal_result.male_ff is not None
     )
     if is_fm_twin and prenatal_result.male_ff is not None:
-        m_ratio = float(prenatal_result.male_ff) / max(
-            float(prenatal_result.active_ff), 1e-6
+        f_base = max(
+            min(float(prenatal_result.male_ff), float(prenatal_result.active_ff)),
+            1e-4,
         )
-        m_share = float(np.clip(m_ratio, 0.05, 1.0))
-        f_base = max(float(prenatal_result.active_ff) * m_share, 1e-4)
         se_base = max(math.hypot(se_ffy_obs, float(pm.ffy_std)), 0.005)
     else:
         f_base = max(float(prenatal_result.active_ff), 1e-4)
