@@ -14,11 +14,14 @@ from ccnv.models import (
 from ccnv.models.results import (
     BranchQCStatus,
     FetalFractionResult,
+    GestationType,
     PredictionOutputs,
     ReferenceQCOutputs,
     SCACall,
     SCAResult,
     SegmentResult,
+    TwinResult,
+    TwinSexPair,
 )
 from ccnv.stats.prenatal_math import classify_sca_ray_4d
 
@@ -144,6 +147,7 @@ class TestPredictConfig(unittest.TestCase):
         self.assertEqual(config.sex, "autosomal")
         self.assertEqual(config.threads, 1)
         self.assertFalse(config.bins_vcf)
+        self.assertFalse(config.twins)
         self.assertFalse(hasattr(config, "bin_size"))
 
     def test_predict_config_prenatal_mode(self) -> None:
@@ -153,9 +157,11 @@ class TestPredictConfig(unittest.TestCase):
             prefix=Path("out"),
             mode="prenatal",
             min_fetal_fraction_warning=0.05,
+            twins=True,
         )
         self.assertEqual(config.mode, "prenatal")
         self.assertAlmostEqual(config.min_fetal_fraction_warning, 0.05)
+        self.assertTrue(config.twins)
 
     def test_predict_config_validation(self) -> None:
         with self.assertRaisesRegex(
@@ -192,6 +198,14 @@ class TestPredictConfig(unittest.TestCase):
                 reference=Path("r"),
                 prefix=Path("o"),
                 threads=0,
+            )
+        with self.assertRaisesRegex(TypeError, "twins must be a boolean"):
+            _call(
+                PredictConfig,
+                sample=Path("s"),
+                reference=Path("r"),
+                prefix=Path("o"),
+                twins="yes",
             )
 
     def test_predict_config_immutability(self) -> None:
@@ -462,6 +476,187 @@ class TestFetalFractionResult(unittest.TestCase):
         parsed = PrenatalModelMetadata.from_dict(raw_meta)
         self.assertTrue(parsed.ffa_logit_mode)
 
+    def test_twin_result_and_fetal_fraction_result_validation(self) -> None:
+        twin = TwinResult(
+            call="FM",
+            fetal_sexes=("F", "M"),
+            is_twin=True,
+            twin_probability=0.95,
+            confidence=0.97,
+            posteriors={"FF": 0.001, "FM": 0.969, "MM": 0.030},
+            male_ff=0.14,
+            female_ff=0.08,
+        )
+        ff_res = FetalFractionResult(
+            fetal_sex="M",
+            active_ff=0.22,
+            active_ff_source="FF_SIZE",
+            ffy=0.14,
+            ffx=0.15,
+            ffa=0.10,
+            chrx_ratio=0.81,
+            chry_score=0.00023,
+            yfrac_threshold=0.000043,
+            sca=SCAResult(
+                call="XY", is_aneuploid=False, confidence=0.99, chrx_zscore=-6.5
+            ),
+            twin=twin,
+        )
+        self.assertEqual(ff_res.gestation, "twin")
+        self.assertEqual(ff_res.fetal_sexes, ("F", "M"))
+        self.assertEqual(ff_res.twin, twin)
+        self.assertAlmostEqual(ff_res.male_ff or 0.0, 0.14)
+        self.assertAlmostEqual(ff_res.female_ff or 0.0, 0.08)
+        self.assertAlmostEqual(ff_res.twin_confidence or 0.0, 0.97)
+        ff_explicit_twin = FetalFractionResult(
+            fetal_sex="M",
+            active_ff=0.22,
+            active_ff_source="FF_SIZE",
+            ffy=0.14,
+            ffx=0.15,
+            ffa=0.10,
+            chrx_ratio=0.81,
+            chry_score=0.00023,
+            yfrac_threshold=0.000043,
+            sca=SCAResult(
+                call="XY", is_aneuploid=False, confidence=0.99, chrx_zscore=-6.5
+            ),
+            gestation="twin",
+            twin=twin,
+        )
+        self.assertEqual(ff_explicit_twin.fetal_sexes, ("F", "M"))
+        self.assertAlmostEqual(ff_explicit_twin.male_ff or 0.0, 0.14)
+        self.assertAlmostEqual(ff_explicit_twin.female_ff or 0.0, 0.08)
+        self.assertAlmostEqual(ff_explicit_twin.twin_confidence or 0.0, 0.97)
+        with self.assertRaisesRegex(ValueError, "conflicts with twin.fetal_sexes"):
+            _call(
+                FetalFractionResult,
+                fetal_sex="M",
+                active_ff=0.22,
+                active_ff_source="FF_SIZE",
+                ffy=0.14,
+                ffx=0.15,
+                ffa=0.10,
+                chrx_ratio=0.81,
+                chry_score=0.00023,
+                yfrac_threshold=0.000043,
+                sca=SCAResult("XY", False, 0.99, -6.5),
+                gestation="twin",
+                fetal_sexes=("M", "M"),
+                twin=twin,
+            )
+        with self.assertRaisesRegex(ValueError, "conflicts with twin.is_twin"):
+            _call(
+                FetalFractionResult,
+                fetal_sex="M",
+                active_ff=0.12,
+                active_ff_source="FFY",
+                ffy=0.12,
+                ffx=0.12,
+                ffa=0.12,
+                chrx_ratio=0.94,
+                chry_score=0.01,
+                yfrac_threshold=0.001,
+                sca=SCAResult("XY", False, 0.99, -2.0),
+                twin=TwinResult(
+                    call="MM",
+                    fetal_sexes=("M", "M"),
+                    is_twin=False,
+                    twin_probability=0.05,
+                    confidence=0.95,
+                    posteriors={"FF": 0.0, "FM": 0.05, "MM": 0.95},
+                    male_ff=0.12,
+                    female_ff=0.0,
+                ),
+                gestation="twin",
+            )
+        with self.assertRaisesRegex(ValueError, "does not match fetal_sexes"):
+            _call(
+                TwinResult,
+                call="FF",
+                fetal_sexes=("M", "M"),
+                is_twin=True,
+                twin_probability=0.9,
+                confidence=0.9,
+                posteriors={},
+                male_ff=0.1,
+                female_ff=0.0,
+            )
+
+        for pair, sexes in (("FF", ("F", "F")), ("FM", ("F", "M")), ("MM", ("M", "M"))):
+            t_pair: TwinSexPair = pair
+            g_type: GestationType = "twin"
+            tr = TwinResult(
+                call=t_pair,
+                fetal_sexes=sexes,
+                is_twin=True,
+                twin_probability=1.0,
+                confidence=0.9,
+                posteriors={"FF": 0.1, "FM": 0.8, "MM": 0.1},
+                male_ff=0.1,
+                female_ff=0.1,
+            )
+            self.assertEqual(tr.call, t_pair)
+            self.assertEqual(tr.fetal_sexes, sexes)
+            self.assertEqual(g_type, "twin")
+
+        with self.assertRaisesRegex(ValueError, "invalid twin call"):
+            _call(
+                TwinResult,
+                call="MF",
+                fetal_sexes=("F", "M"),
+                is_twin=True,
+                twin_probability=0.9,
+                confidence=0.9,
+                posteriors={},
+                male_ff=0.1,
+                female_ff=0.1,
+            )
+        with self.assertRaisesRegex(ValueError, "invalid twin fetal_sexes"):
+            _call(
+                TwinResult,
+                call="FM",
+                fetal_sexes=("M", "F"),
+                is_twin=True,
+                twin_probability=0.9,
+                confidence=0.9,
+                posteriors={},
+                male_ff=0.1,
+                female_ff=0.1,
+            )
+        with self.assertRaisesRegex(
+            ValueError, "gestation must be 'singleton' or 'twin'"
+        ):
+            _call(
+                FetalFractionResult,
+                fetal_sex="F",
+                active_ff=0.1,
+                active_ff_source="FFA",
+                ffy=None,
+                ffx=0.1,
+                ffa=0.1,
+                chrx_ratio=1.0,
+                chry_score=0.0,
+                yfrac_threshold=0.01,
+                sca=SCAResult("XX", False, 0.99, 0.0),
+                gestation="triplet",
+            )
+        with self.assertRaisesRegex(ValueError, "fetal_sexes must be"):
+            _call(
+                FetalFractionResult,
+                fetal_sex="M",
+                active_ff=0.1,
+                active_ff_source="FFA",
+                ffy=0.1,
+                ffx=0.1,
+                ffa=0.1,
+                chrx_ratio=0.95,
+                chry_score=0.02,
+                yfrac_threshold=0.01,
+                sca=SCAResult("XY", False, 0.99, -1.0),
+                fetal_sexes=("M", "F"),
+            )
+
 
 class TestPredictionOutputsAliasesAndFields(unittest.TestCase):
     def test_prediction_outputs_optional_qc_and_prenatal(self) -> None:
@@ -692,6 +887,9 @@ class TestModelReExports(unittest.TestCase):
             "SCACall",
             "FetalSex",
             "ActiveFFSource",
+            "GestationType",
+            "TwinSexPair",
+            "TwinResult",
             "SAMPLE_SCHEMA",
             "REFERENCE_SCHEMA",
             "SCHEMA_VERSION",

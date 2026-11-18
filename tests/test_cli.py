@@ -683,6 +683,40 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0, result.output)
                 config = run.call_args.args[0]
                 self.assertEqual(config.mode, "prenatal")
+                self.assertFalse(config.twins)
+
+            with patch("ccnv.cli.run_predict") as run:
+                result = CliRunner().invoke(
+                    app,
+                    [
+                        "predict",
+                        str(sample),
+                        str(reference),
+                        "--mode",
+                        "prenatal",
+                        "--twins",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, result.output)
+                config = run.call_args.args[0]
+                self.assertEqual(config.mode, "prenatal")
+                self.assertTrue(config.twins)
+
+            with patch("ccnv.cli.run_predict") as run:
+                result = CliRunner().invoke(
+                    app,
+                    [
+                        "predict",
+                        str(sample),
+                        str(reference),
+                        "--mode",
+                        "prenatal",
+                        "--no-twins",
+                    ],
+                )
+                self.assertEqual(result.exit_code, 0, result.output)
+                config = run.call_args.args[0]
+                self.assertFalse(config.twins)
 
     def test_predict_rejects_invalid_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

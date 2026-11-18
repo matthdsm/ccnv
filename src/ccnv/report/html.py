@@ -372,8 +372,35 @@ def render_genome_plot(
             if prenatal_result.effective_ff is not None
             else prenatal_result.active_ff
         )
+        twin_payload: dict[str, object] | None = None
+        if prenatal_result.twin is not None:
+            twin_payload = {
+                "call": prenatal_result.twin.call,
+                "fetal_sexes": list(prenatal_result.twin.fetal_sexes),
+                "is_twin": bool(prenatal_result.twin.is_twin),
+                "twin_probability": _finite_or_none(
+                    prenatal_result.twin.twin_probability
+                ),
+                "confidence": _finite_or_none(prenatal_result.twin.confidence),
+                "posteriors": {
+                    str(k): _finite_or_zero(v)
+                    for k, v in prenatal_result.twin.posteriors.items()
+                },
+                "male_ff": _finite_or_none(prenatal_result.twin.male_ff),
+                "female_ff": _finite_or_none(prenatal_result.twin.female_ff),
+            }
         payload["prenatal"] = {
             "fetal_sex": prenatal_result.fetal_sex,
+            "gestation": prenatal_result.gestation,
+            "fetal_sexes": (
+                list(prenatal_result.fetal_sexes)
+                if prenatal_result.fetal_sexes is not None
+                else None
+            ),
+            "male_ff": _finite_or_none(prenatal_result.male_ff),
+            "female_ff": _finite_or_none(prenatal_result.female_ff),
+            "twin_confidence": _finite_or_none(prenatal_result.twin_confidence),
+            "twin": twin_payload,
             "active_ff": _finite_or_none(prenatal_result.active_ff),
             "effective_ff": _finite_or_none(raw_eff_ff, 6),
             "active_ff_source": prenatal_result.active_ff_source,

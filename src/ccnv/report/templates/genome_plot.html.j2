@@ -232,8 +232,15 @@
     const ffaStr = p.ffa !== null && p.ffa !== undefined ? `${(p.ffa * 100).toFixed(1)}%` : "N/A";
     const ffxStr = p.ffx !== null && p.ffx !== undefined ? `${(p.ffx * 100).toFixed(1)}%` : "N/A";
     const ffSizeStr = p.ff_size !== null && p.ff_size !== undefined ? `${(p.ff_size * 100).toFixed(1)}%` : "N/A";
-    badgeEl.innerHTML = `<span><strong>Fetal Sex:</strong> ${escHtml(p.fetal_sex)}</span>` +
+    const sexStr = p.gestation === "twin" && p.fetal_sexes
+      ? escHtml(`Twins (${p.fetal_sexes.join("/")})`)
+      : escHtml(p.fetal_sex);
+    const twinFfHtml = p.gestation === "twin" && p.fetal_sexes && p.male_ff !== null && p.male_ff !== undefined && p.female_ff !== null && p.female_ff !== undefined
+      ? `<span>|</span><span><strong>Twin FF (M/F):</strong> ${(p.male_ff * 100).toFixed(1)}% / ${(p.female_ff * 100).toFixed(1)}%</span>`
+      : "";
+    badgeEl.innerHTML = `<span><strong>Fetal Sex:</strong> ${sexStr}</span>` +
       `<span>|</span><span><strong>Active FF:</strong> ${ffPct} (${escHtml(p.active_ff_source)})</span>` +
+      twinFfHtml +
       `<span>|</span><span><strong>FF (Y/A/X/Size):</strong> ${ffyStr} / ${ffaStr} / ${ffxStr} / ${ffSizeStr}</span>` +
       `<span>|</span><span><strong>SCA:</strong> ${escHtml(p.sca_call)}</span>`;
     badgeEl.style.display = "inline-flex";

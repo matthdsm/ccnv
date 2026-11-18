@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
+from html.parser import HTMLParser
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +35,7 @@ from ccnv.models.results import (
     FetalFractionResult,
     SCAResult,
     SegmentResult,
+    TwinResult,
 )
 from ccnv.predict import run as run_predict
 from ccnv.report import (
@@ -57,6 +59,97 @@ def _extract_payload(html: str) -> dict[str, object]:
     loaded = json.loads(match.group(1))
     if not isinstance(loaded, dict):
         raise TypeError("ccnv-data JSON payload is not an object")
+    return loaded
+
+
+class _LiveIdParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ids: list[str] = []
+
+    def handle_starttag(self, _tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for k, v in attrs:
+            if k == "id" and v:
+                self.ids.append(v)
+
+
+def _run_plot_script_in_node(html: str) -> dict[str, object] | None:
+    node_bin = shutil.which("node")
+    if node_bin is None:
+        return None
+    payload_match = re.search(
+        r'<script id="ccnv-data" type="application/json">(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    script_matches = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)
+    if payload_match is None or not script_matches:
+        raise AssertionError("Expected payload and inline script in rendered HTML")
+    parser = _LiveIdParser()
+    parser.feed(html)
+    harness = """
+const fs = require("fs");
+const vm = require("vm");
+const input = JSON.parse(fs.readFileSync(0, "utf8"));
+const elements = new Map();
+const mkEl = (id, textContent = "") => ({
+  id, value: "", textContent, innerHTML: "", className: "", style: {},
+  layout: { xaxis: { range: [0, 1] } }, listeners: {},
+  addEventListener(ev, fn) { (this.listeners[ev] ||= []).push(fn); },
+  on() {},
+});
+for (const id of input.ids) elements.set(id, mkEl(id));
+if (elements.has("ccnv-data")) elements.get("ccnv-data").textContent = input.payload;
+const calls = [];
+const snap = traces => traces.map(t => ({
+  name: t.name || null,
+  type: t.type,
+  yaxis: t.yaxis || "y",
+  hasClip: Object.prototype.hasOwnProperty.call(t, "cliponaxis"),
+  nPts: t.x ? t.x.length : 0,
+}));
+vm.runInNewContext(input.script, {
+  Buffer, Uint8Array, Uint16Array, Uint32Array, Int8Array, Float32Array, Float64Array,
+  Math, Number, String, Boolean, Array, Map, Object, JSON, parseFloat, isNaN,
+  atob: s => Buffer.from(s, "base64").toString("binary"),
+  setTimeout: fn => { fn(); return 1; },
+  clearTimeout: () => {},
+  document: { getElementById: id => elements.get(id) || null },
+  Plotly: {
+    newPlot(el, traces, layout) {
+      el.layout = layout;
+      calls.push(snap(traces));
+      return { then: fn => fn && fn() };
+    },
+    react(_el, traces) { calls.push(snap(traces)); },
+    relayout() {},
+  },
+});
+elements.get("z-input").value = "4.0";
+for (const fn of elements.get("z-input").listeners.input || []) fn();
+const badge = elements.get("prenatal-badge");
+process.stdout.write(JSON.stringify({
+  calls,
+  badgeDisplay: badge ? (badge.style.display || "") : "",
+  badgeHtml: badge ? (badge.innerHTML || "") : "",
+}));
+"""
+    proc = subprocess.run(
+        [node_bin, "-e", harness],
+        input=json.dumps(
+            {
+                "ids": parser.ids,
+                "payload": payload_match.group(1),
+                "script": script_matches[-1],
+            }
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    loaded = json.loads(proc.stdout)
+    if not isinstance(loaded, dict):
+        raise TypeError("Expected Node harness JSON object")
     return loaded
 
 
@@ -331,6 +424,80 @@ class TestHtmlReport(unittest.TestCase):
             (len(seg_rows[0]), seg_rows[0][6], seg_rows[0][9]),
             (13, True, "SUB_FETAL_RATIO"),
         )
+        self.assertEqual(prenatal_dict["gestation"], "singleton")
+        self.assertIsNone(prenatal_dict["fetal_sexes"])
+        self.assertIsNone(prenatal_dict["twin"])
+
+    def test_render_genome_plot_with_prenatal_twin_metadata_and_banner(self) -> None:
+        contig_lengths = {"chr1": 200_000}
+        bins = (_make_bin_result("autosomal", ("chr1",), [0], [200_000], 0.0, 0.0),)
+        sca = SCAResult("XY", False, 0.99, -6.5)
+        twin = TwinResult(
+            call="FM",
+            fetal_sexes=("F", "M"),
+            is_twin=True,
+            twin_probability=0.92,
+            confidence=0.9718,
+            posteriors={"FF": 0.0001, "FM": 0.9718, "MM": 0.0281},
+            male_ff=0.143,
+            female_ff=0.075,
+        )
+        prenatal = FetalFractionResult(
+            "M",
+            0.218,
+            "FF_SIZE",
+            0.143,
+            0.15,
+            0.101,
+            0.81,
+            0.00023,
+            0.000043,
+            sca,
+            twin=twin,
+            gestation="twin",
+            fetal_sexes=("F", "M"),
+            male_ff=0.143,
+            female_ff=0.075,
+            twin_confidence=0.9718,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html_path = Path(tmpdir) / "twin_plot.html"
+            render_genome_plot(
+                html_path, bins, (), contig_lengths, prenatal_result=prenatal
+            )
+            content = html_path.read_text(encoding="utf-8")
+
+        node_out = _run_plot_script_in_node(content)
+        if node_out is not None:
+            self.assertEqual(node_out["badgeDisplay"], "inline-flex")
+            badge_html = str(node_out["badgeHtml"])
+            self.assertIn("Twins (F/M)", badge_html)
+            self.assertIn("<strong>Twin FF (M/F):</strong> 14.3% / 7.5%", badge_html)
+        else:
+            self.assertIn('Twins (${p.fetal_sexes.join("/")})', content)
+            self.assertIn("Twin FF (M/F):", content)
+        payload = _extract_payload(content)
+        p_dict = payload["prenatal"]
+        if not isinstance(p_dict, dict):
+            self.fail("Expected payload['prenatal'] to be a dict")
+        self.assertEqual(p_dict["gestation"], "twin")
+        self.assertEqual(p_dict["fetal_sexes"], ["F", "M"])
+        self.assertEqual(p_dict["male_ff"], 0.143)
+        self.assertEqual(p_dict["female_ff"], 0.075)
+        self.assertEqual(p_dict["twin_confidence"], 0.9718)
+        self.assertEqual(
+            p_dict["twin"],
+            {
+                "call": "FM",
+                "fetal_sexes": ["F", "M"],
+                "is_twin": True,
+                "twin_probability": 0.92,
+                "confidence": 0.9718,
+                "posteriors": {"FF": 0.0001, "FM": 0.9718, "MM": 0.0281},
+                "male_ff": 0.143,
+                "female_ff": 0.075,
+            },
+        )
 
     def test_render_genome_plot_natural_chrom_sort_order(self) -> None:
         contig_lengths = {c: 50_000 for c in ("chr10", "chr2", "chr1", "chrY", "chrX")}
@@ -572,8 +739,8 @@ class TestHtmlReport(unittest.TestCase):
             "Segments (Loss)",
             "Segments (Discordant)",
         ]
-        node_bin = shutil.which("node")
-        if node_bin is None:
+        node_out = _run_plot_script_in_node(html)
+        if node_out is None:
             mk_lines_match = re.search(
                 r"const mkLines\s*=\s*\([^)]*\)\s*=>\s*\(\{(.*?)\}\);",
                 html,
@@ -600,72 +767,9 @@ class TestHtmlReport(unittest.TestCase):
             self.assertEqual(positions, sorted(positions))
             return
 
-        payload_match = re.search(
-            r'<script id="ccnv-data" type="application/json">(.*?)</script>',
-            html,
-            re.DOTALL,
-        )
-        script_matches = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)
-        if payload_match is None or not script_matches:
-            self.fail("Expected payload and inline script in rendered HTML")
-        harness = """
-const fs = require("fs");
-const vm = require("vm");
-const input = JSON.parse(fs.readFileSync(0, "utf8"));
-const elements = new Map();
-const mkEl = (id, textContent = "") => ({
-  id, value: "", textContent, innerHTML: "", className: "", style: {},
-  layout: { xaxis: { range: [0, 1] } }, listeners: {},
-  addEventListener(ev, fn) { (this.listeners[ev] ||= []).push(fn); },
-  on() {},
-});
-elements.set("ccnv-data", mkEl("ccnv-data", input.payload));
-for (const id of [
-  "z-input", "r-input", "prenatal-badge", "disc-legend",
-  "plot", "bin-tooltip", "search-err", "search-form", "coord-input", "reset-btn",
-]) elements.set(id, mkEl(id));
-const calls = [];
-const snap = traces => traces.map(t => ({
-  name: t.name || null,
-  type: t.type,
-  yaxis: t.yaxis || "y",
-  hasClip: Object.prototype.hasOwnProperty.call(t, "cliponaxis"),
-  nPts: t.x ? t.x.length : 0,
-}));
-vm.runInNewContext(input.script, {
-  Buffer, Uint8Array, Uint16Array, Uint32Array, Int8Array, Float32Array, Float64Array,
-  Math, Number, String, Boolean, Array, Map, Object, JSON, parseFloat, isNaN,
-  atob: s => Buffer.from(s, "base64").toString("binary"),
-  setTimeout: fn => { fn(); return 1; },
-  clearTimeout: () => {},
-  document: { getElementById: id => elements.get(id) || mkEl(id) },
-  Plotly: {
-    newPlot(el, traces, layout) {
-      el.layout = layout;
-      calls.push(snap(traces));
-      return { then: fn => fn && fn() };
-    },
-    react(_el, traces) { calls.push(snap(traces)); },
-    relayout() {},
-  },
-});
-elements.get("z-input").value = "4.0";
-for (const fn of elements.get("z-input").listeners.input || []) fn();
-process.stdout.write(JSON.stringify(calls));
-"""
-        proc = subprocess.run(
-            [node_bin, "-e", harness],
-            input=json.dumps(
-                {
-                    "payload": payload_match.group(1),
-                    "script": script_matches[-1],
-                }
-            ),
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        recorded_calls = json.loads(proc.stdout)
+        recorded_calls = node_out["calls"]
+        if not isinstance(recorded_calls, list):
+            self.fail("Expected recorded_calls list")
         self.assertEqual(len(recorded_calls), 2)
         for call_traces in recorded_calls:
             xy_traces = [t for t in call_traces if t["yaxis"] == "y"]

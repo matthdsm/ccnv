@@ -571,6 +571,13 @@ def predict(
     gc: GcOption = None,
     min_mappability: MinMappabilityOption = DEFAULT_MIN_MAPPABILITY,
     mode: ModeOption = AnalysisMode.germline,
+    twins: Annotated[
+        bool,
+        typer.Option(
+            "--twins/--no-twins",
+            help="Declare a known twin pregnancy in prenatal mode (--no-twins leaves automatic twin detection enabled)",
+        ),
+    ] = False,
     loglevel: LogLevelOption = LogLevel.warning,
 ) -> None:
     """Predict copy-number events for one sample."""
@@ -607,6 +614,7 @@ def predict(
                 fasta=fasta,
                 min_mappability=min_mappability,
                 mode=mode,
+                twins=twins,
                 threads=threads,
             )
         )

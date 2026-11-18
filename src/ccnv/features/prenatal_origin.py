@@ -247,6 +247,7 @@ def classify_segment_origin_5state(
     is_gain: bool,
     *,
     depth_ff: float | None = None,
+    twin_min_ff: float | None = None,
     alpha_dm: float = 10000.0,
     sigma_r: float = 0.005,
 ) -> tuple[str, dict[str, float], float | None, tuple[float, float] | None]:
@@ -266,12 +267,33 @@ def classify_segment_origin_5state(
     f_dep = float(np.clip(depth_ff if depth_ff is not None else active_ff, 0.001, 0.60))
     f_se = max(float(active_ff_se) * (f_dep / f_bio), 0.001)
 
-    r_exp_fc = 1.0 + delta_cn * f_dep
-    phi_fc = (cn_alt / 2.0 * f_bio) / (1.0 - f_bio + cn_alt / 2.0 * f_bio)
-    p_fc = phi_fc * pf_24 + (1.0 - phi_fc) * pm_24
-    ll_fc = _gaussian_depth_loglik(
-        r_obs, r_exp_fc, sigma_r, abs(delta_cn) * f_se
-    ) + _dirichlet_multinomial_logpmf(k_arr, alpha_dm * p_fc)
+    cand_ffs: tuple[float, ...] = (f_bio,)
+    if twin_min_ff is not None and twin_min_ff > 0.0:
+        f_1 = float(np.clip(twin_min_ff, 1e-4, f_bio))
+        f_2 = float(np.clip(f_bio - f_1, 1e-4, f_bio))
+        cand_ffs = (f_bio, f_1, f_2)
+
+    ll_fc = -math.inf
+    for f_aff in cand_ffs:
+        f_aff_dep = f_dep * (f_aff / f_bio)
+        r_exp_aff = 1.0 + delta_cn * f_aff_dep
+        phi_aff = float(
+            np.clip(
+                (f_bio + delta_cn * f_aff) / max(1.0 + delta_cn * f_aff, 1e-6),
+                1e-6,
+                1.0 - 1e-6,
+            )
+        )
+        p_aff = phi_aff * pf_24 + (1.0 - phi_aff) * pm_24
+        se_aff = (
+            abs(delta_cn) * f_se
+            if f_aff == f_bio
+            else abs(delta_cn) * math.hypot(f_se * (f_aff / f_bio), 0.04 * f_dep)
+        )
+        ll_cand = _gaussian_depth_loglik(
+            r_obs, r_exp_aff, sigma_r, se_aff
+        ) + _dirichlet_multinomial_logpmf(k_arr, alpha_dm * p_aff)
+        ll_fc = max(ll_fc, ll_cand)
 
     ll_cpm, m_hat_cpm, var_cpm = _integrate_mosaic_state(
         0.05,
@@ -367,18 +389,26 @@ def annotate_prenatal_origin_and_lod(
     sample_depth_per_mb: float = 10000.0,
     sys_var_per_mb: float = 0.0001,
     z_threshold: float = 3.0,
+    twin_min_ff: float | None = None,
 ) -> tuple[tuple[SegmentResult, ...], PrenatalLoDMetrics]:
     """Annotate segments with expected ratio, implied FF, discordance, 5-state origin, and LoD."""
+    f_act = float(np.clip(active_ff, 0.0, 0.60))
+    lod_scale = (
+        max(f_act / max(float(twin_min_ff), 1e-4), 1.0)
+        if (twin_min_ff is not None and f_act > 0.0)
+        else 1.0
+    )
     z_target = max(float(z_threshold), 0.1) + 2.3263479
     d_mb = max(float(sample_depth_per_mb), 1.0)
     v_sys = max(float(sys_var_per_mb), 0.0)
     sig_35mb = math.sqrt(1.0 / (d_mb * 35.0) + v_sys / 35.0)
     sig_3mb = math.sqrt(1.0 / (d_mb * 3.0) + v_sys / 3.0)
-    lod_ff_35mb = float(np.clip(2.0 * z_target * sig_35mb, 0.005, 0.49))
-    lod_ff_3mb = float(np.clip(2.0 * z_target * sig_3mb, lod_ff_35mb + 0.001, 0.499))
+    base_35mb = float(np.clip(2.0 * z_target * sig_35mb, 0.005, 0.49))
+    base_3mb = float(np.clip(2.0 * z_target * sig_3mb, base_35mb + 0.001, 0.499))
+    lod_ff_35mb = base_35mb * lod_scale
+    lod_ff_3mb = base_3mb * lod_scale
     lod_metrics = PrenatalLoDMetrics(lod_ff_35mb=lod_ff_35mb, lod_ff_3mb=lod_ff_3mb)
 
-    f_act = float(np.clip(active_ff, 0.0, 0.60))
     uniform_24 = np.full(NUM_FRAG_BANDS, 1.0 / NUM_FRAG_BANDS, dtype=np.float64)
     p_f24 = (
         _to_24_band_density(p_fetal_density)
@@ -407,6 +437,11 @@ def annotate_prenatal_origin_and_lod(
     mu_m = max(float(mu_maternal_w), 1e-4)
     f_eff = float(
         np.clip((f_act * mu_f) / ((1.0 - f_act) * mu_m + f_act * mu_f), 0.0, 0.60)
+    )
+    f_min_eff = (
+        float(np.clip(f_eff * (float(twin_min_ff) / max(f_act, 1e-6)), 0.0, f_eff))
+        if (twin_min_ff is not None and f_act > 0.0)
+        else f_eff
     )
     log_ratio_fm = np.log(np.maximum(p_f24, 1e-12)) - np.log(np.maximum(p_m24, 1e-12))
 
@@ -441,12 +476,12 @@ def annotate_prenatal_origin_and_lod(
                 discordant = True
                 reason = "SCA_DISCORDANT"
         else:
-            if f_eff <= 0.0:
+            if f_min_eff <= 0.0:
                 exp_val = 0.0
             elif seg.ratio >= 0.0:
-                exp_val = math.log2(1.0 + 0.5 * f_eff)
+                exp_val = math.log2(1.0 + 0.5 * f_min_eff)
             else:
-                exp_val = math.log2(max(1e-6, 1.0 - 0.5 * f_eff))
+                exp_val = math.log2(max(1e-6, 1.0 - 0.5 * f_min_eff))
             expected_ratio = float(exp_val)
 
             r_obs = 2.0**seg.ratio
@@ -508,6 +543,7 @@ def annotate_prenatal_origin_and_lod(
                             active_ff_se=active_ff_se,
                             is_gain=is_gain,
                             depth_ff=f_eff,
+                            twin_min_ff=twin_min_ff,
                             sigma_r=sigma_r,
                         )
                     )
@@ -545,6 +581,21 @@ def annotate_sample_prenatal_segments(
     total_bp = sum(bufs.meta.contig_lengths.values())
     depth_per_mb = float(np.sum(bufs.count)) / max(total_bp / 1e6, 1e-6)
     mu_f, mu_m = resolve_fisher_moment_weights(bufs, prenatal_meta)
+    f_twin_min: float | None = None
+    if prenatal_result.gestation == "twin":
+        if (
+            prenatal_result.fetal_sexes == ("F", "M")
+            and prenatal_result.male_ff is not None
+            and prenatal_result.female_ff is not None
+        ):
+            raw_min = float(min(prenatal_result.male_ff, prenatal_result.female_ff))
+            f_twin_min = (
+                max(raw_min, 1e-4)
+                if raw_min > 0.0
+                else min(0.01, 0.5 * float(prenatal_result.active_ff))
+            )
+        else:
+            f_twin_min = 0.5 * float(prenatal_result.active_ff)
     return annotate_prenatal_origin_and_lod(
         segments,
         prefix_sums=prefix_sums,
@@ -567,4 +618,5 @@ def annotate_sample_prenatal_segments(
         sca_call=prenatal_result.sca.call,
         sample_depth_per_mb=depth_per_mb,
         z_threshold=z_threshold,
+        twin_min_ff=f_twin_min,
     )

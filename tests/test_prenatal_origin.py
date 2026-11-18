@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from dataclasses import replace
 
 import numpy as np
 from helpers import make_sample_table
@@ -586,6 +587,182 @@ class TestPrenatalSelfReferencedOriginEngine(unittest.TestCase):
         self.assertTrue(ann_xx_gain[0].discordant)
         self.assertEqual(ann_xx_gain[0].discordance_reason, "SCA_DISCORDANT")
         self.assertIsNone(ann_xx_gain[0].origin_call)
+
+    def test_twin_prenatal_origin_and_lod_scaling(self) -> None:
+        p_f_24, p_m_24 = _build_24band_densities()
+        active_ff = 0.22
+        male_ff = 0.14
+        female_ff = 0.08
+        p0 = active_ff * p_f_24 + (1.0 - active_ff) * p_m_24
+
+        n_bins = 200
+        bin_contigs = np.array([0] * 100 + [1] * 100, dtype=np.int16)
+        contig_names = ["chr18", "chr21"]
+        bin_starts = np.tile(np.arange(100, dtype=np.int64) * 20_000, 2)
+        bin_ends = bin_starts + 20_000
+        bin_usable = np.ones(n_bins, dtype=np.bool_)
+        sample_bands = np.zeros((n_bins, 24), dtype=np.uint32)
+        for b in range(n_bins):
+            sample_bands[b] = np.round(500 * p0).astype(np.uint32)
+
+        r_single = 1.0 + 0.5 * female_ff
+        phi_single = (active_ff + 0.5 * female_ff) / r_single
+        p_single = phi_single * p_f_24 + (1.0 - phi_single) * p_m_24
+        for b in range(50):
+            sample_bands[b] = np.round(500 * r_single * p_single).astype(np.uint32)
+        seg_single = SegmentResult(
+            "chr18", 0, 1_000_000, math.log2(r_single), 5.0, 50.0, 50, "gain"
+        )
+
+        r_conc = 1.0 + 0.5 * active_ff
+        phi_conc = (1.5 * active_ff) / r_conc
+        p_conc = phi_conc * p_f_24 + (1.0 - phi_conc) * p_m_24
+        for b in range(100, 150):
+            sample_bands[b] = np.round(500 * r_conc * p_conc).astype(np.uint32)
+        seg_conc = SegmentResult(
+            "chr21", 0, 1_000_000, math.log2(r_conc), 10.0, 50.0, 50, "gain"
+        )
+
+        r_male_single = 1.0 + 0.5 * male_ff
+        phi_male_single = (active_ff + 0.5 * male_ff) / r_male_single
+        p_male_single = phi_male_single * p_f_24 + (1.0 - phi_male_single) * p_m_24
+        for b in range(150, 200):
+            sample_bands[b] = np.round(500 * r_male_single * p_male_single).astype(
+                np.uint32
+            )
+        seg_male_single = SegmentResult(
+            "chr21",
+            1_000_000,
+            2_000_000,
+            math.log2(r_male_single),
+            7.5,
+            50.0,
+            50,
+            "gain",
+        )
+
+        _, lod_singleton = annotate_prenatal_origin_and_lod(
+            segments=(),
+            active_ff=active_ff,
+            sample_depth_per_mb=25_000.0,
+            sys_var_per_mb=0.0001,
+        )
+        prefix_sums = BandPrefixSums(
+            sample_bands, bin_contigs, contig_names, bin_starts, bin_ends, bin_usable
+        )
+        annotated, lod_twin = annotate_prenatal_origin_and_lod(
+            segments=(seg_single, seg_conc, seg_male_single),
+            prefix_sums=prefix_sums,
+            sample_bands=sample_bands,
+            bin_usable=bin_usable,
+            p_fetal_density=p_f_24,
+            p_maternal_density=p_m_24,
+            active_ff=active_ff,
+            active_ff_se=0.01,
+            sca_call="XY",
+            sample_depth_per_mb=25_000.0,
+            sys_var_per_mb=0.0001,
+            twin_min_ff=female_ff,
+        )
+        scale = active_ff / female_ff
+        self.assertAlmostEqual(
+            lod_twin.lod_ff_35mb, lod_singleton.lod_ff_35mb * scale, places=5
+        )
+        self.assertAlmostEqual(
+            lod_twin.lod_ff_3mb, lod_singleton.lod_ff_3mb * scale, places=5
+        )
+        self.assertFalse(annotated[0].discordant)
+        self.assertIsNone(annotated[0].discordance_reason)
+        self.assertEqual(annotated[0].origin_call, "FETAL_CONSTITUTIONAL")
+        self.assertFalse(annotated[1].discordant)
+        self.assertIsNone(annotated[1].discordance_reason)
+        self.assertEqual(annotated[1].origin_call, "FETAL_CONSTITUTIONAL")
+        self.assertFalse(annotated[2].discordant)
+        self.assertIsNone(annotated[2].discordance_reason)
+        self.assertEqual(annotated[2].origin_call, "FETAL_CONSTITUTIONAL")
+
+        meta = SampleMetadata(
+            bin_size=20_000,
+            contig_lengths={"chr18": 2_000_000, "chr21": 2_000_000},
+            contig_order=("chr18", "chr21"),
+            source_identity={},
+            reference_identity={},
+            qc={"effective_reads_kept": int(np.sum(sample_bands))},
+            filters={"min_mapping_quality": 1},
+        )
+        counts_u32 = np.sum(sample_bands, axis=1, dtype=np.uint32)
+        z_u32 = np.zeros(n_bins, dtype=np.uint32)
+        bufs = SampleBuffers(
+            meta=meta,
+            count=counts_u32,
+            paired_count=counts_u32,
+            frag_len_sum=np.zeros(n_bins, dtype=np.uint64),
+            short_frag_count=z_u32,
+            endpoint_count=z_u32,
+            frag_gc_sum=np.zeros(n_bins, dtype=np.float32),
+            frag_bands=sample_bands,
+        )
+        pm = PrenatalModelMetadata(
+            prenatal_bin_size=100_000,
+            yfrac_threshold=0.001,
+            ffy_slope=1.0,
+            olm_weights=[],
+            olm_bias=0.0,
+            female_chrx_ratio_mean=1.0,
+            female_chrx_ratio_std=0.01,
+            p_fetal_density=[float(x) for x in p_f_24],
+            p_maternal_density=[float(x) for x in p_m_24],
+        )
+        pr_twin = FetalFractionResult(
+            fetal_sex="M",
+            active_ff=active_ff,
+            active_ff_source="FF_SIZE",
+            ffy=male_ff,
+            ffx=male_ff,
+            ffa=active_ff,
+            chrx_ratio=0.93,
+            chry_score=0.01,
+            yfrac_threshold=0.001,
+            sca=SCAResult("XY", False, 0.99, -2.0),
+            gestation="twin",
+            fetal_sexes=("F", "M"),
+            male_ff=male_ff,
+            female_ff=female_ff,
+            twin_confidence=0.97,
+        )
+        pr_single = replace(
+            pr_twin,
+            gestation="singleton",
+            fetal_sexes=None,
+            male_ff=None,
+            female_ff=None,
+            twin_confidence=None,
+        )
+        _, lod_s_single = annotate_sample_prenatal_segments(
+            (),
+            bufs,
+            bin_usable=bin_usable,
+            prenatal_meta=pm,
+            prenatal_result=pr_single,
+        )
+        ann_s, lod_s = annotate_sample_prenatal_segments(
+            (seg_single, seg_conc, seg_male_single),
+            bufs,
+            bin_usable=bin_usable,
+            prenatal_meta=pm,
+            prenatal_result=pr_twin,
+        )
+        if lod_s is None or lod_s_single is None:
+            self.fail("expected PrenatalLoDMetrics")
+        self.assertAlmostEqual(
+            lod_s.lod_ff_35mb, lod_s_single.lod_ff_35mb * scale, places=5
+        )
+        self.assertAlmostEqual(
+            lod_s.lod_ff_3mb, lod_s_single.lod_ff_3mb * scale, places=5
+        )
+        self.assertEqual(ann_s[0].origin_call, "FETAL_CONSTITUTIONAL")
+        self.assertEqual(ann_s[1].origin_call, "FETAL_CONSTITUTIONAL")
+        self.assertEqual(ann_s[2].origin_call, "FETAL_CONSTITUTIONAL")
 
 
 if __name__ == "__main__":

@@ -225,6 +225,7 @@ class PredictConfig:
     min_mappability: float = DEFAULT_MIN_MAPPABILITY
     mode: AnalysisMode | Literal["germline", "prenatal"] = AnalysisMode.germline
     min_fetal_fraction_warning: float = 0.04
+    twins: bool = False
 
     def __post_init__(self) -> None:
         """Validate prediction configuration invariants."""
@@ -244,6 +245,8 @@ class PredictConfig:
             )
         if not (0.0 <= self.min_fetal_fraction_warning <= 1.0):
             raise ValueError("min_fetal_fraction_warning must be between 0.0 and 1.0")
+        if not isinstance(self.twins, bool):
+            raise TypeError("twins must be a boolean")
 
 
 __all__ = [

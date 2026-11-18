@@ -13,7 +13,9 @@ from ccnv.models import NUM_FRAG_BANDS
 from ccnv.stats.pca import pca_irlba_numpy
 from ccnv.stats.prenatal_math import (
     classify_sca_ray_4d,
+    classify_twin_pregnancy,
     compute_autosomal_density,
+    effective_ffa_sigma,
     evaluate_poisson_msy_ffy,
     fit_forward_ffx_model,
     fit_msy_sex_mixture,
@@ -506,6 +508,374 @@ class TestSCARayAndActiveFFFusion(unittest.TestCase):
         )
         self.assertTrue(math.isfinite(log_ev_b))
         self.assertGreater(m_hat_b, 0.90)
+
+
+class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
+    def test_effective_ffa_sigma_inflates_only_when_shrunk_and_alt_channel_present(
+        self,
+    ) -> None:
+        shrunk_weights = [0.01525, 0.0, 0.0]
+        sig_inflated = effective_ffa_sigma(0.0375, shrunk_weights, has_alt_ff=True)
+        self.assertGreater(sig_inflated, 0.50)
+        self.assertAlmostEqual(sig_inflated, 0.25 * math.sqrt(0.10 / 0.01525), places=6)
+
+        sig_no_alt = effective_ffa_sigma(0.0375, shrunk_weights, has_alt_ff=False)
+        self.assertAlmostEqual(sig_no_alt, 0.0375, places=6)
+
+        sig_none_alt = effective_ffa_sigma(0.0375, None, has_alt_ff=True)
+        self.assertAlmostEqual(sig_none_alt, 0.25 * math.sqrt(0.10 / 0.01), places=6)
+
+        unshrunk_weights = [0.20, 0.15]
+        sig_unshrunk = effective_ffa_sigma(0.0375, unshrunk_weights, has_alt_ff=True)
+        self.assertAlmostEqual(sig_unshrunk, 0.0375, places=6)
+
+        sig_floor = effective_ffa_sigma(0.001, unshrunk_weights, has_alt_ff=False)
+        self.assertAlmostEqual(sig_floor, 0.005, places=6)
+
+    def test_classify_twin_pregnancy_and_sca_cohort_concordance(
+        self,
+    ) -> None:
+        yfrac_thresh = 0.000043
+        olm_norm = 0.01525
+        sigma_ffa_eff = effective_ffa_sigma(0.0375, [olm_norm], has_alt_ff=True)
+        sigma_size = 0.0247
+        sigma_ffy = 0.0050
+        sigma_x = 0.5 * 0.009393 / 0.398684
+
+        empirical_twins = [
+            ("sample1", "FM", "M", 0.154, 0.133, 0.102, 0.352, 0.351, 0.00025),
+            ("sample2", "MM", "M", 0.173, 0.156, 0.102, 0.174, 0.171, 0.00028),
+            ("sample3", "MM", "M", 0.244, 0.284, 0.102, 0.196, 0.177, 0.00039),
+            ("sample4", "FF", "F", None, 0.044, 0.103, 0.305, 0.294, 0.00000),
+            ("sample5", "MM", "M", 0.119, 0.085, 0.100, 0.084, 0.116, 0.00019),
+            ("sample6", "FM", "M", 0.143, 0.154, 0.102, 0.218, 0.144, 0.00023),
+            ("sample7", "FF", "F", None, -0.010, 0.101, 0.093, 0.096, 0.00000),
+            ("sample8", "FM", "M", 0.094, 0.134, 0.097, 0.128, 0.096, 0.00015),
+            ("sample9", "MM", "M", 0.127, 0.131, 0.100, 0.069, 0.126, 0.00021),
+            ("sample10", "MM", "M", 0.176, 0.145, 0.103, 0.181, 0.174, 0.00028),
+            ("sample11", "FF", "F", None, -0.015, 0.103, 0.082, 0.088, 0.00000),
+            ("sample12", "FM", "M", 0.075, 0.073, 0.100, 0.177, 0.159, 0.00012),
+        ]
+
+        for (
+            sid,
+            truth_call,
+            sex,
+            ffy,
+            ffx,
+            ffa,
+            ff_size,
+            act_ff,
+            chry_sc,
+        ) in empirical_twins:
+            truth_sexes = (truth_call[0], truth_call[1])
+            delta_x = -0.5 * ffx
+            cls = classify_twin_pregnancy(
+                fetal_sex="F" if sex == "F" else "M",
+                chry_score=chry_sc,
+                yfrac_threshold=yfrac_thresh,
+                ffy=ffy,
+                sigma_ffy=sigma_ffy,
+                delta_x=delta_x,
+                sigma_x=sigma_x,
+                ffa=ffa,
+                sigma_ffa=sigma_ffa_eff,
+                ff_size=ff_size,
+                sigma_size=sigma_size,
+                active_ff=act_ff,
+                active_ff_se=0.015,
+                active_ff_source="FUSED",
+                twins=True,
+                olm_norm=olm_norm,
+            )
+            self.assertEqual(cls.twin.call, truth_call, f"Failed on {sid}")
+            self.assertEqual(cls.twin.fetal_sexes, truth_sexes, f"Failed on {sid}")
+            self.assertTrue(cls.twin.is_twin, f"Failed on {sid}")
+            self.assertEqual(cls.gestation, "twin", f"Failed on {sid}")
+            self.assertEqual(cls.fetal_sexes, truth_sexes, f"Failed on {sid}")
+            self.assertEqual(cls.twin.twin_probability, 1.0)
+            self.assertAlmostEqual(
+                sum(cls.twin.posteriors.values()), 1.0, places=5, msg=sid
+            )
+            self.assertIsNotNone(cls.twin_confidence)
+            if truth_call == "FF":
+                self.assertEqual(cls.male_ff, 0.0)
+                self.assertGreater(cls.female_ff or 0.0, 0.0)
+            elif truth_call == "FM":
+                self.assertAlmostEqual(cls.male_ff or 0.0, ffy or 0.0, places=5)
+                self.assertGreater(cls.female_ff or 0.0, 0.0)
+                self.assertEqual(cls.active_ff_source, "FF_SIZE")
+            else:
+                self.assertGreater(cls.male_ff or 0.0, 0.0)
+                self.assertEqual(cls.female_ff, 0.0)
+
+        p0 = dict.fromkeys(("XX", "XY", "XO", "XXX", "XXY", "XYY"), 1e-6)
+        fem_p = p0 | {"XX": 0.90, "XO": 0.05, "XXX": 0.05}
+        male_p = p0 | {"XY": 0.90, "XXY": 0.05, "XYY": 0.05}
+        empirical_scas = [
+            ("sample13", "XXX", "F", None, -0.1407, 0.1009, 0.1286, 0.000004),
+            ("sample14", "XXY", "M", 0.1322, 0.0130, 0.1002, 0.1186, 0.000220),
+            ("sample15", "XO", "F", None, 0.0925, 0.0955, 0.0502, 0.000003),
+        ]
+        for sid, truth_sca, sex, ffy, ffx, ffa, ff_size, chry_sc in empirical_scas:
+            fsex = "F" if sex == "F" else "M"
+            delta_x = -0.5 * ffx
+            sca_cls = classify_sca_ray_4d(
+                delta_x=delta_x,
+                sigma_x=sigma_x,
+                ffy=ffy if fsex == "M" else 0.0,
+                sigma_ffy=sigma_ffy,
+                ffa=ffa,
+                sigma_ffa=sigma_ffa_eff,
+                ff_size=ff_size,
+                sigma_size=sigma_size,
+                clinical_priors=fem_p if fsex == "F" else male_p,
+            )
+            self.assertEqual(sca_cls.call, truth_sca, f"SCA failed on {sid}")
+            twin_cls = classify_twin_pregnancy(
+                fetal_sex=fsex,
+                chry_score=chry_sc,
+                yfrac_threshold=yfrac_thresh,
+                ffy=ffy,
+                sigma_ffy=sigma_ffy,
+                delta_x=delta_x,
+                sigma_x=sigma_x,
+                ffa=ffa,
+                sigma_ffa=sigma_ffa_eff,
+                ff_size=ff_size,
+                sigma_size=sigma_size,
+                active_ff=sca_cls.active_ff,
+                active_ff_se=sca_cls.active_ff_se,
+                active_ff_source=sca_cls.active_ff_source,
+                twins=False,
+                olm_norm=olm_norm,
+            )
+            self.assertEqual(twin_cls.gestation, "singleton", f"Twin failed on {sid}")
+            self.assertFalse(twin_cls.twin.is_twin, f"Twin failed on {sid}")
+
+    def test_classify_twin_pregnancy_auto_mode_promotion_and_47xxy_guard(self) -> None:
+        fm_auto = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00023,
+            yfrac_threshold=0.000043,
+            ffy=0.09,
+            sigma_ffy=0.005,
+            delta_x=-0.045,
+            sigma_x=0.008,
+            ffa=0.22,
+            sigma_ffa=0.02,
+            ff_size=0.22,
+            sigma_size=0.02,
+            active_ff=0.14,
+            active_ff_se=0.01,
+            active_ff_source="FUSED",
+            twins=False,
+            olm_norm=0.50,
+        )
+        self.assertEqual(fm_auto.gestation, "twin")
+        self.assertTrue(fm_auto.twin.is_twin)
+        self.assertEqual(fm_auto.twin.call, "FM")
+        self.assertEqual(fm_auto.fetal_sexes, ("F", "M"))
+        self.assertGreater(fm_auto.twin.twin_probability, 0.80)
+        self.assertAlmostEqual(fm_auto.active_ff, 0.22, places=3)
+        self.assertEqual(fm_auto.active_ff_source, "FUSED")
+
+        ff_high = classify_twin_pregnancy(
+            fetal_sex="F",
+            chry_score=0.0,
+            yfrac_threshold=0.000043,
+            ffy=None,
+            sigma_ffy=0.005,
+            delta_x=0.0,
+            sigma_x=0.008,
+            ffa=0.28,
+            sigma_ffa=0.02,
+            ff_size=0.29,
+            sigma_size=0.02,
+            active_ff=0.285,
+            active_ff_se=0.014,
+            active_ff_source="FUSED",
+            twins=False,
+        )
+        self.assertEqual(ff_high.gestation, "singleton")
+        self.assertFalse(ff_high.twin.is_twin)
+        self.assertIsNone(ff_high.fetal_sexes)
+        self.assertGreater(ff_high.twin.twin_probability, 0.80)
+
+        xy_single = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00018,
+            yfrac_threshold=0.000043,
+            ffy=0.11,
+            sigma_ffy=0.005,
+            delta_x=-0.055,
+            sigma_x=0.008,
+            ffa=0.11,
+            sigma_ffa=0.02,
+            ff_size=0.11,
+            sigma_size=0.02,
+            active_ff=0.11,
+            active_ff_se=0.005,
+            active_ff_source="FUSED",
+            twins=False,
+        )
+        self.assertEqual(xy_single.gestation, "singleton")
+        self.assertFalse(xy_single.twin.is_twin)
+        self.assertIsNone(xy_single.fetal_sexes)
+        self.assertIsNone(xy_single.male_ff)
+        self.assertIsNone(xy_single.female_ff)
+        self.assertIsNone(xy_single.twin_confidence)
+        self.assertEqual(xy_single.twin.call, "MM")
+
+        xxy_single = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00020,
+            yfrac_threshold=0.000043,
+            ffy=0.10,
+            sigma_ffy=0.005,
+            delta_x=0.08,
+            sigma_x=0.005,
+            ffa=0.19,
+            sigma_ffa=0.02,
+            ff_size=0.19,
+            sigma_size=0.02,
+            active_ff=0.13,
+            active_ff_se=0.01,
+            active_ff_source="FUSED",
+            twins=False,
+        )
+        self.assertEqual(xxy_single.gestation, "singleton")
+        self.assertFalse(xxy_single.twin.is_twin)
+        self.assertIsNone(xxy_single.fetal_sexes)
+        self.assertLess(xxy_single.twin.posteriors["FM"], 0.01)
+
+        xxy_high = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00028,
+            yfrac_threshold=0.000043,
+            ffy=0.28,
+            sigma_ffy=0.005,
+            delta_x=0.08,
+            sigma_x=0.005,
+            ffa=0.28,
+            sigma_ffa=0.02,
+            ff_size=0.28,
+            sigma_size=0.02,
+            active_ff=0.28,
+            active_ff_se=0.01,
+            active_ff_source="FUSED",
+            twins=False,
+        )
+        self.assertEqual(xxy_high.gestation, "singleton")
+        self.assertFalse(xxy_high.twin.is_twin)
+
+        no_size_male = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00020,
+            yfrac_threshold=0.000043,
+            ffy=0.12,
+            sigma_ffy=0.006,
+            delta_x=-0.06,
+            sigma_x=0.01,
+            ffa=0.10,
+            sigma_ffa=0.640,
+            ff_size=None,
+            sigma_size=0.02,
+            active_ff=0.12,
+            active_ff_se=0.006,
+            active_ff_source="FFY",
+            twins=False,
+            olm_norm=0.01525,
+        )
+        self.assertEqual(no_size_male.gestation, "singleton")
+        self.assertEqual(no_size_male.twin.call, "MM")
+        self.assertAlmostEqual(no_size_male.active_ff_se, 0.006, places=5)
+
+        vanishing_male = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00008,
+            yfrac_threshold=0.000043,
+            ffy=0.03,
+            sigma_ffy=0.005,
+            delta_x=-0.015,
+            sigma_x=0.01,
+            ffa=0.14,
+            sigma_ffa=0.02,
+            ff_size=0.14,
+            sigma_size=0.02,
+            active_ff=0.10,
+            active_ff_se=0.01,
+            active_ff_source="FUSED",
+            twins=False,
+        )
+        self.assertEqual(vanishing_male.gestation, "singleton")
+        self.assertFalse(vanishing_male.twin.is_twin)
+
+        missing_ffy_male = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00020,
+            yfrac_threshold=0.000043,
+            ffy=None,
+            sigma_ffy=0.005,
+            delta_x=0.0,
+            sigma_x=0.005,
+            ffa=0.12,
+            sigma_ffa=0.005,
+            ff_size=None,
+            sigma_size=0.02,
+            active_ff=0.12,
+            active_ff_se=0.005,
+            active_ff_source="FFA",
+            twins=False,
+        )
+        self.assertEqual(missing_ffy_male.gestation, "singleton")
+        self.assertEqual(missing_ffy_male.twin.call, "MM")
+        self.assertAlmostEqual(missing_ffy_male.twin.male_ff, 0.12, places=5)
+        self.assertLess(missing_ffy_male.twin.confidence, 0.55)
+
+        missing_ffy_fm_twin = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00020,
+            yfrac_threshold=0.000043,
+            ffy=None,
+            sigma_ffy=0.005,
+            delta_x=-0.055,
+            sigma_x=0.005,
+            ffa=0.22,
+            sigma_ffa=0.005,
+            ff_size=None,
+            sigma_size=0.02,
+            active_ff=0.22,
+            active_ff_se=0.005,
+            active_ff_source="FFA",
+            twins=True,
+        )
+        self.assertEqual(missing_ffy_fm_twin.gestation, "twin")
+        self.assertEqual(missing_ffy_fm_twin.twin.call, "FM")
+        self.assertAlmostEqual(missing_ffy_fm_twin.male_ff or 0.0, 0.11, places=3)
+        self.assertAlmostEqual(missing_ffy_fm_twin.female_ff or 0.0, 0.11, places=3)
+
+        unequal_fm = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00025,
+            yfrac_threshold=0.000043,
+            ffy=0.16,
+            sigma_ffy=0.005,
+            delta_x=-0.08,
+            sigma_x=0.008,
+            ffa=None,
+            sigma_ffa=0.02,
+            ff_size=0.22,
+            sigma_size=0.005,
+            active_ff=0.16,
+            active_ff_se=0.005,
+            active_ff_source="FFY",
+            twins=True,
+            olm_norm=0.50,
+        )
+        self.assertEqual(unequal_fm.twin.call, "FM")
+        self.assertEqual(unequal_fm.active_ff_source, "FF_SIZE")
+        self.assertGreater(unequal_fm.twin.female_ff, 0.0)
 
 
 if __name__ == "__main__":

@@ -141,9 +141,9 @@ flowchart TB
     L_IN --> EX_FP["extract.extract_for_predict"]
     L_IN --> REB_SB["rebinning.rebin_sample_buffers"]
     R_PRD --> PR_INF["prenatal.predict_prenatal"]
-    PR_INF --> PM_SCA["prenatal_math.classify_sca_ray_4d / prenatal_math.fuse_active_fetal_fraction_student_t4"]
+    PR_INF --> PM_SCA["prenatal_math.classify_sca_ray_4d / prenatal_math.classify_twin_pregnancy / prenatal_math.effective_ffa_sigma / prenatal_math.fuse_active_fetal_fraction_student_t4"]
     PR_INF --> FG_KL["stats.fragmentomics.predict_ff_kl_deconvolution / stats.fragmentomics.predict_ff_fragmentomics"]
-    PR_INF --> PG_5K["prenatal_grid.compute_5k_msy_exposure"]
+    PR_INF --> PG_5K["prenatal_grid.prepare_5k_msy_sample / prenatal_grid.compute_5k_msy_exposure / prenatal_grid.compute_covariate_chrx_ratio"]
     R_PRD --> N_ONCE["_normalize_branches_once"]
     N_ONCE --> B_BM["predict.build_branch_model"]
     B_BM --> N_BM["normalization.build_branch_model_from_tables"]
@@ -154,6 +154,7 @@ flowchart TB
     N_SBR --> PCA_HUB["pca.project_huber_pca_wave"]
     R_PRD --> PR_CHRY["prenatal.normalize_prenatal_chry"]
     PR_CHRY --> PG_5K
+    PR_CHRY --> PG_ANCH["prenatal_grid.resolve_chry_anchor_ff"]
     R_PRD --> S_C["predict.segment_and_call"]
     S_C --> SEG_GEN["segmentation.segment_and_score_genome"]
     SEG_GEN --> SEG_PRE["_segment_and_prescore_contig"]
@@ -206,7 +207,7 @@ Typer CLI application defining the four `ccnv` subcommands and runtime logging s
 - **`extract(alignment, prefix, bin_size, fasta, min_mapq, keep_duplicates, keep_secondary, keep_supplementary, allow_improper_pairs, all_contigs, threads, loglevel)`** — Typer command that builds an `ExtractConfig`, validates inputs, and invokes `ccnv.extract.run`.
 - **`reference(prefix, samplesheet, fasta, mode, prenatal_binsize, bin_size, all_contigs, autosomal_contig, sex_contig, sex_signal_contig, sex_cutoff, pca_components, max_batch_memory_mb, min_cohort_size, min_sex_group_size, qc_report, mappability, gc, min_mappability, threads, loglevel)`** — Typer command that validates CLI options, constructs a `ReferenceConfig`, and invokes `ccnv.reference.run`.
 - **`ref_qc(reference, prefix, loglevel)`** — Typer command that builds a `ReferenceQCConfig`, invokes `ccnv.ref_qc.run_reference_qc`, and exits with code 2 if any branch reports `FAIL`.
-- **`predict(sample, reference, prefix, sex, penalty, z_threshold, ratio_threshold, min_reference_bins, mask_repeats, max_blacklist_gap, plot, cytobands, vcf, bins_vcf, threads, fasta, mappability, gc, min_mappability, mode, loglevel)`** — Typer command that validates CLI options, constructs a `PredictConfig`, and invokes `ccnv.predict.run`.
+- **`predict(sample, reference, prefix, sex, penalty, z_threshold, ratio_threshold, min_reference_bins, mask_repeats, max_blacklist_gap, plot, cytobands, vcf, bins_vcf, threads, fasta, mappability, gc, min_mappability, mode, twins, loglevel)`** — Typer command that validates CLI options, constructs a `PredictConfig`, and invokes `ccnv.predict.run`.
 - **`_require_positive_float(value: float | None) -> float | None`** — Internal validator enforcing finite strictly positive numeric CLI options.
 - **`_require_finite_unit_float(value: float | None) -> float | None`** — Internal validator enforcing finite values within `[0.0, 1.0]`.
 - **`_fail(error: BaseException, code: int) -> NoReturn`** — Internal helper printing an error message to stderr and exiting with the requested CLI code.
@@ -356,7 +357,8 @@ Structured output containers shared between statistical kernels, QC modules, and
 - **`SegmentResult`** — Dataclass holding called genome segments with breakpoints, BLUE Z-scores, copy-number state (`cn`), Bayes factors, and optional prenatal origin annotations.
 - **`PrenatalLoDMetrics`** — Dataclass reporting prenatal limit-of-detection metrics (minimum detectable fetal fraction and achieved statistical power).
 - **`SCAResult`** — Dataclass holding 4D ray-marginalized sex-chromosome aneuploidy classification (`karyotype`, posteriors, log-likelihoods, and confidence margin).
-- **`FetalFractionResult`** — Dataclass combining `FFY`, `FFX`, `FFA`, `FF_size`, Student-$t_4$ fused `active_ff`, and per-estimator diagnostic statuses.
+- **`TwinResult`** — Dataclass holding 2-fetus twin pregnancy stoichiometry predictions (`call` in `TwinSexPair`, `fetal_sexes`, `is_twin`, `twin_probability`, `confidence`, `posteriors`, `male_ff`, `female_ff`).
+- **`FetalFractionResult`** — Dataclass combining `FFY`, `FFX`, `FFA`, `FF_size`, Student-$t_4$ fused `active_ff`, `SCAResult`, `TwinResult`, `gestation` (`GestationType`), and per-estimator diagnostic statuses.
 - **`PredictionOutputs`** — Dataclass bundling paths of all generated BED, VCF, HTML, and QC JSON artifacts alongside summary statistics.
 - **`BranchQCStatus`** — Dataclass storing per-branch QC metrics, status (`PASS`, `WARN`, `FAIL`), and diagnostic reasons.
   - **`BranchQCStatus.status`** — Property returning the branch quality verdict (`PASS`, `WARN`, or `FAIL`).
@@ -501,6 +503,8 @@ Low-level mathematical models for prenatal Y-chromosome estimation, forward FFX 
 - **`MSYSexModel`** — Dataclass storing bimodal Poisson-Gamma mixture parameters (`mu_female`, `mu_male`, priors) over `chrY` MSY counts.
 - **`PoissonFFYModel`** — Dataclass holding background maternal false-positive rate and male slope for `chrY` fetal-fraction MLE.
 - **`SCARayClassification`** — Dataclass storing 4D Gaussian mixture ray parameters across diploid and aneuploid karyotype classes (`XX`, `XY`, `XO`, `XXX`, `XXY`, `XYY`).
+- **`TwinClassification`** — Dataclass storing 2-fetus twin stoichiometry results (`TwinResult`, `gestation`, `fetal_sexes`, `male_ff`, `female_ff`, `twin_confidence`, and reconciled `active_ff`, `active_ff_se`, `active_ff_source`).
+- **`effective_ffa_sigma(sigma_ffa, olm_weights, *, has_alt_ff)`** — Computes effective `FFA` standard error, inflating uncertainty when autosomal PCA regression weights are heavily shrunk and an orthogonal fetal-fraction channel is available.
 - **`compute_autosomal_density(counts, contigs, exposure, mappability, gc_trend, autosomal_mask)`** — Computes chromosome-median ratio-of-sums autosomal read density used to scale sex-contig relative expectations.
 - **`fit_msy_sex_mixture(msy_counts, msy_exposure, *, bic_delta_min)`** — Fits the two-component `MSYSexModel` expectation-maximization classifier for reference sex labeling.
 - **`fit_poisson_msy_ffy(msy_bin_counts, msy_bin_exposure, mappability, female_mask, male_mask, labeled_ff)`** — Identifies clean single-copy MSY bins and fits exact closed-form Poisson MLE models of Y-based fetal fraction (`FFY`).
@@ -508,6 +512,7 @@ Low-level mathematical models for prenatal Y-chromosome estimation, forward FFX 
 - **`fit_forward_ffx_model(chrx_ratios, f_targets, valid_mask)`** — Fits forward-calibrated regression $R_X = \alpha_0 + \alpha_1 f$ mapping fetal fraction onto diploid `chrX` ratio shifts relative to `XX` baseline.
 - **`fuse_active_fetal_fraction_student_t4(estimates, standard_errors, *, df, max_iter, tol)`** — Combines available `FFY`, `FFX`, `FFA`, and `FF_size` estimators via heavy-tailed Student-$t_4$ IRLS precision fusion.
 - **`classify_sca_ray_4d(delta_x, sigma_x, ffy, sigma_ffy, ffa, sigma_ffa, ff_size, sigma_size, *, chrx_llr_fetal, clinical_priors)`** — Classifies fetal sex-chromosome aneuploidies via analytical 4D `erfc` ray marginalization across $(R_X, R_Y, \mathrm{FFA}, \mathrm{FF}_{\mathrm{size}})$ space, flagging `DISCORDANT_MIXED` when posteriors conflict.
+- **`classify_twin_pregnancy(fetal_sex, chry_score, yfrac_threshold, ffy, sigma_ffy, delta_x, sigma_x, ffa, sigma_ffa, ff_size, sigma_size, active_ff, active_ff_se, active_ff_source, *, twins, olm_norm)`** — Evaluates 2-fetus twin stoichiometry (`FF`, `FM`, `MM`), de novo twin probability, and per-sex fetal fractions (`male_ff`, `female_ff`) without mutating `SCAResult`.
 - **Internal prenatal math helpers** — `_poisson_logpmf` and `_log_normal_interval_prob` provide underflow-safe numerical probability primitives.
 
 ### `ccnv.stats.fragmentomics` (`src/ccnv/stats/fragmentomics.py`)
@@ -625,19 +630,21 @@ Coarse 100 kb autosomal/sex grid construction and covariate coarsening for prena
 - **`prepare_covariate_multipliers(gc, mappability, n_mask, min_mappability, length)`** — Normalizes GC around median 1.0 and thresholds mappability and N-base masks into multiplicative bias adjustments.
 - **`rebin_track_1d(values, src_meta, dst_meta)`** — Projects a 1D covariate or mask array from a source sample grid onto a rebinned sample grid.
 - **`compute_100k_profiles(counts_matrix, contigs, starts, ends, bin_size, auto_mask, chrx_mask)`** — Computes 100 kb normalized log2 ratio profiles and `chrX` dosage ratios used by `FFA` regression and `FFX` baseline calibration.
+- **`compute_covariate_chrx_ratio(sample, reference_table, pm, *, overrides, min_mappability)`** — Computes autosomal-anchored Poisson covariate-normalized and locus-adjusted `chrX` ratio mapped to the reference `FFX` calibration scale when `autosomal` and `female_sex` covariate tracks are present.
 - **`extract_ref_contig_roles(reference_table, ffy_ref)`** — Reads optional custom contig roles from reference metadata or the `prenatal_ffy` branch.
 - **`resolve_5k_covariates(bufs, bufs_5k, auto_5k, ffy_ref, ffy_align, gc_override, map_override, n_mask_override, min_mappability)`** — Resolves 5 kb autosomal and MSY exogenous tracks honoring user prediction overrides.
 - **`fit_sample_gc_exponent(counts, exposure, mappability, gc_mult, auto_mask)`** — Fits a sample-specific log-linear GC exponent $\hat{\beta}_{\text{GC}} \in [-3.0, 3.0]$ across usable autosomal 5 kb bins.
 - **`compute_5k_msy_exposure(bufs, bufs_5k, reference_table, ffy_ref, ffy_bin, ffy_align, roles, overrides, min_mappability)`** — Computes per-bin 5 kb diploid-equivalent MSY exposure across `prenatal_ffy` rows (incorporating $\hat{\beta}_{\text{GC}}$) and usable autosomal bin count.
 - **`resolve_ffy_bin_size(reference_table, ffy_ref_s, ffy_ref_e, fallback)`** — Resolves the 5 kb reference bin size from `ReferenceMetadata` or `prenatal_ffy` interval spans.
-- **`resolve_chry_anchor_ff(c_u, e_u, lam_bg_u, eta_u, kappa_cal, pm, prenatal_result)`** — Resolves a LOCO-guarded 1-copy fetal fraction and uncertainty for `chrY` normalization, switching to off-`chrY` fused fetal fraction (or intact-arm MSY blocks) when `FFY` diverges under `47,XYY` or large `chrY` CNVs.
+- **`prepare_5k_msy_sample(sample, reference_table, ffy_ref, clean_msy_bins)`** — Coerces and rebins a sample to the 5 kb `prenatal_ffy` grid and resolves aligned MSY counts and clean MSY bin indices.
+- **`resolve_chry_anchor_ff(c_u, e_u, lam_bg_u, eta_u, kappa_cal, pm, prenatal_result)`** — Resolves a LOCO-guarded 1-copy fetal fraction and uncertainty for `chrY` normalization, scaling the base anchor to `male_ff` (bounded by `active_ff`) for `("F", "M")` twin pregnancies, returning the base anchor directly when `sca.call != "XY"` (such as `47,XYY`) or `FFY` is unavailable, and switching to intact-arm 80 kb MSY blocks or off-`chrY` fused fetal fraction when `sca.call == "XY"` and `FFY` diverges under large `chrY` CNVs.
 
 ### `ccnv.features.prenatal` (`src/ccnv/features/prenatal.py`)
 
 High-level prenatal reference training and single-sample inference orchestration.
 
 - **`fit_prenatal_models(sample_tables, entries, *, prenatal_bin_size, cohort_gc, cohort_mappability, cohort_n_mask, min_mappability, autosomes, sex_contigs, sex_signal_contig, seed)`** — Trains `FFY` (5 kb `chrY` MSY MLE with empirical per-bin male efficiency in `null_mean` and female-anchored `yfrac_threshold`), `FFA` (100 kb autosomal PCA + logit ensemble), forward `FFX`, fragmentomic deconvolution + Fisher weighting + `FF_size`, 4D SCA classifier, and `PrenatalModelMetadata`.
-- **`predict_prenatal(sample, reference_table, prenatal_meta, *, min_ff_warning, sample_gc_override, sample_mappability_override, sample_n_mask_override, min_mappability)`** — Evaluates `FFY`, `FFX`, `FFA`, and `FF_size`, classifies karyotype via `classify_sca_ray_4d`, fuses `active_ff` via Student-$t_4$ IRLS, and synthesizes normalized prenatal diagnostic metrics.
+- **`predict_prenatal(sample, reference_table, prenatal_meta, *, min_ff_warning, sample_gc_override, sample_mappability_override, sample_n_mask_override, min_mappability, twins)`** — Evaluates `FFY`, `FFX`, `FFA`, and `FF_size`, classifies karyotype via `classify_sca_ray_4d` and twin stoichiometry via `classify_twin_pregnancy`, fuses `active_ff` via Student-$t_4$ IRLS, and synthesizes normalized prenatal diagnostic metrics.
 - **`normalize_prenatal_chry(sample, reference_table, prenatal_meta, prenatal_result, *, sample_gc_override, sample_mappability_override, sample_n_mask_override, min_mappability)`** — Normalizes 5 kb clean MSY `chrY` bins from `prenatal_ffy` for male-fetus (`fetal_sex == "M"`) prenatal samples against the FF-calibrated 1-copy Poisson baseline $\hat{\lambda}_b = e_b(s_{\text{bg}}\lambda_{\text{bg}, b} + \eta_b\frac{f}{2\kappa_{\text{cal}}})$ with Jensen-debiased $\log_2$ ratios, Poisson precision weights, and propagated FF baseline variance (returning `None` for female fetuses).
 - **Internal prenatal helpers** — `_evaluate_sca_and_active_ff` and `_compute_effective_ff` coordinate 4D SCA ray evaluation and active fetal fraction fallback logic.
 
@@ -648,8 +655,8 @@ Five-state biological origin classifier for called prenatal CNV segments and LoD
 - **`BandPrefixSums`** — Prefix-sum index enabling $O(\log U)$ per-segment aggregation of the 24 fragment-length bands across any `(contig, start, end)` span.
   - **`BandPrefixSums.from_sample_table(sample, bin_usable)`** — Classmethod building contig-aligned prefix-sum arrays directly from `SampleBuffers` or Arrow tables.
   - **`BandPrefixSums.query(contig, start, end)`** — Sums fragment counts across the 24 size bands overlapping `[start, end)` on `contig`.
-- **`classify_segment_origin_5state(r_obs, k_band_counts, p_fetal_24, p_maternal_24, p_plasma_0, active_ff, active_ff_se, is_gain, *, depth_ff, alpha_dm, sigma_r)`** — Evaluates the coupled depth + Dirichlet-Multinomial 24-band likelihood across `FETAL_CONSTITUTIONAL`, `PLACENTAL_MOSAIC`, `MATERNAL_UNINHERITED`, `MATERNAL_AND_FETAL_INHERITED`, and `MATERNAL_MOSAIC` states (assigning `INDETERMINATE` when max posterior $\lt 0.80$).
-- **`annotate_prenatal_origin_and_lod(segments, *, prefix_sums, sample_bands, bin_usable, p_fetal_density, p_maternal_density, mu_fetal_w, mu_maternal_w, active_ff, active_ff_se, sca_call, sample_depth_per_mb, sys_var_per_mb, z_threshold)`** — Computes expected ratios, implied fetal fraction, discordance flags (`SCA_DISCORDANT`, `SUB_FETAL_RATIO`, `SUPER_FETAL_RATIO`), `frag_short_ratio`, `frag_llr_size`, origin posteriors, and theoretical `PrenatalLoDMetrics`.
+- **`classify_segment_origin_5state(r_obs, k_band_counts, p_fetal_24, p_maternal_24, p_plasma_0, active_ff, active_ff_se, is_gain, *, depth_ff, twin_min_ff, alpha_dm, sigma_r)`** — Evaluates the coupled depth + Dirichlet-Multinomial 24-band likelihood across `FETAL_CONSTITUTIONAL` (both concordant-twin and single-fetus hypotheses when `twin_min_ff` is set), `PLACENTAL_MOSAIC`, `MATERNAL_UNINHERITED`, `MATERNAL_AND_FETAL_INHERITED`, and `MATERNAL_MOSAIC` states (assigning `INDETERMINATE` when max posterior $\lt 0.80$).
+- **`annotate_prenatal_origin_and_lod(segments, *, prefix_sums, sample_bands, bin_usable, p_fetal_density, p_maternal_density, mu_fetal_w, mu_maternal_w, active_ff, active_ff_se, sca_call, sample_depth_per_mb, sys_var_per_mb, z_threshold, twin_min_ff)`** — Computes expected ratios, implied fetal fraction, discordance flags (`SCA_DISCORDANT`, `SUB_FETAL_RATIO`, `SUPER_FETAL_RATIO`), `frag_short_ratio`, `frag_llr_size`, origin posteriors, and theoretical `PrenatalLoDMetrics`.
 - **`annotate_sample_prenatal_segments(segments, sample, *, bin_usable, prenatal_meta, prenatal_result, z_threshold)`** — Builds `BandPrefixSums` for the sample and annotates all called `SegmentResult` entries with origin calls and fragmentomic statistics.
 - **Internal origin helpers** — `_dirichlet_multinomial_logpmf`, `_gaussian_depth_loglik`, `_to_24_band_density`, and `_integrate_mosaic_state` evaluate marginal log-likelihoods over discrete/continuous mosaic grids.
 
