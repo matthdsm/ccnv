@@ -629,6 +629,7 @@ Coarse 100 kb autosomal/sex grid construction and covariate coarsening for prena
 - **`prepare_covariate_multipliers(gc, mappability, n_mask, min_mappability, length)`** — Normalizes GC around median 1.0 and thresholds mappability and N-base masks into multiplicative bias adjustments.
 - **`rebin_track_1d(values, src_meta, dst_meta)`** — Projects a 1D covariate or mask array from a source sample grid onto a rebinned sample grid.
 - **`compute_100k_profiles(counts_matrix, contigs, starts, ends, bin_size, auto_mask, chrx_mask)`** — Computes 100 kb normalized log2 ratio profiles and `chrX` dosage ratios used by `FFA` regression and `FFX` baseline calibration.
+- **`compute_covariate_chrx_ratio(sample, reference_table, pm, *, overrides, min_mappability)`** — Computes autosomal-anchored Poisson covariate-normalized and locus-adjusted `chrX` ratio mapped to the reference `FFX` calibration scale when `autosomal` and `female_sex` covariate tracks are present.
 - **`extract_ref_contig_roles(reference_table, ffy_ref)`** — Reads optional custom contig roles from reference metadata or the `prenatal_ffy` branch.
 - **`resolve_5k_covariates(bufs, bufs_5k, auto_5k, ffy_ref, ffy_align, gc_override, map_override, n_mask_override, min_mappability)`** — Resolves 5 kb autosomal and MSY exogenous tracks honoring user prediction overrides.
 - **`fit_sample_gc_exponent(counts, exposure, mappability, gc_mult, auto_mask)`** — Fits a sample-specific log-linear GC exponent $\hat{\beta}_{\text{GC}} \in [-3.0, 3.0]$ across usable autosomal 5 kb bins.

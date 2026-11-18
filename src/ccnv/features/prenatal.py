@@ -31,6 +31,7 @@ from ccnv.features.prenatal_grid import (
     col_i64,
     compute_5k_msy_exposure,
     compute_100k_profiles,
+    compute_covariate_chrx_ratio,
     extract_ref_contig_roles,
     fit_sample_gc_exponent,
     prepare_5k_msy_sample,
@@ -624,7 +625,10 @@ def predict_prenatal(
     full_log2, chrx_arr = compute_100k_profiles(
         counts_100k[:, None], c_100k, s_100k, e_100k, p_bin, auto_m, chrx_m
     )
-    chrx_ratio = float(chrx_arr[0])
+    cov_chrx = compute_covariate_chrx_ratio(
+        bufs, rt, pm, overrides=ovr, min_mappability=min_mappability
+    )
+    chrx_ratio = float(cov_chrx) if cov_chrx is not None else float(chrx_arr[0])
 
     ref_null_mean = col_f64(auto_ref, "null_mean")
     ref_pca_center = col_f64(auto_ref, "pca_mean")
@@ -728,6 +732,9 @@ def predict_prenatal(
         chrx_llr_fetal=chrx_llr_fetal,
     )
     abs_a1 = max(abs(float(pm.alpha_1)), 1e-6)
+    delta_x_val = float(0.5 * (chrx_ratio - float(pm.female_chrx_ratio_mean)) / abs_a1)
+    sigma_x_val = max(0.5 * max(float(pm.female_chrx_ratio_std), 1e-4) / abs_a1, 0.005)
+    sigma_y_val = max(math.hypot(float(ffy_se or 0.0), float(pm.ffy_std)), 0.005)
     has_alt = ff_size is not None or (fetal_sex == "M" and ffy is not None)
     olm_norm = (
         float(np.linalg.norm(np.asarray(pm.olm_weights, dtype=np.float64)))
@@ -739,9 +746,9 @@ def predict_prenatal(
         chry_score=chry_score,
         yfrac_threshold=pm.yfrac_threshold,
         ffy=ffy,
-        sigma_ffy=max(math.hypot(float(ffy_se or 0.0), float(pm.ffy_std)), 0.005),
-        delta_x=float(0.5 * (chrx_ratio - float(pm.female_chrx_ratio_mean)) / abs_a1),
-        sigma_x=max(0.5 * max(float(pm.female_chrx_ratio_std), 1e-4) / abs_a1, 0.005),
+        sigma_ffy=sigma_y_val,
+        delta_x=delta_x_val,
+        sigma_x=sigma_x_val,
         ffa=ffa,
         sigma_ffa=effective_ffa_sigma(
             float(pm.ffa_std), pm.olm_weights, has_alt_ff=has_alt
@@ -754,10 +761,14 @@ def predict_prenatal(
         twins=twins,
         olm_norm=olm_norm,
     )
+    z_x_fm = (delta_x_val + 0.5 * float(ffy or 0.0)) / math.hypot(
+        sigma_x_val, 0.5 * sigma_y_val
+    )
     if (
         twin_cls.gestation == "twin"
         and twin_cls.fetal_sexes == ("F", "M")
         and sca_res.call == "DISCORDANT_MIXED"
+        and abs(z_x_fm) <= 3.5
     ):
         sca_res = SCAResult(
             call="XY",

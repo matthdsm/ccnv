@@ -722,6 +722,75 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         if res_fem_fallback.twin is not None:
             self.assertFalse(res_fem_fallback.twin.is_twin)
 
+        cohort_gc = np.array([0.42] * 80 + [0.38] * 40 + [0.40] * 60, dtype=np.float32)
+        cohort_map = np.full(180, 0.95, dtype=np.float32)
+        meta_gc, (auto_gc_fit, ffy_gc_fit), _ = fit_prenatal_models(
+            self.sample_tables,
+            self.entries,
+            prenatal_bin_size=100_000,
+            cohort_gc=cohort_gc,
+            cohort_mappability=cohort_map,
+            seed=42,
+        )
+        auto_5k_fit = BranchFitArrays(
+            branch=BRANCH_AUTOSOMAL,
+            contigs=("chr1",) * 40 + ("chr2",) * 40,
+            starts=np.tile(np.arange(0, 200_000, 5000, dtype=np.int64), 2),
+            ends=np.tile(np.arange(5000, 205_000, 5000, dtype=np.int64), 2),
+            masked=np.zeros(80, dtype=np.bool_),
+            pca_mean=np.ones(80, dtype=np.float64),
+            gc=np.full(80, 0.42, dtype=np.float32),
+            mappability=np.full(80, 0.95, dtype=np.float32),
+        )
+        fem_5k_fit = BranchFitArrays(
+            branch=BRANCH_FEMALE_SEX,
+            contigs=("chrX",) * 40,
+            starts=np.arange(0, 200_000, 5000, dtype=np.int64),
+            ends=np.arange(5000, 205_000, 5000, dtype=np.int64),
+            masked=np.array([True] + [False] * 39, dtype=np.bool_),
+            pca_mean=np.ones(40, dtype=np.float64),
+            gc=np.full(40, 0.38, dtype=np.float32),
+            mappability=np.full(40, 0.95, dtype=np.float32),
+        )
+        ref_cov_tbl = assemble_reference_table(
+            [auto_5k_fit, fem_5k_fit, auto_gc_fit, ffy_gc_fit]
+        )
+        xo_counts = {"chr1": 400.0, "chr2": 400.0, "chrX": 380.0, "chrY": 0.5}
+        xo_bufs = SampleBuffers.from_table(
+            _build_synthetic_sample(
+                self.contig_lengths, xo_counts, 5000, "xo_sample", 0.05, 902
+            )
+        )
+        res_xo = predict_prenatal(
+            xo_bufs,
+            ref_cov_tbl,
+            meta_gc,
+            sample_gc_override=cohort_gc,
+            sample_mappability_override=cohort_map,
+            sample_n_mask_override=np.zeros(180, dtype=np.bool_),
+            twins=False,
+        )
+        self.assertEqual(res_xo.sca.call, "XO")
+        self.assertTrue(res_xo.sca.is_aneuploid)
+        self.assertEqual(res_xo.gestation, "singleton")
+
+        ref_unmasked_tbl = assemble_reference_table(
+            [
+                auto_5k_fit,
+                replace(fem_5k_fit, masked=np.zeros(40, dtype=np.bool_)),
+                auto_gc_fit,
+                ffy_gc_fit,
+            ]
+        )
+        res_shifted_xx = predict_prenatal(
+            xo_bufs,
+            ref_unmasked_tbl,
+            replace(meta_gc, female_chrx_ratio_mean=0.95),
+            twins=False,
+        )
+        self.assertEqual(res_shifted_xx.sca.call, "XX")
+        self.assertFalse(res_shifted_xx.sca.is_aneuploid)
+
         chry_unw = normalize_prenatal_chry(fm_bufs, ref_tbl, fm_meta, res_fm_explicit)
         if chry_unw is None:
             self.fail("expected BinResult for FM twin chrY")

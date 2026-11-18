@@ -715,12 +715,11 @@ def classify_twin_pregnancy(
     if (
         has_ffa
         and ffa is not None
-        and (olm_norm >= 0.10 or has_size or fetal_sex == "F")
+        and (olm_norm >= 0.10 or (fetal_sex == "F" and not has_size))
     ):
         auto_ests.append(max(0.0, float(ffa)))
         auto_ses.append(max(float(sigma_ffa), 1e-4))
-        if olm_norm >= 0.10 or not has_size:
-            auto_srcs.append("FFA")
+        auto_srcs.append("FFA")
     if has_size and ff_size is not None:
         auto_ests.append(max(0.0, float(ff_size)))
         auto_ses.append(max(float(sigma_size), 1e-4))
@@ -756,13 +755,14 @@ def classify_twin_pregnancy(
             "FM": 0.5 * (1.0 - p_ff),
             "MM": 0.5 * (1.0 - p_ff),
         }
+        x_euploid_f = abs(float(delta_x)) <= 2.5 * max(float(sigma_x), 0.005)
         p_high = (
             float(scipy.stats.norm.cdf((f_auto - 0.22) / max(sigma_auto, 0.02)))
-            if has_sample_auto
+            if (has_sample_auto and x_euploid_f)
             else 0.0
         )
         twin_prob = 1.0 if twins else float(np.clip(p_high, 1e-4, 0.999))
-        is_twin = bool(twins or (has_sample_auto and f_auto >= 0.25))
+        is_twin = bool(twins or (has_sample_auto and x_euploid_f and f_auto >= 0.25))
         conf = (
             p_ff
             if twins
@@ -784,7 +784,9 @@ def classify_twin_pregnancy(
         sig_x = max(float(sigma_x), 0.005)
         sig_tot = math.hypot(sig_y, sigma_auto)
         z_x_fm = (float(delta_x) + 0.5 * hat_fy) / math.hypot(sig_x, 0.5 * sig_y)
-        x_concordant = bool(abs(z_x_fm) <= 6.0 and float(delta_x) <= 3.5 * sig_x)
+        x_concordant = bool(
+            abs(z_x_fm) <= 3.5 and float(delta_x) <= -0.15 * hat_fy + 2.0 * sig_x
+        )
 
         ll_mm = float(scipy.stats.norm.logpdf(hat_fy - f_auto, loc=0.0, scale=sig_tot))
         ll_fm_mid = float(
@@ -796,10 +798,10 @@ def classify_twin_pregnancy(
                 ),
             )
         )
-        span_fm = max(0.77 * f_auto, 1e-4)
+        span_fm = max(0.65 * f_auto, 1e-4)
         ll_fm_unif = _log_normal_interval_prob(
-            (0.15 * f_auto - hat_fy) / sig_tot,
-            (0.92 * f_auto - hat_fy) / sig_tot,
+            (0.20 * f_auto - hat_fy) / sig_tot,
+            (0.85 * f_auto - hat_fy) / sig_tot,
         ) - math.log(span_fm)
         ll_fm = float(
             np.logaddexp(math.log(0.75) + ll_fm_mid, math.log(0.25) + ll_fm_unif)

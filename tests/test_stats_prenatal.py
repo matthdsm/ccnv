@@ -532,7 +532,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
         sig_floor = effective_ffa_sigma(0.001, unshrunk_weights, has_alt_ff=False)
         self.assertAlmostEqual(sig_floor, 0.005, places=6)
 
-    def test_classify_twin_pregnancy_12_empirical_cfd_twins_100pct_concordance(
+    def test_classify_twin_pregnancy_and_sca_cohort_concordance(
         self,
     ) -> None:
         yfrac_thresh = 0.000043
@@ -540,23 +540,23 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
         sigma_ffa_eff = effective_ffa_sigma(0.0375, [olm_norm], has_alt_ff=True)
         sigma_size = 0.0247
         sigma_ffy = 0.0050
-        sigma_x = 0.009393 / 0.398684
+        sigma_x = 0.5 * 0.009393 / 0.398684
 
         empirical_twins = [
             (
-                "CFD2600918",
+                "sample1",
                 "FM",
                 ("F", "M"),
                 "M",
-                0.159,
-                -0.099,
+                0.154,
+                0.133,
                 0.102,
                 0.352,
-                0.342,
-                0.00024,
+                0.351,
+                0.00025,
             ),
             (
-                "CFD2601253",
+                "sample2",
                 "MM",
                 ("M", "M"),
                 "M",
@@ -568,7 +568,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
                 0.00028,
             ),
             (
-                "CFD2601385",
+                "sample3",
                 "MM",
                 ("M", "M"),
                 "M",
@@ -580,7 +580,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
                 0.00039,
             ),
             (
-                "CFD2601422",
+                "sample4",
                 "FF",
                 ("F", "F"),
                 "F",
@@ -592,7 +592,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
                 0.00000,
             ),
             (
-                "CFD2601481",
+                "sample5",
                 "MM",
                 ("M", "M"),
                 "M",
@@ -604,7 +604,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
                 0.00019,
             ),
             (
-                "CFD2601666",
+                "sample6",
                 "FM",
                 ("F", "M"),
                 "M",
@@ -616,7 +616,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
                 0.00023,
             ),
             (
-                "CFD2601686",
+                "sample7",
                 "FF",
                 ("F", "F"),
                 "F",
@@ -628,7 +628,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
                 0.00000,
             ),
             (
-                "CFD2601874",
+                "sample8",
                 "FM",
                 ("F", "M"),
                 "M",
@@ -640,7 +640,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
                 0.00015,
             ),
             (
-                "CFD2601891",
+                "sample9",
                 "MM",
                 ("M", "M"),
                 "M",
@@ -652,7 +652,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
                 0.00021,
             ),
             (
-                "CFD2602222",
+                "sample10",
                 "MM",
                 ("M", "M"),
                 "M",
@@ -664,7 +664,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
                 0.00028,
             ),
             (
-                "CFD2602395",
+                "sample11",
                 "FF",
                 ("F", "F"),
                 "F",
@@ -676,7 +676,7 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
                 0.00000,
             ),
             (
-                "CFD2602455",
+                "sample12",
                 "FM",
                 ("F", "M"),
                 "M",
@@ -740,6 +740,50 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
             else:
                 self.assertGreater(cls.male_ff or 0.0, 0.0)
                 self.assertEqual(cls.female_ff, 0.0)
+
+        p0 = dict.fromkeys(("XX", "XY", "XO", "XXX", "XXY", "XYY"), 1e-6)
+        fem_p = p0 | {"XX": 0.90, "XO": 0.05, "XXX": 0.05}
+        male_p = p0 | {"XY": 0.90, "XXY": 0.05, "XYY": 0.05}
+        empirical_scas = [
+            ("sample13", "XXX", "F", None, -0.1407, 0.1009, 0.1286, 0.000004),
+            ("sample14", "XXY", "M", 0.1322, 0.0130, 0.1002, 0.1186, 0.000220),
+            ("sample15", "XO", "F", None, 0.0925, 0.0955, 0.0502, 0.000003),
+        ]
+        for sid, truth_sca, sex, ffy, ffx, ffa, ff_size, chry_sc in empirical_scas:
+            fsex = "F" if sex == "F" else "M"
+            delta_x = -0.5 * ffx
+            sca_cls = classify_sca_ray_4d(
+                delta_x=delta_x,
+                sigma_x=sigma_x,
+                ffy=ffy if fsex == "M" else 0.0,
+                sigma_ffy=sigma_ffy,
+                ffa=ffa,
+                sigma_ffa=sigma_ffa_eff,
+                ff_size=ff_size,
+                sigma_size=sigma_size,
+                clinical_priors=fem_p if fsex == "F" else male_p,
+            )
+            self.assertEqual(sca_cls.call, truth_sca, f"SCA failed on {sid}")
+            twin_cls = classify_twin_pregnancy(
+                fetal_sex=fsex,
+                chry_score=chry_sc,
+                yfrac_threshold=yfrac_thresh,
+                ffy=ffy,
+                sigma_ffy=sigma_ffy,
+                delta_x=delta_x,
+                sigma_x=sigma_x,
+                ffa=ffa,
+                sigma_ffa=sigma_ffa_eff,
+                ff_size=ff_size,
+                sigma_size=sigma_size,
+                active_ff=sca_cls.active_ff,
+                active_ff_se=sca_cls.active_ff_se,
+                active_ff_source=sca_cls.active_ff_source,
+                twins=False,
+                olm_norm=olm_norm,
+            )
+            self.assertEqual(twin_cls.gestation, "singleton", f"Twin failed on {sid}")
+            self.assertFalse(twin_cls.twin.is_twin, f"Twin failed on {sid}")
 
     def test_classify_twin_pregnancy_auto_mode_promotion_and_47xxy_guard(self) -> None:
         fm_auto = classify_twin_pregnancy(
@@ -924,15 +968,15 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
             fetal_sex="M",
             chry_score=0.00025,
             yfrac_threshold=0.000043,
-            ffy=0.20,
+            ffy=0.16,
             sigma_ffy=0.005,
-            delta_x=-0.10,
+            delta_x=-0.08,
             sigma_x=0.008,
             ffa=None,
             sigma_ffa=0.02,
             ff_size=0.22,
             sigma_size=0.005,
-            active_ff=0.20,
+            active_ff=0.16,
             active_ff_se=0.005,
             active_ff_source="FFY",
             twins=True,
