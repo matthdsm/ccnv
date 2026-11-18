@@ -433,7 +433,11 @@ def resolve_chry_anchor_ff(
         if prenatal_result.active_ff_se is not None
         else max(pm.ffy_std, 0.008)
     )
-    if prenatal_result.sca.call != "XY" or prenatal_result.ffy is None:
+    if (
+        prenatal_result.sca.call != "XY"
+        or prenatal_result.ffy is None
+        or prenatal_result.fetal_sexes == ("F", "M")
+    ):
         return f_base, se_base
 
     off_ests = [float(prenatal_result.ffa), float(prenatal_result.ffx)]

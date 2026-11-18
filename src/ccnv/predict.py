@@ -309,6 +309,7 @@ def run(config: PredictConfig) -> PredictionOutputs:
                 sample_mappability_override=sample_map,
                 sample_n_mask_override=sample_n_mask,
                 min_mappability=config.min_mappability,
+                twins=config.twins,
             )
             weighted_sample = apply_prenatal_fisher_weighting(raw_sample, prenatal_meta)
         except (SchemaError, ValueError) as err:

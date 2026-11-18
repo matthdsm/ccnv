@@ -11,6 +11,8 @@ CallType = Literal["gain", "loss"]
 SCACall = Literal["XX", "XY", "XO", "XXX", "XXY", "XYY", "DISCORDANT_MIXED"]
 FetalSex = Literal["M", "F"]
 ActiveFFSource = Literal["FFY", "FFA", "FFX", "FF_SIZE", "FUSED"]
+GestationType = Literal["singleton", "twin"]
+TwinSexPair = Literal["FF", "FM", "MM"]
 
 
 class ScanQcCounts(TypedDict):
@@ -119,6 +121,29 @@ class SCAResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TwinResult:
+    """Twin pregnancy and fetal sex-pair prediction result."""
+
+    call: TwinSexPair
+    fetal_sexes: tuple[FetalSex, FetalSex]
+    is_twin: bool
+    twin_probability: float
+    confidence: float
+    posteriors: dict[TwinSexPair, float]
+    male_ff: float
+    female_ff: float
+
+    def __post_init__(self) -> None:
+        """Validate twin sex-pair call and fetal sexes."""
+        if self.call not in ("FF", "FM", "MM"):
+            raise ValueError(f"invalid twin call: {self.call!r}")
+        if tuple(self.fetal_sexes) not in (("F", "F"), ("F", "M"), ("M", "M")):
+            raise ValueError(f"invalid twin fetal_sexes: {self.fetal_sexes!r}")
+        if not isinstance(self.fetal_sexes, tuple):
+            object.__setattr__(self, "fetal_sexes", tuple(self.fetal_sexes))
+
+
+@dataclass(frozen=True, slots=True)
 class FetalFractionResult:
     """Prenatal fetal fraction and sex chromosome analysis results."""
 
@@ -138,9 +163,15 @@ class FetalFractionResult:
     active_ff_se: float | None = None
     effective_ff: float | None = None
     lod_metrics: PrenatalLoDMetrics | None = None
+    twin: TwinResult | None = None
+    gestation: GestationType = "singleton"
+    fetal_sexes: tuple[FetalSex, FetalSex] | None = None
+    male_ff: float | None = None
+    female_ff: float | None = None
+    twin_confidence: float | None = None
 
     def __post_init__(self) -> None:
-        """Validate fetal sex and active FF source invariants."""
+        """Validate fetal sex, active FF source, and twin gestation invariants."""
         if self.fetal_sex not in ("M", "F"):
             raise ValueError(f"fetal_sex must be 'M' or 'F', got {self.fetal_sex!r}")
         if self.active_ff_source not in ("FFY", "FFA", "FFX", "FF_SIZE", "FUSED"):
@@ -148,6 +179,18 @@ class FetalFractionResult:
                 "active_ff_source must be 'FFY', 'FFA', 'FFX', 'FF_SIZE', or 'FUSED', "
                 f"got {self.active_ff_source!r}"
             )
+        if self.gestation not in ("singleton", "twin"):
+            raise ValueError(
+                f"gestation must be 'singleton' or 'twin', got {self.gestation!r}"
+            )
+        if self.fetal_sexes is not None:
+            if tuple(self.fetal_sexes) not in (("F", "F"), ("F", "M"), ("M", "M")):
+                raise ValueError(
+                    "fetal_sexes must be ('F', 'F'), ('F', 'M'), or ('M', 'M'), "
+                    f"got {self.fetal_sexes!r}"
+                )
+            if not isinstance(self.fetal_sexes, tuple):
+                object.__setattr__(self, "fetal_sexes", tuple(self.fetal_sexes))
         if not isinstance(self.warnings, tuple):
             object.__setattr__(self, "warnings", tuple(self.warnings))
 
@@ -217,6 +260,7 @@ __all__ = [
     "CallType",
     "FetalFractionResult",
     "FetalSex",
+    "GestationType",
     "PredictionOutputs",
     "PrenatalLoDMetrics",
     "ReferenceQCOutputs",
@@ -225,4 +269,6 @@ __all__ = [
     "ScanAlignmentResult",
     "ScanQcCounts",
     "SegmentResult",
+    "TwinResult",
+    "TwinSexPair",
 ]

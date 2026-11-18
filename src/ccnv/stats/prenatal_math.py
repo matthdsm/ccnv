@@ -16,15 +16,25 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import HuberRegressor
 
 from ccnv.models.exceptions import InvalidInputError
-from ccnv.models.results import ActiveFFSource, SCACall
+from ccnv.models.results import (
+    ActiveFFSource,
+    FetalSex,
+    GestationType,
+    SCACall,
+    TwinResult,
+    TwinSexPair,
+)
 from ccnv.stats.regression import mad_scale
 
 __all__ = [
     "MSYSexModel",
     "PoissonFFYModel",
     "SCARayClassification",
+    "TwinClassification",
     "classify_sca_ray_4d",
+    "classify_twin_pregnancy",
     "compute_autosomal_density",
+    "effective_ffa_sigma",
     "evaluate_poisson_msy_ffy",
     "fit_forward_ffx_model",
     "fit_msy_sex_mixture",
@@ -72,6 +82,44 @@ class SCARayClassification:
     active_ff: float
     active_ff_source: ActiveFFSource
     active_ff_se: float = 0.05
+
+
+@dataclass(frozen=True, slots=True)
+class TwinClassification:
+    """Two-fetus stoichiometry classification and reconciled fetal fraction estimates."""
+
+    twin: TwinResult
+    gestation: GestationType
+    fetal_sexes: tuple[FetalSex, FetalSex] | None
+    male_ff: float | None
+    female_ff: float | None
+    twin_confidence: float | None
+    active_ff: float
+    active_ff_se: float
+    active_ff_source: ActiveFFSource
+
+
+def effective_ffa_sigma(
+    sigma_ffa: float,
+    olm_weights: Sequence[float] | NDArray[np.floating] | None,
+    *,
+    has_alt_ff: bool,
+) -> float:
+    """Compute effective FFA standard error, inflating when OLM weights are heavily shrunk."""
+    olm_norm = (
+        float(np.linalg.norm(np.asarray(olm_weights, dtype=np.float64)))
+        if olm_weights is not None and len(olm_weights) > 0
+        else 0.0
+    )
+    if has_alt_ff and olm_norm < 0.10:
+        return float(
+            max(
+                float(sigma_ffa),
+                0.25 * math.sqrt(0.10 / max(olm_norm, 0.01)),
+                0.005,
+            )
+        )
+    return float(max(float(sigma_ffa), 0.005))
 
 
 def _poisson_logpmf(
@@ -635,4 +683,216 @@ def classify_sca_ray_4d(
         active_ff=act_ff,
         active_ff_source=act_source,
         active_ff_se=act_se,
+    )
+
+
+def classify_twin_pregnancy(
+    fetal_sex: FetalSex,
+    chry_score: float,
+    yfrac_threshold: float,
+    ffy: float | None,
+    sigma_ffy: float,
+    delta_x: float,
+    sigma_x: float,
+    ffa: float | None,
+    sigma_ffa: float,
+    ff_size: float | None,
+    sigma_size: float,
+    active_ff: float,
+    active_ff_se: float,
+    active_ff_source: ActiveFFSource,
+    *,
+    twins: bool = False,
+    olm_norm: float = 1.0,
+) -> TwinClassification:
+    """Classify twin gestation and fetal sex pair (FF, FM, MM) via 2-fetus stoichiometry."""
+    auto_ests: list[float] = []
+    auto_ses: list[float] = []
+    if ffa is not None and math.isfinite(ffa):
+        auto_ests.append(max(0.0, float(ffa)))
+        auto_ses.append(max(float(sigma_ffa), 1e-4))
+    if ff_size is not None and math.isfinite(ff_size):
+        auto_ests.append(max(0.0, float(ff_size)))
+        auto_ses.append(max(float(sigma_size), 1e-4))
+    if auto_ests:
+        f_auto, raw_sigma_auto = fuse_active_fetal_fraction_student_t4(
+            auto_ests, auto_ses
+        )
+    else:
+        f_auto = max(0.0, float(active_ff))
+        raw_sigma_auto = max(float(active_ff_se), 0.005)
+    sigma_auto = max(float(raw_sigma_auto), 0.005)
+
+    if fetal_sex == "F":
+        p_ff = float(
+            np.clip(
+                1.0
+                - 0.5
+                * math.exp(
+                    -max(0.0, float(yfrac_threshold) - float(chry_score))
+                    / max(0.25 * float(yfrac_threshold), 1e-6)
+                ),
+                0.50,
+                0.9999,
+            )
+        )
+        posteriors: dict[TwinSexPair, float] = {
+            "FF": p_ff,
+            "FM": 0.5 * (1.0 - p_ff),
+            "MM": 0.5 * (1.0 - p_ff),
+        }
+        p_high = float(scipy.stats.norm.cdf((f_auto - 0.22) / max(sigma_auto, 0.02)))
+        twin_prob = 1.0 if twins else float(np.clip(p_high, 1e-4, 0.999))
+        is_twin = bool(twins or f_auto >= 0.25)
+        conf = (
+            p_ff
+            if twins
+            else float(
+                np.clip(
+                    scipy.stats.norm.cdf((f_auto - 0.20) / max(sigma_auto, 0.005)),
+                    0.50,
+                    0.99,
+                )
+            )
+        )
+        sexes_f: tuple[FetalSex, FetalSex] = ("F", "F")
+        fem_ff = float(active_ff)
+        twin_res = TwinResult(
+            call="FF",
+            fetal_sexes=sexes_f,
+            is_twin=is_twin,
+            twin_probability=twin_prob,
+            confidence=conf,
+            posteriors=posteriors,
+            male_ff=0.0,
+            female_ff=fem_ff,
+        )
+        return TwinClassification(
+            twin=twin_res,
+            gestation="twin" if is_twin else "singleton",
+            fetal_sexes=sexes_f if is_twin else None,
+            male_ff=0.0 if is_twin else None,
+            female_ff=fem_ff if is_twin else None,
+            twin_confidence=conf if is_twin else None,
+            active_ff=fem_ff,
+            active_ff_se=float(active_ff_se),
+            active_ff_source=active_ff_source,
+        )
+
+    hat_fy = max(0.0, float(ffy) if (ffy is not None and math.isfinite(ffy)) else 0.0)
+    sig_y = max(float(sigma_ffy), 0.005)
+    ll_mm = float(
+        scipy.stats.norm.logpdf(
+            hat_fy - f_auto, loc=0.0, scale=math.hypot(sig_y, sigma_auto)
+        )
+    )
+    ll_fm = float(
+        scipy.stats.norm.logpdf(
+            hat_fy - 0.50 * f_auto,
+            loc=0.0,
+            scale=math.sqrt(sig_y**2 + (0.50 * sigma_auto) ** 2 + (0.12 * f_auto) ** 2),
+        )
+    )
+    p_fm_cond = float(scipy.special.expit(ll_fm - ll_mm + math.log(0.55 / 0.45)))
+    p_ff = 1e-4
+    posteriors = {
+        "FF": p_ff,
+        "FM": (1.0 - p_ff) * p_fm_cond,
+        "MM": (1.0 - p_ff) * (1.0 - p_fm_cond),
+    }
+    call: TwinSexPair = "FM" if p_fm_cond >= 0.50 else "MM"
+    sexes: tuple[FetalSex, FetalSex] = ("F", "M") if call == "FM" else ("M", "M")
+
+    z_x_fm = (float(delta_x) + 0.5 * hat_fy) / math.hypot(
+        max(float(sigma_x), 0.005), 0.5 * sig_y
+    )
+    p_fm_auto = (
+        float(scipy.special.expit(ll_fm - ll_mm + math.log(0.25 / 0.75)))
+        if (hat_fy < f_auto and abs(z_x_fm) <= 3.5)
+        else 0.0
+    )
+    p_high = float(
+        scipy.stats.norm.cdf(
+            (max(f_auto, float(active_ff)) - 0.22) / max(sigma_auto, 0.02)
+        )
+    )
+    twin_prob = 1.0 if twins else float(np.clip(max(p_fm_auto, p_high), 1e-4, 0.999))
+    is_fm_auto = bool(p_fm_auto > 0.80 and hat_fy < f_auto and abs(z_x_fm) <= 3.5)
+    is_mm_auto = bool(not is_fm_auto and max(f_auto, float(active_ff)) >= 0.25)
+    is_twin = bool(twins or is_fm_auto or is_mm_auto)
+    if not twins and is_mm_auto and not is_fm_auto:
+        call = "MM"
+        sexes = ("M", "M")
+
+    if call == "FM":
+        if is_twin:
+            out_act_ff = max(f_auto, hat_fy + 0.02)
+            out_se = sigma_auto
+            out_src: ActiveFFSource = (
+                "FF_SIZE"
+                if (ff_size is not None and math.isfinite(ff_size) and olm_norm < 0.10)
+                else (
+                    "FUSED"
+                    if (
+                        ff_size is not None
+                        and math.isfinite(ff_size)
+                        and ffa is not None
+                        and math.isfinite(ffa)
+                    )
+                    else "FFA"
+                )
+            )
+        else:
+            out_act_ff = float(active_ff)
+            out_se = float(active_ff_se)
+            out_src = active_ff_source
+        m_ff = hat_fy
+        f_ff = max(0.0, max(out_act_ff, f_auto) - hat_fy)
+        conf = (
+            float(np.clip(posteriors["FM"] if twins else p_fm_auto, 0.50, 0.999))
+            if is_twin
+            else float(posteriors["FM"])
+        )
+    else:
+        out_act_ff = float(active_ff)
+        out_se = float(active_ff_se)
+        out_src = active_ff_source
+        m_ff = out_act_ff
+        f_ff = 0.0
+        conf = (
+            float(
+                np.clip(
+                    posteriors["MM"]
+                    if twins
+                    else scipy.stats.norm.cdf(
+                        (max(f_auto, float(active_ff)) - 0.20) / max(sigma_auto, 0.005)
+                    ),
+                    0.50,
+                    0.999,
+                )
+            )
+            if is_twin
+            else float(posteriors["MM"])
+        )
+
+    twin_res = TwinResult(
+        call=call,
+        fetal_sexes=sexes,
+        is_twin=is_twin,
+        twin_probability=twin_prob,
+        confidence=conf,
+        posteriors=posteriors,
+        male_ff=m_ff,
+        female_ff=f_ff,
+    )
+    return TwinClassification(
+        twin=twin_res,
+        gestation="twin" if is_twin else "singleton",
+        fetal_sexes=sexes if is_twin else None,
+        male_ff=m_ff if is_twin else None,
+        female_ff=f_ff if is_twin else None,
+        twin_confidence=conf if is_twin else None,
+        active_ff=out_act_ff,
+        active_ff_se=out_se,
+        active_ff_source=out_src,
     )

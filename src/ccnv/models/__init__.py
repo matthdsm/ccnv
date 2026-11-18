@@ -47,6 +47,7 @@ from ccnv.models.results import (
     CallType,
     FetalFractionResult,
     FetalSex,
+    GestationType,
     PredictionOutputs,
     PrenatalLoDMetrics,
     ReferenceQCOutputs,
@@ -55,6 +56,8 @@ from ccnv.models.results import (
     ScanQcCounts,
     SCAResult,
     SegmentResult,
+    TwinResult,
+    TwinSexPair,
 )
 from ccnv.models.schemas import (
     BRANCH_AUTOSOMAL,
@@ -133,6 +136,7 @@ __all__ = [
     "FetalFractionResult",
     "FetalSex",
     "FragmentomicsMetadata",
+    "GestationType",
     "InvalidInputError",
     "PredictConfig",
     "PredictError",
@@ -157,6 +161,8 @@ __all__ = [
     "SchemaVersionError",
     "SegmentResult",
     "SexBranch",
+    "TwinResult",
+    "TwinSexPair",
     "assemble_reference_table",
     "build_reference_schema",
     "canonical_dictionary_array",

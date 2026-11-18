@@ -162,8 +162,43 @@ def build_predict_qc_payload(
             if prenatal_result.effective_ff is not None
             else float(prenatal_result.active_ff)
         )
+        twin_block: dict[str, object] | None = None
+        if prenatal_result.twin is not None:
+            twin_block = {
+                "call": prenatal_result.twin.call,
+                "fetal_sexes": list(prenatal_result.twin.fetal_sexes),
+                "is_twin": bool(prenatal_result.twin.is_twin),
+                "twin_probability": float(prenatal_result.twin.twin_probability),
+                "confidence": float(prenatal_result.twin.confidence),
+                "posteriors": {
+                    str(k): float(v) for k, v in prenatal_result.twin.posteriors.items()
+                },
+                "male_ff": float(prenatal_result.twin.male_ff),
+                "female_ff": float(prenatal_result.twin.female_ff),
+            }
         prenatal_data = {
             "fetal_sex": prenatal_result.fetal_sex,
+            "gestation": prenatal_result.gestation,
+            "fetal_sexes": (
+                list(prenatal_result.fetal_sexes)
+                if prenatal_result.fetal_sexes is not None
+                else None
+            ),
+            "male_ff": (
+                float(prenatal_result.male_ff)
+                if prenatal_result.male_ff is not None
+                else None
+            ),
+            "female_ff": (
+                float(prenatal_result.female_ff)
+                if prenatal_result.female_ff is not None
+                else None
+            ),
+            "twin_confidence": (
+                float(prenatal_result.twin_confidence)
+                if prenatal_result.twin_confidence is not None
+                else None
+            ),
             "active_ff": float(prenatal_result.active_ff),
             "effective_ff": eff_ff,
             "active_ff_se": (
@@ -196,6 +231,7 @@ def build_predict_qc_payload(
                     else None
                 ),
             },
+            "twin": twin_block,
             "low_ff_warning": bool(prenatal_result.low_ff_warning),
             "warnings": list(prenatal_result.warnings),
             "origin_summary": origin_counts,

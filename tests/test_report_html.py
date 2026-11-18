@@ -34,6 +34,7 @@ from ccnv.models.results import (
     FetalFractionResult,
     SCAResult,
     SegmentResult,
+    TwinResult,
 )
 from ccnv.predict import run as run_predict
 from ccnv.report import (
@@ -330,6 +331,73 @@ class TestHtmlReport(unittest.TestCase):
         self.assertEqual(
             (len(seg_rows[0]), seg_rows[0][6], seg_rows[0][9]),
             (13, True, "SUB_FETAL_RATIO"),
+        )
+        self.assertEqual(prenatal_dict["gestation"], "singleton")
+        self.assertIsNone(prenatal_dict["fetal_sexes"])
+        self.assertIsNone(prenatal_dict["twin"])
+
+    def test_render_genome_plot_with_prenatal_twin_metadata_and_banner(self) -> None:
+        contig_lengths = {"chr1": 200_000}
+        bins = (_make_bin_result("autosomal", ("chr1",), [0], [200_000], 0.0, 0.0),)
+        sca = SCAResult("XY", False, 0.99, -6.5)
+        twin = TwinResult(
+            call="FM",
+            fetal_sexes=("F", "M"),
+            is_twin=True,
+            twin_probability=0.92,
+            confidence=0.9718,
+            posteriors={"FF": 0.0001, "FM": 0.9718, "MM": 0.0281},
+            male_ff=0.143,
+            female_ff=0.075,
+        )
+        prenatal = FetalFractionResult(
+            "M",
+            0.218,
+            "FF_SIZE",
+            0.143,
+            0.15,
+            0.101,
+            0.81,
+            0.00023,
+            0.000043,
+            sca,
+            twin=twin,
+            gestation="twin",
+            fetal_sexes=("F", "M"),
+            male_ff=0.143,
+            female_ff=0.075,
+            twin_confidence=0.9718,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            html_path = Path(tmpdir) / "twin_plot.html"
+            render_genome_plot(
+                html_path, bins, (), contig_lengths, prenatal_result=prenatal
+            )
+            content = html_path.read_text(encoding="utf-8")
+
+        self.assertIn('Twins (${p.fetal_sexes.join("/")})', content)
+        self.assertIn("Twin FF (M/F):", content)
+        payload = _extract_payload(content)
+        p_dict = payload["prenatal"]
+        if not isinstance(p_dict, dict):
+            self.fail("Expected payload['prenatal'] to be a dict")
+        self.assertEqual(p_dict["gestation"], "twin")
+        self.assertEqual(p_dict["fetal_sexes"], ["F", "M"])
+        self.assertEqual(p_dict["male_ff"], 0.143)
+        self.assertEqual(p_dict["female_ff"], 0.075)
+        self.assertEqual(p_dict["twin_confidence"], 0.9718)
+        self.assertEqual(
+            p_dict["twin"],
+            {
+                "call": "FM",
+                "fetal_sexes": ["F", "M"],
+                "is_twin": True,
+                "twin_probability": 0.92,
+                "confidence": 0.9718,
+                "posteriors": {"FF": 0.0001, "FM": 0.9718, "MM": 0.0281},
+                "male_ff": 0.143,
+                "female_ff": 0.075,
+            },
         )
 
     def test_render_genome_plot_natural_chrom_sort_order(self) -> None:

@@ -13,7 +13,9 @@ from ccnv.models import NUM_FRAG_BANDS
 from ccnv.stats.pca import pca_irlba_numpy
 from ccnv.stats.prenatal_math import (
     classify_sca_ray_4d,
+    classify_twin_pregnancy,
     compute_autosomal_density,
+    effective_ffa_sigma,
     evaluate_poisson_msy_ffy,
     fit_forward_ffx_model,
     fit_msy_sex_mixture,
@@ -506,6 +508,333 @@ class TestSCARayAndActiveFFFusion(unittest.TestCase):
         )
         self.assertTrue(math.isfinite(log_ev_b))
         self.assertGreater(m_hat_b, 0.90)
+
+
+class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
+    def test_effective_ffa_sigma_inflates_only_when_shrunk_and_alt_channel_present(
+        self,
+    ) -> None:
+        shrunk_weights = [0.01525, 0.0, 0.0]
+        sig_inflated = effective_ffa_sigma(0.0375, shrunk_weights, has_alt_ff=True)
+        self.assertGreater(sig_inflated, 0.50)
+        self.assertAlmostEqual(sig_inflated, 0.25 * math.sqrt(0.10 / 0.01525), places=6)
+
+        sig_no_alt = effective_ffa_sigma(0.0375, shrunk_weights, has_alt_ff=False)
+        self.assertAlmostEqual(sig_no_alt, 0.0375, places=6)
+
+        sig_none_alt = effective_ffa_sigma(0.0375, None, has_alt_ff=True)
+        self.assertAlmostEqual(sig_none_alt, 0.25 * math.sqrt(0.10 / 0.01), places=6)
+
+        unshrunk_weights = [0.20, 0.15]
+        sig_unshrunk = effective_ffa_sigma(0.0375, unshrunk_weights, has_alt_ff=True)
+        self.assertAlmostEqual(sig_unshrunk, 0.0375, places=6)
+
+        sig_floor = effective_ffa_sigma(0.001, unshrunk_weights, has_alt_ff=False)
+        self.assertAlmostEqual(sig_floor, 0.005, places=6)
+
+    def test_classify_twin_pregnancy_12_empirical_cfd_twins_100pct_concordance(
+        self,
+    ) -> None:
+        yfrac_thresh = 0.000043
+        olm_norm = 0.01525
+        sigma_ffa_eff = effective_ffa_sigma(0.0375, [olm_norm], has_alt_ff=True)
+        sigma_size = 0.0247
+        sigma_ffy = 0.0050
+        sigma_x = 0.009393 / 0.398684
+
+        empirical_twins = [
+            (
+                "CFD2600918",
+                "FM",
+                ("F", "M"),
+                "M",
+                0.159,
+                -0.099,
+                0.102,
+                0.352,
+                0.342,
+                0.00024,
+            ),
+            (
+                "CFD2601253",
+                "MM",
+                ("M", "M"),
+                "M",
+                0.173,
+                0.156,
+                0.102,
+                0.174,
+                0.171,
+                0.00028,
+            ),
+            (
+                "CFD2601385",
+                "MM",
+                ("M", "M"),
+                "M",
+                0.244,
+                0.284,
+                0.102,
+                0.196,
+                0.177,
+                0.00039,
+            ),
+            (
+                "CFD2601422",
+                "FF",
+                ("F", "F"),
+                "F",
+                None,
+                0.044,
+                0.103,
+                0.305,
+                0.294,
+                0.00000,
+            ),
+            (
+                "CFD2601481",
+                "MM",
+                ("M", "M"),
+                "M",
+                0.119,
+                0.085,
+                0.100,
+                0.084,
+                0.116,
+                0.00019,
+            ),
+            (
+                "CFD2601666",
+                "FM",
+                ("F", "M"),
+                "M",
+                0.143,
+                0.154,
+                0.102,
+                0.218,
+                0.144,
+                0.00023,
+            ),
+            (
+                "CFD2601686",
+                "FF",
+                ("F", "F"),
+                "F",
+                None,
+                -0.010,
+                0.101,
+                0.093,
+                0.096,
+                0.00000,
+            ),
+            (
+                "CFD2601874",
+                "FM",
+                ("F", "M"),
+                "M",
+                0.094,
+                0.134,
+                0.097,
+                0.128,
+                0.096,
+                0.00015,
+            ),
+            (
+                "CFD2601891",
+                "MM",
+                ("M", "M"),
+                "M",
+                0.127,
+                0.131,
+                0.100,
+                0.069,
+                0.126,
+                0.00021,
+            ),
+            (
+                "CFD2602222",
+                "MM",
+                ("M", "M"),
+                "M",
+                0.176,
+                0.145,
+                0.103,
+                0.181,
+                0.174,
+                0.00028,
+            ),
+            (
+                "CFD2602395",
+                "FF",
+                ("F", "F"),
+                "F",
+                None,
+                -0.015,
+                0.103,
+                0.082,
+                0.088,
+                0.00000,
+            ),
+            (
+                "CFD2602455",
+                "FM",
+                ("F", "M"),
+                "M",
+                0.075,
+                0.073,
+                0.100,
+                0.177,
+                0.159,
+                0.00012,
+            ),
+        ]
+
+        for (
+            sid,
+            truth_call,
+            truth_sexes,
+            sex,
+            ffy,
+            ffx,
+            ffa,
+            ff_size,
+            act_ff,
+            chry_sc,
+        ) in empirical_twins:
+            delta_x = -0.5 * ffx
+            cls = classify_twin_pregnancy(
+                fetal_sex="F" if sex == "F" else "M",
+                chry_score=chry_sc,
+                yfrac_threshold=yfrac_thresh,
+                ffy=ffy,
+                sigma_ffy=sigma_ffy,
+                delta_x=delta_x,
+                sigma_x=sigma_x,
+                ffa=ffa,
+                sigma_ffa=sigma_ffa_eff,
+                ff_size=ff_size,
+                sigma_size=sigma_size,
+                active_ff=act_ff,
+                active_ff_se=0.015,
+                active_ff_source="FUSED",
+                twins=True,
+                olm_norm=olm_norm,
+            )
+            self.assertEqual(cls.twin.call, truth_call, f"Failed on {sid}")
+            self.assertEqual(cls.twin.fetal_sexes, truth_sexes, f"Failed on {sid}")
+            self.assertTrue(cls.twin.is_twin, f"Failed on {sid}")
+            self.assertEqual(cls.gestation, "twin", f"Failed on {sid}")
+            self.assertEqual(cls.fetal_sexes, truth_sexes, f"Failed on {sid}")
+            self.assertEqual(cls.twin.twin_probability, 1.0)
+            self.assertAlmostEqual(
+                sum(cls.twin.posteriors.values()), 1.0, places=5, msg=sid
+            )
+            self.assertIsNotNone(cls.twin_confidence)
+            if truth_call == "FF":
+                self.assertEqual(cls.male_ff, 0.0)
+                self.assertGreater(cls.female_ff or 0.0, 0.0)
+            elif truth_call == "FM":
+                self.assertAlmostEqual(cls.male_ff or 0.0, ffy or 0.0, places=5)
+                self.assertGreater(cls.female_ff or 0.0, 0.0)
+                self.assertEqual(cls.active_ff_source, "FF_SIZE")
+            else:
+                self.assertGreater(cls.male_ff or 0.0, 0.0)
+                self.assertEqual(cls.female_ff, 0.0)
+
+    def test_classify_twin_pregnancy_auto_mode_promotion_and_47xxy_guard(self) -> None:
+        fm_auto = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00023,
+            yfrac_threshold=0.000043,
+            ffy=0.09,
+            sigma_ffy=0.005,
+            delta_x=-0.045,
+            sigma_x=0.008,
+            ffa=0.22,
+            sigma_ffa=0.02,
+            ff_size=0.22,
+            sigma_size=0.02,
+            active_ff=0.14,
+            active_ff_se=0.01,
+            active_ff_source="FUSED",
+            twins=False,
+            olm_norm=0.50,
+        )
+        self.assertEqual(fm_auto.gestation, "twin")
+        self.assertTrue(fm_auto.twin.is_twin)
+        self.assertEqual(fm_auto.twin.call, "FM")
+        self.assertEqual(fm_auto.fetal_sexes, ("F", "M"))
+        self.assertGreater(fm_auto.twin.twin_probability, 0.80)
+        self.assertAlmostEqual(fm_auto.active_ff, 0.22, places=3)
+        self.assertEqual(fm_auto.active_ff_source, "FUSED")
+
+        ff_high = classify_twin_pregnancy(
+            fetal_sex="F",
+            chry_score=0.0,
+            yfrac_threshold=0.000043,
+            ffy=None,
+            sigma_ffy=0.005,
+            delta_x=0.0,
+            sigma_x=0.008,
+            ffa=0.28,
+            sigma_ffa=0.02,
+            ff_size=0.29,
+            sigma_size=0.02,
+            active_ff=0.285,
+            active_ff_se=0.014,
+            active_ff_source="FUSED",
+            twins=False,
+        )
+        self.assertEqual(ff_high.gestation, "twin")
+        self.assertTrue(ff_high.twin.is_twin)
+        self.assertEqual(ff_high.fetal_sexes, ("F", "F"))
+        self.assertGreater(ff_high.twin.twin_probability, 0.80)
+
+        xy_single = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00018,
+            yfrac_threshold=0.000043,
+            ffy=0.11,
+            sigma_ffy=0.005,
+            delta_x=-0.055,
+            sigma_x=0.008,
+            ffa=0.11,
+            sigma_ffa=0.02,
+            ff_size=0.11,
+            sigma_size=0.02,
+            active_ff=0.11,
+            active_ff_se=0.005,
+            active_ff_source="FUSED",
+            twins=False,
+        )
+        self.assertEqual(xy_single.gestation, "singleton")
+        self.assertFalse(xy_single.twin.is_twin)
+        self.assertIsNone(xy_single.fetal_sexes)
+        self.assertIsNone(xy_single.male_ff)
+        self.assertIsNone(xy_single.female_ff)
+        self.assertIsNone(xy_single.twin_confidence)
+        self.assertEqual(xy_single.twin.call, "MM")
+
+        xxy_single = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00020,
+            yfrac_threshold=0.000043,
+            ffy=0.10,
+            sigma_ffy=0.005,
+            delta_x=0.08,
+            sigma_x=0.005,
+            ffa=0.19,
+            sigma_ffa=0.02,
+            ff_size=0.19,
+            sigma_size=0.02,
+            active_ff=0.13,
+            active_ff_se=0.01,
+            active_ff_source="FUSED",
+            twins=False,
+        )
+        self.assertEqual(xxy_single.gestation, "singleton")
+        self.assertFalse(xxy_single.twin.is_twin)
+        self.assertIsNone(xxy_single.fetal_sexes)
 
 
 if __name__ == "__main__":

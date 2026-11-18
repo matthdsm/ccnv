@@ -30,6 +30,7 @@ from ccnv.models import (
     ReferenceQCConfig,
     SCAResult,
     SegmentResult,
+    TwinResult,
     assemble_reference_table,
 )
 from ccnv.qc.predict import build_predict_qc_payload, write_predict_qc_json
@@ -752,6 +753,78 @@ class TestQCPredict(unittest.TestCase):
         self.assertEqual(sca_dict["call"], "XY")
         self.assertFalse(sca_dict["is_aneuploid"])
         self.assertEqual(sca_dict["confidence"], 0.98)
+        self.assertIsNone(prenatal["twin"])
+        self.assertEqual(prenatal["gestation"], "singleton")
+        self.assertIsNone(prenatal["fetal_sexes"])
+        self.assertIsNone(prenatal["male_ff"])
+        self.assertIsNone(prenatal["female_ff"])
+        self.assertIsNone(prenatal["twin_confidence"])
+
+    def test_build_predict_qc_payload_prenatal_twin(self) -> None:
+        table = _make_predict_sample_table()
+        sca = SCAResult("XY", False, 0.9912, -6.53, ff_delta=0.011)
+        twin = TwinResult(
+            call="FM",
+            fetal_sexes=("F", "M"),
+            is_twin=True,
+            twin_probability=0.92,
+            confidence=0.9718,
+            posteriors={"FF": 0.0001, "FM": 0.9718, "MM": 0.0281},
+            male_ff=0.143,
+            female_ff=0.075,
+        )
+        prenatal_result = FetalFractionResult(
+            "M",
+            0.218,
+            "FF_SIZE",
+            0.143,
+            0.15,
+            0.101,
+            0.81,
+            0.00023,
+            0.000043,
+            sca,
+            twin=twin,
+            gestation="twin",
+            fetal_sexes=("F", "M"),
+            male_ff=0.143,
+            female_ff=0.075,
+            twin_confidence=0.9718,
+        )
+        payload = build_predict_qc_payload(
+            "prenatal", table, (), prenatal_result=prenatal_result
+        )
+        prenatal = payload["prenatal"]
+        if not isinstance(prenatal, dict):
+            self.fail("expected prenatal dict")
+        self.assertEqual(prenatal["gestation"], "twin")
+        self.assertEqual(prenatal["fetal_sexes"], ["F", "M"])
+        self.assertEqual(prenatal["male_ff"], 0.143)
+        self.assertEqual(prenatal["female_ff"], 0.075)
+        self.assertEqual(prenatal["twin_confidence"], 0.9718)
+        self.assertEqual(
+            prenatal["sca"],
+            {
+                "call": "XY",
+                "is_aneuploid": False,
+                "confidence": 0.9912,
+                "chrx_zscore": -6.53,
+                "ff_delta": 0.011,
+            },
+        )
+        self.assertEqual(
+            prenatal["twin"],
+            {
+                "call": "FM",
+                "fetal_sexes": ["F", "M"],
+                "is_twin": True,
+                "twin_probability": 0.92,
+                "confidence": 0.9718,
+                "posteriors": {"FF": 0.0001, "FM": 0.9718, "MM": 0.0281},
+                "male_ff": 0.143,
+                "female_ff": 0.075,
+            },
+        )
 
     def test_build_predict_qc_payload_sex_resolution(self) -> None:
         table = _make_predict_sample_table()
