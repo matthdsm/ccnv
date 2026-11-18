@@ -58,9 +58,71 @@ __all__ = [
     "BranchNormalizationResult",
     "align_reference_unmasked_bins",
     "build_branch_model_from_tables",
+    "estimate_adjacent_dispersion_tau",
     "normalize_branch",
     "normalize_sample_branch",
+    "shrink_kish_kappa",
 ]
+
+
+def shrink_kish_kappa(
+    counts: NDArray[np.floating],
+    kappa_frag: NDArray[np.floating] | None,
+    *,
+    eligible_mask: NDArray[np.bool_] | None = None,
+) -> NDArray[np.float64]:
+    """Shrink per-bin Kish shot-noise inflation factors toward the branch median at low counts."""
+    counts_arr = np.asarray(counts, dtype=np.float64)
+    n_bins = counts_arr.size
+    if kappa_frag is None:
+        return np.ones(n_bins, dtype=np.float64)
+    kap_raw = np.asarray(kappa_frag, dtype=np.float64)
+    if kap_raw.shape != (n_bins,):
+        raise PredictError(f"kappa_frag shape {kap_raw.shape} != ({n_bins},)")
+    kap_clean = np.where(np.isfinite(kap_raw), np.maximum(kap_raw, 1.0), 1.0)
+    mask = (
+        np.ones(n_bins, dtype=np.bool_)
+        if eligible_mask is None
+        else np.asarray(eligible_mask, dtype=np.bool_)
+    )
+    elig_kap = mask & np.isfinite(counts_arr) & (counts_arr >= 5.0)
+    if np.any(elig_kap):
+        kap_prior = float(np.median(kap_clean[elig_kap]))
+    elif np.any(mask):
+        kap_prior = float(np.median(kap_clean[mask]))
+    else:
+        kap_prior = 1.0
+    n_eff = np.where(np.isfinite(counts_arr), np.maximum(counts_arr, 0.0), 0.0)
+    return (n_eff * kap_clean + 10.0 * kap_prior) / (n_eff + 10.0)
+
+
+def estimate_adjacent_dispersion_tau(
+    valid_indices: NDArray[np.integer],
+    contigs: NDArray[np.str_],
+    centered_ratios: NDArray[np.floating],
+    sig0_sq: NDArray[np.floating],
+    *,
+    tau_min: float = _TAU_MIN,
+    tau_max: float = _TAU_MAX,
+) -> float:
+    """Estimate sample overdispersion scale tau from adjacent same-contig bin differences."""
+    if valid_indices.size < 5:
+        return 1.0
+    same_adj = (valid_indices[1:] == valid_indices[:-1] + 1) & (
+        contigs[1:] == contigs[:-1]
+    )
+    if int(np.count_nonzero(same_adj)) < 4:
+        return 1.0
+    r_arr = np.asarray(centered_ratios, dtype=np.float64)
+    v_arr = np.asarray(sig0_sq, dtype=np.float64)
+    d_adj = (r_arr[1:][same_adj] - r_arr[:-1][same_adj]) / np.sqrt(
+        np.maximum(v_arr[:-1][same_adj] + v_arr[1:][same_adj], 1e-12)
+    )
+    mad_d = mad_scale(d_adj)
+    scale_d = mad_d if mad_d > 1e-8 else float(np.std(d_adj))
+    if scale_d <= 1e-8:
+        return 1.0
+    return float(np.clip(scale_d, tau_min, tau_max))
 
 
 @dataclass(frozen=True, slots=True)
@@ -512,22 +574,7 @@ def normalize_sample_branch(
     )
 
     eff_kappa = kappa_frag if kappa_frag is not None else model.kappa_frag
-    if eff_kappa is None:
-        kappa_full = np.ones(n_bins, dtype=np.float64)
-    else:
-        kap_raw = np.asarray(eff_kappa, dtype=np.float64)
-        if kap_raw.shape != (n_bins,):
-            raise PredictError(f"kappa_frag shape {kap_raw.shape} != ({n_bins},)")
-        kap_clean = np.where(np.isfinite(kap_raw), np.maximum(kap_raw, 1.0), 1.0)
-        elig_kap = unmasked & np.isfinite(counts_arr) & (counts_arr >= 5.0)
-        if np.any(elig_kap):
-            kap_prior = float(np.median(kap_clean[elig_kap]))
-        elif np.any(unmasked):
-            kap_prior = float(np.median(kap_clean[unmasked]))
-        else:
-            kap_prior = 1.0
-        n_eff = np.where(np.isfinite(counts_arr), np.maximum(counts_arr, 0.0), 0.0)
-        kappa_full = (n_eff * kap_clean + 10.0 * kap_prior) / (n_eff + 10.0)
+    kappa_full = shrink_kish_kappa(counts_arr, eff_kappa, eligible_mask=unmasked)
 
     reference_sizes = np.zeros(n_bins, dtype=np.int64)
     u_idx = np.flatnonzero(unmasked)
@@ -665,25 +712,18 @@ def normalize_sample_branch(
     expected_out[valid_global] = eff_lam_v * float(2.0**hsm_shift)
     ratios[valid_global] = r_tilde_v
 
-    sig0_sq_full = np.zeros(n_bins, dtype=np.float64)
-    sig0_sq_full[valid_global] = sig0_sq_v
-    tau_sample = 1.0
-    if valid_global.size >= 5:
-        same_adj = (valid_global[1:] == valid_global[:-1] + 1) & (
-            contig_str[valid_global[1:]] == contig_str[valid_global[:-1]]
-        )
-        if int(np.count_nonzero(same_adj)) >= 4:
-            i0, i1 = valid_global[:-1][same_adj], valid_global[1:][same_adj]
-            d_adj = (
-                (ratios[i1] - null_mean_full[i1]) - (ratios[i0] - null_mean_full[i0])
-            ) / np.sqrt(np.maximum(sig0_sq_full[i0] + sig0_sq_full[i1], 1e-12))
-            mad_d = mad_scale(d_adj)
-            scale_d = mad_d if mad_d > 1e-8 else float(np.std(d_adj))
-            if scale_d > 1e-8:
-                tau_sample = float(np.clip(scale_d, _TAU_MIN, _TAU_MAX))
+    centered_v = r_tilde_v - null_mean_full[valid_global]
+    tau_sample = estimate_adjacent_dispersion_tau(
+        valid_global,
+        contig_str[valid_global],
+        centered_v,
+        sig0_sq_v,
+        tau_min=_TAU_MIN,
+        tau_max=_TAU_MAX,
+    )
 
     sig_v = tau_sample * np.sqrt(sig0_sq_v)
-    zscores[valid_global] = (r_tilde_v - null_mean_full[valid_global]) / sig_v
+    zscores[valid_global] = centered_v / sig_v
     weights_v = 1.0 / np.square(sig_v)
     if model.is_flat:
         d_v = dist_full[valid_global]

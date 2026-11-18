@@ -300,21 +300,34 @@
   }
 
   const effFF = D.prenatal ? (D.prenatal.effective_ff ?? D.prenatal.active_ff) : 0;
-  if (typeof effFF === "number" && effFF > 0) {
+  if (typeof effFF === "number" && effFF > 0 && D.contigs.length > 0) {
     const posRef = Math.log2(1 + 0.5 * effFF);
     const negRef = Math.log2(Math.max(1e-4, 1 - 0.5 * effFF));
-    for (const yVal of [posRef, negRef]) {
-      baseShapes.push({
-        type: "line",
-        xref: "paper",
-        yref: "y",
-        x0: 0,
-        x1: 1,
-        y0: yVal,
-        y1: yVal,
-        line: { color: "#9333ea", width: 1.5, dash: "dash" },
-        layer: "below"
-      });
+    const dipSpans = [];
+    for (let i = 0; i < D.contigs.length; i++) {
+      if (String(D.contigs[i]).replace(/^chr/i, "").toUpperCase() === "Y") continue;
+      const sx0 = offsets[i];
+      const sx1 = sx0 + D.lengths[i];
+      if (dipSpans.length > 0 && dipSpans[dipSpans.length - 1][1] === sx0) {
+        dipSpans[dipSpans.length - 1][1] = sx1;
+      } else {
+        dipSpans.push([sx0, sx1]);
+      }
+    }
+    for (const [sx0, sx1] of dipSpans) {
+      for (const yVal of [posRef, negRef]) {
+        baseShapes.push({
+          type: "line",
+          xref: "x",
+          yref: "y",
+          x0: sx0,
+          x1: sx1,
+          y0: yVal,
+          y1: yVal,
+          line: { color: "#9333ea", width: 1.5, dash: "dash" },
+          layer: "below"
+        });
+      }
     }
   }
 

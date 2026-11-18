@@ -412,6 +412,9 @@ def annotate_prenatal_origin_and_lod(
 
     annotated: list[SegmentResult] = []
     is_aneuploid = sca_call not in ("XX", "XY")
+    total_y_bins = sum(
+        max(0, s.bin_count) for s in segments if normalize_chr(s.contig) == "Y"
+    )
 
     for seg in segments:
         norm_contig = normalize_chr(seg.contig)
@@ -425,8 +428,15 @@ def annotate_prenatal_origin_and_lod(
         reason: str | None = None
 
         if is_y:
-            if sca_call in ("XYY", "DISCORDANT_MIXED") or (
-                sca_call in ("XX", "XO", "XXX") and has_call
+            whole_y_call = (
+                seg.call is not None
+                and total_y_bins > 0
+                and seg.bin_count >= 0.75 * total_y_bins
+            )
+            if (
+                sca_call in ("XYY", "DISCORDANT_MIXED")
+                or (sca_call in ("XX", "XO", "XXX") and has_call)
+                or whole_y_call
             ):
                 discordant = True
                 reason = "SCA_DISCORDANT"

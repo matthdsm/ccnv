@@ -19,7 +19,7 @@ flowchart TD
         H --> I["ccnv.models.schemas: REFERENCE_SCHEMA Parquet (.ccnv)"]
     end
     subgraph Inference["Sample Inference & Segmentation"]
-        A -.-> J["ccnv.predict: extract_for_predict & normalize_branch"]
+        A -.-> J["ccnv.predict: extract_for_predict, normalize_branch & normalize_prenatal_chry"]
         I --> J
         C --> J
         J --> K["ccnv.stats.segmentation: Pre-Split Euchromatic Segmentation (Calibrated Pelt + mBIC)"]
@@ -51,7 +51,7 @@ In `--mode prenatal` with paired-end fragmentomics and deconvolved reference den
 
 #### 5. Pre-Split Euchromatic Pelt Segmentation, Dyadic BLUE Scoring & 5-State Origin Engine
 
-Contigs are pre-split at masked gaps $`\gt 2\text{ Mb}`$ into contiguous euchromatic arm blocks before change-point detection via calibrated `ruptures.Pelt(custom_cost=WeightedL2Cost())` with modified BIC (mBIC) penalty. Segments are scored using Gauss-Markov Best Linear Unbiased Estimator (BLUE) Z-scores adjusted for multi-scale dyadic variance inflation. Germline calls are made using discrete integer copy-number Bayes factors ($`\ln \mathrm{BF}_{CN \ne 2} \gt 2.0`$) over $`CN \in \lbrace 0, 1, 2, 3, 4+\rbrace`$, detecting homozygous deletions ($`CN=0`$) down to $`0.1\times`$ sequencing depth. In `--mode prenatal`, `predict_prenatal` evaluates `FFY`, `FFA`, `FFX`, `FF_size`, 4D erfc ray-marginalized SCA calls, Student-$`t_4`$ IRLS fused `active_ff`, and Fisher-weighted `effective_ff`, while annotating segment discordance and classifying biological origin via a 5-state self-referenced coupled depth + Dirichlet-Multinomial origin engine (`FETAL_CONSTITUTIONAL`, `PLACENTAL_MOSAIC`, `MATERNAL_UNINHERITED`, `MATERNAL_AND_FETAL_INHERITED`, `MATERNAL_MOSAIC`, with `INDETERMINATE` when max posterior $`\lt 0.80`$).
+Contigs are pre-split at masked gaps $`\gt 2\text{ Mb}`$ into contiguous euchromatic arm blocks before change-point detection via calibrated `ruptures.Pelt(custom_cost=WeightedL2Cost())` with modified BIC (mBIC) penalty. Segments are scored using Gauss-Markov Best Linear Unbiased Estimator (BLUE) Z-scores adjusted for multi-scale dyadic variance inflation. Germline calls are made using discrete integer copy-number Bayes factors ($`\ln \mathrm{BF}_{CN \ne 2} \gt 2.0`$) over $`CN \in \lbrace 0, 1, 2, 3, 4+\rbrace`$, detecting homozygous deletions ($`CN=0`$) down to $`0.1\times`$ sequencing depth. In `--mode prenatal`, `predict_prenatal` evaluates `FFY`, `FFA`, `FFX`, `FF_size`, 4D erfc ray-marginalized SCA calls, Student-$`t_4`$ IRLS fused `active_ff`, and Fisher-weighted `effective_ff`, `normalize_prenatal_chry` normalizes male-fetus (`fetal_sex == "M"`) 5 kb clean MSY `chrY` bins from `prenatal_ffy` against an FF-calibrated 1-copy Poisson baseline for haploid ($`CN_0 = 1`$) segmentation, BED/VCF reporting, and HTML plotting (omitting `chrY` when `fetal_sex == "F"`), and `annotate_sample_prenatal_segments` annotates segment discordance and classifies biological origin via a 5-state self-referenced coupled depth + Dirichlet-Multinomial origin engine (`FETAL_CONSTITUTIONAL`, `PLACENTAL_MOSAIC`, `MATERNAL_UNINHERITED`, `MATERNAL_AND_FETAL_INHERITED`, `MATERNAL_MOSAIC`, with `INDETERMINATE` when max posterior $`\lt 0.80`$).
 
 ## Interface
 

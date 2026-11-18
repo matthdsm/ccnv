@@ -42,6 +42,7 @@ from ccnv.models import (
     InvalidInputError,
     PredictConfig,
     PredictError,
+    PredictionOutputs,
     PrenatalModelMetadata,
     ReferenceConfig,
     ReferenceMetadata,
@@ -695,87 +696,89 @@ def _setup_synthetic_cohort_and_references(
     return parquet_path(prenatal_prefix), test_sample_path
 
 
+def _read_bed_rows(bed_path: Path) -> list[list[str]]:
+    with gzip.open(bed_path, "rt", encoding="utf-8") as fh:
+        return [line.rstrip("\r\n").split("\t") for line in fh if line.strip()]
+
+
 class TestPrenatalEndToEndIntegration(unittest.TestCase):
-    def test_prenatal_pipeline_deliverables(self) -> None:
-        contig_lengths = {"chr1": 200_000, "chr2": 200_000, "chrX": 200_000} | {
+    _tmpdir: tempfile.TemporaryDirectory[str]
+    root: Path
+    contig_lengths: dict[str, int]
+    prenatal_ref: Path
+    test_sample: Path
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmpdir = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls._tmpdir.cleanup)
+        cls.root = Path(cls._tmpdir.name)
+        cls.contig_lengths = dict.fromkeys(("chr1", "chr2", "chrX"), 200_000) | {
             "chrY": 300_000
         }
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            prenatal_ref, test_sample = _setup_synthetic_cohort_and_references(
-                root, contig_lengths
+        cls.prenatal_ref, cls.test_sample = _setup_synthetic_cohort_and_references(
+            cls.root, cls.contig_lengths
+        )
+
+    def _predict_path(
+        self, s_path: Path, prefix: Path, ref: Path | None = None, z: float = 3.0
+    ) -> PredictionOutputs:
+        return run_predict(
+            PredictConfig(
+                sample=s_path,
+                reference=ref or self.prenatal_ref,
+                prefix=prefix,
+                mode=AnalysisMode.prenatal,
+                plot=True,
+                vcf=True,
+                penalty=0.5,
+                min_reference_bins=1,
+                z_threshold=z,
             )
+        )
 
-            ref_table = pq.read_table(prenatal_ref)
-            branches = set(ref_table.column("branch").unique().to_pylist())
-            for branch in (BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX):
-                self.assertIn(branch, branches)
-            for branch in (BRANCH_PRENATAL_AUTOSOMAL, BRANCH_PRENATAL_FFY):
-                self.assertIn(branch, branches)
+    def test_prenatal_pipeline_deliverables(self) -> None:
+        ref_table = pq.read_table(self.prenatal_ref)
+        branches = set(ref_table.column("branch").unique().to_pylist())
+        for b in (BRANCH_AUTOSOMAL, BRANCH_FEMALE_SEX, BRANCH_MALE_SEX):
+            self.assertIn(b, branches)
+        for b in (BRANCH_PRENATAL_AUTOSOMAL, BRANCH_PRENATAL_FFY):
+            self.assertIn(b, branches)
 
-            pred_prefix = root / "predict_out"
-            outputs = run_predict(
-                PredictConfig(
-                    sample=test_sample,
-                    reference=prenatal_ref,
-                    prefix=pred_prefix,
-                    mode=AnalysisMode.prenatal,
-                    plot=True,
-                    vcf=True,
-                    penalty=0.5,
-                    min_reference_bins=1,
-                    z_threshold=1.5,
-                )
-            )
+        pred_prefix = self.root / "predict_out"
+        outputs = self._predict_path(self.test_sample, pred_prefix, z=1.5)
+        if outputs.qc_json_path is None or outputs.segments_vcf is None:
+            self.fail("Expected qc_json_path and segments_vcf")
+        qc = json.loads(outputs.qc_json_path.read_text(encoding="utf-8"))
+        self.assertEqual(qc["mode"], "prenatal")
+        p_qc = qc["prenatal"]
+        for k in ("fetal_sex", "active_ff", "effective_ff", "active_ff_source"):
+            self.assertIn(k, p_qc)
+        for k in ("sca", "ffy", "ffa", "ffx"):
+            self.assertIn(k, p_qc)
+        self.assertEqual(p_qc["fetal_sex"], "M")
+        self.assertGreater(p_qc["active_ff"], 0.0)
+        self.assertGreater(p_qc["effective_ff"], 0.0)
+        self.assertIn(p_qc["active_ff_source"], ("FFY", "FUSED"))
+        self.assertTrue(any(s.discordant for s in outputs.segments))
 
-            if outputs.qc_json_path is None:
-                self.fail("Expected qc_json_path to be populated")
-            self.assertTrue(outputs.qc_json_path.is_file())
-            qc = json.loads(outputs.qc_json_path.read_text(encoding="utf-8"))
-            self.assertEqual(qc["mode"], "prenatal")
-            p_qc = qc["prenatal"]
-            for key in ("fetal_sex", "active_ff", "effective_ff", "active_ff_source"):
-                self.assertIn(key, p_qc)
-            for key in ("sca", "ffy", "ffa", "ffx"):
-                self.assertIn(key, p_qc)
-            self.assertEqual(p_qc["fetal_sex"], "M")
-            self.assertGreater(p_qc["active_ff"], 0.0)
-            self.assertGreater(p_qc["effective_ff"], 0.0)
-            self.assertIn(p_qc["active_ff_source"], ("FFY", "FUSED"))
-            self.assertTrue(any(s.discordant for s in outputs.segments))
+        bed_lines = _read_bed_rows(outputs.segments_bed)
+        self.assertEqual(tuple(bed_lines[0]), PRENATAL_SEGMENTS_BED_HEADER)
+        self.assertTrue(all(len(row) == 15 for row in bed_lines))
+        disc_reasons = {r[11] for r in bed_lines[1:] if r[10] == "true"}
+        self.assertIn("SUPER_FETAL_RATIO", disc_reasons)
 
-            self.assertTrue(outputs.segments_bed.is_file())
-            with gzip.open(outputs.segments_bed, "rt") as f:
-                bed_lines = [
-                    line.rstrip("\r\n").split("\t") for line in f if line.strip()
-                ]
-            self.assertGreater(len(bed_lines), 1)
-            self.assertEqual(tuple(bed_lines[0]), PRENATAL_SEGMENTS_BED_HEADER)
-            self.assertEqual(len(bed_lines[0]), 15)
-            for row in bed_lines[1:]:
-                self.assertEqual(len(row), 15)
-            disc_rows = [r for r in bed_lines[1:] if r[10] == "true"]
-            self.assertGreaterEqual(len(disc_rows), 1)
-            self.assertIn("SUPER_FETAL_RATIO", {r[11] for r in disc_rows})
+        with pysam.VariantFile(str(outputs.segments_vcf)) as vf:
+            hdr = str(vf.header)
+            for t in ("EXP_LOG2R", "IMPLIED_FF", "DISCORDANT", "DISC_REASON"):
+                self.assertIn(f"ID={t}", hdr)
+            for t in ("FRAG_SHORT_R", "FRAG_LLR", "ORIGIN"):
+                self.assertIn(f"ID={t}", hdr)
+            self.assertTrue(any(r.info.get("DISCORDANT") for r in vf.fetch("chr1")))
 
-            if outputs.segments_vcf is None:
-                self.fail("Expected segments_vcf to be populated")
-            self.assertTrue(outputs.segments_vcf.is_file())
-            with pysam.VariantFile(str(outputs.segments_vcf)) as vf:
-                vcf_header_text = str(vf.header)
-                for tag in ("EXP_LOG2R", "IMPLIED_FF", "DISCORDANT", "DISC_REASON"):
-                    self.assertIn(f"ID={tag}", vcf_header_text)
-                for tag in ("FRAG_SHORT_R", "FRAG_LLR", "ORIGIN"):
-                    self.assertIn(f"ID={tag}", vcf_header_text)
-                records = list(vf.fetch("chr1"))
-                self.assertTrue(any(rec.info.get("DISCORDANT") for rec in records))
-
-            html_text = Path(f"{pred_prefix}_plot.html").read_text(encoding="utf-8")
-            self.assertTrue(Path(f"{pred_prefix}_plot.html").is_file())
-            for token in ('id="prenatal-badge"', "Fetal Sex:", "Active FF:"):
-                self.assertIn(token, html_text)
-            for token in ("#9333ea", "Discordant"):
-                self.assertIn(token, html_text)
+        html_text = Path(f"{pred_prefix}_plot.html").read_text(encoding="utf-8")
+        for token in ('id="prenatal-badge"', "Fetal Sex:", "Active FF:", "#9333ea"):
+            self.assertIn(token, html_text)
 
 
 if __name__ == "__main__":

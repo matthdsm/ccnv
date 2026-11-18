@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import Final
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 from numpy.typing import NDArray
 
 from ccnv.features.binning import (
@@ -16,7 +18,10 @@ from ccnv.features.binning import (
     rebin_counts,
 )
 from ccnv.models import (
+    BRANCH_AUTOSOMAL,
+    FetalFractionResult,
     PredictError,
+    PrenatalModelMetadata,
     SampleBuffers,
     SampleMetadata,
     decode_dictionary_contigs,
@@ -26,17 +31,24 @@ from ccnv.models import (
     reconstruct_sample_grid,
     unique_dictionary_contigs,
 )
-from ccnv.stats.prenatal_math import compute_autosomal_density
+from ccnv.stats.prenatal_math import (
+    compute_autosomal_density,
+    fuse_active_fetal_fraction_student_t4,
+)
 
 __all__ = [
     "col_f64",
     "col_i64",
+    "compute_5k_msy_exposure",
     "compute_100k_profiles",
     "extract_ref_contig_roles",
+    "fit_sample_gc_exponent",
     "prepare_covariate_multipliers",
     "rebin_track_1d",
     "resolve_5k_covariates",
+    "resolve_chry_anchor_ff",
     "resolve_contig_masks",
+    "resolve_ffy_bin_size",
     "sample_grid",
 ]
 
@@ -287,3 +299,191 @@ def resolve_5k_covariates(
     ffy_gc[hit_y] = gc_5k[ffy_align[hit_y]].astype(np.float64)
     ffy_map[hit_y] = map_5k[ffy_align[hit_y]].astype(np.float64)
     return gc_5k, map_5k, ffy_gc, ffy_map
+
+
+def fit_sample_gc_exponent(
+    counts: NDArray[np.floating],
+    exposure: NDArray[np.floating],
+    mappability: NDArray[np.floating],
+    gc_mult: NDArray[np.floating],
+    auto_mask: NDArray[np.bool_],
+) -> float:
+    """Fit sample-specific log-linear GC exponent across usable autosomal 5 kb bins."""
+    c_arr = np.asarray(counts, dtype=np.float64)
+    base_exp = np.asarray(exposure, dtype=np.float64) * np.asarray(
+        mappability, dtype=np.float64
+    )
+    g_arr = np.asarray(gc_mult, dtype=np.float64)
+    ok = (
+        auto_mask
+        & np.isfinite(c_arr)
+        & (c_arr > 0.0)
+        & np.isfinite(base_exp)
+        & (base_exp > 0.0)
+        & np.isfinite(g_arr)
+        & (g_arr > 0.0)
+    )
+    if int(np.count_nonzero(ok)) < 16:
+        return 1.0
+    x = np.log(g_arr[ok])
+    w = c_arr[ok]
+    w_sum = float(np.sum(w))
+    if w_sum <= 0.0:
+        return 1.0
+    dx = x - float(np.sum(w * x) / w_sum)
+    s_xx = float(np.sum(w * dx * dx))
+    if s_xx <= 1e-6:
+        return 1.0
+    y = np.log(c_arr[ok] / base_exp[ok])
+    dy = y - float(np.sum(w * y) / w_sum)
+    return float(np.clip(float(np.sum(w * dx * dy)) / s_xx, -3.0, 3.0))
+
+
+def compute_5k_msy_exposure(
+    bufs: SampleBuffers,
+    bufs_5k: SampleBuffers,
+    reference_table: pa.Table,
+    ffy_ref: pa.Table,
+    ffy_bin: int,
+    ffy_align: NDArray[np.int64],
+    roles: tuple[tuple[str, ...] | None, tuple[str, ...] | None, str | None],
+    overrides: tuple[
+        NDArray[np.floating] | None,
+        NDArray[np.floating] | None,
+        NDArray[np.bool_] | None,
+    ],
+    min_mappability: float,
+) -> tuple[NDArray[np.float64], int]:
+    """Compute per-bin 5 kb diploid-equivalent MSY exposure and usable autosomal bin count."""
+    auto_cand = reference_table.filter(
+        pc.equal(reference_table.column("branch"), BRANCH_AUTOSOMAL)
+    )
+    gc_5k, map_5k, ffy_gc, ffy_map = resolve_5k_covariates(
+        bufs,
+        bufs_5k,
+        auto_cand if auto_cand.num_rows > 0 else None,
+        ffy_ref,
+        ffy_align,
+        *overrides,
+        min_mappability,
+    )
+    sample_c, sample_s, sample_e = sample_grid(bufs_5k.meta)
+    auto_mask_5k, _, _ = resolve_contig_masks(
+        sample_c, autosomes=roles[0], sex_contigs=roles[1], sex_signal_contig=roles[2]
+    )
+    counts_5k = np.asarray(bufs_5k.count, dtype=np.float64)
+    exp_5k = compute_bin_exposure(sample_s, sample_e, ffy_bin)
+    beta_gc = fit_sample_gc_exponent(counts_5k, exp_5k, map_5k, gc_5k, auto_mask_5k)
+    if beta_gc != 1.0:
+        gc_5k = np.power(np.maximum(gc_5k, 1e-3), beta_gc).astype(np.float32)
+        ffy_gc = np.where(
+            ffy_align >= 0, np.power(np.maximum(ffy_gc, 1e-3), beta_gc), 1.0
+        )
+    _, c_ids_5k = np.unique([normalize_chr(c) for c in sample_c], return_inverse=True)
+    r_auto_5k = compute_autosomal_density(
+        counts_5k,
+        c_ids_5k.astype(np.int16),
+        exp_5k,
+        map_5k,
+        gc_5k,
+        auto_mask_5k,
+    )
+    n_auto_usable = int(
+        np.count_nonzero(auto_mask_5k & (exp_5k > 0.0) & (map_5k > 0.0))
+    )
+    spans = (col_i64(ffy_ref, "end") - col_i64(ffy_ref, "start")).astype(np.float64)
+    return (
+        r_auto_5k * (spans / max(float(ffy_bin), 1.0)) * ffy_map * ffy_gc,
+        n_auto_usable,
+    )
+
+
+def resolve_ffy_bin_size(
+    reference_table: pa.Table,
+    ffy_ref_s: NDArray[np.int64],
+    ffy_ref_e: NDArray[np.int64],
+    fallback: int,
+) -> int:
+    """Resolve 5 kb reference bin size from metadata or interval spans."""
+    model = decode_metadata(reference_table.schema.metadata).get("model")
+    if (
+        isinstance(model, dict)
+        and isinstance(bs := model.get("bin_size"), int)
+        and bs > 0
+    ):
+        return bs
+    if ffy_ref_e.size > 0:
+        return max(1, int(np.max(ffy_ref_e - ffy_ref_s)))
+    return max(1, fallback)
+
+
+def resolve_chry_anchor_ff(
+    c_u: NDArray[np.float64],
+    e_u: NDArray[np.float64],
+    lam_bg_u: NDArray[np.float64],
+    eta_u: NDArray[np.float64],
+    kappa_cal: float,
+    pm: PrenatalModelMetadata,
+    prenatal_result: FetalFractionResult,
+) -> tuple[float, float]:
+    """Resolve LOCO-guarded 1-copy fetal fraction and uncertainty for chrY baseline."""
+    f_base = max(float(prenatal_result.active_ff), 1e-4)
+    se_base = float(
+        prenatal_result.active_ff_se
+        if prenatal_result.active_ff_se is not None
+        else max(pm.ffy_std, 0.008)
+    )
+    if prenatal_result.sca.call != "XY" or prenatal_result.ffy is None:
+        return f_base, se_base
+
+    off_ests = [float(prenatal_result.ffa), float(prenatal_result.ffx)]
+    off_ses = [
+        max(float(pm.ffa_std), 0.01),
+        max(2.0 * float(pm.female_chrx_ratio_std), 0.015),
+    ]
+    if prenatal_result.ff_size is not None and math.isfinite(prenatal_result.ff_size):
+        off_ests.append(float(prenatal_result.ff_size))
+        off_ses.append(max(float(pm.ff_size_std), 0.01))
+    f_off, se_off = fuse_active_fetal_fraction_student_t4(off_ests, off_ses)
+
+    denom_tot = max(float(np.sum(e_u * eta_u)), 1e-6)
+    se_ffy_obs = max(
+        0.005, math.sqrt(max(float(np.sum(c_u)), 1.0)) * 2.0 * kappa_cal / denom_tot
+    )
+    ffy_val = float(prenatal_result.ffy)
+
+    if c_u.size >= 32 and f_off > 0.015:
+        n_blk = c_u.size // 16
+        trim = n_blk * 16
+        c_blk = np.sum(c_u[:trim].reshape(n_blk, 16), axis=1)
+        bg_blk = np.sum((e_u[:trim] * lam_bg_u[:trim]).reshape(n_blk, 16), axis=1)
+        ee_blk = np.sum((e_u[:trim] * eta_u[:trim]).reshape(n_blk, 16), axis=1)
+        f_blk = (
+            2.0
+            * kappa_cal
+            * np.maximum(0.0, (c_blk - bg_blk) / np.maximum(ee_blk, 1e-9))
+        )
+        se_blk = float(
+            np.median(
+                2.0
+                * kappa_cal
+                * np.sqrt(np.maximum(c_blk, 1.0))
+                / np.maximum(ee_blk, 1e-6)
+            )
+        )
+        med_blk = float(np.median(f_blk))
+        lo_vals, hi_vals = f_blk[f_blk <= med_blk], f_blk[f_blk >= med_blk]
+        if lo_vals.size >= 2 and hi_vals.size >= 2:
+            f_lo, f_hi = float(np.median(lo_vals)), float(np.median(hi_vals))
+            if (f_hi - f_lo) > max(3.5 * se_blk, 0.35 * max(f_lo, 0.03)):
+                f_intact = (
+                    f_hi
+                    if f_lo < 0.015
+                    else (f_lo if abs(f_lo - f_off) <= abs(f_hi - f_off) else f_hi)
+                )
+                return max(f_intact, 1e-4), max(1.5 * se_ffy_obs, 0.008)
+
+    sigma_diff = math.sqrt(se_ffy_obs**2 + float(pm.ffy_std) ** 2 + se_off**2)
+    if se_off <= 0.06 and abs(ffy_val - f_off) > 1.8 * sigma_diff:
+        return max(f_off, 1e-4), se_off
+    return f_base, se_base

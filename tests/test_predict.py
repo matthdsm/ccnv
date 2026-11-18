@@ -569,7 +569,12 @@ class TestPrenatalPredictPipeline(unittest.TestCase):
             self.assertIn("read_metrics", qc_data)
             self.assertIn("cnv_summary", qc_data)
 
-            for seg in outputs.segments:
+            chry_segs = [s for s in outputs.segments if s.contig == "chrY"]
+            self.assertGreaterEqual(len(chry_segs), 1)
+            for seg in chry_segs:
+                self.assertIsNone(seg.expected_ratio)
+                self.assertIsNone(seg.implied_ff)
+            for seg in (s for s in outputs.segments if s.contig != "chrY"):
                 self.assertIsNotNone(seg.expected_ratio)
                 self.assertIsNotNone(seg.implied_ff)
                 self.assertIsInstance(seg.discordant, bool)

@@ -20,7 +20,7 @@ flowchart TD
     S5 --> S6["6. Vectorized 2D Prototype Normalization & Depth-Decomposed Precision Weighting"]
     S6 --> S7["7. Pre-Split Euchromatic Pelt + mBIC Segmentation & Dyadic BLUE Integer CN Bayes Factor Calling"]
     S3 --> S8["8. Prenatal Reference: Poisson MSY FFY, Coarsened Logit FFA, Forward RX & Reference-Side 24-Band Fisher Weighting"]
-    S8 --> S9["9. Prenatal Inference: 4D Ray-Marginalized SCA, Student-t4 active_ff & 5-State Self-Referenced Origin Engine"]
+    S8 --> S9["9. Prenatal Inference: 4D Ray-Marginalized SCA, Student-t4 active_ff, Male-Fetus 5 kb chrY & 5-State Origin Engine"]
     S7 --> S9
 ```
 
@@ -250,7 +250,7 @@ $$
 
 #### 7.1.3 Discrete Integer Copy-Number Bayes Factors
 
-In germline mode, event calling requires $|Z_{\text{BLUE}}| \ge z_{\text{threshold}}$, BH-FDR $q \le 0.05$, and discrete integer copy-state log-Bayes factor $\ln \mathrm{BF}_{CN \ne CN_0} \gt 2.0$ over diploid states $CN \in \{0, 1, 2, 3, 4+\}$ ($CN_0 = 2$) or haploid male sex-chromosome states $CN \in \{0, 1, 2, 3+\}$ ($CN_0 = 1$). When segment observed counts $C_S$ and expected neutral baseline $\hat{\lambda}_S$ are available, $\ln \mathrm{BF}_{CN}$ evaluates the Negative-Binomial count log-likelihood ratio with segment overdispersion $\alpha_S = \max(0, (\ln 2)^2 \sigma_S^2 - \hat{\lambda}_S^{-1})$ (reducing smoothly to the exact Poisson log-likelihood ratio when $\alpha_S = 0$, and falling back to a Gaussian $\log_2$-ratio log-likelihood ratio only when raw counts are absent):
+In germline mode, event calling requires $|Z_{\text{BLUE}}| \ge z_{\text{threshold}}$, BH-FDR $q \le 0.05$, and discrete integer copy-state log-Bayes factor $\ln \mathrm{BF}_{CN \ne CN_0} \gt 2.0$ over diploid states $CN \in \{0, 1, 2, 3, 4+\}$ ($CN_0 = 2$) or haploid male sex-chromosome states $CN \in \{0, 1, 2, 3+\}$ ($CN_0 = 1$ on `male_sex` and prenatal male-fetus `prenatal_ffy`). When segment observed counts $C_S$ and expected neutral baseline $\hat{\lambda}_S$ are available, $\ln \mathrm{BF}_{CN}$ evaluates the Negative-Binomial count log-likelihood ratio with segment overdispersion $\alpha_S = \max(0, (\ln 2)^2 \sigma_S^2 - \hat{\lambda}_S^{-1})$ (reducing smoothly to the exact Poisson log-likelihood ratio when $\alpha_S = 0$, and falling back to a Gaussian $\log_2$-ratio log-likelihood ratio only when raw counts are absent):
 
 $$
 \ln \mathrm{BF}_{CN} = \ln P_{\text{NB}}\left(C_S \mid \mu_k = \frac{CN}{CN_0}\hat{\lambda}_S, \alpha_S\right) - \ln P_{\text{NB}}\left(C_S \mid \mu_0 = \hat{\lambda}_S, \alpha_S\right)
@@ -292,7 +292,7 @@ $$
 
 ---
 
-## 9. Prenatal Single-Sample Inference: 4D Ray-Marginalized SCA, Student-$t_4$ Fusion & 5-State Origin Engine
+## 9. Prenatal Single-Sample Inference: 4D Ray-Marginalized SCA, Student-$t_4$ Fusion, Male-Fetus `chrY` Normalization & 5-State Origin Engine
 
 ### 9.1 4D erfc Ray-Marginalized SCA Classifier
 
@@ -302,7 +302,23 @@ Sex chromosome aneuploidies (`XX`, `XY`, `XO`, `XXX`, `XXY`, `XYY`, `DISCORDANT_
 
 Concordant estimators are fused into $(\hat{f}_{\text{active}}, \sigma_{f_{\text{active}}})$ via iterative reweighted least squares (IRLS) under a Student-$t_4$ heavy-tailed likelihood, bounding outlier contamination while achieving optimal precision.
 
-### 9.3 5-State Self-Referenced Coupled Depth + Dirichlet-Multinomial Origin Engine
+### 9.3 Male-Fetus 5 kb `chrY` Normalization (`normalize_prenatal_chry`)
+
+Because maternal plasma carries zero constitutional `chrY` copies, normalizing a male-fetus prenatal sample against a fixed-FF `male_sex` prototype branch would center $\log_2 R$ away from zero whenever sample fetal fraction differs from the cohort average, whereas female-fetus (`fetal_sex == "F"`, separated via a female-background-anchored `yfrac_threshold`) plasma carries only spurious background mapping and omits `chrY` (`normalize_prenatal_chry` returns `None`). Because clean MSY `chrY` reads are already predominantly fetal and `prenatal_ffy` is fit on unweighted $5\text{ kb}$ counts, `predict.run` evaluates `normalize_prenatal_chry` on unweighted `raw_sample` counts over `clean_msy_bins` intersected with unmasked reference rows and positive autosomal-scaled diploid exposure $e_b = r_{\text{auto}, 5\text{k}} a_b m_b g_b^{\hat{\beta}_{\text{GC}}} \gt 0$, where $\hat{\beta}_{\text{GC}} \in [-3, 3]$ is fit per sample on autosomal $5\text{ kb}$ bins (`fit_sample_gc_exponent`) and $\eta_b = 2^{\text{null\_mean}_b}$ captures Empirical Bayes per-bin male MSY relative yield (masking extreme $\gt 3.5\times$ ampliconic repeat arrays during reference training). To prevent `FFY` self-cancellation on low-FF `47,XYY` or large partial `chrY` deletions/duplications (`del(Y)`, `idic(Y)`), `resolve_chry_anchor_ff` compares `FFY` against the LOCO off-`chrY` Student-$t_4$ fused fetal fraction $(\hat{f}_{\text{off}}, \sigma_{\text{off}})$ (`FFA`, `FF_size`, `FFX`) and $80\text{ kb}$ MSY sub-blocks, anchoring to intact-arm or off-`chrY` $f$ whenever `FFY` diverges ($s_{\text{bg}} = 1$ unweighted, or $\frac{\mu_M}{(1 - f)\mu_M + f\mu_F}$ with $f \to \text{effective\_ff}$ when `kappa_frag` is attached):
+
+$$
+\hat{\lambda}_b = e_b \left(s_{\text{bg}} \max(\lambda_{\text{bg}, b}, 0) + \eta_b \frac{f}{2 \kappa_{\text{cal}}}\right)
+$$
+
+Per-bin $\log_2$ ratios apply exact discrete Poisson Jensen bias correction (`exact_poisson_log2_jensen_bias`), while Pelt segments on `prenatal_ffy` evaluate sufficient-statistic pooled segment ratios $R_S = \log_2\left(\frac{C_S + 0.5}{\hat{\lambda}_S + 0.5}\right) - \mathrm{bias}_{\text{Jensen}}(\hat{\lambda}_S)$ so `47,XYY` segments center at $\log_2 R \approx +1.0$ (flagged `SCA_DISCORDANT`) and focal MSY deletions shift strongly negative even at low-pass NIPT depths ($\hat{\lambda}_b \ll 1$, where single-bin `+0.5` pseudocounts visually attenuate individual $5\text{ kb}$ bin dots):
+
+$$
+r_b = \log_2\left(\frac{C_b + 0.5}{\hat{\lambda}_b + 0.5}\right) - \mathrm{bias}_{\text{Jensen}}(\hat{\lambda}_b)
+$$
+
+Per-bin shot-noise variance $\sigma_{0, b}^2 = \max(\tilde{\kappa}_{\text{frag}, b} \mathrm{Var}_{\text{Pois}}(\ln(C_b + 0.5)) / (\ln 2)^2, 10^{-12})$ incorporates shrunk Kish design inflation $\tilde{\kappa}_{\text{frag}, b} \ge 1$ and adjacent-bin MAD guard $\hat{\tau}_Y \in [1.0, 2.5]$ for Pelt breakpoint detection, while segment BLUE scoring propagates shared fetal-fraction calibration variance $\sigma_{\text{base}, \log_2}^2 = (\sigma_f / (\max(f, 0.02)\ln 2))^2$ alongside step-detrended dyadic inflation $\hat{\kappa}_c(N_S)$ and discrete haploid ($CN_0 = 1$, $CN \in \{0, 1, 2, 3+\}$ above maternal background $E_{\text{bg}, S}$) Negative-Binomial Bayes factor calling ($\ln \mathrm{BF}_{CN \ne 1} \gt 2.0$).
+
+### 9.4 5-State Self-Referenced Coupled Depth + Dirichlet-Multinomial Origin Engine
 
 Segment biological origin is classified across 5 biological states via 16-node Gauss-Legendre quadrature coupling continuous copy-number depth and self-referenced 24-band Dirichlet-Multinomial fragment length likelihoods:
 

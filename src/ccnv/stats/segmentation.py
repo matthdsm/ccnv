@@ -23,7 +23,11 @@ from scipy.special import erfc
 from ccnv.models import AnalysisMode, CallType
 from ccnv.models.exceptions import InvalidInputError
 from ccnv.models.results import SegmentResult
-from ccnv.stats.neighbors import LN2_SQ
+from ccnv.stats.neighbors import (
+    LN2_SQ,
+    exact_poisson_log2_jensen_bias,
+    exact_poisson_log_variance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,14 +71,19 @@ class ContigSegmentationInput:
     zscores: ArrayLike | None = None
     counts: ArrayLike | None = None
     expected: ArrayLike | None = None
+    background_expected: ArrayLike | None = None
     baseline_ploidy: int = 2
+    baseline_log2_var: float = 0.0
+    poisson_pooled: bool = False
 
     def __post_init__(self) -> None:
-        """Validate baseline ploidy state."""
+        """Validate baseline ploidy and baseline variance state."""
         if isinstance(self.baseline_ploidy, bool) or self.baseline_ploidy not in (1, 2):
             raise InvalidInputError(
                 f"baseline_ploidy must be 1 or 2, got {self.baseline_ploidy!r}"
             )
+        if not math.isfinite(self.baseline_log2_var) or self.baseline_log2_var < 0.0:
+            raise InvalidInputError("baseline_log2_var must be finite and non-negative")
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +422,7 @@ def _evaluate_integer_cn_bf(
     has_counts: bool,
     c_s: float,
     lam_s: float,
+    bg_s: float = 0.0,
 ) -> tuple[int, float]:
     """Compute best integer CN candidate and log-Bayes-factor strictly from one likelihood."""
     alt_states = (0, 1, 3, 4) if baseline_ploidy == 2 else (0, 2, 3)
@@ -421,13 +431,23 @@ def _evaluate_integer_cn_bf(
 
     if has_counts and lam_s > 0.0:
         nb_alpha = max(0.0, LN2_SQ * sigma_s_sq - 1.0 / lam_s)
+        bg_clean = min(max(0.0, bg_s), 0.99 * lam_s)
+        fetal_lam = max(lam_s - bg_clean, 0.0)
         for k in alt_states:
-            scale_k = (
-                0.01
-                if k == 0
-                else (0.5 * float(k) if baseline_ploidy == 2 else float(k))
-            )
-            mu_k = max(0.001, scale_k * lam_s)
+            if baseline_ploidy == 1 and bg_clean > 0.0:
+                mu_k = max(
+                    0.001,
+                    max(bg_clean, 0.01 * lam_s)
+                    if k == 0
+                    else bg_clean + float(k) * fetal_lam,
+                )
+            else:
+                scale_k = (
+                    0.01
+                    if k == 0
+                    else (0.5 * float(k) if baseline_ploidy == 2 else float(k))
+                )
+                mu_k = max(0.001, scale_k * lam_s)
             if nb_alpha <= 1e-12:
                 term_c = c_s * math.log(mu_k / lam_s) if c_s > 0.0 else 0.0
                 ll_diff = term_c - (mu_k - lam_s)
@@ -507,6 +527,7 @@ def _segment_and_prescore_contig(
     c_z_raw = _as_optional_1d_f64(item.zscores, n_bins, "zscores")
     c_counts = _as_optional_1d_f64(item.counts, n_bins, "counts")
     c_exp = _as_optional_1d_f64(item.expected, n_bins, "expected")
+    c_bg = _as_optional_1d_f64(item.background_expected, n_bins, "background_expected")
 
     u = np.isfinite(c_ratios) & np.isfinite(c_weights) & (c_weights > 0.0)
     if c_z_raw is None:
@@ -518,7 +539,7 @@ def _segment_and_prescore_contig(
     if not np.any(u):
         return []
 
-    infl = estimate_dyadic_inflation(c_z, u)
+    kappa_local = float(estimate_dyadic_inflation(c_z, u, scales=(1,))[0])
     s_bins, e_bins = _segment_bin_spans(
         c_starts,
         c_ends,
@@ -527,7 +548,7 @@ def _segment_and_prescore_contig(
         u,
         penalty=penalty,
         sensitivity=sensitivity,
-        kappa_local=float(infl[0]),
+        kappa_local=kappa_local,
         min_size=min_size,
         jump=jump,
         max_blacklist_gap=max_blacklist_gap,
@@ -538,6 +559,24 @@ def _segment_and_prescore_contig(
     clean_w, seg_w, seg_u, seg_ratios = _reduce_segment_means(
         c_ratios, c_weights, u, s_bins, e_bins
     )
+    if s_bins.size > 1:
+        c_z_resid = c_z.copy()
+        cumsum_z_raw = _cumulative(np.where(u, c_z, 0.0))
+        seg_z_sum = cumsum_z_raw[e_bins] - cumsum_z_raw[s_bins]
+        has_step = False
+        for k_idx in range(s_bins.size):
+            n_k = int(seg_u[k_idx])
+            if n_k >= 2 and abs(float(seg_z_sum[k_idx])) >= 5.0 * math.sqrt(float(n_k)):
+                sl = slice(int(s_bins[k_idx]), int(e_bins[k_idx]))
+                u_sl = u[sl]
+                c_z_resid[sl] = np.where(
+                    u_sl, c_z_resid[sl] - float(seg_z_sum[k_idx]) / float(n_k), 0.0
+                )
+                has_step = True
+        infl = estimate_dyadic_inflation(c_z_resid if has_step else c_z, u)
+    else:
+        infl = estimate_dyadic_inflation(c_z, u)
+
     cumsum_wz = _cumulative(np.sqrt(np.maximum(clean_w, 0.0)) * c_z)
     seg_wz = cumsum_wz[e_bins] - cumsum_wz[s_bins]
 
@@ -554,11 +593,37 @@ def _segment_and_prescore_contig(
         cumsum_e = _cumulative(np.where(u_cnt, c_exp, 0.0))
         seg_c = cumsum_c[e_bins] - cumsum_c[s_bins]
         seg_e = cumsum_e[e_bins] - cumsum_e[s_bins]
+        seg_bg = (
+            (
+                _cumulative(
+                    np.where(u_cnt & np.isfinite(c_bg), np.maximum(c_bg, 0.0), 0.0)
+                )[e_bins]
+                - _cumulative(
+                    np.where(u_cnt & np.isfinite(c_bg), np.maximum(c_bg, 0.0), 0.0)
+                )[s_bins]
+            )
+            if c_bg is not None
+            else np.zeros(s_bins.size, dtype=np.float64)
+        )
+        if item.poisson_pooled:
+            w0_bins = np.where(
+                u_cnt,
+                LN2_SQ / np.maximum(exact_poisson_log_variance(c_exp), 1e-12),
+                0.0,
+            )
+            cumsum_w0 = _cumulative(w0_bins)
+            seg_w0 = cumsum_w0[e_bins] - cumsum_w0[s_bins]
+        else:
+            seg_w0 = seg_w
     else:
         seg_c = np.zeros(s_bins.size, dtype=np.float64)
         seg_e = np.zeros(s_bins.size, dtype=np.float64)
+        seg_bg = np.zeros(s_bins.size, dtype=np.float64)
+        seg_w0 = seg_w
 
     ploidy = int(item.baseline_ploidy)
+    base_var = float(item.baseline_log2_var)
+    use_cn_bf = mode == "germline" or ploidy == 1
     out: list[_PreScoredSegment] = []
     for idx in range(s_bins.size):
         n_u = int(seg_u[idx])
@@ -569,20 +634,46 @@ def _segment_and_prescore_contig(
         w_tot = float(seg_w[idx])
         ratio_val = float(seg_ratios[idx])
         kappa_s = interpolate_dyadic_inflation(float(n_u), infl)
-        denom = math.sqrt(kappa_s * max(w_tot, 1e-12))
-        z_blue = float(seg_wz[idx]) / denom if denom > 1e-12 else 0.0
+        c_s_val = float(seg_c[idx])
+        lam_s_val = float(seg_e[idx])
+
+        if item.poisson_pooled and has_counts and lam_s_val > 0.0:
+            lam_1d = np.array([lam_s_val], dtype=np.float64)
+            ratio_val = math.log2((c_s_val + 0.5) / (lam_s_val + 0.5)) - float(
+                exact_poisson_log2_jensen_bias(lam_1d)[0]
+            )
+            v_inf = max(1.0, float(seg_w0[idx]) / max(w_tot, 1e-12))
+            shot_var = (
+                kappa_s * v_inf * float(exact_poisson_log_variance(lam_1d)[0]) / LN2_SQ
+            )
+            j_s = lam_s_val / (lam_s_val + 0.5)
+            sigma_s_sq = max(shot_var + j_s * j_s * base_var, 1e-12)
+            fetal_s = max(lam_s_val - float(seg_bg[idx]), 0.0)
+            var_c = (
+                kappa_s * v_inf * max(lam_s_val, 0.25)
+                + (fetal_s * fetal_s) * LN2_SQ * base_var
+            )
+            z_blue = (c_s_val - lam_s_val) / math.sqrt(max(var_c, 1e-12))
+            w_tot = 1.0 / sigma_s_sq
+        else:
+            sigma_s_sq = (kappa_s / max(w_tot, 1e-12)) + base_var
+            z_blue = (
+                (float(seg_wz[idx]) / max(w_tot, 1e-12)) / math.sqrt(sigma_s_sq)
+                if w_tot > 1e-12
+                else 0.0
+            )
 
         cand_cn: int | None = None
         log_bf: float | None = None
-        if mode == "germline":
-            sigma_s_sq = kappa_s / max(w_tot, 1e-4)
+        if use_cn_bf:
             cand_cn, log_bf = _evaluate_integer_cn_bf(
                 seg_ratio=ratio_val,
-                sigma_s_sq=sigma_s_sq,
+                sigma_s_sq=max(sigma_s_sq, 1e-4),
                 baseline_ploidy=ploidy,
                 has_counts=has_counts,
-                c_s=float(seg_c[idx]),
-                lam_s=float(seg_e[idx]),
+                c_s=c_s_val,
+                lam_s=lam_s_val,
+                bg_s=float(seg_bg[idx]),
             )
 
         out.append(
@@ -684,7 +775,7 @@ def segment_and_score_genome(
         call: CallType | None
         final_cn: int | None
         final_bf: float | None
-        if mode == "germline":
+        if mode == "germline" or seg.baseline_ploidy == 1:
             neutral_cn = seg.baseline_ploidy
             bf = seg.log_bf
             k_cand = seg.cand_cn

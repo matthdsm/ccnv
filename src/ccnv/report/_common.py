@@ -349,6 +349,12 @@ def sort_bin_result(result: BinResult) -> BinResult:
         expected_counts=(
             result.expected_counts[idx] if result.expected_counts is not None else None
         ),
+        background_counts=(
+            result.background_counts[idx]
+            if result.background_counts is not None
+            else None
+        ),
+        baseline_log2_var=result.baseline_log2_var,
     )
 
 

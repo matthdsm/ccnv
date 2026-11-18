@@ -23,24 +23,32 @@ from ccnv.features.fragmentomics import (
     fit_cohort_fragmentomics_model,
     resolve_fisher_moment_weights,
 )
+from ccnv.features.normalization import (
+    estimate_adjacent_dispersion_tau,
+    shrink_kish_kappa,
+)
 from ccnv.features.prenatal_grid import (
     col_f64,
     col_i64,
+    compute_5k_msy_exposure,
     compute_100k_profiles,
     extract_ref_contig_roles,
+    fit_sample_gc_exponent,
     prepare_covariate_multipliers,
-    resolve_5k_covariates,
+    rebin_track_1d,
+    resolve_chry_anchor_ff,
     resolve_contig_masks,
+    resolve_ffy_bin_size,
     sample_grid,
 )
 from ccnv.features.rebinning import rebin_sample_buffers
 from ccnv.features.sex import SexLabel
 from ccnv.models import (
-    BRANCH_AUTOSOMAL,
     BRANCH_PRENATAL_AUTOSOMAL,
     BRANCH_PRENATAL_FFY,
     DEFAULT_MIN_MAPPABILITY,
     ActiveFFSource,
+    BinResult,
     BranchFitArrays,
     FetalFractionResult,
     FetalSex,
@@ -61,6 +69,11 @@ from ccnv.stats.fragmentomics import (
     compute_fragment_length_llr,
     predict_ff_fragmentomics,
 )
+from ccnv.stats.neighbors import (
+    LN2_SQ,
+    exact_poisson_log2_jensen_bias,
+    exact_poisson_log_variance,
+)
 from ccnv.stats.pca import pca_irlba_numpy, project_huber_pca_wave
 from ccnv.stats.prenatal_math import (
     PoissonFFYModel,
@@ -73,19 +86,11 @@ from ccnv.stats.prenatal_math import (
 )
 from ccnv.stats.regression import fit_logit_linear_ensemble
 
-_REQUIRED_REF_COLUMNS: Final[frozenset[str]] = frozenset(
-    (
-        "branch",
-        "contig",
-        "start",
-        "end",
-        "masked",
-        "gc",
-        "mappability",
-        "pca_mean",
-        "pca_loadings",
-        "null_mean",
-    )
+_REQUIRED_CHRY_REF_COLUMNS: Final[frozenset[str]] = frozenset(
+    ("branch", "contig", "start", "end", "masked", "gc", "mappability", "pca_mean")
+)
+_REQUIRED_REF_COLUMNS: Final[frozenset[str]] = _REQUIRED_CHRY_REF_COLUMNS | frozenset(
+    ("pca_loadings", "null_mean")
 )
 _BASE_SCA_PRIORS: Final[dict[str, float]] = dict.fromkeys(
     ("XX", "XY", "XO", "XXX", "XXY", "XYY"), 1e-6
@@ -101,7 +106,7 @@ _MALE_SCA_PRIORS: Final[dict[str, float]] = _BASE_SCA_PRIORS | {
     "XYY": 0.05,
 }
 
-__all__ = ["fit_prenatal_models", "predict_prenatal"]
+__all__ = ["fit_prenatal_models", "normalize_prenatal_chry", "predict_prenatal"]
 
 
 def _evaluate_sca_and_active_ff(
@@ -210,10 +215,18 @@ def fit_prenatal_models(
         cohort_gc, cohort_mappability, eff_n_mask, min_mappability, len(c_5k)
     )
     r_auto_5k = np.zeros(n_samples, dtype=np.float64)
+    sample_gc_betas = np.ones(n_samples, dtype=np.float64)
     for i in range(n_samples):
         col_i = counts_5k[:, i].astype(np.float64)
+        beta_i = fit_sample_gc_exponent(col_i, exp_5k, map_5k, gc_5k, auto_mask_5k)
+        sample_gc_betas[i] = beta_i
+        gc_i = (
+            np.power(np.maximum(gc_5k, 1e-3), beta_i).astype(np.float32)
+            if beta_i != 1.0
+            else gc_5k
+        )
         r_auto_5k[i] = compute_autosomal_density(
-            col_i, c_ids_i16, exp_5k, map_5k, gc_5k, auto_mask_5k
+            col_i, c_ids_i16, exp_5k, map_5k, gc_i, auto_mask_5k
         )
     labeled_ff = np.array(
         [
@@ -223,13 +236,16 @@ def fit_prenatal_models(
         dtype=np.float64,
     )
 
+    ffy_null_mean = np.zeros(n_chry_bins, dtype=np.float64)
     if n_chry_bins > 0:
         msy_counts = counts_5k[chry_mask_5k, :].astype(np.float64)
         map_y = map_5k[chry_mask_5k]
-        chry_unit = (exp_5k[chry_mask_5k] * map_y * gc_5k[chry_mask_5k]).astype(
-            np.float64
+        gc_y_base = np.maximum(gc_5k[chry_mask_5k].astype(np.float64), 1e-3)
+        msy_exposure = (
+            (exp_5k[chry_mask_5k] * map_y).astype(np.float64)[:, np.newaxis]
+            * np.power(gc_y_base[:, np.newaxis], sample_gc_betas[np.newaxis, :])
+            * r_auto_5k[np.newaxis, :]
         )
-        msy_exposure = chry_unit[:, np.newaxis] * r_auto_5k[np.newaxis, :]
         q25_rate = np.quantile(
             msy_counts / np.maximum(msy_exposure, 1e-6), 0.25, axis=1
         )
@@ -283,11 +299,53 @@ def fit_prenatal_models(
             )
 
         clean_idx = poisson_model.clean_bin_indices
+        ffy_slope = float(poisson_model.kappa_cal)
+        if clean_idx.size > 0 and np.any(clean_m):
+            m_cols = np.flatnonzero(clean_m)
+            c_m_sum = np.sum(msy_counts[np.ix_(clean_idx, m_cols)], axis=1)
+            e_m_sub = msy_exposure[np.ix_(clean_idx, m_cols)]
+            e_bg_sum = poisson_model.lambda_bg * np.sum(e_m_sub, axis=1)
+            f_m_pos = np.maximum(final_ffy[m_cols], 0.0)
+            e_f1_sum = e_m_sub @ (0.5 * f_m_pos / max(ffy_slope, 1e-6))
+            eta_raw = (np.maximum(c_m_sum - e_bg_sum, 0.0) + 3.0) / (e_f1_sum + 3.0)
+            keep_m = ~((e_f1_sum >= 15.0) & ((eta_raw > 3.5) | (eta_raw < 0.15)))
+            if np.any(keep_m) and not np.all(keep_m):
+                clean_idx = clean_idx[keep_m]
+                poisson_model = PoissonFFYModel(
+                    clean_bin_indices=clean_idx,
+                    lambda_bg=poisson_model.lambda_bg[keep_m],
+                    kappa_cal=poisson_model.kappa_cal,
+                    pooled_bg_rate=poisson_model.pooled_bg_rate,
+                )
+                c_m_sum, e_bg_sum, e_f1_sum = (
+                    c_m_sum[keep_m],
+                    e_bg_sum[keep_m],
+                    e_f1_sum[keep_m],
+                )
+                eta_raw = eta_raw[keep_m]
+                for idx in np.flatnonzero(is_male_arr):
+                    final_ffy[idx], male_ffy_se[idx] = evaluate_poisson_msy_ffy(
+                        msy_counts[:, int(idx)],
+                        msy_exposure[:, int(idx)],
+                        poisson_model,
+                    )
+            exp_m_tot = e_bg_sum + e_f1_sum
+            k_win = np.ones(min(3, c_m_sum.size), dtype=np.float64)
+            c_win = np.convolve(c_m_sum, k_win, mode="same")
+            e_win = np.convolve(exp_m_tot, k_win, mode="same")
+            sig_shift = np.abs(c_win - e_win) > 3.5 * np.sqrt(np.maximum(e_win, 1.0))
+            base_eta = (
+                float(np.median(eta_raw[~sig_shift])) if np.any(~sig_shift) else 1.0
+            )
+            eta_shrunk = np.where(sig_shift, eta_raw, base_eta)
+            eta_mean = float(np.mean(eta_shrunk)) if eta_shrunk.size > 0 else 1.0
+            eta_norm = eta_shrunk / max(eta_mean, 1e-6)
+            ffy_null_mean[clean_idx] = np.log2(np.clip(eta_norm, 0.1, 8.0))
+
         informative_mask = np.zeros(n_chry_bins, dtype=np.bool_)
         informative_mask[clean_idx] = True
         ffy_weights = np.zeros(n_chry_bins, dtype=np.float64)
         ffy_weights[clean_idx] = poisson_model.lambda_bg
-        ffy_slope = float(poisson_model.kappa_cal)
 
         msy_sums = np.sum(
             msy_counts[clean_idx] if clean_idx.size else msy_counts, axis=0
@@ -296,12 +354,14 @@ def fit_prenatal_models(
         y_f, y_m = yfracs[clean_f], yfracs[clean_m]
         if y_f.size > 0 and y_m.size > 0:
             max_f, min_m = float(np.max(y_f)), float(np.min(y_m))
-            mid = (
-                max_f + min_m
-                if max_f < min_m
-                else float(np.median(y_f) + np.median(y_m))
-            )
-            yfrac_threshold = 0.5 * mid
+            if max_f < min_m:
+                std_f = float(np.std(y_f)) if y_f.size >= 2 else 0.0
+                fem_upper = max(
+                    max_f * 2.5 + 2e-4, float(np.median(y_f)) + 6.0 * std_f + 2e-4
+                )
+                yfrac_threshold = min(0.5 * (max_f + min_m), fem_upper)
+            else:
+                yfrac_threshold = 0.5 * float(np.median(y_f) + np.median(y_m))
         elif y_f.size > 0:
             yfrac_threshold = max(float(np.max(y_f)) * 2.0 + 1e-4, 0.002)
         else:
@@ -479,6 +539,7 @@ def fit_prenatal_models(
         ends=e_5k[chry_idx],
         masked=~informative_mask,
         pca_mean=ffy_weights,
+        null_mean=ffy_null_mean,
         gc=cohort_gc[chry_idx] if cohort_gc is not None else None,
         mappability=cohort_mappability[chry_idx]
         if cohort_mappability is not None
@@ -522,19 +583,13 @@ def predict_prenatal(
     bufs = SampleBuffers.coerce(sample, validate=True)
     ffy_ref_c = decode_dictionary_contigs(ffy_ref.column("contig"))
     ffy_ref_s, ffy_ref_e = col_i64(ffy_ref, "start"), col_i64(ffy_ref, "end")
-    ffy_bin = (
-        max(1, int(np.max(ffy_ref_e - ffy_ref_s)))
-        if ffy_ref.num_rows > 0
-        else bufs.meta.bin_size
+    ffy_bin = resolve_ffy_bin_size(
+        reference_table, ffy_ref_s, ffy_ref_e, bufs.meta.bin_size
     )
     bufs_5k = (
         bufs if bufs.meta.bin_size == ffy_bin else rebin_sample_buffers(bufs, ffy_bin)
     )
     counts_5k = np.asarray(bufs_5k.count, dtype=np.float64)
-    sample_c, sample_s, sample_e = sample_grid(bufs_5k.meta)
-    auto_mask_5k, _, _ = resolve_contig_masks(
-        sample_c, autosomes=roles[0], sex_contigs=roles[1], sex_signal_contig=roles[2]
-    )
 
     ffy_align = align_sample_to_grid_indices(
         bufs_5k.meta, ffy_ref_c, ffy_ref_s, ffy_ref_e, allow_alias=True
@@ -561,33 +616,17 @@ def predict_prenatal(
     ffy: float | None = None
     ffy_se: float | None = None
     if fetal_sex == "M" and np.any(hit_y):
-        auto_5k = (
-            reference_table.filter(pc.equal(branch_col, BRANCH_AUTOSOMAL))
-            if BRANCH_AUTOSOMAL in ref_branches
-            else None
-        )
-        gc_5k, map_5k, ffy_gc, ffy_map = resolve_5k_covariates(
+        sample_chry_exp, _ = compute_5k_msy_exposure(
             bufs,
             bufs_5k,
-            auto_5k,
+            reference_table,
             ffy_ref,
+            ffy_bin,
             ffy_align,
-            sample_gc_override,
-            sample_mappability_override,
-            sample_n_mask_override,
+            roles,
+            (sample_gc_override, sample_mappability_override, sample_n_mask_override),
             min_mappability,
         )
-        _, c_ids_5k = np.unique(
-            [normalize_chr(c) for c in sample_c], return_inverse=True
-        )
-        exp_5k = compute_bin_exposure(sample_s, sample_e, ffy_bin)
-        r_auto_5k = compute_autosomal_density(
-            counts_5k, c_ids_5k.astype(np.int16), exp_5k, map_5k, gc_5k, auto_mask_5k
-        )
-        ffy_exp_unit = (ffy_ref_e - ffy_ref_s).astype(np.float64) / max(
-            float(ffy_bin), 1.0
-        )
-        sample_chry_exp = r_auto_5k * ffy_exp_unit * ffy_map * ffy_gc
         ref_w = col_f64(ffy_ref, "pca_mean")
         lam_bg = ref_w[clean_idx] if clean_idx.size else np.empty(0, dtype=np.float64)
         p_model = PoissonFFYModel(
@@ -745,4 +784,190 @@ def predict_prenatal(
         warnings=tuple(warnings_list),
         active_ff_se=active_ff_se,
         effective_ff=effective_ff,
+    )
+
+
+def normalize_prenatal_chry(
+    sample: SampleBuffers,
+    reference_table: pa.Table,
+    prenatal_meta: PrenatalModelMetadata,
+    prenatal_result: FetalFractionResult,
+    *,
+    sample_gc_override: NDArray[np.floating] | None = None,
+    sample_mappability_override: NDArray[np.floating] | None = None,
+    sample_n_mask_override: NDArray[np.bool_] | None = None,
+    min_mappability: float = DEFAULT_MIN_MAPPABILITY,
+) -> BinResult | None:
+    """Normalize 5 kb clean MSY chrY bins against the FF-calibrated 1-copy Poisson baseline."""
+    if prenatal_result.fetal_sex != "M":
+        return None
+    missing_cols = sorted(
+        _REQUIRED_CHRY_REF_COLUMNS - set(reference_table.column_names)
+    )
+    if missing_cols:
+        raise PredictError(
+            f"reference table is missing required columns: {', '.join(missing_cols)}"
+        )
+
+    ffy_ref = reference_table.filter(
+        pc.equal(reference_table.column("branch"), BRANCH_PRENATAL_FFY)
+    )
+    n_y = ffy_ref.num_rows
+    if n_y == 0:
+        return None
+
+    ffy_ref_c = decode_dictionary_contigs(ffy_ref.column("contig"))
+    ffy_ref_s, ffy_ref_e = col_i64(ffy_ref, "start"), col_i64(ffy_ref, "end")
+    bufs = SampleBuffers.coerce(sample, validate=True)
+    ffy_bin = resolve_ffy_bin_size(
+        reference_table, ffy_ref_s, ffy_ref_e, bufs.meta.bin_size
+    )
+    bufs_5k = (
+        bufs if bufs.meta.bin_size == ffy_bin else rebin_sample_buffers(bufs, ffy_bin)
+    )
+    ffy_align = align_sample_to_grid_indices(
+        bufs_5k.meta, ffy_ref_c, ffy_ref_s, ffy_ref_e, allow_alias=True
+    )
+    hit_y = ffy_align >= 0
+    if not np.any(hit_y):
+        return None
+
+    sample_chry_c = np.zeros(n_y, dtype=np.float64)
+    sample_chry_c[hit_y] = np.asarray(bufs_5k.count, dtype=np.float64)[ffy_align[hit_y]]
+    roles = extract_ref_contig_roles(reference_table, ffy_ref)
+    e_b, n_auto_usable = compute_5k_msy_exposure(
+        bufs,
+        bufs_5k,
+        reference_table,
+        ffy_ref,
+        ffy_bin,
+        ffy_align,
+        roles,
+        (sample_gc_override, sample_mappability_override, sample_n_mask_override),
+        min_mappability,
+    )
+
+    pm = prenatal_meta
+    ref_ffy_masked = np.asarray(
+        ffy_ref.column("masked").to_numpy(zero_copy_only=False), dtype=np.bool_
+    )
+    if pm.clean_msy_bins is not None:
+        clean_mask = np.zeros(n_y, dtype=np.bool_)
+        raw_clean = np.asarray(pm.clean_msy_bins, dtype=np.int64)
+        clean_mask[raw_clean[(raw_clean >= 0) & (raw_clean < n_y)]] = True
+    else:
+        clean_mask = ~ref_ffy_masked
+
+    usable = (
+        clean_mask
+        & (~ref_ffy_masked)
+        & hit_y
+        & np.isfinite(e_b)
+        & (e_b > 0.0)
+        & np.isfinite(sample_chry_c)
+        & (sample_chry_c >= 0.0)
+    )
+    ratios = np.full(n_y, np.nan, dtype=np.float64)
+    zscores = np.full(n_y, np.nan, dtype=np.float64)
+    weights = np.zeros(n_y, dtype=np.float64)
+    expected_out = np.zeros(n_y, dtype=np.float64)
+    bg_out = np.zeros(n_y, dtype=np.float64)
+    ref_sizes = np.zeros(n_y, dtype=np.int64)
+    baseline_log2_var = 0.0
+
+    u_idx = np.flatnonzero(usable)
+    if u_idx.size > 0:
+        c_u, u_sample_idx, e_u = sample_chry_c[u_idx], ffy_align[u_idx], e_b[u_idx]
+        eta_u = (
+            np.power(
+                2.0,
+                np.where(
+                    np.isfinite(nm := col_f64(ffy_ref, "null_mean")[u_idx]), nm, 0.0
+                ),
+            )
+            if "null_mean" in ffy_ref.column_names
+            else np.ones(u_idx.size, dtype=np.float64)
+        )
+        kappa_cal = max(float(pm.ffy_slope), 1e-6)
+        raw_bg_u = np.maximum(col_f64(ffy_ref, "pca_mean")[u_idx], 0.0)
+        f_anchor, se_anchor = resolve_chry_anchor_ff(
+            c_u, e_u, raw_bg_u, eta_u, kappa_cal, pm, prenatal_result
+        )
+        if bufs.kappa_frag is None:
+            f_eff, bg_scale = f_anchor, 1.0
+        else:
+            mu_f, mu_m = resolve_fisher_moment_weights(bufs, pm)
+            f_act = float(np.clip(f_anchor, 0.0, 1.0))
+            w_mix = (1.0 - f_act) * mu_m + f_act * mu_f
+            f_eff = max(_compute_effective_ff(f_act, bufs, pm), 1e-4)
+            bg_scale = (mu_m / w_mix) if w_mix > 0.0 else 1.0
+
+        sigma_f = math.sqrt(
+            se_anchor**2
+            + (max(f_anchor, 0.02) * min(float(pm.ffy_std) / 0.10, 0.12)) ** 2
+        )
+        baseline_log2_var = (sigma_f / (max(f_anchor, 0.02) * math.log(2.0))) ** 2
+
+        bg_counts_u = e_u * bg_scale * raw_bg_u
+        lam_u = bg_counts_u + e_u * eta_u * (0.5 * f_eff / kappa_cal)
+        r_u = np.log2((c_u + 0.5) / (lam_u + 0.5)) - exact_poisson_log2_jensen_bias(
+            lam_u
+        )
+
+        raw_kappa_5k = (
+            bufs_5k.kappa_frag
+            if bufs_5k.kappa_frag is not None
+            else rebin_track_1d(bufs.kappa_frag, bufs.meta, bufs_5k.meta)
+        )
+        kap_sub = (
+            np.asarray(raw_kappa_5k, dtype=np.float64)[u_sample_idx]
+            if raw_kappa_5k is not None
+            else None
+        )
+        kap_u = shrink_kish_kappa(c_u, kap_sub)
+        sig0_sq_u = np.maximum(
+            kap_u * exact_poisson_log_variance(lam_u) / LN2_SQ, 1e-12
+        )
+        tau_y = estimate_adjacent_dispersion_tau(
+            u_idx,
+            np.asarray(ffy_ref_c, dtype=str)[u_idx],
+            r_u,
+            sig0_sq_u,
+            tau_min=1.0,
+            tau_max=2.5,
+        )
+
+        sig_u = tau_y * np.sqrt(sig0_sq_u)
+        lower = (c_u < lam_u) & (lam_u > 0.0)
+        if np.any(lower):
+            c_pos = np.maximum(c_u, 1e-12)
+            dev_sq = np.maximum(
+                2.0
+                * (
+                    np.where(c_u > 0.0, c_u * np.log(c_pos / lam_u), 0.0)
+                    - (c_u - lam_u)
+                ),
+                1e-12,
+            )
+            sig_dev = tau_y * np.sqrt(kap_u) * np.abs(r_u) / np.sqrt(dev_sq)
+            sig_u = np.where(lower, np.maximum(sig_u, sig_dev), sig_u)
+        ratios[u_idx], zscores[u_idx] = r_u, r_u / sig_u
+        weights[u_idx], expected_out[u_idx] = 1.0 / np.square(sig_u), lam_u
+        bg_out[u_idx] = bg_counts_u
+        ref_sizes[u_idx] = max(n_auto_usable, int(u_idx.size))
+
+    return BinResult(
+        branch=BRANCH_PRENATAL_FFY,
+        contigs=ffy_ref_c,
+        starts=ffy_ref_s,
+        ends=ffy_ref_e,
+        ratios=ratios,
+        zscores=zscores,
+        weights=weights,
+        reference_sizes=ref_sizes,
+        masked=~usable,
+        counts=sample_chry_c,
+        expected_counts=expected_out,
+        background_counts=bg_out,
+        baseline_log2_var=baseline_log2_var,
     )

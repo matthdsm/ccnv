@@ -64,6 +64,8 @@ class BinResult:
     masked: NDArray[np.bool_]
     counts: NDArray[np.float64] | None = None
     expected_counts: NDArray[np.float64] | None = None
+    background_counts: NDArray[np.float64] | None = None
+    baseline_log2_var: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

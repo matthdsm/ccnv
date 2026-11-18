@@ -143,6 +143,7 @@ flowchart TB
     R_PRD --> PR_INF["prenatal.predict_prenatal"]
     PR_INF --> PM_SCA["prenatal_math.classify_sca_ray_4d / prenatal_math.fuse_active_fetal_fraction_student_t4"]
     PR_INF --> FG_KL["stats.fragmentomics.predict_ff_kl_deconvolution / stats.fragmentomics.predict_ff_fragmentomics"]
+    PR_INF --> PG_5K["prenatal_grid.compute_5k_msy_exposure"]
     R_PRD --> N_ONCE["_normalize_branches_once"]
     N_ONCE --> B_BM["predict.build_branch_model"]
     B_BM --> N_BM["normalization.build_branch_model_from_tables"]
@@ -151,6 +152,8 @@ flowchart TB
     N_SBR --> SB_EST["superblocks.estimate_superblock_scales"]
     N_SBR --> REG_POI["regression.fit_poisson_covariate_trends"]
     N_SBR --> PCA_HUB["pca.project_huber_pca_wave"]
+    R_PRD --> PR_CHRY["prenatal.normalize_prenatal_chry"]
+    PR_CHRY --> PG_5K
     R_PRD --> S_C["predict.segment_and_call"]
     S_C --> SEG_GEN["segmentation.segment_and_score_genome"]
     SEG_GEN --> SEG_PRE["_segment_and_prescore_contig"]
@@ -235,10 +238,10 @@ Stage 3 orchestrator for auditing existing reference Parquet files.
 Stage 4 orchestrator for single-sample normalization, segmentation, CNV calling, prenatal inference, and deliverable export.
 
 - **`PredictionInput`** — Dataclass holding loaded sample buffers, metadata, authoritative contig lengths, and filtered reference branches ready for normalization.
-- **`run(config: PredictConfig) -> PredictionOutputs`** — Executes input loading, track preloading, optional prenatal fetal fraction/SCA evaluation, branch normalization, segmentation/calling, report emission, and prediction QC export (re-exported as `run_predict`).
+- **`run(config: PredictConfig) -> PredictionOutputs`** — Executes input loading, track preloading, optional prenatal fetal fraction/SCA evaluation, branch normalization (plus male-fetus `prenatal_ffy` 5 kb `chrY` normalization via `normalize_prenatal_chry`), segmentation/calling, report emission, and prediction QC export (re-exported as `run_predict`).
 - **`load_inputs(sample_path, reference_path, *, sex, mode, fasta, threads) -> PredictionInput`** — Reads and validates reference Parquet branches and loads or extracts the sample table (rebinning in memory when sample bin size differs from the reference).
 - **`build_branch_model(inputs, branch, ref_meta)`** — Compiles a reusable `BranchModel` from loaded prediction inputs and reference metadata.
-- **`segment_and_call(bins, contig_lengths, *, penalty, z_threshold, ratio_threshold, max_blacklist_gap, threads, mode)`** — Segments normalized branches with calibrated Pelt and evaluates discrete copy-number Bayes factors and dyadic BLUE Z-scores.
+- **`segment_and_call(bins, contig_lengths, *, penalty, z_threshold, ratio_threshold, max_blacklist_gap, threads, mode)`** — Segments normalized branches with calibrated Pelt and evaluates discrete copy-number Bayes factors (using haploid baseline ploidy `1` on `male_sex` and `prenatal_ffy`, and diploid ploidy `2` elsewhere) and dyadic BLUE Z-scores.
 - **Internal predict helpers** — `_preload_sample_track_overrides`, `_normalize_branches_once`, `_sample_usable_from_bin_results`, `_validate_branch_contigs`, and `_validate_config` validate parameters, preload optional `--gc`/`--mappability` overrides, normalize branches once per invocation, and summarize usable autosomal bins.
 
 ## 3. Domain Models & Schema Contracts (`ccnv.models`)
@@ -589,6 +592,8 @@ Compiled branch models and single-sample within-sample prototype normalization.
 
 - **`BranchModel`** — Dataclass holding aligned reference tracks, whitened PCA matrices, off-contig Prototype Graph indices/weights, biological dispersions, and usable masks for one branch.
 - **`BranchNormalizationResult`** — Dataclass returning bin-level log2 ratios, precision weights, residuals, scale factors, and per-sample covariate predictions.
+- **`shrink_kish_kappa(counts, kappa_frag, *, eligible_mask)`** — Shrinks per-bin Kish shot-noise inflation factors toward the branch median at low effective read counts.
+- **`estimate_adjacent_dispersion_tau(valid_indices, contigs, centered_ratios, sig0_sq, *, tau_min, tau_max)`** — Estimates sample overdispersion scale $\hat{\tau}$ from MAD-scaled adjacent same-contig bin differences clamped to `[tau_min, tau_max]`.
 - **`align_reference_unmasked_bins(sample, reference)`** — Aligns unmasked reference branch intervals onto target sample bin coordinates.
 - **`build_branch_model_from_tables(ref_table, branch, *, sample, ref_meta)`** — Compiles a `BranchModel` from filtered reference Parquet rows and optional `SampleBuffers`.
 - **`normalize_sample_branch(counts, exposure, model, *, mask_repeats, kappa_frag, min_reference_bins, gc_override, gc_quantiles_override, mappability_override, n_mask_override, min_mappability)`** — Executes super-block depth scaling, per-sample Poisson exogenous bias removal, Huber PCA projection, weighted prototype baseline reconstruction, and Empirical Bayes precision weight synthesis.
@@ -620,13 +625,18 @@ Coarse 100 kb autosomal/sex grid construction and covariate coarsening for prena
 - **`compute_100k_profiles(counts_matrix, contigs, starts, ends, bin_size, auto_mask, chrx_mask)`** — Computes 100 kb normalized log2 ratio profiles and `chrX` dosage ratios used by `FFA` regression and `FFX` baseline calibration.
 - **`extract_ref_contig_roles(reference_table, ffy_ref)`** — Reads optional custom contig roles from reference metadata or the `prenatal_ffy` branch.
 - **`resolve_5k_covariates(bufs, bufs_5k, auto_5k, ffy_ref, ffy_align, gc_override, map_override, n_mask_override, min_mappability)`** — Resolves 5 kb autosomal and MSY exogenous tracks honoring user prediction overrides.
+- **`fit_sample_gc_exponent(counts, exposure, mappability, gc_mult, auto_mask)`** — Fits a sample-specific log-linear GC exponent $\hat{\beta}_{\text{GC}} \in [-3.0, 3.0]$ across usable autosomal 5 kb bins.
+- **`compute_5k_msy_exposure(bufs, bufs_5k, reference_table, ffy_ref, ffy_bin, ffy_align, roles, overrides, min_mappability)`** — Computes per-bin 5 kb diploid-equivalent MSY exposure across `prenatal_ffy` rows (incorporating $\hat{\beta}_{\text{GC}}$) and usable autosomal bin count.
+- **`resolve_ffy_bin_size(reference_table, ffy_ref_s, ffy_ref_e, fallback)`** — Resolves the 5 kb reference bin size from `ReferenceMetadata` or `prenatal_ffy` interval spans.
+- **`resolve_chry_anchor_ff(c_u, e_u, lam_bg_u, eta_u, kappa_cal, pm, prenatal_result)`** — Resolves a LOCO-guarded 1-copy fetal fraction and uncertainty for `chrY` normalization, switching to off-`chrY` fused fetal fraction (or intact-arm MSY blocks) when `FFY` diverges under `47,XYY` or large `chrY` CNVs.
 
 ### `ccnv.features.prenatal` (`src/ccnv/features/prenatal.py`)
 
 High-level prenatal reference training and single-sample inference orchestration.
 
-- **`fit_prenatal_models(sample_tables, entries, *, prenatal_bin_size, cohort_gc, cohort_mappability, cohort_n_mask, min_mappability, autosomes, sex_contigs, sex_signal_contig, seed)`** — Trains `FFY` (5 kb `chrY` MSY MLE), `FFA` (100 kb autosomal PCA + logit ensemble), forward `FFX`, fragmentomic deconvolution + Fisher weighting + `FF_size`, 4D SCA classifier, and `PrenatalModelMetadata`.
+- **`fit_prenatal_models(sample_tables, entries, *, prenatal_bin_size, cohort_gc, cohort_mappability, cohort_n_mask, min_mappability, autosomes, sex_contigs, sex_signal_contig, seed)`** — Trains `FFY` (5 kb `chrY` MSY MLE with empirical per-bin male efficiency in `null_mean` and female-anchored `yfrac_threshold`), `FFA` (100 kb autosomal PCA + logit ensemble), forward `FFX`, fragmentomic deconvolution + Fisher weighting + `FF_size`, 4D SCA classifier, and `PrenatalModelMetadata`.
 - **`predict_prenatal(sample, reference_table, prenatal_meta, *, min_ff_warning, sample_gc_override, sample_mappability_override, sample_n_mask_override, min_mappability)`** — Evaluates `FFY`, `FFX`, `FFA`, and `FF_size`, classifies karyotype via `classify_sca_ray_4d`, fuses `active_ff` via Student-$t_4$ IRLS, and synthesizes normalized prenatal diagnostic metrics.
+- **`normalize_prenatal_chry(sample, reference_table, prenatal_meta, prenatal_result, *, sample_gc_override, sample_mappability_override, sample_n_mask_override, min_mappability)`** — Normalizes 5 kb clean MSY `chrY` bins from `prenatal_ffy` for male-fetus (`fetal_sex == "M"`) prenatal samples against the FF-calibrated 1-copy Poisson baseline $\hat{\lambda}_b = e_b(s_{\text{bg}}\lambda_{\text{bg}, b} + \eta_b\frac{f}{2\kappa_{\text{cal}}})$ with Jensen-debiased $\log_2$ ratios, Poisson precision weights, and propagated FF baseline variance (returning `None` for female fetuses).
 - **Internal prenatal helpers** — `_evaluate_sca_and_active_ff` and `_compute_effective_ff` coordinate 4D SCA ray evaluation and active fetal fraction fallback logic.
 
 ### `ccnv.features.prenatal_origin` (`src/ccnv/features/prenatal_origin.py`)

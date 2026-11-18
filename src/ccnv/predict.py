@@ -26,7 +26,7 @@ from ccnv.features.normalization import (
     normalize_branch,
     normalize_sample_branch,
 )
-from ccnv.features.prenatal import predict_prenatal
+from ccnv.features.prenatal import normalize_prenatal_chry, predict_prenatal
 from ccnv.features.prenatal_origin import annotate_sample_prenatal_segments
 from ccnv.features.rebinning import rebin_sample_buffers
 from ccnv.features.sex import infer_single_sample_sex
@@ -321,6 +321,27 @@ def run(config: PredictConfig) -> PredictionOutputs:
         sample_map=sample_map,
         tracks_loaded=True,
     )
+    if (
+        config.mode == "prenatal"
+        and prenatal_meta is not None
+        and prenatal_result is not None
+        and prenatal_result.fetal_sex == "M"
+    ):
+        try:
+            chry_bins = normalize_prenatal_chry(
+                raw_sample,
+                inputs.reference,
+                prenatal_meta,
+                prenatal_result,
+                sample_gc_override=sample_gc,
+                sample_mappability_override=sample_map,
+                sample_n_mask_override=sample_n_mask,
+                min_mappability=config.min_mappability,
+            )
+        except (SchemaError, ValueError) as err:
+            raise PredictError(str(err)) from err
+        if chry_bins is not None:
+            bin_results = (*bin_results, chry_bins)
     segments = segment_and_call(
         bin_results,
         inputs.contig_lengths,
@@ -386,17 +407,28 @@ def _validate_branch_contigs(
     branches: list[str],
     sample_lens: dict[str, int],
     ref_lens: dict[str, int],
+    *,
+    allow_alias: bool = False,
 ) -> None:
     active_ref = filter_reference_branches(reference, branches)
     active_contigs = unique_dictionary_contigs(active_ref.column("contig"))
-    missing_contigs = [c for c in active_contigs if c not in sample_lens]
+    lookup = ContigLookup.from_names(sample_lens.keys()) if allow_alias else None
+    missing_contigs: list[str] = []
+    resolved_pairs: list[tuple[str, str]] = []
+    for c_name in active_contigs:
+        if c_name in sample_lens:
+            resolved_pairs.append((c_name, c_name))
+        elif lookup is not None and (alias := lookup.resolve(c_name)) is not None:
+            resolved_pairs.append((c_name, alias))
+        else:
+            missing_contigs.append(c_name)
     if missing_contigs:
         raise PredictError(
             f"sample is missing reference bins on contig(s): {', '.join(missing_contigs)}"
         )
-    for contig_name in active_contigs:
-        if sample_lens.get(contig_name) != ref_lens.get(contig_name):
-            raise PredictError(f"contig length mismatch for {contig_name!r}")
+    for ref_name, sample_name in resolved_pairs:
+        if sample_lens.get(sample_name) != ref_lens.get(ref_name):
+            raise PredictError(f"contig length mismatch for {ref_name!r}")
 
 
 def load_inputs(
@@ -517,6 +549,10 @@ def load_inputs(
             reference = filter_reference_branches(reference, branches)
 
     _validate_branch_contigs(reference, branches, sample_lens, ref_lens)
+    if mode == "prenatal":
+        _validate_branch_contigs(
+            reference, read_branches, sample_lens, ref_lens, allow_alias=True
+        )
 
     return PredictionInput(
         sample=sample,
@@ -573,7 +609,8 @@ def segment_and_call(
 
     by_contig: dict[str, ContigSegmentationInput] = {}
     for result in bins:
-        ploidy = 1 if result.branch == BRANCH_MALE_SEX else 2
+        is_ffy = result.branch == BRANCH_PRENATAL_FFY
+        ploidy = 1 if (result.branch == BRANCH_MALE_SEX or is_ffy) else 2
         contig_array = np.asarray(result.contigs, dtype=object)
         for contig_name in dict.fromkeys(result.contigs):
             selected = contig_array == contig_name
@@ -590,7 +627,14 @@ def segment_and_call(
                     if result.expected_counts is not None
                     else None
                 ),
+                background_expected=(
+                    result.background_counts[selected]
+                    if result.background_counts is not None
+                    else None
+                ),
                 baseline_ploidy=ploidy,
+                baseline_log2_var=result.baseline_log2_var,
+                poisson_pooled=is_ffy,
             )
 
     try:
