@@ -103,6 +103,8 @@ hooks = "prek run --all-files"
 docker-build = "docker build --platform linux/amd64 -t ghcr.io/matthdsm/ccnv:dev ."
 docs-build = "pixi run -e docs zensical build --clean --strict"
 docs-serve = "pixi run -e docs zensical serve"
+bump-version = "python scripts/bump.py version"
+bump-schema = "python scripts/bump.py schema"
 
 [tool.pytest.ini_options]
 addopts = "-ra"

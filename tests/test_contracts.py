@@ -86,7 +86,7 @@ class TestRepositoryCodebaseContracts(unittest.TestCase):
     def test_repository_line_count_invariants(self) -> None:
         long_files: list[tuple[str, int]] = []
 
-        for base_dir in ("src", "tests"):
+        for base_dir in ("src", "tests", "scripts"):
             for py_path in (self.repo_root / base_dir).glob("**/*.py"):
                 line_count = len(py_path.read_text(encoding="utf-8").splitlines())
                 if line_count >= 1_000:
@@ -112,23 +112,24 @@ class TestRepositoryCodebaseContracts(unittest.TestCase):
         assert_violations: list[tuple[str, int]] = []
         type_ignore_violations: list[tuple[str, int, str]] = []
 
-        for py_path in (self.repo_root / "src").glob("**/*.py"):
-            rel_path = str(py_path.relative_to(self.repo_root))
-            text = py_path.read_text(encoding="utf-8")
-            for idx, line in enumerate(text.splitlines(), start=1):
-                if "# type: ignore" in line:
-                    type_ignore_violations.append((rel_path, idx, line.strip()))
+        for base_dir in ("src", "scripts"):
+            for py_path in (self.repo_root / base_dir).glob("**/*.py"):
+                rel_path = str(py_path.relative_to(self.repo_root))
+                text = py_path.read_text(encoding="utf-8")
+                for idx, line in enumerate(text.splitlines(), start=1):
+                    if "# type: ignore" in line:
+                        type_ignore_violations.append((rel_path, idx, line.strip()))
 
-            tree = ast.parse(text, filename=str(py_path))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Assert):
-                    assert_violations.append((rel_path, node.lineno))
-                elif isinstance(node, ast.ImportFrom) and node.module == "typing":
-                    for alias in node.names:
-                        if alias.name == "Any":
-                            any_violations.append((rel_path, node.lineno))
-                        elif alias.name == "cast":
-                            cast_violations.append((rel_path, node.lineno))
+                tree = ast.parse(text, filename=str(py_path))
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Assert):
+                        assert_violations.append((rel_path, node.lineno))
+                    elif isinstance(node, ast.ImportFrom) and node.module == "typing":
+                        for alias in node.names:
+                            if alias.name == "Any":
+                                any_violations.append((rel_path, node.lineno))
+                            elif alias.name == "cast":
+                                cast_violations.append((rel_path, node.lineno))
 
         self.assertEqual(
             any_violations,
