@@ -501,11 +501,6 @@ class TestFetalFractionResult(unittest.TestCase):
                 call="XY", is_aneuploid=False, confidence=0.99, chrx_zscore=-6.5
             ),
             twin=twin,
-            gestation="twin",
-            fetal_sexes=("F", "M"),
-            male_ff=0.14,
-            female_ff=0.08,
-            twin_confidence=0.97,
         )
         self.assertEqual(ff_res.gestation, "twin")
         self.assertEqual(ff_res.fetal_sexes, ("F", "M"))
@@ -513,6 +508,43 @@ class TestFetalFractionResult(unittest.TestCase):
         self.assertAlmostEqual(ff_res.male_ff or 0.0, 0.14)
         self.assertAlmostEqual(ff_res.female_ff or 0.0, 0.08)
         self.assertAlmostEqual(ff_res.twin_confidence or 0.0, 0.97)
+        with self.assertRaisesRegex(ValueError, "conflicts with twin.is_twin"):
+            _call(
+                FetalFractionResult,
+                fetal_sex="M",
+                active_ff=0.12,
+                active_ff_source="FFY",
+                ffy=0.12,
+                ffx=0.12,
+                ffa=0.12,
+                chrx_ratio=0.94,
+                chry_score=0.01,
+                yfrac_threshold=0.001,
+                sca=SCAResult("XY", False, 0.99, -2.0),
+                twin=TwinResult(
+                    call="MM",
+                    fetal_sexes=("M", "M"),
+                    is_twin=False,
+                    twin_probability=0.05,
+                    confidence=0.95,
+                    posteriors={"FF": 0.0, "FM": 0.05, "MM": 0.95},
+                    male_ff=0.12,
+                    female_ff=0.0,
+                ),
+                gestation="twin",
+            )
+        with self.assertRaisesRegex(ValueError, "does not match fetal_sexes"):
+            _call(
+                TwinResult,
+                call="FF",
+                fetal_sexes=("M", "M"),
+                is_twin=True,
+                twin_probability=0.9,
+                confidence=0.9,
+                posteriors={},
+                male_ff=0.1,
+                female_ff=0.0,
+            )
 
         for pair, sexes in (("FF", ("F", "F")), ("FM", ("F", "M")), ("MM", ("M", "M"))):
             t_pair: TwinSexPair = pair

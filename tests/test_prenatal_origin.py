@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from dataclasses import replace
 
 import numpy as np
 from helpers import make_sample_table
@@ -622,6 +623,24 @@ class TestPrenatalSelfReferencedOriginEngine(unittest.TestCase):
             "chr21", 0, 1_000_000, math.log2(r_conc), 10.0, 50.0, 50, "gain"
         )
 
+        r_male_single = 1.0 + 0.5 * male_ff
+        phi_male_single = (active_ff + 0.5 * male_ff) / r_male_single
+        p_male_single = phi_male_single * p_f_24 + (1.0 - phi_male_single) * p_m_24
+        for b in range(150, 200):
+            sample_bands[b] = np.round(500 * r_male_single * p_male_single).astype(
+                np.uint32
+            )
+        seg_male_single = SegmentResult(
+            "chr21",
+            1_000_000,
+            2_000_000,
+            math.log2(r_male_single),
+            7.5,
+            50.0,
+            50,
+            "gain",
+        )
+
         _, lod_singleton = annotate_prenatal_origin_and_lod(
             segments=(),
             active_ff=active_ff,
@@ -632,7 +651,7 @@ class TestPrenatalSelfReferencedOriginEngine(unittest.TestCase):
             sample_bands, bin_contigs, contig_names, bin_starts, bin_ends, bin_usable
         )
         annotated, lod_twin = annotate_prenatal_origin_and_lod(
-            segments=(seg_single, seg_conc),
+            segments=(seg_single, seg_conc, seg_male_single),
             prefix_sums=prefix_sums,
             sample_bands=sample_bands,
             bin_usable=bin_usable,
@@ -658,6 +677,9 @@ class TestPrenatalSelfReferencedOriginEngine(unittest.TestCase):
         self.assertFalse(annotated[1].discordant)
         self.assertIsNone(annotated[1].discordance_reason)
         self.assertEqual(annotated[1].origin_call, "FETAL_CONSTITUTIONAL")
+        self.assertFalse(annotated[2].discordant)
+        self.assertIsNone(annotated[2].discordance_reason)
+        self.assertEqual(annotated[2].origin_call, "FETAL_CONSTITUTIONAL")
 
         meta = SampleMetadata(
             bin_size=20_000,
@@ -708,18 +730,39 @@ class TestPrenatalSelfReferencedOriginEngine(unittest.TestCase):
             female_ff=female_ff,
             twin_confidence=0.97,
         )
+        pr_single = replace(
+            pr_twin,
+            gestation="singleton",
+            fetal_sexes=None,
+            male_ff=None,
+            female_ff=None,
+            twin_confidence=None,
+        )
+        _, lod_s_single = annotate_sample_prenatal_segments(
+            (),
+            bufs,
+            bin_usable=bin_usable,
+            prenatal_meta=pm,
+            prenatal_result=pr_single,
+        )
         ann_s, lod_s = annotate_sample_prenatal_segments(
-            (seg_single, seg_conc),
+            (seg_single, seg_conc, seg_male_single),
             bufs,
             bin_usable=bin_usable,
             prenatal_meta=pm,
             prenatal_result=pr_twin,
         )
-        if lod_s is None:
+        if lod_s is None or lod_s_single is None:
             self.fail("expected PrenatalLoDMetrics")
-        self.assertGreater(lod_s.lod_ff_35mb, lod_singleton.lod_ff_35mb)
+        self.assertAlmostEqual(
+            lod_s.lod_ff_35mb, lod_s_single.lod_ff_35mb * scale, places=5
+        )
+        self.assertAlmostEqual(
+            lod_s.lod_ff_3mb, lod_s_single.lod_ff_3mb * scale, places=5
+        )
         self.assertEqual(ann_s[0].origin_call, "FETAL_CONSTITUTIONAL")
         self.assertEqual(ann_s[1].origin_call, "FETAL_CONSTITUTIONAL")
+        self.assertEqual(ann_s[2].origin_call, "FETAL_CONSTITUTIONAL")
 
 
 if __name__ == "__main__":

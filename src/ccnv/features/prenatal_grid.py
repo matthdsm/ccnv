@@ -17,6 +17,7 @@ from ccnv.features.binning import (
     compute_bin_exposure,
     rebin_counts,
 )
+from ccnv.features.rebinning import rebin_sample_buffers
 from ccnv.models import (
     BRANCH_AUTOSOMAL,
     FetalFractionResult,
@@ -43,6 +44,7 @@ __all__ = [
     "compute_100k_profiles",
     "extract_ref_contig_roles",
     "fit_sample_gc_exponent",
+    "prepare_5k_msy_sample",
     "prepare_covariate_multipliers",
     "rebin_track_1d",
     "resolve_5k_covariates",
@@ -417,6 +419,62 @@ def resolve_ffy_bin_size(
     return max(1, fallback)
 
 
+def prepare_5k_msy_sample(
+    sample: SampleBuffers,
+    reference_table: pa.Table,
+    ffy_ref: pa.Table,
+    clean_msy_bins: Sequence[int] | None,
+) -> tuple[
+    SampleBuffers,
+    SampleBuffers,
+    int,
+    tuple[str, ...],
+    NDArray[np.int64],
+    NDArray[np.int64],
+    NDArray[np.int64],
+    NDArray[np.float64],
+    NDArray[np.bool_],
+    NDArray[np.int64],
+]:
+    """Coerce and rebin sample to 5 kb prenatal_ffy grid and resolve clean MSY indices."""
+    bufs = SampleBuffers.coerce(sample, validate=True)
+    ffy_ref_c = decode_dictionary_contigs(ffy_ref.column("contig"))
+    ffy_ref_s, ffy_ref_e = col_i64(ffy_ref, "start"), col_i64(ffy_ref, "end")
+    ffy_bin = resolve_ffy_bin_size(
+        reference_table, ffy_ref_s, ffy_ref_e, bufs.meta.bin_size
+    )
+    bufs_5k = (
+        bufs if bufs.meta.bin_size == ffy_bin else rebin_sample_buffers(bufs, ffy_bin)
+    )
+    ffy_align = align_sample_to_grid_indices(
+        bufs_5k.meta, ffy_ref_c, ffy_ref_s, ffy_ref_e, allow_alias=True
+    )
+    sample_chry_c = np.zeros(ffy_ref.num_rows, dtype=np.float64)
+    hit_y = ffy_align >= 0
+    sample_chry_c[hit_y] = np.asarray(bufs_5k.count, dtype=np.float64)[ffy_align[hit_y]]
+    ref_ffy_masked = np.asarray(
+        ffy_ref.column("masked").to_numpy(zero_copy_only=False), dtype=np.bool_
+    )
+    raw_clean = (
+        np.asarray(clean_msy_bins, dtype=np.int64)
+        if clean_msy_bins is not None
+        else np.flatnonzero(~ref_ffy_masked).astype(np.int64)
+    )
+    clean_idx = raw_clean[(raw_clean >= 0) & (raw_clean < ffy_ref.num_rows)]
+    return (
+        bufs,
+        bufs_5k,
+        ffy_bin,
+        ffy_ref_c,
+        ffy_ref_s,
+        ffy_ref_e,
+        ffy_align,
+        sample_chry_c,
+        ref_ffy_masked,
+        clean_idx,
+    )
+
+
 def resolve_chry_anchor_ff(
     c_u: NDArray[np.float64],
     e_u: NDArray[np.float64],
@@ -427,33 +485,46 @@ def resolve_chry_anchor_ff(
     prenatal_result: FetalFractionResult,
 ) -> tuple[float, float]:
     """Resolve LOCO-guarded 1-copy fetal fraction and uncertainty for chrY baseline."""
-    f_base = max(float(prenatal_result.active_ff), 1e-4)
-    se_base = float(
-        prenatal_result.active_ff_se
-        if prenatal_result.active_ff_se is not None
-        else max(pm.ffy_std, 0.008)
-    )
-    if (
-        prenatal_result.sca.call != "XY"
-        or prenatal_result.ffy is None
-        or prenatal_result.fetal_sexes == ("F", "M")
-    ):
-        return f_base, se_base
-
-    off_ests = [float(prenatal_result.ffa), float(prenatal_result.ffx)]
-    off_ses = [
-        max(float(pm.ffa_std), 0.01),
-        max(2.0 * float(pm.female_chrx_ratio_std), 0.015),
-    ]
-    if prenatal_result.ff_size is not None and math.isfinite(prenatal_result.ff_size):
-        off_ests.append(float(prenatal_result.ff_size))
-        off_ses.append(max(float(pm.ff_size_std), 0.01))
-    f_off, se_off = fuse_active_fetal_fraction_student_t4(off_ests, off_ses)
-
     denom_tot = max(float(np.sum(e_u * eta_u)), 1e-6)
     se_ffy_obs = max(
         0.005, math.sqrt(max(float(np.sum(c_u)), 1.0)) * 2.0 * kappa_cal / denom_tot
     )
+    is_fm_twin = (
+        prenatal_result.fetal_sexes == ("F", "M")
+        and prenatal_result.male_ff is not None
+    )
+    if is_fm_twin and prenatal_result.male_ff is not None:
+        m_ratio = float(prenatal_result.male_ff) / max(
+            float(prenatal_result.active_ff), 1e-6
+        )
+        m_share = float(np.clip(m_ratio, 0.05, 1.0))
+        f_base = max(float(prenatal_result.active_ff) * m_share, 1e-4)
+        se_base = max(math.hypot(se_ffy_obs, float(pm.ffy_std)), 0.005)
+    else:
+        f_base = max(float(prenatal_result.active_ff), 1e-4)
+        se_base = float(
+            prenatal_result.active_ff_se
+            if prenatal_result.active_ff_se is not None
+            else max(pm.ffy_std, 0.008)
+        )
+    if prenatal_result.sca.call != "XY" or prenatal_result.ffy is None:
+        return f_base, se_base
+
+    if is_fm_twin:
+        f_off, se_off = f_base, se_base
+    else:
+        off_ests = [float(prenatal_result.ffa), float(prenatal_result.ffx)]
+        off_ses = [
+            max(float(pm.ffa_std), 0.01),
+            max(2.0 * float(pm.female_chrx_ratio_std), 0.015),
+        ]
+        if prenatal_result.ff_size is not None and math.isfinite(
+            prenatal_result.ff_size
+        ):
+            off_ests.append(float(prenatal_result.ff_size))
+            off_ses.append(max(float(pm.ff_size_std), 0.01))
+        f_off, se_off = fuse_active_fetal_fraction_student_t4(off_ests, off_ses)
+
     ffy_val = float(prenatal_result.ffy)
 
     if c_u.size >= 32 and f_off > 0.015:
@@ -487,7 +558,8 @@ def resolve_chry_anchor_ff(
                 )
                 return max(f_intact, 1e-4), max(1.5 * se_ffy_obs, 0.008)
 
-    sigma_diff = math.sqrt(se_ffy_obs**2 + float(pm.ffy_std) ** 2 + se_off**2)
-    if se_off <= 0.06 and abs(ffy_val - f_off) > 1.8 * sigma_diff:
-        return max(f_off, 1e-4), se_off
+    if not is_fm_twin:
+        sigma_diff = math.sqrt(se_ffy_obs**2 + float(pm.ffy_std) ** 2 + se_off**2)
+        if se_off <= 0.06 and abs(ffy_val - f_off) > 1.8 * sigma_diff:
+            return max(f_off, 1e-4), se_off
     return f_base, se_base

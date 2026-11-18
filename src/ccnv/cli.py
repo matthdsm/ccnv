@@ -575,7 +575,7 @@ def predict(
         bool,
         typer.Option(
             "--twins/--no-twins",
-            help="Treat sample as a known twin pregnancy in prenatal mode",
+            help="Declare a known twin pregnancy in prenatal mode (--no-twins leaves automatic twin detection enabled)",
         ),
     ] = False,
     loglevel: LogLevelOption = LogLevel.warning,

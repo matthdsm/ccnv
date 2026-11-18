@@ -267,28 +267,33 @@ def classify_segment_origin_5state(
     f_dep = float(np.clip(depth_ff if depth_ff is not None else active_ff, 0.001, 0.60))
     f_se = max(float(active_ff_se) * (f_dep / f_bio), 0.001)
 
-    r_exp_fc = 1.0 + delta_cn * f_dep
-    phi_fc = (cn_alt / 2.0 * f_bio) / (1.0 - f_bio + cn_alt / 2.0 * f_bio)
-    p_fc = phi_fc * pf_24 + (1.0 - phi_fc) * pm_24
-    ll_fc = _gaussian_depth_loglik(
-        r_obs, r_exp_fc, sigma_r, abs(delta_cn) * f_se
-    ) + _dirichlet_multinomial_logpmf(k_arr, alpha_dm * p_fc)
+    cand_ffs: tuple[float, ...] = (f_bio,)
     if twin_min_ff is not None and twin_min_ff > 0.0:
-        f_min_bio = float(np.clip(twin_min_ff, 0.001, f_bio))
-        f_min_dep = f_dep * (f_min_bio / f_bio)
-        r_exp_1 = 1.0 + delta_cn * f_min_dep
-        phi_fc_1 = float(
+        f_1 = float(np.clip(twin_min_ff, 0.001, f_bio))
+        f_2 = float(np.clip(f_bio - f_1, 0.001, f_bio))
+        cand_ffs = (f_bio, f_1, f_2)
+
+    ll_fc = -math.inf
+    for f_aff in cand_ffs:
+        f_aff_dep = f_dep * (f_aff / f_bio)
+        r_exp_aff = 1.0 + delta_cn * f_aff_dep
+        phi_aff = float(
             np.clip(
-                (f_bio + delta_cn * f_min_bio) / max(1.0 + delta_cn * f_min_bio, 1e-6),
+                (f_bio + delta_cn * f_aff) / max(1.0 + delta_cn * f_aff, 1e-6),
                 1e-6,
                 1.0 - 1e-6,
             )
         )
-        p_fc_1 = phi_fc_1 * pf_24 + (1.0 - phi_fc_1) * pm_24
-        ll_fc_single = _gaussian_depth_loglik(
-            r_obs, r_exp_1, sigma_r, abs(delta_cn) * f_se * (f_min_bio / f_bio)
-        ) + _dirichlet_multinomial_logpmf(k_arr, alpha_dm * p_fc_1)
-        ll_fc = max(ll_fc, ll_fc_single)
+        p_aff = phi_aff * pf_24 + (1.0 - phi_aff) * pm_24
+        se_aff = (
+            abs(delta_cn) * f_se
+            if f_aff == f_bio
+            else abs(delta_cn) * math.hypot(f_se * (f_aff / f_bio), 0.04 * f_dep)
+        )
+        ll_cand = _gaussian_depth_loglik(
+            r_obs, r_exp_aff, sigma_r, se_aff
+        ) + _dirichlet_multinomial_logpmf(k_arr, alpha_dm * p_aff)
+        ll_fc = max(ll_fc, ll_cand)
 
     ll_cpm, m_hat_cpm, var_cpm = _integrate_mosaic_state(
         0.05,
@@ -582,9 +587,11 @@ def annotate_sample_prenatal_segments(
             prenatal_result.fetal_sexes == ("F", "M")
             and prenatal_result.male_ff is not None
             and prenatal_result.female_ff is not None
-            and min(prenatal_result.male_ff, prenatal_result.female_ff) > 0.0
         ):
-            f_twin_min = float(min(prenatal_result.male_ff, prenatal_result.female_ff))
+            f_twin_min = max(
+                float(min(prenatal_result.male_ff, prenatal_result.female_ff)),
+                min(0.01, 0.5 * float(prenatal_result.active_ff)),
+            )
         else:
             f_twin_min = 0.5 * float(prenatal_result.active_ff)
     return annotate_prenatal_origin_and_lod(

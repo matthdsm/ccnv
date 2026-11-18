@@ -39,7 +39,7 @@ Contiguous change-point segments from `SegmentResult` are drawn on the WebGL `sc
 
 When rendered from a prenatal run (`prenatal_result` present), the viewer adds three cell-free DNA diagnostic layers:
 
-- **Prenatal Status Banner**: Displays inferred `Fetal Sex`, fused `Active FF` (with winning estimator source), individual fetal fraction readouts `FF (Y/A/X/Size)`, and 4D sex-chromosome aneuploidy classification `SCA`.
+- **Prenatal Status Banner**: Displays inferred `Fetal Sex`, fused `Active FF` (with winning estimator source), individual fetal fraction readouts `FF (Y/A/X/Size)`, 4D sex-chromosome aneuploidy classification `SCA`, and when `gestation == "twin"`, a `TWIN (FF|FM|MM)` badge with per-sex `Male FF` / `Female FF` readouts.
 - **Expected Fetal Fraction Reference Lines**: Draws two horizontal dashed purple (`#9333ea`) guidelines ($y_{+}$ and $y_{-}$, defined below) across all diploid maternal+fetal chromosomes (`chr1`–`chr22` and `chrX`, stopping before haploid `chrY`) showing the expected $\log_2$ ratio shifts for pure fetal heterozygous trisomy ($CN_{\text{fet}} = 3$) and monosomy ($CN_{\text{fet}} = 1$) computed from `effective_ff` ($f_{\text{eff}}$, or `active_ff` when unweighted).
 - **High-Contrast Discordant Segment Track**: Segments flagged `discordant == True` (`SCA_DISCORDANT`, `SUB_FETAL_RATIO`, or `SUPER_FETAL_RATIO`, e.g., maternal constitutional/mosaic events or confined placental mosaicism) override standard Gain/Loss/Neutral coloring and render as thick (`6.0 px`) purple lines capped with diamond endpoint markers (`◆`), bringing discordant stoichiometry and biological origin predictions (`origin_call`) into immediate focus.
 

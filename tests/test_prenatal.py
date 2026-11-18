@@ -688,6 +688,9 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
                 for w in res_fm_auto.warnings
             )
         )
+        self.assertFalse(
+            any("sex chromosome aneuploidy detected" in w for w in res_fm_auto.warnings)
+        )
 
         res_fm_explicit = predict_prenatal(fm_bufs, ref_tbl, fm_meta, twins=True)
         self.assertEqual(res_fm_explicit.gestation, "twin")
@@ -698,6 +701,26 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
                 for w in res_fm_explicit.warnings
             )
         )
+        self.assertFalse(
+            any(
+                "sex chromosome aneuploidy detected" in w
+                for w in res_fm_explicit.warnings
+            )
+        )
+
+        fem_fallback_meta = replace(
+            fm_meta,
+            olm_weights=[0.0],
+            olm_bias=math.log(0.30 / 0.70),
+        )
+        fem_bufs = SampleBuffers.from_table(self.sample_tables[0])
+        res_fem_fallback = predict_prenatal(
+            fem_bufs, ref_tbl, fem_fallback_meta, twins=False
+        )
+        self.assertEqual(res_fem_fallback.gestation, "singleton")
+        self.assertIsNotNone(res_fem_fallback.twin)
+        if res_fem_fallback.twin is not None:
+            self.assertFalse(res_fem_fallback.twin.is_twin)
 
         chry_unw = normalize_prenatal_chry(fm_bufs, ref_tbl, fm_meta, res_fm_explicit)
         if chry_unw is None:

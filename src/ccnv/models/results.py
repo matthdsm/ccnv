@@ -137,10 +137,15 @@ class TwinResult:
         """Validate twin sex-pair call and fetal sexes."""
         if self.call not in ("FF", "FM", "MM"):
             raise ValueError(f"invalid twin call: {self.call!r}")
-        if tuple(self.fetal_sexes) not in (("F", "F"), ("F", "M"), ("M", "M")):
+        sex_tuple = tuple(self.fetal_sexes)
+        if sex_tuple not in (("F", "F"), ("F", "M"), ("M", "M")):
             raise ValueError(f"invalid twin fetal_sexes: {self.fetal_sexes!r}")
+        if sex_tuple != (self.call[0], self.call[1]):
+            raise ValueError(
+                f"twin call {self.call!r} does not match fetal_sexes {self.fetal_sexes!r}"
+            )
         if not isinstance(self.fetal_sexes, tuple):
-            object.__setattr__(self, "fetal_sexes", tuple(self.fetal_sexes))
+            object.__setattr__(self, "fetal_sexes", sex_tuple)
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +184,24 @@ class FetalFractionResult:
                 "active_ff_source must be 'FFY', 'FFA', 'FFX', 'FF_SIZE', or 'FUSED', "
                 f"got {self.active_ff_source!r}"
             )
+        if self.twin is not None:
+            if (
+                self.twin.is_twin
+                and self.gestation == "singleton"
+                and self.fetal_sexes is None
+            ):
+                object.__setattr__(self, "gestation", "twin")
+                object.__setattr__(self, "fetal_sexes", self.twin.fetal_sexes)
+                if self.male_ff is None:
+                    object.__setattr__(self, "male_ff", self.twin.male_ff)
+                if self.female_ff is None:
+                    object.__setattr__(self, "female_ff", self.twin.female_ff)
+                if self.twin_confidence is None:
+                    object.__setattr__(self, "twin_confidence", self.twin.confidence)
+            if (self.gestation == "twin") != self.twin.is_twin:
+                raise ValueError(
+                    f"gestation {self.gestation!r} conflicts with twin.is_twin={self.twin.is_twin}"
+                )
         if self.gestation not in ("singleton", "twin"):
             raise ValueError(
                 f"gestation must be 'singleton' or 'twin', got {self.gestation!r}"

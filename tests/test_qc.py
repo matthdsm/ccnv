@@ -760,6 +760,34 @@ class TestQCPredict(unittest.TestCase):
         self.assertIsNone(prenatal["female_ff"])
         self.assertIsNone(prenatal["twin_confidence"])
 
+        singleton_twin = TwinResult(
+            call="MM",
+            fetal_sexes=("M", "M"),
+            is_twin=False,
+            twin_probability=0.02,
+            confidence=0.98,
+            posteriors={"FF": 0.0001, "FM": 0.0199, "MM": 0.9800},
+            male_ff=0.12,
+            female_ff=0.0,
+        )
+        pr_auto_single = FetalFractionResult(
+            *ff_args,
+            twin=singleton_twin,
+            gestation="singleton",
+        )
+        auto_payload = build_predict_qc_payload(
+            "prenatal", table, segments, prenatal_result=pr_auto_single
+        )
+        auto_prenatal = auto_payload["prenatal"]
+        if not isinstance(auto_prenatal, dict):
+            self.fail("expected prenatal dict")
+        self.assertEqual(auto_prenatal["gestation"], "singleton")
+        self.assertIsNone(auto_prenatal["fetal_sexes"])
+        self.assertIsNone(auto_prenatal["male_ff"])
+        self.assertIsNone(auto_prenatal["female_ff"])
+        self.assertIsNone(auto_prenatal["twin_confidence"])
+        self.assertIsInstance(auto_prenatal["twin"], dict)
+
     def test_build_predict_qc_payload_prenatal_twin(self) -> None:
         table = _make_predict_sample_table()
         sca = SCAResult("XY", False, 0.9912, -6.53, ff_delta=0.011)

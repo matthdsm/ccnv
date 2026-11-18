@@ -61,6 +61,83 @@ def _extract_payload(html: str) -> dict[str, object]:
     return loaded
 
 
+def _run_plot_script_in_node(html: str) -> dict[str, object] | None:
+    node_bin = shutil.which("node")
+    if node_bin is None:
+        return None
+    payload_match = re.search(
+        r'<script id="ccnv-data" type="application/json">(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    script_matches = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)
+    if payload_match is None or not script_matches:
+        raise AssertionError("Expected payload and inline script in rendered HTML")
+    harness = """
+const fs = require("fs");
+const vm = require("vm");
+const input = JSON.parse(fs.readFileSync(0, "utf8"));
+const elements = new Map();
+const mkEl = (id, textContent = "") => ({
+  id, value: "", textContent, innerHTML: "", className: "", style: {},
+  layout: { xaxis: { range: [0, 1] } }, listeners: {},
+  addEventListener(ev, fn) { (this.listeners[ev] ||= []).push(fn); },
+  on() {},
+});
+elements.set("ccnv-data", mkEl("ccnv-data", input.payload));
+for (const id of [
+  "z-input", "r-input", "prenatal-badge", "disc-legend",
+  "plot", "bin-tooltip", "search-err", "search-form", "coord-input", "reset-btn",
+]) elements.set(id, mkEl(id));
+const calls = [];
+const snap = traces => traces.map(t => ({
+  name: t.name || null,
+  type: t.type,
+  yaxis: t.yaxis || "y",
+  hasClip: Object.prototype.hasOwnProperty.call(t, "cliponaxis"),
+  nPts: t.x ? t.x.length : 0,
+}));
+vm.runInNewContext(input.script, {
+  Buffer, Uint8Array, Uint16Array, Uint32Array, Int8Array, Float32Array, Float64Array,
+  Math, Number, String, Boolean, Array, Map, Object, JSON, parseFloat, isNaN,
+  atob: s => Buffer.from(s, "base64").toString("binary"),
+  setTimeout: fn => { fn(); return 1; },
+  clearTimeout: () => {},
+  document: { getElementById: id => elements.get(id) || mkEl(id) },
+  Plotly: {
+    newPlot(el, traces, layout) {
+      el.layout = layout;
+      calls.push(snap(traces));
+      return { then: fn => fn && fn() };
+    },
+    react(_el, traces) { calls.push(snap(traces)); },
+    relayout() {},
+  },
+});
+elements.get("z-input").value = "4.0";
+for (const fn of elements.get("z-input").listeners.input || []) fn();
+const badge = elements.get("prenatal-badge");
+process.stdout.write(JSON.stringify({
+  calls,
+  badgeDisplay: badge.style.display || "",
+  badgeHtml: badge.innerHTML || "",
+}));
+"""
+    proc = subprocess.run(
+        [node_bin, "-e", harness],
+        input=json.dumps(
+            {"payload": payload_match.group(1), "script": script_matches[-1]}
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    loaded = json.loads(proc.stdout)
+    if not isinstance(loaded, dict):
+        raise TypeError("Expected Node harness JSON object")
+    return loaded
+
+
 def _make_bin_result(
     branch: str,
     contigs: tuple[str, ...],
@@ -375,8 +452,15 @@ class TestHtmlReport(unittest.TestCase):
             )
             content = html_path.read_text(encoding="utf-8")
 
-        self.assertIn('Twins (${p.fetal_sexes.join("/")})', content)
-        self.assertIn("Twin FF (M/F):", content)
+        node_out = _run_plot_script_in_node(content)
+        if node_out is not None:
+            self.assertEqual(node_out["badgeDisplay"], "inline-flex")
+            badge_html = str(node_out["badgeHtml"])
+            self.assertIn("Twins (F/M)", badge_html)
+            self.assertIn("<strong>Twin FF (M/F):</strong> 14.3% / 7.5%", badge_html)
+        else:
+            self.assertIn('Twins (${p.fetal_sexes.join("/")})', content)
+            self.assertIn("Twin FF (M/F):", content)
         payload = _extract_payload(content)
         p_dict = payload["prenatal"]
         if not isinstance(p_dict, dict):
@@ -640,8 +724,8 @@ class TestHtmlReport(unittest.TestCase):
             "Segments (Loss)",
             "Segments (Discordant)",
         ]
-        node_bin = shutil.which("node")
-        if node_bin is None:
+        node_out = _run_plot_script_in_node(html)
+        if node_out is None:
             mk_lines_match = re.search(
                 r"const mkLines\s*=\s*\([^)]*\)\s*=>\s*\(\{(.*?)\}\);",
                 html,
@@ -668,72 +752,9 @@ class TestHtmlReport(unittest.TestCase):
             self.assertEqual(positions, sorted(positions))
             return
 
-        payload_match = re.search(
-            r'<script id="ccnv-data" type="application/json">(.*?)</script>',
-            html,
-            re.DOTALL,
-        )
-        script_matches = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)
-        if payload_match is None or not script_matches:
-            self.fail("Expected payload and inline script in rendered HTML")
-        harness = """
-const fs = require("fs");
-const vm = require("vm");
-const input = JSON.parse(fs.readFileSync(0, "utf8"));
-const elements = new Map();
-const mkEl = (id, textContent = "") => ({
-  id, value: "", textContent, innerHTML: "", className: "", style: {},
-  layout: { xaxis: { range: [0, 1] } }, listeners: {},
-  addEventListener(ev, fn) { (this.listeners[ev] ||= []).push(fn); },
-  on() {},
-});
-elements.set("ccnv-data", mkEl("ccnv-data", input.payload));
-for (const id of [
-  "z-input", "r-input", "prenatal-badge", "disc-legend",
-  "plot", "bin-tooltip", "search-err", "search-form", "coord-input", "reset-btn",
-]) elements.set(id, mkEl(id));
-const calls = [];
-const snap = traces => traces.map(t => ({
-  name: t.name || null,
-  type: t.type,
-  yaxis: t.yaxis || "y",
-  hasClip: Object.prototype.hasOwnProperty.call(t, "cliponaxis"),
-  nPts: t.x ? t.x.length : 0,
-}));
-vm.runInNewContext(input.script, {
-  Buffer, Uint8Array, Uint16Array, Uint32Array, Int8Array, Float32Array, Float64Array,
-  Math, Number, String, Boolean, Array, Map, Object, JSON, parseFloat, isNaN,
-  atob: s => Buffer.from(s, "base64").toString("binary"),
-  setTimeout: fn => { fn(); return 1; },
-  clearTimeout: () => {},
-  document: { getElementById: id => elements.get(id) || mkEl(id) },
-  Plotly: {
-    newPlot(el, traces, layout) {
-      el.layout = layout;
-      calls.push(snap(traces));
-      return { then: fn => fn && fn() };
-    },
-    react(_el, traces) { calls.push(snap(traces)); },
-    relayout() {},
-  },
-});
-elements.get("z-input").value = "4.0";
-for (const fn of elements.get("z-input").listeners.input || []) fn();
-process.stdout.write(JSON.stringify(calls));
-"""
-        proc = subprocess.run(
-            [node_bin, "-e", harness],
-            input=json.dumps(
-                {
-                    "payload": payload_match.group(1),
-                    "script": script_matches[-1],
-                }
-            ),
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        recorded_calls = json.loads(proc.stdout)
+        recorded_calls = node_out["calls"]
+        if not isinstance(recorded_calls, list):
+            self.fail("Expected recorded_calls list")
         self.assertEqual(len(recorded_calls), 2)
         for call_traces in recorded_calls:
             xy_traces = [t for t in call_traces if t["yaxis"] == "y"]

@@ -141,9 +141,9 @@ flowchart TB
     L_IN --> EX_FP["extract.extract_for_predict"]
     L_IN --> REB_SB["rebinning.rebin_sample_buffers"]
     R_PRD --> PR_INF["prenatal.predict_prenatal"]
-    PR_INF --> PM_SCA["prenatal_math.classify_sca_ray_4d / prenatal_math.fuse_active_fetal_fraction_student_t4"]
+    PR_INF --> PM_SCA["prenatal_math.classify_sca_ray_4d / prenatal_math.classify_twin_pregnancy / prenatal_math.effective_ffa_sigma / prenatal_math.fuse_active_fetal_fraction_student_t4"]
     PR_INF --> FG_KL["stats.fragmentomics.predict_ff_kl_deconvolution / stats.fragmentomics.predict_ff_fragmentomics"]
-    PR_INF --> PG_5K["prenatal_grid.compute_5k_msy_exposure"]
+    PR_INF --> PG_5K["prenatal_grid.prepare_5k_msy_sample / prenatal_grid.compute_5k_msy_exposure"]
     R_PRD --> N_ONCE["_normalize_branches_once"]
     N_ONCE --> B_BM["predict.build_branch_model"]
     B_BM --> N_BM["normalization.build_branch_model_from_tables"]
@@ -634,7 +634,8 @@ Coarse 100 kb autosomal/sex grid construction and covariate coarsening for prena
 - **`fit_sample_gc_exponent(counts, exposure, mappability, gc_mult, auto_mask)`** — Fits a sample-specific log-linear GC exponent $\hat{\beta}_{\text{GC}} \in [-3.0, 3.0]$ across usable autosomal 5 kb bins.
 - **`compute_5k_msy_exposure(bufs, bufs_5k, reference_table, ffy_ref, ffy_bin, ffy_align, roles, overrides, min_mappability)`** — Computes per-bin 5 kb diploid-equivalent MSY exposure across `prenatal_ffy` rows (incorporating $\hat{\beta}_{\text{GC}}$) and usable autosomal bin count.
 - **`resolve_ffy_bin_size(reference_table, ffy_ref_s, ffy_ref_e, fallback)`** — Resolves the 5 kb reference bin size from `ReferenceMetadata` or `prenatal_ffy` interval spans.
-- **`resolve_chry_anchor_ff(c_u, e_u, lam_bg_u, eta_u, kappa_cal, pm, prenatal_result)`** — Resolves a LOCO-guarded 1-copy fetal fraction and uncertainty for `chrY` normalization, switching to off-`chrY` fused fetal fraction (or intact-arm MSY blocks) when `FFY` diverges under `47,XYY` or large `chrY` CNVs.
+- **`prepare_5k_msy_sample(sample, reference_table, ffy_ref, clean_msy_bins)`** — Coerces and rebins a sample to the 5 kb `prenatal_ffy` grid and resolves aligned MSY counts and clean MSY bin indices.
+- **`resolve_chry_anchor_ff(c_u, e_u, lam_bg_u, eta_u, kappa_cal, pm, prenatal_result)`** — Resolves a LOCO-guarded 1-copy fetal fraction and uncertainty for `chrY` normalization, switching to off-`chrY` fused fetal fraction (or intact-arm MSY blocks) when `FFY` diverges under `47,XYY` or large `chrY` CNVs, and scaling to `male_ff` for `("F", "M")` twin pregnancies.
 
 ### `ccnv.features.prenatal` (`src/ccnv/features/prenatal.py`)
 

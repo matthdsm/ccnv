@@ -835,6 +835,112 @@ class TestTwinStoichiometryAndDegenerateFFASigma(unittest.TestCase):
         self.assertEqual(xxy_single.gestation, "singleton")
         self.assertFalse(xxy_single.twin.is_twin)
         self.assertIsNone(xxy_single.fetal_sexes)
+        self.assertLess(xxy_single.twin.posteriors["FM"], 0.01)
+
+        xxy_high = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00028,
+            yfrac_threshold=0.000043,
+            ffy=0.28,
+            sigma_ffy=0.005,
+            delta_x=0.08,
+            sigma_x=0.005,
+            ffa=0.28,
+            sigma_ffa=0.02,
+            ff_size=0.28,
+            sigma_size=0.02,
+            active_ff=0.28,
+            active_ff_se=0.01,
+            active_ff_source="FUSED",
+            twins=False,
+        )
+        self.assertEqual(xxy_high.gestation, "singleton")
+        self.assertFalse(xxy_high.twin.is_twin)
+
+        no_size_male = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00020,
+            yfrac_threshold=0.000043,
+            ffy=0.12,
+            sigma_ffy=0.006,
+            delta_x=-0.06,
+            sigma_x=0.01,
+            ffa=0.10,
+            sigma_ffa=0.640,
+            ff_size=None,
+            sigma_size=0.02,
+            active_ff=0.12,
+            active_ff_se=0.006,
+            active_ff_source="FFY",
+            twins=False,
+            olm_norm=0.01525,
+        )
+        self.assertEqual(no_size_male.gestation, "singleton")
+        self.assertEqual(no_size_male.twin.call, "MM")
+        self.assertAlmostEqual(no_size_male.active_ff_se, 0.006, places=5)
+
+        vanishing_male = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00008,
+            yfrac_threshold=0.000043,
+            ffy=0.03,
+            sigma_ffy=0.005,
+            delta_x=-0.015,
+            sigma_x=0.01,
+            ffa=0.14,
+            sigma_ffa=0.02,
+            ff_size=0.14,
+            sigma_size=0.02,
+            active_ff=0.10,
+            active_ff_se=0.01,
+            active_ff_source="FUSED",
+            twins=False,
+        )
+        self.assertEqual(vanishing_male.gestation, "singleton")
+        self.assertFalse(vanishing_male.twin.is_twin)
+
+        missing_ffy_male = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00020,
+            yfrac_threshold=0.000043,
+            ffy=None,
+            sigma_ffy=0.005,
+            delta_x=0.0,
+            sigma_x=0.005,
+            ffa=0.12,
+            sigma_ffa=0.005,
+            ff_size=None,
+            sigma_size=0.02,
+            active_ff=0.12,
+            active_ff_se=0.005,
+            active_ff_source="FFA",
+            twins=False,
+        )
+        self.assertEqual(missing_ffy_male.gestation, "singleton")
+        self.assertEqual(missing_ffy_male.twin.call, "MM")
+        self.assertAlmostEqual(missing_ffy_male.twin.male_ff, 0.12, places=5)
+
+        unequal_fm = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00025,
+            yfrac_threshold=0.000043,
+            ffy=0.20,
+            sigma_ffy=0.005,
+            delta_x=-0.10,
+            sigma_x=0.008,
+            ffa=None,
+            sigma_ffa=0.02,
+            ff_size=0.22,
+            sigma_size=0.005,
+            active_ff=0.20,
+            active_ff_se=0.005,
+            active_ff_source="FFY",
+            twins=True,
+            olm_norm=0.50,
+        )
+        self.assertEqual(unequal_fm.twin.call, "FM")
+        self.assertEqual(unequal_fm.active_ff_source, "FF_SIZE")
+        self.assertGreater(unequal_fm.twin.female_ff, 0.0)
 
 
 if __name__ == "__main__":
