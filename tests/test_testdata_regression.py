@@ -371,22 +371,22 @@ class TestRealWorldTestdataRegression(unittest.TestCase):
                 "reference/schema_2.0/NIPS.GRCh38-noalt.100kb.ccnv",
                 1060,
                 False,
-                "FAIL",
-                "usable chrY bins",
+                "WARN",
+                "n_refs<150",
             ),
             (
                 "reference/schema_2.0/WGS-full-pass.GRCh38-noalt.10kb.ccnv",
                 79,
                 False,
-                "FAIL",
-                "usable chrY bins",
+                "WARN",
+                "n_refs<150",
             ),
             (
                 "reference/schema_2.0/WGS-low-pass.GRCh38-noalt.15kb.ccnv",
                 715,
                 False,
-                "FAIL",
-                "usable chrY bins",
+                "WARN",
+                "n_refs<150",
             ),
             (
                 "reference/schema_2.0/flat_equCab-T2T.100kb.ccnv",
@@ -412,6 +412,12 @@ class TestRealWorldTestdataRegression(unittest.TestCase):
                     and any(exp_msg in str(m) for m in messages),
                     f"expected {exp_msg!r} in ref-qc messages: {messages}",
                 )
+                if not exp_flat:
+                    branches = pf.require_dict(qc_out.data, "branches")
+                    male_b = pf.require_dict(branches, "male_sex")
+                    sig = pf.require_dict(male_b, "signal_contig_metrics")
+                    self.assertGreaterEqual(pf.require_float(sig, "unmasked_pct"), 20.0)
+                    self.assertGreaterEqual(pf.require_float(sig, "usable_pct"), 50.0)
 
     def test_real_germline_samples_predict_with_calibrated_qc(self) -> None:
         cases = (

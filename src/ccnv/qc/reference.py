@@ -33,6 +33,7 @@ from ccnv.stats.neighbors import compute_loco_prototype_support
 
 DEFAULT_MIN_REF_BINS: Final[int] = 150
 OUTLIER_N_SIGMA: Final[float] = 3.0
+CHRY_MIN_UNMASKED_PCT_FAIL: Final[float] = 5.0
 CHRY_MIN_USABLE_PCT_WARN: Final[float] = 50.0
 CHRY_MIN_USABLE_PCT_FAIL: Final[float] = 20.0
 CHRY_MEAN_DIST_WARN: Final[float] = 5.0
@@ -54,6 +55,7 @@ SEVERITY_TO_VERDICT: Final[dict[int, str]] = {
 __all__ = [
     "CHRY_MEAN_DIST_FAIL",
     "CHRY_MEAN_DIST_WARN",
+    "CHRY_MIN_UNMASKED_PCT_FAIL",
     "CHRY_MIN_USABLE_PCT_FAIL",
     "CHRY_MIN_USABLE_PCT_WARN",
     "DEFAULT_MIN_REF_BINS",
@@ -167,6 +169,7 @@ def compute_signal_contig_metrics(
             "signal_contig": signal_contig,
             "n_bins": total_bins,
             "n_valid": 0,
+            "unmasked_pct": 0.0,
             "mean_of_means": None,
             "std_of_means": None,
             "n_mean_outlier": 0,
@@ -185,6 +188,7 @@ def compute_signal_contig_metrics(
             "signal_contig": signal_contig,
             "n_bins": denom,
             "n_valid": 0,
+            "unmasked_pct": 0.0,
             "mean_of_means": None,
             "std_of_means": None,
             "n_mean_outlier": 0,
@@ -195,12 +199,14 @@ def compute_signal_contig_metrics(
 
     usable = valid & (r >= min_ref_bins)
     n_usable = int(np.sum(usable))
-    usable_pct = float(100.0 * n_usable / max(denom, 1))
+    unmasked_pct = float(100.0 * n_valid / max(denom, 1))
+    usable_pct = float(100.0 * n_usable / max(n_valid, 1))
 
     return {
         "signal_contig": signal_contig,
         "n_bins": denom,
         "n_valid": n_valid,
+        "unmasked_pct": unmasked_pct,
         "mean_of_means": float(np.mean(m[valid])),
         "std_of_means": float(np.std(m[valid])),
         "n_mean_outlier": int(np.sum(m[valid] >= cutoff_outlier)),
@@ -254,9 +260,18 @@ def evaluate_male_verdict(
 
     cy = m.get("signal_contig_metrics")
     if isinstance(cy, Mapping):
+        unmasked_pct = _metric_float(cy, "unmasked_pct", float("nan"))
         usable_pct = _metric_float(cy, "usable_pct", float("nan"))
         sig_name = str(cy.get("signal_contig", "chrY"))
         n_usable = cy.get("n_usable")
+        if np.isfinite(unmasked_pct) and unmasked_pct < CHRY_MIN_UNMASKED_PCT_FAIL:
+            result = _escalate(
+                result,
+                (
+                    "FAIL",
+                    f"unmasked {sig_name} bins = {unmasked_pct:.1f}% (<{CHRY_MIN_UNMASKED_PCT_FAIL:.0f}%)",
+                ),
+            )
         if (n_usable == 0 and (usable_pct == 0.0 or not np.isfinite(usable_pct))) or (
             np.isfinite(usable_pct) and usable_pct < CHRY_MIN_USABLE_PCT_FAIL
         ):

@@ -521,7 +521,7 @@ class TestQCReference(unittest.TestCase):
             )
             self.assertEqual(verdict.branches[BRANCH_MALE_SEX].status, "FAIL")
 
-    def test_compute_branch_qc_male_chry_usable_pct_uses_total_branch_chry_bins(
+    def test_compute_branch_qc_male_chry_unmasked_floor_and_usable_over_unmasked(
         self,
     ) -> None:
         n_x, n_y = 20, 100
@@ -531,47 +531,63 @@ class TestQCReference(unittest.TestCase):
                 np.arange(n_y, dtype=np.int64) * 5000,
             ]
         )
-        masked = np.zeros(n_x + n_y, dtype=np.bool_)
-        masked[n_x + 1 :] = True
-        pids = np.zeros((n_x + n_y, NUM_PROTOTYPES_PER_BIN), dtype=np.uint16)
-        pweights = np.zeros((n_x + n_y, NUM_PROTOTYPES_PER_BIN), dtype=np.float16)
-        pweights[~masked, 0] = np.float16(1.0)
-        pids[: n_x + 1, 0] = np.uint16(1)
 
-        fit = BranchFitArrays(
-            branch=BRANCH_MALE_SEX,
-            contigs=("chrX",) * n_x + ("chrY",) * n_y,
-            starts=starts,
-            ends=starts + 5000,
-            masked=masked,
-            pca_mean=np.ones(n_x + n_y, dtype=np.float32),
-            proto_ids=pids,
-            proto_weights=pweights,
-            mean_distance=np.full(n_x + n_y, 0.5, dtype=np.float32),
-        )
-        ref_meta = ReferenceMetadata(
-            bin_size=5000,
-            contig_lengths={"chrX": n_x * 5000, "chrY": n_y * 5000},
-            branches=(BRANCH_MALE_SEX,),
-            autosomal_contigs=(),
-            sex_contigs=("chrX", "chrY"),
-            sex_signal_contig="chrY",
-            pca_components=1,
-        )
-        table = assemble_reference_table(
-            [fit],
-            contig_order=("chrX", "chrY"),
-            metadata=ref_meta.build_arrow_metadata(),
-        )
-        qc = compute_branch_qc(table, BRANCH_MALE_SEX, "chrY", min_ref_bins=1)
-        if qc is None:
-            self.fail("expected non-None male_sex branch QC dictionary")
-        self.assertEqual(qc["verdict"], "FAIL")
-        sig = qc["signal_contig_metrics"]
-        if not isinstance(sig, dict):
+        def _eval_with_unmasked_y(n_unmasked_y: int) -> dict[str, object]:
+            masked = np.zeros(n_x + n_y, dtype=np.bool_)
+            masked[n_x + n_unmasked_y :] = True
+            pids = np.zeros((n_x + n_y, NUM_PROTOTYPES_PER_BIN), dtype=np.uint16)
+            pweights = np.zeros((n_x + n_y, NUM_PROTOTYPES_PER_BIN), dtype=np.float16)
+            pweights[~masked, 0] = np.float16(1.0)
+            pids[: n_x + n_unmasked_y, 0] = np.uint16(1)
+            fit = BranchFitArrays(
+                branch=BRANCH_MALE_SEX,
+                contigs=("chrX",) * n_x + ("chrY",) * n_y,
+                starts=starts,
+                ends=starts + 5000,
+                masked=masked,
+                pca_mean=np.ones(n_x + n_y, dtype=np.float32),
+                proto_ids=pids,
+                proto_weights=pweights,
+                mean_distance=np.full(n_x + n_y, 0.5, dtype=np.float32),
+            )
+            ref_meta = ReferenceMetadata(
+                bin_size=5000,
+                contig_lengths={"chrX": n_x * 5000, "chrY": n_y * 5000},
+                branches=(BRANCH_MALE_SEX,),
+                autosomal_contigs=(),
+                sex_contigs=("chrX", "chrY"),
+                sex_signal_contig="chrY",
+                pca_components=1,
+            )
+            table = assemble_reference_table(
+                [fit],
+                contig_order=("chrX", "chrY"),
+                metadata=ref_meta.build_arrow_metadata(),
+            )
+            qc_res = compute_branch_qc(table, BRANCH_MALE_SEX, "chrY", min_ref_bins=1)
+            if qc_res is None:
+                self.fail("expected non-None male_sex branch QC dictionary")
+            return qc_res
+
+        # 99%-masked chrY (1/100 unmasked) must still FAIL via CHRY_MIN_UNMASKED_PCT_FAIL (<5%)
+        qc_collapsed = _eval_with_unmasked_y(1)
+        self.assertEqual(qc_collapsed["verdict"], "FAIL")
+        self.assertIn("unmasked chrY bins", str(qc_collapsed["message"]))
+        sig_col = qc_collapsed["signal_contig_metrics"]
+        if not isinstance(sig_col, dict):
             self.fail("expected signal_contig_metrics dictionary")
-        self.assertEqual(sig["n_bins"], 100)
-        self.assertAlmostEqual(float(sig["usable_pct"]), 1.0)
+        self.assertEqual(sig_col["n_bins"], 100)
+        self.assertAlmostEqual(float(sig_col["unmasked_pct"]), 1.0)
+        self.assertAlmostEqual(float(sig_col["usable_pct"]), 100.0)
+
+        # Realistic GRCh38-like 27% unmasked chrY with full LOCO support passes cleanly
+        qc_grch38 = _eval_with_unmasked_y(27)
+        self.assertEqual(qc_grch38["verdict"], "PASS")
+        sig_ok = qc_grch38["signal_contig_metrics"]
+        if not isinstance(sig_ok, dict):
+            self.fail("expected signal_contig_metrics dictionary")
+        self.assertAlmostEqual(float(sig_ok["unmasked_pct"]), 27.0)
+        self.assertAlmostEqual(float(sig_ok["usable_pct"]), 100.0)
 
     def test_reference_qc_low_refs_uses_total_unmasked_bins(self) -> None:
         n_val, (verdict, msg) = _evaluate_base_support(

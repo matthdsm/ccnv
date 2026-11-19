@@ -677,7 +677,7 @@ Stage 1 extraction QC construction and strict JSON serialization.
 
 Stage 2/3 reference branch quality auditing and `PASS`/`WARN`/`FAIL` verdict escalation.
 
-- **`compute_signal_contig_metrics(contigs, signal_contig, mean_d, n_refs, cutoff_outlier, min_ref_bins, *, total_bins)`** — Computes masked fraction, residual dispersion, null bias, and effective prototype distance per contig group.
+- **`compute_signal_contig_metrics(contigs, signal_contig, mean_d, n_refs, cutoff_outlier, min_ref_bins, *, total_bins)`** — Computes unmasked contig fraction (`unmasked_pct` over total bins), prototype-supported usable fraction (`usable_pct` over unmasked bins), outlier counts, and mean prototype distance for the sex-signal contig.
 - **`evaluate_autosomal_or_female_verdict(m, min_ref_bins, dist_scale)`** — Evaluates quality thresholds for `autosomal` and `female_sex` branches (prenatal summary metrics are audited separately in `run_reference_qc_on_table`).
 - **`evaluate_male_verdict(m, min_ref_bins, dist_scale)`** — Evaluates `male_sex` branch quality with sex-specific contig coverage rules.
 - **`compute_branch_qc(table, branch_name, signal_contig, min_ref_bins, dist_scale)`** — Computes a `BranchQCStatus` summary for a single reference branch table.

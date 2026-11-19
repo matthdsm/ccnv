@@ -7,6 +7,7 @@ from ccnv.qc.predict import (
 from ccnv.qc.reference import (
     CHRY_MEAN_DIST_FAIL,
     CHRY_MEAN_DIST_WARN,
+    CHRY_MIN_UNMASKED_PCT_FAIL,
     CHRY_MIN_USABLE_PCT_FAIL,
     CHRY_MIN_USABLE_PCT_WARN,
     DEFAULT_MIN_REF_BINS,
@@ -32,6 +33,7 @@ from ccnv.qc.sample import (
 __all__ = [
     "CHRY_MEAN_DIST_FAIL",
     "CHRY_MEAN_DIST_WARN",
+    "CHRY_MIN_UNMASKED_PCT_FAIL",
     "CHRY_MIN_USABLE_PCT_FAIL",
     "CHRY_MIN_USABLE_PCT_WARN",
     "DEFAULT_MIN_REF_BINS",
