@@ -392,12 +392,15 @@ pub(super) fn process_record<R: AlignmentRecord>(
     let is_rev = flags.is_reverse_complemented();
     if flags.is_segmented() {
         acc.paired_end = true;
-        if tlen <= 0 {
-            if tlen < 0 {
-                let (_, first_m, last_m) = record.cigar_summary()?;
-                if let Some(m) = extract_motif(&seq, is_rev, first_m, last_m) {
-                    acc.motif_counts[usize::from(m)] += 1;
-                }
+        let is_dup_mate = tlen < 0
+            || (tlen == 0
+                && !flags.is_mate_unmapped()
+                && flags.is_last_segment()
+                && !flags.is_first_segment());
+        if is_dup_mate {
+            let (_, first_m, last_m) = record.cigar_summary()?;
+            if let Some(m) = extract_motif(&seq, is_rev, first_m, last_m) {
+                acc.motif_counts[usize::from(m)] += 1;
             }
             acc.qc.mate_dedup_skipped += 1;
             return Ok(());
@@ -415,7 +418,7 @@ pub(super) fn process_record<R: AlignmentRecord>(
     let gc_frac = gc_fraction(&seq);
     let max_coord = target.length - 1;
 
-    if flags.is_segmented() {
+    if flags.is_segmented() && tlen > 0 {
         let tlen_usize = tlen as usize;
         let p = start_0.saturating_add(tlen_usize / 2).min(max_coord);
         let end_pos = start_0.saturating_add(tlen_usize - 1).min(max_coord);
@@ -700,5 +703,60 @@ mod tests {
         assert_eq!(out.count[9], 1);
         assert_eq!(out.endpoint_count[0], 1);
         assert_eq!(out.endpoint_count[9], 1);
+    }
+
+    #[test]
+    fn tlen_zero_pairs_under_improper_pair_keep_first_mate_only() {
+        let target = TargetContig {
+            header_ref_id: 0,
+            length: 1000,
+            bin_offset: 0,
+            role: ContigRole::Autosomal,
+        };
+        let r1 = make_record(
+            Flags::SEGMENTED | Flags::FIRST_SEGMENT,
+            Some(101),
+            60,
+            0,
+            &[(CigarKind::Match, 8)],
+            b"ACGTACGT",
+        );
+        let r2 = make_record(
+            Flags::SEGMENTED | Flags::LAST_SEGMENT,
+            Some(201),
+            60,
+            0,
+            &[(CigarKind::Match, 8)],
+            b"TGCATGCA",
+        );
+        let r3 = make_record(
+            Flags::SEGMENTED | Flags::LAST_SEGMENT | Flags::MATE_UNMAPPED,
+            Some(301),
+            60,
+            0,
+            &[(CigarKind::Match, 8)],
+            b"GGGGCCCC",
+        );
+        let filters = FilterSpec {
+            min_mapq: 1,
+            require_proper_pair: false,
+            exclude_duplicates: true,
+            exclude_secondary: true,
+            exclude_supplementary: true,
+            exclude_unmapped: true,
+            collect_bands: true,
+            se_fragment_length: 0,
+        };
+        let mut acc = TileAccumulator::new(0, 0, 10, true);
+        process_record(&r1, &target, 100, filters, None, &mut acc).unwrap();
+        process_record(&r2, &target, 100, filters, None, &mut acc).unwrap();
+        process_record(&r3, &target, 100, filters, None, &mut acc).unwrap();
+        let out = reduce_tile_accumulators(vec![acc], 10, true);
+
+        assert_eq!(out.qc.reads_kept, 2);
+        assert_eq!(out.qc.mate_dedup_skipped, 1);
+        assert_eq!(out.count[1], 1);
+        assert_eq!(out.count[2], 0);
+        assert_eq!(out.count[3], 1);
     }
 }

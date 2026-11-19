@@ -564,6 +564,115 @@ class TestNormalization(unittest.TestCase):
         res_unit = normalize_sample_branch(counts_arr, exp_arr, model_unit_kappa)
         self.assertLess(float(res_hi.weights[0]), float(res_unit.weights[0]))
 
+    def test_lower_tail_deviance_floor_preserves_biological_dispersion(self) -> None:
+        from ccnv.features.normalization import apply_lower_tail_deviance_floor
+        from ccnv.features.prenatal import normalize_prenatal_chry
+        from ccnv.models import (
+            BRANCH_AUTOSOMAL,
+            BRANCH_PRENATAL_FFY,
+            BranchFitArrays,
+            FetalFractionResult,
+            PrenatalModelMetadata,
+            SCAResult,
+        )
+        from ccnv.reference import assemble_reference_table
+        from ccnv.stats.neighbors import LN2_SQ
+
+        sig_direct = apply_lower_tail_deviance_floor(
+            counts=np.array([0.0]),
+            expected=np.array([10.0]),
+            ratios=np.array([-4.0]),
+            kappa=np.array([1.0]),
+            shot_var=np.array([0.22]),
+            bio_var=np.array([0.62]),
+            tau=1.0,
+        )
+        dev_only = (4.0**2) / 20.0
+        self.assertGreater(float(sig_direct[0] ** 2), dev_only + 0.60)
+
+        contig_lengths = {"chr1": 100_000, "chrY": 50_000}
+        n_auto, n_y = 20, 10
+        n_tot = n_auto + n_y
+        counts = np.full(n_tot, 200.0, dtype=np.float64)
+        # First chrY bin has zero counts (strong lower tail), others oscillate near lam=10.0
+        counts[n_auto] = 0.0
+        counts[n_auto + 1 :] = np.array(
+            [9.0, 11.0, 10.0, 9.0, 11.0, 10.0, 9.0, 11.0, 10.0], dtype=np.float64
+        )
+        bands = np.zeros((n_tot, NUM_FRAG_BANDS), dtype=np.uint32)
+        bands[:, 0] = counts.astype(np.uint32)
+        sb = SampleBuffers(
+            count=counts,
+            paired_count=counts,
+            frag_len_sum=counts * 150.0,
+            short_frag_count=np.zeros(n_tot, dtype=np.float64),
+            endpoint_count=counts * 2.0,
+            frag_gc_sum=counts * 0.45,
+            frag_bands=bands,
+            meta=SampleMetadata(
+                bin_size=5000,
+                contig_lengths=contig_lengths,
+                contig_order=("chr1", "chrY"),
+                qc={"paired_end": True, "effective_reads_kept": int(np.sum(counts))},
+                filters={"min_mapping_quality": 1},
+            ),
+        )
+        y_starts = np.arange(n_y, dtype=np.int64) * 5000
+        auto_fit = BranchFitArrays(
+            branch=BRANCH_AUTOSOMAL,
+            contigs=("chr1",) * n_auto,
+            starts=np.arange(n_auto, dtype=np.int64) * 5000,
+            ends=(np.arange(n_auto, dtype=np.int64) + 1) * 5000,
+            masked=np.zeros(n_auto, dtype=np.bool_),
+            pca_mean=np.ones(n_auto, dtype=np.float64),
+        )
+        bio_disp_val = 0.30
+        ffy_fit = BranchFitArrays(
+            branch=BRANCH_PRENATAL_FFY,
+            contigs=("chrY",) * n_y,
+            starts=y_starts,
+            ends=y_starts + 5000,
+            masked=np.zeros(n_y, dtype=np.bool_),
+            pca_mean=np.zeros(n_y, dtype=np.float64),
+            null_mean=np.zeros(n_y, dtype=np.float64),
+            bio_dispersion=np.full(n_y, bio_disp_val, dtype=np.float64),
+        )
+        ref_tbl = assemble_reference_table([auto_fit, ffy_fit])
+        pm = PrenatalModelMetadata(
+            prenatal_bin_size=100_000,
+            yfrac_threshold=0.001,
+            ffy_slope=1.0,
+            olm_weights=[0.0],
+            olm_bias=math.log(0.10 / 0.90),
+            female_chrx_ratio_mean=1.0,
+            female_chrx_ratio_std=0.01,
+            alpha_1=-0.5,
+            clean_msy_bins=list(range(n_y)),
+        )
+        pr = FetalFractionResult(
+            fetal_sex="M",
+            ffy=0.10,
+            ffa=0.10,
+            ffx=0.10,
+            chrx_ratio=0.95,
+            chry_score=0.005,
+            yfrac_threshold=0.001,
+            active_ff=0.10,
+            active_ff_se=0.005,
+            active_ff_source="FFY",
+            low_ff_warning=False,
+            sca=SCAResult("XY", False, 0.99, 0.0),
+        )
+        ffy_zero = replace(ffy_fit, bio_dispersion=np.zeros(n_y, dtype=np.float64))
+        ref_zero = assemble_reference_table([auto_fit, ffy_zero])
+        br_zero = normalize_prenatal_chry(sb, ref_zero, pm, pr)
+        br = normalize_prenatal_chry(sb, ref_tbl, pm, pr)
+        if br is None or br_zero is None:
+            self.fail("expected chrY BinResult")
+        obs_var_bio = 1.0 / float(br.weights[0])
+        obs_var_zero = 1.0 / float(br_zero.weights[0])
+        self.assertGreater(obs_var_bio - obs_var_zero, 0.5 * (bio_disp_val / LN2_SQ))
+
 
 if __name__ == "__main__":
     unittest.main()

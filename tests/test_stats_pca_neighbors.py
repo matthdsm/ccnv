@@ -770,6 +770,52 @@ class TestPrototypeNeighbors(unittest.TestCase):
         self.assertGreater(float(var_post[0]), 0.0)
         self.assertGreater(d0, 0.0)
 
+    def test_calibrate_prototype_dispersion_mixed_depth_and_fisher_anscombe_floor(
+        self,
+    ) -> None:
+        from ccnv.stats.neighbors import (
+            _winsorized_anscombe_mean_and_var,
+            exact_poisson_log2_jensen_bias,
+        )
+
+        # Part A: Mixed-depth cohort (1 sample at lam=4.0, 9 samples at lam=4000.0)
+        n_bins, n_samples = 6, 10
+        counts = np.full((n_bins, n_samples), 4000.0, dtype=np.float64)
+        recon = np.full((n_bins, n_samples), 4000.0, dtype=np.float64)
+        recon[:, 0] = 4.0
+        counts[:, 0] = 4.0
+        counts[0, 0] = 2.0  # normal low-depth fluctuation around lam=4.0 (r ~ -0.71)
+        counts[1, 1] = 4060.0
+        counts[2, 2] = 3940.0
+        contigs = np.repeat(np.array([0, 1], dtype=np.int64), 3)
+        usable = np.ones(n_bins, dtype=np.bool_)
+        pids = np.array([[0, 0, 0, 0]] * 3 + [[0, 0, 0, 0]] * 3, dtype=np.uint16)
+        pw = np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float16), (n_bins, 1))
+        null_mean, _ = calibrate_prototype_dispersion(
+            counts, recon, contigs, usable, pids, pw, pca_rank=0
+        )
+        lam0 = np.array([4.0], dtype=np.float64)
+        r0 = float(np.log2(2.5 / 4.5) - exact_poisson_log2_jensen_bias(lam0)[0])
+        # Under per-sample Anscombe lam, sample 0 is NOT clipped (~ r0 / 10)
+        self.assertAlmostEqual(float(null_mean[0]), r0 / n_samples, delta=0.015)
+
+        # Part B: Fisher-weighted compound-Poisson null with kappa = 4.0
+        lam_f = np.full((2, 10), 400.0, dtype=np.float64)
+        j_f = exact_poisson_log2_jensen_bias(lam_f.ravel()).reshape(lam_f.shape)
+        r_chunk = np.zeros_like(lam_f)
+        # +/- 2.5 SD in A-space under kappa=4 -> A = +/- 5.0 (c = (sqrt(400.375) +/- 2.5)^2 - 0.375)
+        for col, a_val in enumerate((5.0, -5.0)):
+            c_val = (math.sqrt(400.375) + 0.5 * a_val) ** 2 - 0.375
+            r_chunk[:, col] = math.log2((c_val + 0.5) / 400.5) - float(j_f[0, col])
+        _, var_f = _winsorized_anscombe_mean_and_var(
+            r_chunk,
+            lam_f,
+            ddof=1.0,
+            kappa=np.full(2, 4.0, dtype=np.float64),
+        )
+        expected_var = float(np.var(r_chunk[0], ddof=1))
+        self.assertAlmostEqual(float(var_f[0]), expected_var, places=8)
+
 
 if __name__ == "__main__":
     unittest.main()

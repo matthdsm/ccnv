@@ -199,10 +199,25 @@ class TestMSYSexMixtureAndPoissonFFY(unittest.TestCase):
             / np.sum(e_sub, axis=0)
         )
         expected_slope = float(
-            np.dot(raw_post_bg, labeled_ff[3:]) / np.dot(raw_post_bg, raw_post_bg)
+            np.dot(labeled_ff[3:], labeled_ff[3:]) / np.dot(raw_post_bg, labeled_ff[3:])
         )
         self.assertAlmostEqual(model.kappa_cal, expected_slope, places=6)
         self.assertGreater(model.kappa_cal, 1.15)
+
+        rng_att = np.random.default_rng(314)
+        e_att = np.full((20, 12), 12.5, dtype=np.float64)
+        fem_att = np.array([i < 4 for i in range(12)], dtype=np.bool_)
+        male_att = ~fem_att
+        lab_att = np.where(male_att, np.linspace(0.04, 0.16, 12), np.nan)
+        kappas: list[float] = []
+        for _ in range(100):
+            rate_att = 0.002 + np.where(male_att, 0.5 * lab_att / 1.25, 0.0)
+            c_att = rng_att.poisson(e_att * rate_att[None, :]).astype(np.float64)
+            m_att = fit_poisson_msy_ffy(
+                c_att, e_att, np.ones(20), fem_att, male_att, lab_att
+            )
+            kappas.append(m_att.kappa_cal)
+        self.assertLess(abs(float(np.mean(kappas)) - 1.25), 0.04)
 
         unimodal = fit_msy_sex_mixture(
             np.array([10.0, 11.0, 9.0, 10.0, 12.0, 10.0]),
@@ -482,6 +497,13 @@ class TestSCARayAndActiveFFFusion(unittest.TestCase):
         )
         self.assertLess(abs(f_out - 0.10), 0.005)
         self.assertGreater(se_out, 0.01 / math.sqrt(3.0))
+        self.assertLess(se_out, 0.012)
+
+        f_conf, se_conf = fuse_active_fetal_fraction_student_t4(
+            [0.07, 0.10], [0.01, 0.01]
+        )
+        self.assertAlmostEqual(f_conf, 0.085, places=4)
+        self.assertGreater(se_conf, 0.012)
 
     def test_mosaic_quadrature_captures_narrow_interior_and_boundary_peaks(
         self,

@@ -733,6 +733,128 @@ class TestPrenatalFragmentomics(unittest.TestCase):
         )
         self.assertIsNotNone(ann_clamped[0].origin_call)
 
+    def test_origin_engine_twin_marginalization_joint_dm_mode_and_exact_f_se_jacobian(
+        self,
+    ) -> None:
+        from ccnv.features.prenatal_origin import _integrate_mosaic_state
+
+        lengths = np.arange(sf.FRAG_MIN_LEN, sf.FRAG_MAX_LEN + 1, dtype=np.float64)
+        edges = np.asarray(FRAG_BAND_EDGES, dtype=np.int64)
+
+        def _to_24(mu: float, sd: float) -> NDArray[np.float64]:
+            full = np.maximum(norm.pdf(lengths, loc=mu, scale=sd), 0.0)
+            arr = np.array(
+                [
+                    float(
+                        np.sum(
+                            full[
+                                int(edges[k] - sf.FRAG_MIN_LEN) : int(
+                                    edges[k + 1] - sf.FRAG_MIN_LEN
+                                )
+                            ]
+                        )
+                    )
+                    for k in range(len(edges) - 1)
+                ],
+                dtype=np.float64,
+            )
+            arr = np.clip(arr, 1e-8, None)
+            return arr / float(np.sum(arr))
+
+        p_f_24, p_m_24 = _to_24(143.0, 10.0), _to_24(166.0, 12.0)
+
+        f_bio = 0.30
+        m_true = 0.75
+        r_true = 1.0 + 0.5 * m_true * f_bio
+        phi_true = (1.0 + 0.5 * m_true) * f_bio / r_true
+        p_seg = phi_true * p_f_24 + (1.0 - phi_true) * p_m_24
+        k_strong = np.round(250_000.0 * p_seg)
+
+        _, m_hat, _ = _integrate_mosaic_state(
+            0.05,
+            0.95,
+            0.5,
+            f_bio,
+            f_bio,
+            0.002,
+            is_fetal=True,
+            r_obs=1.01,
+            sigma_r=0.008,
+            k_band_counts=k_strong,
+            p_fetal_24=p_f_24,
+            p_maternal_24=p_m_24,
+            alpha_dm=200_000.0,
+        )
+        self.assertGreater(m_hat, 0.45)
+
+        p0_s = 0.10 * p_f_24 + 0.90 * p_m_24
+        r_half = 1.0 + 0.5 * 0.05
+        phi_half = (0.10 + 0.5 * 0.05) / r_half
+        p_half = phi_half * p_f_24 + (1.0 - phi_half) * p_m_24
+        k_half = np.round(5_000.0 * p_half)
+        _, post_single, _, _ = classify_segment_origin_5state(
+            r_obs=1.025,
+            k_band_counts=k_half,
+            p_fetal_24=p_f_24,
+            p_maternal_24=p_m_24,
+            p_plasma_0=p0_s,
+            active_ff=0.10,
+            active_ff_se=0.01,
+            is_gain=True,
+            sigma_r=0.008,
+        )
+        _, post_twin, _, _ = classify_segment_origin_5state(
+            r_obs=1.025,
+            k_band_counts=k_half,
+            p_fetal_24=p_f_24,
+            p_maternal_24=p_m_24,
+            p_plasma_0=p0_s,
+            active_ff=0.10,
+            active_ff_se=0.01,
+            is_gain=True,
+            twin_min_ff=0.05,
+            sigma_r=0.008,
+        )
+        _, post_single_only, _, _ = classify_segment_origin_5state(
+            r_obs=1.025,
+            k_band_counts=k_half,
+            p_fetal_24=p_f_24,
+            p_maternal_24=p_m_24,
+            p_plasma_0=p0_s,
+            active_ff=0.05,
+            active_ff_se=0.01,
+            is_gain=True,
+            sigma_r=0.008,
+        )
+        odds_single = post_single_only["FETAL_CONSTITUTIONAL"] / max(
+            post_single_only["PLACENTAL_MOSAIC"], 1e-12
+        )
+        odds_twin = post_twin["FETAL_CONSTITUTIONAL"] / max(
+            post_twin["PLACENTAL_MOSAIC"], 1e-12
+        )
+        self.assertGreater(odds_single / max(odds_twin, 1e-12), 1.5)
+        self.assertLess(
+            post_twin["FETAL_CONSTITUTIONAL"], post_single_only["FETAL_CONSTITUTIONAL"]
+        )
+        self.assertTrue(0.0 <= post_single["FETAL_CONSTITUTIONAL"] <= 1.0)
+
+        _, post_jac, _, _ = classify_segment_origin_5state(
+            r_obs=1.42,
+            k_band_counts=np.zeros(24, dtype=np.float64),
+            p_fetal_24=p_f_24,
+            p_maternal_24=p_m_24,
+            p_plasma_0=p0_s,
+            active_ff=0.15,
+            active_ff_se=0.08,
+            is_gain=True,
+            depth_ff=0.45,
+            sigma_r=0.04,
+        )
+        self.assertGreater(
+            post_jac["MATERNAL_AND_FETAL_INHERITED"],
+            post_jac["MATERNAL_UNINHERITED"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

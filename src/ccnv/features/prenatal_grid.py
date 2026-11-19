@@ -36,6 +36,7 @@ from ccnv.models import (
     reconstruct_sample_grid,
     unique_dictionary_contigs,
 )
+from ccnv.stats.neighbors import exact_poisson_log2_jensen_bias
 from ccnv.stats.prenatal_math import (
     compute_autosomal_density,
     fuse_active_fetal_fraction_student_t4,
@@ -150,7 +151,7 @@ def prepare_covariate_multipliers(
 
     if gc is not None:
         raw_gc = np.asarray(gc, dtype=np.float64)
-        in_range = np.isfinite(raw_gc) & (raw_gc > 0.0) & (raw_gc <= 1.0)
+        in_range = np.isfinite(raw_gc) & (raw_gc >= 0.0) & (raw_gc <= 1.0)
         if np.any(in_range):
             map_out = np.where(
                 np.isfinite(raw_gc) & (raw_gc < 0.0), np.float32(0.0), map_out
@@ -158,7 +159,8 @@ def prepare_covariate_multipliers(
         usable_gc = in_range & (map_out > 0.0)
         usable_gc = usable_gc if np.any(usable_gc) else in_range
         if np.any(usable_gc) and (med := float(np.median(raw_gc[usable_gc]))) > 0.0:
-            return np.where(in_range, raw_gc / med, 1.0).astype(np.float32), map_out
+            gc_floor = np.maximum(raw_gc, 1e-4)
+            return np.where(in_range, gc_floor / med, 1.0).astype(np.float32), map_out
     return np.ones(length, dtype=np.float32), map_out
 
 
@@ -228,9 +230,13 @@ def compute_100k_profiles(
         denom = r_i * exp.astype(np.float64)
         pos = (denom > 0.0) & (col > 0.0)
         full_log2[i, pos] = np.log2(col[pos] / denom[pos])
-        x_vals = full_log2[i, chrx_mask & pos]
-        if x_vals.size > 0:
-            chrx_ratios[i] = float(2.0 ** float(np.mean(x_vals)))
+        x_elig = chrx_mask & (denom > 0.0) & np.isfinite(col) & (col >= 0.0)
+        if np.any(x_elig):
+            lam_x = denom[x_elig]
+            log2_x = np.log2((col[x_elig] + 0.5) / (lam_x + 0.5)) - (
+                exact_poisson_log2_jensen_bias(lam_x)
+            )
+            chrx_ratios[i] = float(2.0 ** float(np.mean(log2_x)))
     return full_log2, chrx_ratios
 
 
@@ -446,7 +452,7 @@ def resolve_5k_covariates(
             hit = align >= 0
             if np.any(hit):
                 col_g, col_m = col_f64(tbl, "gc"), col_f64(tbl, "mappability")
-                if np.any(np.isfinite(col_g) & (col_g > 0.0)):
+                if np.any(np.isfinite(col_g) & (col_g >= 0.0)):
                     ref_gc[align[hit]] = col_g[hit].astype(np.float32)
                 if np.any(np.isfinite(col_m) & (col_m >= 0.0)):
                     ref_map[align[hit]] = col_m[hit].astype(np.float32)
@@ -472,7 +478,7 @@ def fit_sample_gc_exponent(
     gc_mult: NDArray[np.floating],
     auto_mask: NDArray[np.bool_],
 ) -> float:
-    """Fit sample-specific log-linear GC exponent across usable autosomal 5 kb bins."""
+    """Fit sample-specific Poisson MLE GC exponent across usable autosomal 5 kb bins."""
     c_arr = np.asarray(counts, dtype=np.float64)
     base_exp = np.asarray(exposure, dtype=np.float64) * np.asarray(
         mappability, dtype=np.float64
@@ -481,7 +487,7 @@ def fit_sample_gc_exponent(
     ok = (
         auto_mask
         & np.isfinite(c_arr)
-        & (c_arr > 0.0)
+        & (c_arr >= 0.0)
         & np.isfinite(base_exp)
         & (base_exp > 0.0)
         & np.isfinite(g_arr)
@@ -489,18 +495,35 @@ def fit_sample_gc_exponent(
     )
     if int(np.count_nonzero(ok)) < 16:
         return 1.0
+    c_v, base_v = c_arr[ok], base_exp[ok]
+    total_c = float(np.sum(c_v))
+    if total_c <= 0.0:
+        return 1.0
     x = np.log(g_arr[ok])
-    w = c_arr[ok]
-    w_sum = float(np.sum(w))
-    if w_sum <= 0.0:
+    x_mean = float(np.average(x, weights=base_v))
+    dx = x - x_mean
+    if float(np.average(dx * dx, weights=base_v)) <= 1e-6:
         return 1.0
-    dx = x - float(np.sum(w * x) / w_sum)
-    s_xx = float(np.sum(w * dx * dx))
-    if s_xx <= 1e-6:
-        return 1.0
-    y = np.log(c_arr[ok] / base_exp[ok])
-    dy = y - float(np.sum(w * y) / w_sum)
-    return float(np.clip(float(np.sum(w * dx * dy)) / s_xx, -3.0, 3.0))
+    target_cx = float(np.sum(c_v * dx))
+    gamma = 0.0
+    for _ in range(12):
+        w_g = base_v * np.exp(np.clip(gamma * dx, -20.0, 20.0))
+        sw = float(np.sum(w_g))
+        if sw <= 0.0:
+            break
+        mu_x = float(np.sum(w_g * dx) / sw)
+        var_x = float(np.sum(w_g * np.square(dx - mu_x)) / sw)
+        if var_x <= 1e-12:
+            break
+        step = float(
+            np.clip((target_cx - total_c * mu_x) / (total_c * var_x), -1.0, 1.0)
+        )
+        gamma_next = float(np.clip(gamma + step, -3.0, 3.0))
+        if abs(gamma_next - gamma) < 1e-7:
+            gamma = gamma_next
+            break
+        gamma = gamma_next
+    return gamma
 
 
 def compute_5k_msy_exposure(

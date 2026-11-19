@@ -208,26 +208,41 @@ def _integrate_mosaic_state(
             abs(delta_cn) * min(m_high, m_star + 6.0 * (sig_eff / jacobian)) * f_se,
         )
         width = 6.0 * (sig_hi / jacobian)
+
+    def _eval_joint_ll(m_vals: NDArray[np.float64]) -> NDArray[np.float64]:
+        out = np.empty(m_vals.size, dtype=np.float64)
+        for idx, m in enumerate(m_vals):
+            r_exp_m = 1.0 + delta_cn * float(m) * depth_scale
+            if is_fetal:
+                f_mult = (1.0 + delta_cn * float(m)) * f_bio
+                phi_m = f_mult / (1.0 - f_bio + f_mult)
+            else:
+                phi_m = f_bio / ((1.0 + delta_cn * float(m)) * (1.0 - f_bio) + f_bio)
+            p_m_st = phi_m * p_fetal_24 + (1.0 - phi_m) * p_maternal_24
+            out[idx] = _gaussian_depth_loglik(
+                r_obs, r_exp_m, sigma_r, abs(delta_cn) * float(m) * f_se
+            ) + _dirichlet_multinomial_logpmf(k_band_counts, alpha_dm * p_m_st)
+        return out
+
     a = max(m_low, m_star - width)
     b = min(m_high, m_star + width)
+    if float(np.sum(k_band_counts)) > 0.0:
+        cand_m = np.unique(np.concatenate([np.linspace(m_low, m_high, 17), [m_star]]))
+        ll_cand = _eval_joint_ll(cand_m)
+        active = cand_m[ll_cand >= float(np.max(ll_cand)) - 25.0]
+        if (
+            not (active.size == 1 and abs(float(active[0]) - m_star) < 1e-9)
+            and active.size >= 1
+        ):
+            step_h = (m_high - m_low) / 16.0
+            a = max(m_low, float(np.min(active)) - step_h)
+            b = min(m_high, float(np.max(active)) + step_h)
     if b <= a:
         a, b = m_low, m_high
     half_span = 0.5 * (b - a)
     m_nodes = half_span * nodes_x + 0.5 * (b + a)
     m_weights = half_span * weights_w
-
-    ll_nodes = np.empty(m_nodes.size, dtype=np.float64)
-    for idx, m in enumerate(m_nodes):
-        r_exp_m = 1.0 + delta_cn * m * depth_scale
-        if is_fetal:
-            f_mult = (1.0 + delta_cn * m) * f_bio
-            phi_m = f_mult / (1.0 - f_bio + f_mult)
-        else:
-            phi_m = f_bio / ((1.0 + delta_cn * m) * (1.0 - f_bio) + f_bio)
-        p_m_st = phi_m * p_fetal_24 + (1.0 - phi_m) * p_maternal_24
-        ll_nodes[idx] = _gaussian_depth_loglik(
-            r_obs, r_exp_m, sigma_r, abs(delta_cn) * m * f_se
-        ) + _dirichlet_multinomial_logpmf(k_band_counts, alpha_dm * p_m_st)
+    ll_nodes = _eval_joint_ll(m_nodes)
 
     max_ll = float(np.max(ll_nodes))
     unnorm = np.exp(ll_nodes - max_ll)
@@ -271,7 +286,8 @@ def classify_segment_origin_5state(
     delta_cn = cn_alt / 2.0 - 1.0
     f_bio = float(np.clip(active_ff, 0.001, 0.60))
     f_dep = float(np.clip(depth_ff if depth_ff is not None else active_ff, 0.001, 0.60))
-    f_se = max(float(active_ff_se) * (f_dep / f_bio), 0.001)
+    f_dep_deriv = (f_dep * (1.0 - f_dep)) / max(f_bio * (1.0 - f_bio), 1e-6)
+    f_se = max(float(active_ff_se) * f_dep_deriv, 0.001)
 
     cand_ffs: tuple[float, ...] = (f_bio,)
     if twin_min_ff is not None and twin_min_ff > 0.0:
@@ -279,7 +295,7 @@ def classify_segment_origin_5state(
         f_2 = float(np.clip(f_bio - f_1, 1e-4, f_bio))
         cand_ffs = (f_bio, f_1, f_2)
 
-    ll_fc = -math.inf
+    cand_lls: list[float] = []
     for f_aff in cand_ffs:
         f_aff_dep = f_dep * (f_aff / f_bio)
         r_exp_aff = 1.0 + delta_cn * f_aff_dep
@@ -296,10 +312,12 @@ def classify_segment_origin_5state(
             if f_aff == f_bio
             else abs(delta_cn) * math.hypot(f_se * (f_aff / f_bio), 0.04 * f_dep)
         )
-        ll_cand = _gaussian_depth_loglik(
-            r_obs, r_exp_aff, sigma_r, se_aff
-        ) + _dirichlet_multinomial_logpmf(k_arr, alpha_dm * p_aff)
-        ll_fc = max(ll_fc, ll_cand)
+        cand_lls.append(
+            _gaussian_depth_loglik(r_obs, r_exp_aff, sigma_r, se_aff)
+            + _dirichlet_multinomial_logpmf(k_arr, alpha_dm * p_aff)
+        )
+    twin_occ = math.log(len(cand_ffs))
+    ll_fc = float(scipy.special.logsumexp(cand_lls)) - twin_occ
 
     ll_cpm, m_hat_cpm, var_cpm = _integrate_mosaic_state(
         0.05,
@@ -316,6 +334,7 @@ def classify_segment_origin_5state(
         p_maternal_24=pm_24,
         alpha_dm=alpha_dm,
     )
+    ll_cpm -= twin_occ
 
     r_exp_mu = 1.0 + delta_cn * (1.0 - f_dep)
     phi_mu = f_bio / (cn_alt / 2.0 * (1.0 - f_bio) + f_bio)

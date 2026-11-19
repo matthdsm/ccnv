@@ -715,6 +715,76 @@ class TestBenchmarkConcordance(unittest.TestCase):
         ]
         self.assertEqual(gains, [("21", 13_000_000, 46_700_000)])
 
+    def test_integer_cn_bf_deflates_spatial_autocorrelation_and_avoids_nb_double_count(
+        self,
+    ) -> None:
+        from ccnv.stats.neighbors import LN2_SQ
+
+        n_wave, n_del = 256, 64
+        s_wave = np.arange(n_wave, dtype=np.int64) * 5000
+        # Smooth diploid wave on chr1 -> genome-wide dyadic autocorrelation kappa_s > 3.0
+        wave_inp = ContigSegmentationInput(
+            s_wave,
+            s_wave + 5000,
+            0.35 * np.sin(2.0 * np.pi * np.arange(n_wave) / 32.0),
+            np.full(n_wave, 25.0),
+            n_wave * 5000,
+            counts=np.full(n_wave, 25.0),
+            expected=np.full(n_wave, 25.0),
+            baseline_ploidy=2,
+        )
+        s_del = np.arange(n_del, dtype=np.int64) * 5000
+        del_inp = ContigSegmentationInput(
+            s_del,
+            s_del + 5000,
+            np.full(n_del, -4.0),
+            np.full(n_del, 2.0),
+            n_del * 5000,
+            counts=np.zeros(n_del),
+            expected=np.full(n_del, 2.0 / n_del),
+            baseline_ploidy=2,
+            poisson_pooled=True,
+        )
+        segs_all = segment_and_score_genome(
+            {"chr1": wave_inp, "chr2": del_inp}, penalty=500.0
+        )
+        chr2_segs = [s for s in segs_all if s.contig == "chr2"]
+        # Raw lam_s=2.0 without kappa_s deflation would return bf ~ 1.98; deflated bf must be < 1.2
+        self.assertEqual(len(chr2_segs), 1)
+        self.assertLess(float(chr2_segs[0].log_bf or 0.0), 1.2)
+
+        _, bf_uncorr = _evaluate_integer_cn_bf(
+            seg_ratio=-4.0,
+            sigma_s_sq=0.50,
+            baseline_ploidy=2,
+            has_counts=True,
+            c_s=0.0,
+            lam_s=2.0,
+            kappa_s=1.0,
+        )
+        _, bf_corr = _evaluate_integer_cn_bf(
+            seg_ratio=-4.0,
+            sigma_s_sq=0.50,
+            baseline_ploidy=2,
+            has_counts=True,
+            c_s=0.0,
+            lam_s=2.0,
+            kappa_s=4.0,
+        )
+        self.assertAlmostEqual(bf_uncorr, 1.98, places=2)
+        self.assertAlmostEqual(bf_corr, 0.495, places=2)
+
+        _, bf_mod_corr = _evaluate_integer_cn_bf(
+            seg_ratio=-4.0,
+            sigma_s_sq=4.0 / (LN2_SQ * 100.0),
+            baseline_ploidy=2,
+            has_counts=True,
+            c_s=0.0,
+            lam_s=100.0,
+            kappa_s=4.0,
+        )
+        self.assertAlmostEqual(bf_mod_corr, 24.75, delta=0.5)
+
 
 if __name__ == "__main__":
     unittest.main()

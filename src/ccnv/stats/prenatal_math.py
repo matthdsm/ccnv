@@ -319,7 +319,10 @@ def fit_poisson_msy_ffy(
     if has_females:
         fem_c_sum = np.sum(c_mat[:, fem_arr], axis=1)
         fem_e_sum = np.sum(e_mat[:, fem_arr], axis=1)
-        lambda_bg_all = (0.5 + fem_c_sum) / (1.0 + fem_e_sum)
+        prior_bg = max(
+            float(np.sum(fem_c_sum)) / max(float(np.sum(fem_e_sum)), 1.0), 1e-4
+        )
+        lambda_bg_all = (prior_bg + fem_c_sum) / (1.0 + fem_e_sum)
     else:
         lambda_bg_all = np.zeros(n_bins, dtype=np.float64)
 
@@ -362,9 +365,9 @@ def fit_poisson_msy_ffy(
                 0.0, 2.0 * (c_sums - e_bg_sums) / np.maximum(e_sums, 1e-9)
             )
             lab_vec = lab_arr[cal_idx]
-            denom_xx = float(np.dot(raw_vec, raw_vec))
-            if denom_xx > 1e-8:
-                slope = float(np.dot(raw_vec, lab_vec) / denom_xx)
+            denom_xy = float(np.dot(raw_vec, lab_vec))
+            if denom_xy > 1e-8:
+                slope = float(np.dot(lab_vec, lab_vec) / denom_xy)
                 if math.isfinite(slope) and 0.5 <= slope <= 2.0:
                     kappa_cal = slope
 
@@ -503,7 +506,7 @@ def fuse_active_fetal_fraction_student_t4(
     standard_errors: Sequence[float],
     *,
     df: float = 4.0,
-    max_iter: int = 5,
+    max_iter: int = 25,
     tol: float = 1e-4,
 ) -> tuple[float, float]:
     """Fuse multi-modal fetal fraction estimates via Student-t4 IRLS."""
@@ -538,8 +541,16 @@ def fuse_active_fetal_fraction_student_t4(
         current_f = next_f
 
     r_final = est_arr - current_f
-    w_final = inv_var / (1.0 + np.square(r_final / se_arr) / nu)
-    final_se = float(1.0 / math.sqrt(max(float(np.sum(w_final)), 1e-12)))
+    z2_nu = np.square(r_final / se_arr) / nu
+    w_final = inv_var / (1.0 + z2_nu)
+    sum_w_final = float(np.sum(w_final))
+    se_w = 1.0 / math.sqrt(max(sum_w_final, 1e-12))
+    chi2_w = float(np.sum(w_final * np.square(r_final)))
+    birge = max(1.0, math.sqrt(chi2_w / max(len(valid_pairs) - 1, 1)))
+    se_birge = birge * se_w
+    obs_info = float(np.sum(inv_var * (1.0 - z2_nu) / np.square(1.0 + z2_nu)))
+    se_curv = 1.0 / math.sqrt(obs_info) if obs_info > 0.25 * sum_w_final else se_birge
+    final_se = max(se_birge, se_curv)
     return max(0.0, current_f), max(final_se, 1e-4)
 
 
@@ -605,9 +616,12 @@ def classify_sca_ray_4d(
         sqrt_vk = math.sqrt(vk)
         z_lo = -sqrt_vk * mk
         z_hi = sqrt_vk * (f_max - mk)
-        log_integral = 0.5 * (
-            math.log(2.0 * math.pi) - math.log(vk)
-        ) + _log_normal_interval_prob(z_lo, z_hi)
+        a_norm = float(np.linalg.norm(ak))
+        log_integral = (
+            0.5 * (math.log(2.0 * math.pi) - math.log(vk))
+            + math.log(max(a_norm, 1e-12))
+            + _log_normal_interval_prob(z_lo, z_hi)
+        )
         log_lik = (
             -0.5 * dim * math.log(2.0 * math.pi)
             - 0.5 * log_det_sigma
@@ -630,7 +644,15 @@ def classify_sca_ray_4d(
     best_k = max(posteriors, key=lambda k: posteriors[k])
     best_d2 = float(d2_dict[best_k])
 
-    deg_f = max(dim - 1, 1)
+    eff_dim = dim
+    if (
+        1 in indices
+        and ffy is not None
+        and float(ffy) == 0.0
+        and _SCA_RAY_DIRECTIONS[best_k][1] == 0.0
+    ):
+        eff_dim -= 1
+    deg_f = max(eff_dim - 1, 1)
     chi2_crit = float(scipy.stats.chi2.ppf(0.999, df=deg_f))
 
     call: SCACall = "DISCORDANT_MIXED" if best_d2 > chi2_crit else best_k
@@ -739,22 +761,64 @@ def classify_twin_pregnancy(
     out_src: ActiveFFSource = active_ff_source
 
     if fetal_sex == "F":
-        p_ff = float(
-            np.clip(
-                1.0
-                - 0.5
-                * math.exp(
-                    -max(0.0, float(yfrac_threshold) - float(chry_score))
-                    / max(0.25 * float(yfrac_threshold), 1e-6)
-                ),
-                0.50,
-                0.9999,
+        sig_y = max(float(sigma_ffy), 0.005)
+        sig_x = max(float(sigma_x), 0.005)
+        sig_a = sigma_auto if has_sample_auto else max(sigma_auto, 0.02)
+        f_tot = f_auto if has_sample_auto else max(out_act_ff, 0.04)
+        sig_tot = math.hypot(sig_y, sig_a)
+        y_ratio = (
+            float(np.clip(float(chry_score) / float(yfrac_threshold), 0.0, 1.0))
+            if float(yfrac_threshold) > 0.0
+            else 0.0
+        )
+        hat_fy_ub = 2.0 * sig_y * y_ratio
+        y_margin = max(0.0, float(yfrac_threshold) - float(chry_score)) / max(
+            0.25 * float(yfrac_threshold), 1e-6
+        )
+        p_y_male = 0.50 * math.exp(-y_margin)
+
+        def _male_frac_lp(ratio: float) -> float:
+            fm = ratio * f_tot
+            return float(
+                scipy.stats.norm.logpdf(
+                    max(0.0, fm - hat_fy_ub), loc=0.0, scale=sig_tot
+                )
+                + scipy.stats.norm.logpdf(
+                    float(delta_x) + 0.5 * fm,
+                    loc=0.0,
+                    scale=math.hypot(sig_x, 0.5 * ratio * sig_a),
+                )
+            )
+
+        lp_ff = math.log(max(1.0 - p_y_male, 1e-12)) + _male_frac_lp(0.0)
+        lp_mm = math.log(max(0.45 * p_y_male, 1e-12)) + _male_frac_lp(1.0)
+        fm_ratios = (0.15, 0.30, 0.50, 0.70, 0.85)
+        raw_fm_w = np.array(
+            [
+                0.75 * scipy.stats.norm.pdf(r, loc=0.50, scale=0.12) + 0.25 / 0.70
+                for r in fm_ratios
+            ],
+            dtype=np.float64,
+        )
+        raw_fm_w /= float(np.sum(raw_fm_w))
+        lp_fm = math.log(max(0.55 * p_y_male, 1e-12)) + float(
+            scipy.special.logsumexp(
+                [
+                    math.log(max(float(w_r), 1e-12)) + _male_frac_lp(r)
+                    for r, w_r in zip(fm_ratios, raw_fm_w, strict=True)
+                ]
             )
         )
+        lps = np.array([lp_ff, lp_fm, lp_mm], dtype=np.float64)
+        p_ff = float(
+            np.clip(math.exp(lp_ff - float(scipy.special.logsumexp(lps))), 0.50, 0.9999)
+        )
+        rem = 1.0 - p_ff
+        fm_share = float(scipy.special.expit(lp_fm - lp_mm))
         posteriors: dict[TwinSexPair, float] = {
             "FF": p_ff,
-            "FM": 0.5 * (1.0 - p_ff),
-            "MM": 0.5 * (1.0 - p_ff),
+            "FM": rem * fm_share,
+            "MM": rem * (1.0 - fm_share),
         }
         x_euploid_f = abs(float(delta_x)) <= 2.5 * max(float(sigma_x), 0.005)
         p_high = (
@@ -809,9 +873,9 @@ def classify_twin_pregnancy(
                 ),
             )
         )
-        span_fm = max(0.65 * f_auto, 1e-4)
+        span_fm = max(0.70 * f_auto, 1e-4)
         ll_fm_unif = _log_normal_interval_prob(
-            (0.20 * f_auto - hat_fy) / sig_tot,
+            (0.15 * f_auto - hat_fy) / sig_tot,
             (0.85 * f_auto - hat_fy) / sig_tot,
         ) - math.log(span_fm)
         ll_fm = float(

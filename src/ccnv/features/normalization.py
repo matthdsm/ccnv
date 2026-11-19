@@ -57,6 +57,7 @@ __all__ = [
     "BranchModel",
     "BranchNormalizationResult",
     "align_reference_unmasked_bins",
+    "apply_lower_tail_deviance_floor",
     "build_branch_model_from_tables",
     "estimate_adjacent_dispersion_tau",
     "normalize_branch",
@@ -513,6 +514,37 @@ def _evaluate_loco_scores(
     shot_var_v = kap_u[ok_u] * exact_poisson_log_variance(eff_lam_v) / LN2_SQ
     sig0_sq_v = np.maximum((shot_var_v + phi_u[ok_u] / LN2_SQ) * f_loco_u[ok_u], 1e-12)
     return eff_lam_v, r_raw_v, sig0_sq_v
+
+
+def apply_lower_tail_deviance_floor(
+    counts: NDArray[np.float64],
+    expected: NDArray[np.float64],
+    ratios: NDArray[np.float64],
+    kappa: NDArray[np.float64],
+    shot_var: NDArray[np.float64],
+    bio_var: NDArray[np.float64],
+    tau: float,
+) -> NDArray[np.float64]:
+    """Apply lower-tail Poisson deviance inflation to shot noise while preserving bio variance."""
+    bio_pos = np.maximum(bio_var, 0.0)
+    shot_pos = np.maximum(shot_var, 0.0)
+    sig_u = tau * np.sqrt(np.maximum(shot_pos + bio_pos, 1e-12))
+    lower = (counts < expected) & (expected > 0.0)
+    if np.any(lower):
+        c_pos = np.maximum(counts, 1e-12)
+        dev_sq = np.maximum(
+            2.0
+            * (
+                np.where(counts > 0.0, counts * np.log(c_pos / expected), 0.0)
+                - (counts - expected)
+            ),
+            1e-12,
+        )
+        sig_dev = tau * np.sqrt(kappa) * np.abs(ratios) / np.sqrt(dev_sq)
+        shot_sd = np.maximum(tau * np.sqrt(shot_pos), sig_dev)
+        sig_lower = np.hypot(tau * np.sqrt(bio_pos), shot_sd)
+        sig_u = np.where(lower, np.maximum(sig_u, sig_lower), sig_u)
+    return np.maximum(sig_u, 1e-12)
 
 
 def _empty_norm_result(

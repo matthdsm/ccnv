@@ -480,19 +480,30 @@ def _winsorized_anscombe_mean_and_var(
     r_chunk: NDArray[np.float64],
     mean_lam: NDArray[np.float64],
     ddof: float,
+    *,
+    kappa: NDArray[np.float64] | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Winsorize log2 ratios in skewness-free Anscombe space and compute mean and variance."""
     n_rows, n_samples = r_chunk.shape
     if n_samples == 0:
         return np.zeros(n_rows, dtype=np.float64), np.zeros(n_rows, dtype=np.float64)
 
-    lam_col = np.maximum(mean_lam, 1e-6)[:, np.newaxis]
-    j_col = exact_poisson_log2_jensen_bias(lam_col.ravel())[:, np.newaxis]
-    root_lam = np.sqrt(lam_col + 0.375)
+    lam_mat = np.maximum(
+        mean_lam[:, np.newaxis] if mean_lam.ndim == 1 else mean_lam, 1e-6
+    )
+    j_mat = exact_poisson_log2_jensen_bias(lam_mat.ravel()).reshape(lam_mat.shape)
+    root_lam = np.sqrt(lam_mat + 0.375)
+    kap_col = (
+        np.ones((n_rows, 1), dtype=np.float64)
+        if kappa is None
+        else np.maximum(np.asarray(kappa, dtype=np.float64).ravel(), 1e-6)[
+            :, np.newaxis
+        ]
+    )
     finite_mask = np.isfinite(r_chunk)
     all_finite = bool(np.all(finite_mask))
-    exp_arg = np.clip(np.where(finite_mask, r_chunk + j_col, 0.0), -20.0, 20.0)
-    c_p375 = np.maximum(0.375, (lam_col + 0.5) * np.exp2(exp_arg) - 0.125)
+    exp_arg = np.clip(np.where(finite_mask, r_chunk + j_mat, 0.0), -20.0, 20.0)
+    c_p375 = np.maximum(0.375, (lam_mat + 0.5) * np.exp2(exp_arg) - 0.125)
     a_mat = np.where(finite_mask, 2.0 * (np.sqrt(c_p375) - root_lam), np.nan)
 
     if all_finite:
@@ -507,14 +518,19 @@ def _winsorized_anscombe_mean_and_var(
                 nan=1.0,
             )
 
-    scale_a = np.maximum(1.0, mad_a)
+    shot_v_lam = exact_poisson_log_variance(lam_mat.ravel()).reshape(lam_mat.shape)
+    anscombe_var = kap_col * np.square(lam_mat + 0.5) / (lam_mat + 0.375) * shot_v_lam
+    shot_sd_a = np.maximum(
+        0.5 * np.sqrt(kap_col), np.sqrt(np.maximum(anscombe_var, 0.0))
+    )
+    scale_a = np.maximum(shot_sd_a, mad_a)
     a_win = np.clip(
         np.where(finite_mask, a_mat, med_a),
         med_a - _WINSOR_DISPERSION_SIGMA * scale_a,
         med_a + _WINSOR_DISPERSION_SIGMA * scale_a,
     )
     c_win_p5 = np.square(np.maximum(0.0, root_lam + 0.5 * a_win)) + 0.125
-    r_mapped = np.log2(c_win_p5 / (lam_col + 0.5)) - j_col
+    r_mapped = np.log2(c_win_p5 / (lam_mat + 0.5)) - j_mat
 
     if all_finite:
         r_win = np.where(a_win != a_mat, r_mapped, r_chunk)
@@ -612,7 +628,9 @@ def calibrate_prototype_dispersion(
     shot_cnt = np.zeros(u_count, dtype=np.int32)
     last_sup = np.zeros(u_count, dtype=np.int64)
 
-    def _populate_ratios(r_store: NDArray[np.float32]) -> None:
+    def _populate_ratios(
+        r_store: NDArray[np.float32], lam_store: NDArray[np.float32]
+    ) -> None:
         nonlocal last_sup
         for s_idx in range(n_samples):
             c_s = np.asarray(counts_arr[u_idx, s_idx], dtype=np.float64)
@@ -636,6 +654,9 @@ def calibrate_prototype_dispersion(
             ) - exact_poisson_log2_jensen_bias(eff_lam[ok])
             r_col[ok] = r_unbiased.astype(np.float32)
             r_store[:, s_idx] = r_col
+            lam_col = np.full(u_count, np.nan, dtype=np.float32)
+            lam_col[ok] = eff_lam[ok].astype(np.float32)
+            lam_store[:, s_idx] = lam_col
             shot_sum[ok] += kap_u[ok] * exact_poisson_log_variance(eff_lam[ok]) / LN2_SQ
             lam_sum[ok] += eff_lam[ok]
             shot_cnt[ok] += 1
@@ -646,8 +667,11 @@ def calibrate_prototype_dispersion(
     obs_var_u = np.zeros(u_count, dtype=np.float64)
 
     with ExitStack() as stack:
-        if u_count * n_samples <= _MAX_INMEM_RATIO_ELEMENTS:
+        if u_count * n_samples * 2 <= _MAX_INMEM_RATIO_ELEMENTS:
             r_store: NDArray[np.float32] = np.empty(
+                (u_count, n_samples), dtype=np.float32
+            )
+            lam_store: NDArray[np.float32] = np.empty(
                 (u_count, n_samples), dtype=np.float32
             )
         else:
@@ -658,22 +682,35 @@ def calibrate_prototype_dispersion(
                 mode="w+",
                 shape=(u_count, n_samples),
             )
+            lam_store = np.memmap(
+                Path(tmp_dir) / "loco_lams.f32",
+                dtype=np.float32,
+                mode="w+",
+                shape=(u_count, n_samples),
+            )
         try:
-            _populate_ratios(r_store)
+            _populate_ratios(r_store, lam_store)
             if isinstance(r_store, np.memmap):
                 r_store.flush()
+            if isinstance(lam_store, np.memmap):
+                lam_store.flush()
             mean_lam_u = np.where(shot_cnt > 0, lam_sum / np.maximum(shot_cnt, 1), 1.0)
             for c0 in range(0, u_count, _DISPERSION_ROW_CHUNK):
                 c1 = min(u_count, c0 + _DISPERSION_ROW_CHUNK)
+                lam_chunk = np.asarray(lam_store[c0:c1], dtype=np.float64)
+                lam_chunk = np.where(
+                    np.isfinite(lam_chunk), lam_chunk, mean_lam_u[c0:c1, np.newaxis]
+                )
                 m_c, v_c = _winsorized_anscombe_mean_and_var(
                     np.asarray(r_store[c0:c1], dtype=np.float64),
-                    mean_lam_u[c0:c1],
+                    lam_chunk,
                     ddof=ddof,
+                    kappa=kap_u[c0:c1],
                 )
                 mean_u[c0:c1] = m_c
                 obs_var_u[c0:c1] = v_c
         finally:
-            del r_store
+            del r_store, lam_store
 
     has_support = (shot_cnt > 0) & (last_sup > 0)
     null_mean[u_idx] = np.where(has_support, mean_u, 0.0).astype(np.float32)

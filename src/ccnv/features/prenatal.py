@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import scipy.special
 from numpy.typing import NDArray
+from sklearn.model_selection import KFold
 
 from ccnv.features.binning import (
     align_grid_indices,
@@ -23,6 +24,7 @@ from ccnv.features.fragmentomics import (
     resolve_fisher_moment_weights,
 )
 from ccnv.features.normalization import (
+    apply_lower_tail_deviance_floor,
     estimate_adjacent_dispersion_tau,
     shrink_kish_kappa,
 )
@@ -137,7 +139,7 @@ def _evaluate_sca_and_active_ff(
     cls_res = classify_sca_ray_4d(
         delta_x=float(0.5 * (float(chrx_ratio) - mu_xf) / abs_a1),
         sigma_x=max(0.5 * std_xf / abs_a1, 0.005),
-        ffy=f_y,
+        ffy=float(ffy) if (fetal_sex == "M" and ffy is not None) else None,
         sigma_ffy=max(math.hypot(se_y, float(meta.ffy_std)), 0.005),
         ffa=ffa,
         sigma_ffa=sigma_ffa_eff,
@@ -385,17 +387,25 @@ def fit_prenatal_models(
     )
 
     cohort_100k = rebin_cohort(cohort_5k, prenatal_bin_size)
-    c_100k = list(cohort_100k.contigs)
-    s_100k, e_100k = cohort_100k.starts, cohort_100k.ends
+    c_100k, s_100k, e_100k = (
+        list(cohort_100k.contigs),
+        cohort_100k.starts,
+        cohort_100k.ends,
+    )
     auto_m_100k, chrx_m_100k, _ = resolve_contig_masks(
         c_100k,
         autosomes=autosomes,
         sex_contigs=sex_contigs,
         sex_signal_contig=sex_signal_contig,
     )
-    cts_100k = cohort_100k.counts
     full_log2_100k, chrx_ratios = compute_100k_profiles(
-        cts_100k, c_100k, s_100k, e_100k, prenatal_bin_size, auto_m_100k, chrx_m_100k
+        cohort_100k.counts,
+        c_100k,
+        s_100k,
+        e_100k,
+        prenatal_bin_size,
+        auto_m_100k,
+        chrx_m_100k,
     )
     log2_ratios_100k = full_log2_100k[:, auto_m_100k]
 
@@ -420,8 +430,9 @@ def fit_prenatal_models(
     n_unmasked = int(np.count_nonzero(unmasked_cols))
     n_feat = min(50, max(1, n_samples - 1), max(1, n_unmasked))
     x_sub = x_autosomal[:, unmasked_cols]
+    has_pca_var = n_unmasked > 0 and float(np.var(x_sub)) >= 1e-12
     pca_center = np.zeros(n_auto_100k, dtype=np.float64)
-    if n_unmasked == 0 or float(np.var(x_sub)) < 1e-12:
+    if not has_pca_var:
         if n_unmasked > 0:
             pca_center[unmasked_cols] = np.mean(x_sub, axis=0)
         scores = np.zeros((n_samples, n_feat), dtype=np.float64)
@@ -436,21 +447,32 @@ def fit_prenatal_models(
 
     ffa_valid = (~quarantined) & np.isfinite(ff_targets)
     if int(np.count_nonzero(ffa_valid)) >= 3:
+        v_idx = np.flatnonzero(ffa_valid)
         ens_fit = fit_logit_linear_ensemble(
-            scores[ffa_valid],
-            ff_targets[ffa_valid],
-            standardize=False,
-            l1_ratios=(0.1, 0.5),
-            seed=seed,
+            scores[v_idx], ff_targets[v_idx], l1_ratios=(0.1, 0.5), seed=seed
         )
         w_ens, b_ens, sigma_ffa = ens_fit.weights, ens_fit.intercept, ens_fit.oof_rmse
+        y_cv = np.clip(ff_targets[v_idx], 0.005, 0.85)
+        if has_pca_var and float(np.ptp(y_cv)) >= 1e-4:
+            oof_p = np.empty(v_idx.size, dtype=np.float64)
+            kf = KFold(n_splits=min(5, v_idx.size), shuffle=True, random_state=seed)
+            for tr_r, va_r in kf.split(v_idx):
+                tr_a, va_a = v_idx[tr_r], v_idx[va_r]
+                p_m = np.ones(n_samples, dtype=np.bool_)
+                p_m[va_a] = False
+                f_k = min(n_feat, max(1, int(np.count_nonzero(p_m)) - 1), n_unmasked)
+                _, fc, fr = pca_irlba_numpy(x_sub[p_m], n_components=f_k, seed=seed)
+                s_tr, s_va = (x_sub[tr_a] - fc) @ fr, (x_sub[va_a] - fc) @ fr
+                ffit = fit_logit_linear_ensemble(
+                    s_tr, ff_targets[tr_a], l1_ratios=(0.1, 0.5), seed=seed
+                )
+                oof_p[va_r] = scipy.special.expit(s_va @ ffit.weights + ffit.intercept)
+            sigma_ffa = max(float(np.sqrt(np.mean(np.square(oof_p - y_cv)))), 0.005)
     else:
         w_ens = np.zeros(scores.shape[1], dtype=np.float64)
         mean_ff = float(np.mean(ff_targets[ffa_valid])) if np.any(ffa_valid) else 0.05
-        b_ens, sigma_ffa = (
-            float(scipy.special.logit(float(np.clip(mean_ff, 0.005, 0.5)))),
-            0.25,
-        )
+        b_ens = float(scipy.special.logit(float(np.clip(mean_ff, 0.005, 0.5))))
+        sigma_ffa = 0.25
 
     f_rx = np.where(is_male_arr, ff_targets, 0.0)
     alpha_0, raw_alpha_1, sigma_x_sys = fit_forward_ffx_model(
@@ -458,20 +480,18 @@ def fit_prenatal_models(
     )
     alpha_1 = float(raw_alpha_1) if raw_alpha_1 < -1e-6 else -0.5
 
-    if isinstance(sample_tables, Sequence):
-        frag_metas = [
+    raw_metas = (
+        [
             t.meta.fragmentomics
             if isinstance(t, SampleBuffers)
             else extract_sample_fragmentomics(decode_metadata(t.schema.metadata))
             for t in sample_tables
         ]
-    else:
-        frag_metas = [
-            extract_sample_fragmentomics(m) for m in cohort_5k.sample_metadata
-        ]
-
+        if isinstance(sample_tables, Sequence)
+        else [extract_sample_fragmentomics(m) for m in cohort_5k.sample_metadata]
+    )
     frag_fit = fit_cohort_fragmentomics_model(
-        frag_metas, is_male_arr, ff_targets, quarantined=quarantined, seed=seed
+        raw_metas, is_male_arr, ff_targets, quarantined=quarantined, seed=seed
     )
     p_fet = p_mat = w_frag = b_frag = m_frag = s_frag = band_w_list = mu_f_val = (
         mu_m_val
@@ -576,18 +596,9 @@ def predict_prenatal(
     auto_ref = rt.filter(pc.equal(branch_col, BRANCH_PRENATAL_AUTOSOMAL))
     roles = extract_ref_contig_roles(rt, ffy_ref)
 
-    (
-        bufs,
-        bufs_5k,
-        ffy_bin,
-        _,
-        _,
-        _,
-        ffy_align,
-        sample_chry_c,
-        _,
-        clean_idx,
-    ) = prepare_5k_msy_sample(sample, rt, ffy_ref, pm.clean_msy_bins)
+    msy_prep = prepare_5k_msy_sample(sample, rt, ffy_ref, pm.clean_msy_bins)
+    bufs, bufs_5k, ffy_bin = msy_prep[0], msy_prep[1], msy_prep[2]
+    ffy_align, sample_chry_c, clean_idx = msy_prep[6], msy_prep[7], msy_prep[9]
     counts_5k = np.asarray(bufs_5k.count, dtype=np.float64)
     hit_y = ffy_align >= 0
     chry_reads = float(
@@ -944,9 +955,12 @@ def normalize_prenatal_chry(
             else None
         )
         kap_u = shrink_kish_kappa(c_u, kap_sub)
-        sig0_sq_u = np.maximum(
-            kap_u * exact_poisson_log_variance(lam_u) / LN2_SQ, 1e-12
-        )
+        shot_var_u = kap_u * exact_poisson_log_variance(lam_u) / LN2_SQ
+        bio_var_u = np.zeros(u_idx.size, dtype=np.float64)
+        if "bio_dispersion" in ffy_ref.column_names:
+            bd = col_f64(ffy_ref, "bio_dispersion")[u_idx]
+            bio_var_u = np.where(np.isfinite(bd) & (bd > 0.0), bd, 0.0) / LN2_SQ
+        sig0_sq_u = np.maximum(shot_var_u + bio_var_u, 1e-12)
         tau_y = estimate_adjacent_dispersion_tau(
             u_idx,
             np.asarray(ffy_ref_c, dtype=str)[u_idx],
@@ -955,21 +969,9 @@ def normalize_prenatal_chry(
             tau_min=1.0,
             tau_max=2.5,
         )
-
-        sig_u = tau_y * np.sqrt(sig0_sq_u)
-        lower = (c_u < lam_u) & (lam_u > 0.0)
-        if np.any(lower):
-            c_pos = np.maximum(c_u, 1e-12)
-            dev_sq = np.maximum(
-                2.0
-                * (
-                    np.where(c_u > 0.0, c_u * np.log(c_pos / lam_u), 0.0)
-                    - (c_u - lam_u)
-                ),
-                1e-12,
-            )
-            sig_dev = tau_y * np.sqrt(kap_u) * np.abs(r_u) / np.sqrt(dev_sq)
-            sig_u = np.where(lower, np.maximum(sig_u, sig_dev), sig_u)
+        sig_u = apply_lower_tail_deviance_floor(
+            c_u, lam_u, r_u, kap_u, shot_var_u, bio_var_u, tau_y
+        )
         ratios[u_idx], zscores[u_idx] = r_u, r_u / sig_u
         weights[u_idx], expected_out[u_idx] = 1.0 / np.square(sig_u), lam_u
         bg_out[u_idx] = bg_counts_u

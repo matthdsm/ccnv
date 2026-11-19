@@ -622,6 +622,49 @@ class TestFragmentomicsDeconvolutionAndFisher(unittest.TestCase):
         np.testing.assert_allclose(flat_counts, raw_counts.astype(np.float64))
         np.testing.assert_allclose(flat_kappa, 1.0, atol=1e-6)
 
+    def test_deconvolve_anchors_fetal_density_under_1000x_autosomal_imbalance_and_unlabeled_males(
+        self,
+    ) -> None:
+        rng = np.random.default_rng(77)
+        n_samples = 12
+        is_male = np.array([True] * 6 + [False] * 6, dtype=np.bool_)
+        true_ff = np.array(
+            [0.10, 0.12, 0.08, 0.11, 0.09, 0.13, 0.07, 0.09, 0.10, 0.11, 0.08, 0.12],
+            dtype=np.float64,
+        )
+        ff_input = np.full(n_samples, np.nan, dtype=np.float64)
+        ff_input[0] = true_ff[0]
+        ff_input[1] = true_ff[1]
+
+        hist_auto = np.zeros((n_samples, FRAG_NUM_BINS), dtype=np.float64)
+        hist_chry = np.zeros((n_samples, FRAG_NUM_BINS), dtype=np.float64)
+        for i in range(n_samples):
+            f = true_ff[i]
+            mix = f * self.p_f_true + (1.0 - f) * self.p_m_true
+            hist_auto[i] = rng.multinomial(500_000, mix)
+            if is_male[i]:
+                hist_chry[i] = rng.multinomial(250, self.p_f_true) + rng.multinomial(
+                    150, self.p_m_true
+                )
+            else:
+                hist_chry[i] = rng.multinomial(150, self.p_m_true)
+
+        p_f_hat, _ = deconvolve_fetal_maternal_densities(
+            hist_auto,
+            hist_chry,
+            ff_input,
+            is_male,
+            smooth_sigma=1.2,
+            em_steps=8,
+        )
+        peak_f = float(self.lengths[np.argmax(p_f_hat)])
+        tv_f = 0.5 * float(np.sum(np.abs(p_f_hat - self.p_f_true)))
+        self.assertTrue(
+            139.0 <= peak_f <= 147.0,
+            f"Fetal peak drifted to {peak_f:.1f} bp (TV={tv_f:.4f})",
+        )
+        self.assertLess(tv_f, 0.055, f"Fetal density TV error {tv_f:.4f} >= 0.055")
+
     def test_compound_poisson_kappa_scale_invariance(self) -> None:
         bands = np.zeros((3, NUM_FRAG_BANDS), dtype=np.uint32)
         bands[:, 4] = 40

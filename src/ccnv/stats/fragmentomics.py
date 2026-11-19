@@ -301,6 +301,7 @@ def deconvolve_fetal_maternal_densities(
         eligible_males = male_arr & np.isfinite(ff_arr) & (ff_arr >= 0.02)
 
     h_y_fetal = np.zeros(FRAG_NUM_BINS, dtype=np.float64)
+    has_y_anchor = False
     if np.any(eligible_males) and float(np.sum(chry[eligible_males])) > 0.0:
         h_male_y = np.sum(chry[eligible_males], axis=0)
         h_female_y = (
@@ -308,20 +309,36 @@ def deconvolve_fetal_maternal_densities(
             if np.any(female_arr)
             else np.zeros(FRAG_NUM_BINS, dtype=np.float64)
         )
-        sum_male_n = float(
-            np.sum((1.0 - ff_arr[eligible_males]) * n_reads[eligible_males])
-        )
+        sum_male_n = float(np.sum(n_reads[eligible_males]))
         sum_female_n = float(np.sum(n_reads[female_arr])) if np.any(female_arr) else 0.0
         bg_scale = sum_male_n / max(sum_female_n, 1.0) if sum_female_n > 0.0 else 0.0
+
+        y_anchor_males = male_arr & (
+            (np.isfinite(ff_arr) & (ff_arr >= 0.08)) | ~np.isfinite(ff_arr)
+        )
+        if np.any(y_anchor_males) and float(np.sum(chry[y_anchor_males])) > float(
+            np.sum(chry[eligible_males])
+        ):
+            h_male_y = np.sum(chry[y_anchor_males], axis=0)
+            sum_male_n = float(np.sum(n_reads[y_anchor_males]))
+            bg_scale = (
+                sum_male_n / max(sum_female_n, 1.0) if sum_female_n > 0.0 else 0.0
+            )
 
         h_y_fetal = np.maximum(h_male_y - bg_scale * h_female_y, 0.0)
         s_male_y = ndimage.gaussian_filter1d(h_male_y, sigma=smooth_sigma)
         s_female_y = ndimage.gaussian_filter1d(h_female_y, sigma=smooth_sigma)
         h_f0 = np.maximum(s_male_y - bg_scale * s_female_y, 0.0)
         sum_f0 = float(np.sum(h_f0))
-        p_f = (h_f0 / sum_f0) if sum_f0 > 0.0 else param_f.copy()
+        if sum_f0 > 0.0:
+            p_f = h_f0 / sum_f0
+            has_y_anchor = float(np.sum(h_y_fetal)) > 100.0
+        else:
+            p_f = param_f.copy()
     else:
         p_f = param_f.copy()
+    # Preserve smoothed chrY anchor so autosomal soft-EM refines without drowning chrY.
+    p_y_anchor = p_f.copy()
 
     h_m0 = np.zeros(FRAG_NUM_BINS, dtype=np.float64)
     for i in np.flatnonzero(eligible_males):
@@ -341,6 +358,7 @@ def deconvolve_fetal_maternal_densities(
     )
 
     for _ in range(max(1, em_steps)):
+        p_f_ff = 0.5 * (p_f + p_y_anchor) if has_y_anchor else p_f
         for i in range(n_samples):
             if eligible_males[i] or n_reads[i] <= 0.0:
                 continue
@@ -349,7 +367,7 @@ def deconvolve_fetal_maternal_densities(
             def _neg_ll(
                 f_val: float,
                 h_target: NDArray[np.float64] = h_i,
-                pf_step: NDArray[np.float64] = p_f,
+                pf_step: NDArray[np.float64] = p_f_ff,
                 pm_step: NDArray[np.float64] = p_m,
             ) -> float:
                 p_mix = f_val * pf_step + (1.0 - f_val) * pm_step
@@ -360,12 +378,19 @@ def deconvolve_fetal_maternal_densities(
             )
             f_curr[i] = float(np.clip(res.x, 0.002, 0.55))
 
-        mix = (
+        all_mix = (
             f_curr[:, np.newaxis] * p_f[np.newaxis, :]
             + (1.0 - f_curr[:, np.newaxis]) * p_m[np.newaxis, :]
         )
-        gamma_f = (f_curr[:, np.newaxis] * p_f[np.newaxis, :]) / np.maximum(mix, 1e-12)
-        h_f_acc = np.sum(auto * gamma_f, axis=0) + h_y_fetal
+        gamma_f = (f_curr[:, np.newaxis] * p_f[np.newaxis, :]) / np.maximum(
+            all_mix, 1e-12
+        )
+        if has_y_anchor:
+            auto_f_acc = np.sum(auto[eligible_males] * gamma_f[eligible_males], axis=0)
+            anchor_mass = max(float(np.sum(h_y_fetal)), float(np.sum(auto_f_acc)))
+            h_f_acc = auto_f_acc + anchor_mass * p_y_anchor
+        else:
+            h_f_acc = np.sum(auto * gamma_f, axis=0) + h_y_fetal
         h_m_acc = np.sum(auto * (1.0 - gamma_f), axis=0)
 
         sum_f_acc = float(np.sum(h_f_acc))

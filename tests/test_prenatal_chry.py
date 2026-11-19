@@ -672,5 +672,208 @@ class TestPrenatalChrYDeliverables(unittest.TestCase):
             load_inputs(bad_y_path, self.prenatal_ref, mode=AnalysisMode.prenatal)
 
 
+class TestPrenatalCalibrationAndGridRegressions(unittest.TestCase):
+    def test_fit_prenatal_models_ffa_cv_no_pca_subspace_leakage(self) -> None:
+        from unittest.mock import patch
+
+        from ccnv.stats.pca import pca_irlba_numpy
+
+        contig_lengths = {
+            "chr1": 1_000_000,
+            "chr2": 1_000_000,
+            "chrX": 200_000,
+            "chrY": 100_000,
+        }
+        n_5k = sum(contig_lengths.values()) // 5000
+        ff_vals = [0.05, 0.08, 0.11, 0.14, 0.17, 0.20, 0.23, 0.26]
+        samples: list[SampleBuffers] = []
+        entries: list[SamplesheetEntry] = []
+        for idx, ff_v in enumerate(ff_vals):
+            is_m = idx >= 4
+            counts = np.full(n_5k, 100.0, dtype=np.float64)
+            bands = np.zeros((n_5k, NUM_FRAG_BANDS), dtype=np.uint32)
+            s_bin, e_bin = idx * 20, (idx + 1) * 20
+            counts[s_bin:e_bin] = 100.0 * (1.5 + 0.3 * idx)
+            if not is_m:
+                counts[-20:] = 0.0
+            else:
+                counts[-20:] = 100.0 * 0.5 * ff_v
+            bands[:, 0] = np.round(counts).astype(np.uint32)
+            samples.append(_make_sample_buffers(contig_lengths, 5000, counts, bands))
+            entries.append(
+                SamplesheetEntry(
+                    Path(f"leak_{idx}.ccnv"),
+                    sex="M" if is_m else "F",
+                    ff=ff_v,
+                )
+            )
+        with patch(
+            "ccnv.features.prenatal.pca_irlba_numpy", wraps=pca_irlba_numpy
+        ) as mock_pca:
+            meta, _, _ = fit_prenatal_models(
+                samples, entries, prenatal_bin_size=100_000, seed=42
+            )
+        self.assertGreaterEqual(mock_pca.call_count, 6)
+        fold_row_counts = [
+            call.args[0].shape[0] for call in mock_pca.call_args_list[1:]
+        ]
+        self.assertTrue(all(n_rows < len(samples) for n_rows in fold_row_counts))
+        self.assertGreaterEqual(meta.ffa_std, float(np.std(ff_vals)) * 0.90)
+
+    def test_zero_inclusive_gc_exponent_all_at_bin_and_low_depth_100k_chrx_ratio(
+        self,
+    ) -> None:
+        from ccnv.features.prenatal_grid import (
+            compute_100k_profiles,
+            fit_sample_gc_exponent,
+            prepare_covariate_multipliers,
+        )
+
+        rng = np.random.default_rng(101)
+        n_bins = 2000
+        gc_mult = np.linspace(0.5, 1.5, n_bins)
+        exp_b = np.full(n_bins, 0.5, dtype=np.float64)
+        lam_true = exp_b * np.power(gc_mult, 2.0)
+        counts_low = rng.poisson(lam_true).astype(np.float64)
+        beta_hat = fit_sample_gc_exponent(
+            counts_low, exp_b, np.ones(n_bins), gc_mult, np.ones(n_bins, dtype=np.bool_)
+        )
+        self.assertLess(abs(beta_hat - 2.0), 0.15)
+
+        c_x = rng.poisson(1.5, size=400).astype(np.float64)
+        self.assertGreater(int(np.count_nonzero(c_x == 0.0)), 40)
+        c_mat = np.concatenate([np.full(400, 1.5), c_x]).reshape(-1, 1)
+        contigs = ["chr1"] * 400 + ["chrX"] * 400
+        starts = np.tile(np.arange(400, dtype=np.int64) * 100_000, 2)
+        ends = starts + 100_000
+        auto_m = np.array([c == "chr1" for c in contigs], dtype=np.bool_)
+        chrx_m = np.array([c == "chrX" for c in contigs], dtype=np.bool_)
+        _, chrx_rat = compute_100k_profiles(
+            c_mat, contigs, starts, ends, 100_000, auto_m, chrx_m
+        )
+        self.assertAlmostEqual(float(chrx_rat[0]), 1.0, delta=0.06)
+
+        gc_mult_at, _ = prepare_covariate_multipliers(
+            np.array([0.0, 0.4, 0.5, 0.6]),
+            np.ones(4),
+            None,
+            0.5,
+            4,
+        )
+        self.assertLess(float(gc_mult_at[0]), 0.01)
+
+    def test_classify_sca_ray_4d_female_ghost_ffy_df_and_xyy_arclength_invariance(
+        self,
+    ) -> None:
+        from ccnv.stats.prenatal_math import classify_sca_ray_4d
+
+        p0 = dict.fromkeys(("XX", "XY", "XO", "XXX", "XXY", "XYY"), 1e-6)
+        fem_priors = p0 | {"XX": 0.90, "XO": 0.05, "XXX": 0.05}
+        res_ghost = classify_sca_ray_4d(
+            delta_x=0.0,
+            sigma_x=0.01,
+            ffy=0.0,
+            sigma_ffy=0.005,
+            ffa=0.10,
+            sigma_ffa=0.01,
+            ff_size=0.1535,
+            sigma_size=0.01,
+            clinical_priors=fem_priors,
+        )
+        res_none = classify_sca_ray_4d(
+            delta_x=0.0,
+            sigma_x=0.01,
+            ffy=None,
+            sigma_ffy=0.005,
+            ffa=0.10,
+            sigma_ffa=0.01,
+            ff_size=0.1535,
+            sigma_size=0.01,
+            clinical_priors=fem_priors,
+        )
+        self.assertEqual(res_ghost.call, "DISCORDANT_MIXED")
+        self.assertEqual(res_none.call, "DISCORDANT_MIXED")
+        self.assertAlmostEqual(
+            res_ghost.mahalanobis_d2, res_none.mahalanobis_d2, places=6
+        )
+        self.assertAlmostEqual(res_ghost.posterior, res_none.posterior, places=6)
+
+        unif = dict.fromkeys(("XX", "XY", "XO", "XXX", "XXY", "XYY"), 1.0 / 6.0)
+        res_xy = classify_sca_ray_4d(
+            delta_x=-0.05,
+            sigma_x=0.01,
+            ffy=0.10,
+            sigma_ffy=0.005,
+            ffa=0.10,
+            sigma_ffa=0.02,
+            ff_size=0.10,
+            sigma_size=0.02,
+            clinical_priors=unif,
+        )
+        res_xyy = classify_sca_ray_4d(
+            delta_x=-0.05,
+            sigma_x=0.01,
+            ffy=0.20,
+            sigma_ffy=0.005,
+            ffa=0.10,
+            sigma_ffa=0.02,
+            ff_size=0.10,
+            sigma_size=0.02,
+            clinical_priors=unif,
+        )
+        self.assertEqual(res_xy.call, "XY")
+        self.assertEqual(res_xyy.call, "XYY")
+        self.assertGreaterEqual(
+            res_xyy.posteriors["XYY"], res_xy.posteriors["XY"] - 0.05
+        )
+
+    def test_female_singleton_twin_posteriors_and_symmetric_fm_interval(self) -> None:
+        from ccnv.stats.prenatal_math import classify_twin_pregnancy
+
+        res_fem = classify_twin_pregnancy(
+            fetal_sex="F",
+            chry_score=0.85 * 0.0001,
+            yfrac_threshold=0.0001,
+            ffy=None,
+            sigma_ffy=0.005,
+            delta_x=0.0,
+            sigma_x=0.008,
+            ffa=0.08,
+            sigma_ffa=0.008,
+            ff_size=0.08,
+            sigma_size=0.008,
+            active_ff=0.08,
+            active_ff_se=0.006,
+            active_ff_source="FUSED",
+            twins=False,
+        )
+        self.assertEqual(res_fem.gestation, "singleton")
+        self.assertFalse(res_fem.twin.is_twin)
+        self.assertGreater(res_fem.twin.posteriors["FF"], 0.90)
+        self.assertGreater(res_fem.twin.posteriors["FM"], res_fem.twin.posteriors["MM"])
+        self.assertLess(res_fem.twin.posteriors["MM"], 0.03)
+        self.assertLess(res_fem.twin.twin_probability, 0.05)
+
+        fm_lo = classify_twin_pregnancy(
+            fetal_sex="M",
+            chry_score=0.00010,
+            yfrac_threshold=0.000043,
+            ffy=0.036,
+            sigma_ffy=0.004,
+            delta_x=-0.018,
+            sigma_x=0.006,
+            ffa=0.20,
+            sigma_ffa=0.004,
+            ff_size=0.20,
+            sigma_size=0.004,
+            active_ff=0.20,
+            active_ff_se=0.003,
+            active_ff_source="FUSED",
+            twins=True,
+        )
+        self.assertEqual(fm_lo.twin.call, "FM")
+        self.assertGreater(fm_lo.twin.posteriors["FM"], 0.98)
+
+
 if __name__ == "__main__":
     unittest.main()

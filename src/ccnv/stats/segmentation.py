@@ -423,6 +423,7 @@ def _evaluate_integer_cn_bf(
     c_s: float,
     lam_s: float,
     bg_s: float = 0.0,
+    kappa_s: float = 1.0,
 ) -> tuple[int, float]:
     """Compute best integer CN candidate and log-Bayes-factor strictly from one likelihood."""
     alt_states = (0, 1, 3, 4) if baseline_ploidy == 2 else (0, 2, 3)
@@ -430,14 +431,18 @@ def _evaluate_integer_cn_bf(
     best_raw_diff = -math.inf
 
     if has_counts and lam_s > 0.0:
-        nb_alpha = max(0.0, LN2_SQ * sigma_s_sq - 1.0 / lam_s)
-        bg_clean = min(max(0.0, bg_s), 0.99 * lam_s)
-        fetal_lam = max(lam_s - bg_clean, 0.0)
+        k_eff = max(1.0, float(kappa_s))
+        c_eff = c_s / k_eff
+        lam_eff = lam_s / k_eff
+        bg_eff = bg_s / k_eff
+        nb_alpha = max(0.0, LN2_SQ * sigma_s_sq - k_eff / lam_s)
+        bg_clean = min(max(0.0, bg_eff), 0.99 * lam_eff)
+        fetal_lam = max(lam_eff - bg_clean, 0.0)
         for k in alt_states:
             if baseline_ploidy == 1 and bg_clean > 0.0:
                 mu_k = max(
                     0.001,
-                    max(bg_clean, 0.01 * lam_s)
+                    max(bg_clean, 0.01 * lam_eff)
                     if k == 0
                     else bg_clean + float(k) * fetal_lam,
                 )
@@ -447,18 +452,19 @@ def _evaluate_integer_cn_bf(
                     if k == 0
                     else (0.5 * float(k) if baseline_ploidy == 2 else float(k))
                 )
-                mu_k = max(0.001, scale_k * lam_s)
+                mu_k = max(0.001, scale_k * lam_eff)
             if nb_alpha <= 1e-12:
-                term_c = c_s * math.log(mu_k / lam_s) if c_s > 0.0 else 0.0
-                ll_diff = term_c - (mu_k - lam_s)
+                term_c = c_eff * math.log(mu_k / lam_eff) if c_eff > 0.0 else 0.0
+                ll_diff = term_c - (mu_k - lam_eff)
             else:
                 r_nb = 1.0 / nb_alpha
                 term_c = (
-                    c_s * math.log((mu_k * (lam_s + r_nb)) / (lam_s * (mu_k + r_nb)))
-                    if c_s > 0.0
+                    c_eff
+                    * math.log((mu_k * (lam_eff + r_nb)) / (lam_eff * (mu_k + r_nb)))
+                    if c_eff > 0.0
                     else 0.0
                 )
-                ll_diff = term_c + r_nb * math.log((lam_s + r_nb) / (mu_k + r_nb))
+                ll_diff = term_c + r_nb * math.log((lam_eff + r_nb) / (mu_k + r_nb))
             if ll_diff > best_raw_diff:
                 best_raw_diff = ll_diff
                 best_alt_k = k
@@ -655,6 +661,7 @@ def _segment_and_prescore_contig(
             )
             z_blue = (c_s_val - lam_s_val) / math.sqrt(max(var_c, 1e-12))
             w_tot = 1.0 / sigma_s_sq
+            kappa_bf = kappa_s * v_inf
         else:
             sigma_s_sq = (kappa_s / max(w_tot, 1e-12)) + base_var
             z_blue = (
@@ -662,6 +669,7 @@ def _segment_and_prescore_contig(
                 if w_tot > 1e-12
                 else 0.0
             )
+            kappa_bf = kappa_s
 
         cand_cn: int | None = None
         log_bf: float | None = None
@@ -674,6 +682,7 @@ def _segment_and_prescore_contig(
                 c_s=c_s_val,
                 lam_s=lam_s_val,
                 bg_s=float(seg_bg[idx]),
+                kappa_s=kappa_bf,
             )
 
         out.append(
