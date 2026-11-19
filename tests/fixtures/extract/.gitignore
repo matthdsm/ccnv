@@ -3,3 +3,5 @@
 *.fna
 *.fai
 *.tmp
+testdata/
+.cache_extracted/

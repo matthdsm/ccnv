@@ -418,28 +418,37 @@ class TestBenchmarkNumericAgreement(unittest.TestCase):
 
 
 class TestReferencePublishedCrams(unittest.TestCase):
-    def test_cli_builds_reference_from_two_published_crams(self) -> None:
+    def test_cli_builds_reference_from_testdata_and_audits_ref_qc(self) -> None:
         fasta = pf.ensure_published_fasta()
-        crams = (
-            pf.ensure_published_file(pf.PUBLISHED_CRAM, pf.PUBLISHED_CRAM_URL),
-            pf.ensure_published_file(pf.PUBLISHED_CRAM2, pf.PUBLISHED_CRAM2_URL),
-        )
+        cram = pf.ensure_published_cram()
+        bam = pf.ensure_published_bam()
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             sample_paths: list[Path] = []
             bs_str = str(pf.PUBLISHED_BIN_SIZE)
-            for index, cram in enumerate(crams, start=1):
-                pfx = root / f"sample{index}"
-                ext_args = ["extract", str(cram), "--fasta", str(fasta)]
-                ext_args += ["--prefix", str(pfx), "--bin-size", bs_str]
+            for idx, (aln, ref_fa) in enumerate(((cram, fasta), (bam, None)), start=1):
+                pfx = root / f"sample{idx}"
+                ext_args = [
+                    "extract",
+                    str(aln),
+                    "--prefix",
+                    str(pfx),
+                    "--bin-size",
+                    bs_str,
+                ]
+                if ref_fa is not None:
+                    ext_args += ["--fasta", str(ref_fa)]
                 res_ext = runner.invoke(app, ext_args)
                 self.assertEqual(res_ext.exit_code, 0, res_ext.output)
                 sample_paths.append(parquet_path(pfx))
 
             samples = [read_sample_buffers(path) for path in sample_paths]
+            self.assertEqual(samples[0].num_rows, pf.PUBLISHED_CANONICAL_BINS)
             self.assertEqual(samples[0].num_rows, samples[1].num_rows)
-            self.assertEqual(samples[0].meta.contig_order, ("chr21",))
+            self.assertEqual(
+                samples[0].meta.contig_order, tuple(pf.PUBLISHED_CANONICAL_CONTIGS)
+            )
 
             sheet_path = root / "samplesheet.yaml"
             sheet_txt = yaml.safe_dump([{"filepath": str(p)} for p in sample_paths])
@@ -458,38 +467,70 @@ class TestReferencePublishedCrams(unittest.TestCase):
             if not isinstance(model, dict):
                 self.fail("expected model dict")
             self.assertNotIn("sample_identities", metadata)
-            self.assertEqual(table.num_rows, samples[0].num_rows)
-            self.assertEqual(set(table.column("contig").to_pylist()), {"chr21"})
-            self.assertEqual(
-                set(table.column("branch").to_pylist()), {BRANCH_AUTOSOMAL}
-            )
-            self.assertEqual(table.column("end").to_pylist()[-1], pf.CHR21_LENGTH)
-            self.assertEqual(metadata["contig_lengths"], {"chr21": pf.CHR21_LENGTH})
+            self.assertEqual(metadata["contig_lengths"], pf.PUBLISHED_CANONICAL_CONTIGS)
             self.assertEqual(model["bin_size"], pf.PUBLISHED_BIN_SIZE)
             self.assertEqual(model["branches"], [BRANCH_AUTOSOMAL])
-            self.assertEqual(model["autosomal_contigs"], ["chr21"])
+            self.assertEqual(model["autosomal_contigs"], ["chr1", "chr2"])
             self.assertEqual(model["sample_count"], 2)
             unmasked = sum(1 for masked in table.column("masked") if not masked)
             self.assertGreater(unmasked, 0)
 
+            ref_truth = pf.load_testdata_truth("reference/synthetic_cohort/truth.json")
+            for key, filename in (
+                ("ref_qc_pass_autosomal", "ref_qc_pass_autosomal.ccnv"),
+                ("ref_qc_warn_flat", "ref_qc_warn_flat.ccnv"),
+                ("ref_qc_fail_masked_male", "ref_qc_fail_masked_male.ccnv"),
+            ):
+                ref_file = pf.ensure_testdata_file(
+                    f"reference/synthetic_cohort/{filename}"
+                )
+                qc_pfx = root / key
+                qc_res = runner.invoke(
+                    app, ["ref-qc", str(ref_file), "--prefix", str(qc_pfx)]
+                )
+                self.assertEqual(qc_res.exit_code, 0, qc_res.output)
+                qc_json = json.loads(
+                    Path(f"{qc_pfx}_qc.json").read_text(encoding="utf-8")
+                )
+                expected_entry = ref_truth[key]
+                if not isinstance(expected_entry, dict):
+                    self.fail(f"expected dict for {key} in reference truth.json")
+                self.assertEqual(
+                    qc_json["overall_verdict"], expected_entry["ref_qc_verdict"]
+                )
+
 
 class TestPredictPublishedCrams(unittest.TestCase):
-    def test_cli_predicts_published_sample_against_two_sample_reference(self) -> None:
+    def test_cli_predicts_germline_and_prenatal_testdata_suites(self) -> None:
         runner = CliRunner()
+        germ_truth = pf.load_testdata_truth("predict/germline/synthetic/truth.json")
+        germ_ref = pf.ensure_testdata_file(
+            "reference/synthetic_cohort/germline_ref_5kb.ccnv"
+        )
+        cyto_track = pf.ensure_testdata_file("tracks/synthetic_cohort_cytobands.bed.gz")
+        germ_samples = germ_truth["samples"]
+        if not isinstance(germ_samples, dict):
+            self.fail("expected samples dict in germline truth.json")
+
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            sample_a, sample_b = pf.extract_published_samples(root)
-            ref_pfx = root / "reference"
-            entries = (SamplesheetEntry(sample_a), SamplesheetEntry(sample_b))
-            ref_cfg = ReferenceConfig(
-                prefix=ref_pfx, entries=entries, pca_components=1, min_cohort_size=2
+            cnv_sample = pf.ensure_testdata_file(
+                "predict/germline/synthetic/cnv_events_female.ccnv"
             )
-            reference(ref_cfg)
-            ref_pq = str(parquet_path(ref_pfx))
-            pred_pfx = root / "prediction"
-            pred_args = ["predict", str(sample_a), ref_pq, "--prefix", str(pred_pfx)]
-            result = runner.invoke(app, pred_args)
-            self.assertEqual(result.exit_code, 0, result.output)
+            pred_pfx = root / "cnv_events_female"
+            res = runner.invoke(
+                app,
+                [
+                    "predict",
+                    str(cnv_sample),
+                    str(germ_ref),
+                    "--prefix",
+                    str(pred_pfx),
+                    "--cytobands",
+                    str(cyto_track),
+                ],
+            )
+            self.assertEqual(res.exit_code, 0, res.output)
 
             for stem in (
                 "_bins.bed",
@@ -504,41 +545,98 @@ class TestPredictPublishedCrams(unittest.TestCase):
                 self.assertTrue(Path(f"{pred_pfx}{sfx}").is_file())
             for sfx in ("_bins.vcf.gz", "_bins.vcf.gz.tbi"):
                 self.assertFalse(Path(f"{pred_pfx}{sfx}").exists())
-            for sfx in ("_bins.ccnv", "_segments.ccnv"):
-                self.assertFalse(Path(f"{pred_pfx}{sfx}").exists())
 
             qc_data = json.loads(
                 Path(f"{pred_pfx}_qc.json").read_text(encoding="utf-8")
             )
+            cnv_exp = germ_samples["cnv_events_female"]
+            if not isinstance(cnv_exp, dict):
+                self.fail("expected cnv_events_female dict")
             self.assertEqual(qc_data["mode"], "germline")
             self.assertEqual(qc_data["schema_version"], "2.0.0")
+            self.assertEqual(qc_data["sample"], "cnv_events_female")
+            self.assertEqual(qc_data["sex"], cnv_exp["sex"])
+            self.assertEqual(
+                qc_data["cnv_summary"]["gain_calls"], cnv_exp["gain_calls"]
+            )
+            self.assertEqual(
+                qc_data["cnv_summary"]["loss_calls"], cnv_exp["loss_calls"]
+            )
 
             with gzip.open(f"{pred_pfx}_bins.bed.gz", "rt") as h:
                 bin_lines = h.read().splitlines()
             self.assertEqual(tuple(bin_lines[0].split("\t")), BINS_BED_HEADER)
-            self.assertEqual(len(bin_lines) - 1, 468)
-            self.assertEqual(bin_lines[1].split("\t")[0], "chr21")
-            self.assertEqual(int(bin_lines[1].split("\t")[1]), 0)
-            self.assertEqual(int(bin_lines[-1].split("\t")[2]), pf.CHR21_LENGTH)
-
+            self.assertGreater(len(bin_lines), 1)
             with gzip.open(f"{pred_pfx}_segments.bed.gz", "rt") as h:
-                seg_hdr = tuple(h.read().splitlines()[0].split("\t"))
-            self.assertEqual(seg_hdr, SEGMENTS_BED_HEADER)
+                self.assertEqual(
+                    tuple(h.read().splitlines()[0].split("\t")), SEGMENTS_BED_HEADER
+                )
             with gzip.open(f"{pred_pfx}_calls.bed.gz", "rt") as h:
-                call_hdr = tuple(h.read().splitlines()[0].split("\t"))
-            self.assertEqual(call_hdr, CALLS_BED_HEADER)
+                self.assertEqual(
+                    tuple(h.read().splitlines()[0].split("\t")), CALLS_BED_HEADER
+                )
             self.assertGreater(Path(f"{pred_pfx}_plot.html").stat().st_size, 0)
 
             opt_pfx = root / "prediction_with_bins"
-            opt_args = ["predict", str(sample_a), ref_pq, "--prefix", str(opt_pfx)]
-            opt_args += ["--bins-vcf", "--no-plot"]
-            res_bins = runner.invoke(app, opt_args)
+            res_bins = runner.invoke(
+                app,
+                [
+                    "predict",
+                    str(cnv_sample),
+                    str(germ_ref),
+                    "--prefix",
+                    str(opt_pfx),
+                    "--bins-vcf",
+                    "--no-plot",
+                ],
+            )
             self.assertEqual(res_bins.exit_code, 0, res_bins.output)
             opt_bins_vcf = Path(f"{opt_pfx}_bins.vcf.gz")
             self.assertTrue(opt_bins_vcf.is_file())
             self.assertTrue(Path(f"{opt_bins_vcf}.tbi").is_file())
             with pysam.TabixFile(str(opt_bins_vcf)) as tb:
-                self.assertEqual(len(list(tb.fetch("chr21", 0, pf.CHR21_LENGTH))), 468)
+                self.assertEqual(len(list(tb.fetch("chr1", 0, 625_000))), 125)
+
+            pren_truth = pf.load_testdata_truth("predict/prenatal/synthetic/truth.json")
+            pren_ref = pf.ensure_testdata_file(
+                "predict/prenatal/synthetic/prenatal_ref_synthetic.ccnv"
+            )
+            pren_samples = pren_truth["samples"]
+            if not isinstance(pren_samples, dict):
+                self.fail("expected samples dict in prenatal truth.json")
+            for name, extra_flags in (
+                ("euploid_xx", []),
+                ("trisomy_chr2_xy", []),
+                ("maternal_dup_xx", []),
+                ("twin_fm", ["--twins"]),
+            ):
+                sp = pf.ensure_testdata_file(f"predict/prenatal/synthetic/{name}.ccnv")
+                p_pfx = root / f"pren_{name}"
+                p_res = runner.invoke(
+                    app,
+                    [
+                        "predict",
+                        str(sp),
+                        str(pren_ref),
+                        "--mode",
+                        "prenatal",
+                        "--prefix",
+                        str(p_pfx),
+                        "--no-plot",
+                        "--no-vcf",
+                        *extra_flags,
+                    ],
+                )
+                self.assertEqual(p_res.exit_code, 0, p_res.output)
+                p_qc = json.loads(Path(f"{p_pfx}_qc.json").read_text(encoding="utf-8"))
+                exp = pren_samples[name]
+                if not isinstance(exp, dict):
+                    self.fail(f"expected dict for prenatal sample {name}")
+                self.assertEqual(p_qc["prenatal"]["fetal_sex"], exp["fetal_sex"])
+                self.assertEqual(p_qc["prenatal"]["sca"]["call"], exp["sca_call"])
+                self.assertEqual(p_qc["prenatal"]["gestation"], exp["gestation"])
+                self.assertEqual(p_qc["cnv_summary"]["gain_calls"], exp["gain_calls"])
+                self.assertEqual(p_qc["cnv_summary"]["loss_calls"], exp["loss_calls"])
 
     def test_normalize_branch_zero_bio_dispersion(self) -> None:
         model = _zero_disp_branch_model(

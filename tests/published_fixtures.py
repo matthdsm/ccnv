@@ -1,104 +1,164 @@
-"""Published CRAM/FASTA fixtures downloaded on first functional-test run."""
+"""Testdata fixture resolver backed by ``copynumber-cnv-testdata``."""
 
+from __future__ import annotations
+
+import json
+import os
+import shutil
 import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-import pysam
-
 from ccnv.extract import run as extract
 from ccnv.models import ExtractConfig
 
 EXTRACT_FIXTURES = Path(__file__).parent / "fixtures" / "extract"
-_DATASETS = "https://raw.githubusercontent.com/nf-cmgg/test-datasets/wisecondorx/"
-PUBLISHED_CRAM_URL = f"{_DATASETS}data/genomics/homo_sapiens/illumina/cram/test.cram"
-PUBLISHED_CRAM2_URL = f"{_DATASETS}data/genomics/homo_sapiens/illumina/cram/test2.cram"
-PUBLISHED_FASTA_URL = (
-    f"{_DATASETS}data/genomics/homo_sapiens/genome/seq/"
-    "GCA_000001405.15_GRCh38_full_plus_hs38d1_analysis_set_chr21.fna"
+_TESTDATA_URL = (
+    "https://raw.githubusercontent.com/matthdsm/copynumber-cnv-testdata/main/"
 )
-PUBLISHED_CRAM = EXTRACT_FIXTURES / "test.cram"
-PUBLISHED_CRAM2 = EXTRACT_FIXTURES / "test2.cram"
-PUBLISHED_FASTA = (
-    EXTRACT_FIXTURES / "GCA_000001405.15_GRCh38_full_plus_hs38d1_analysis_set_chr21.fna"
-)
-CHR21_LENGTH = 46_709_983
-PUBLISHED_BIN_SIZE = 100_000
+_SIBLING_TESTDATA = Path(__file__).resolve().parents[2] / "copynumber-cnv-testdata"
+
+PUBLISHED_BIN_SIZE = 5_000
+PUBLISHED_CANONICAL_BINS = 12
+PUBLISHED_CANONICAL_CONTIGS: dict[str, int] = {
+    "chr1": 25_000,
+    "chr2": 12_345,
+    "chrX": 10_000,
+    "chrY": 10_000,
+}
+
+_INDEX_SUFFIXES: dict[str, tuple[str, ...]] = {
+    ".fa": (".fai",),
+    ".fna": (".fai",),
+    ".fasta": (".fai",),
+    ".cram": (".crai",),
+}
 
 
-def ensure_published_file(path: Path, url: str) -> Path:
-    """Download ``url`` to ``path`` unless cached, indexing ``.cram`` files when needed."""
+def _local_testdata_root() -> Path | None:
+    env_dir = os.environ.get("CCNV_TESTDATA_DIR")
+    if env_dir:
+        candidate = Path(env_dir).expanduser()
+        if candidate.is_dir():
+            return candidate
+    if _SIBLING_TESTDATA.is_dir():
+        return _SIBLING_TESTDATA
+    return None
 
-    if not (path.is_file() and path.stat().st_size > 0):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.tmp")
-        try:
-            with (
-                urllib.request.urlopen(url, timeout=120) as response,
-                tmp.open("wb") as handle,
-            ):
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    handle.write(chunk)
-        except urllib.error.URLError as error:
-            tmp.unlink(missing_ok=True)
-            raise unittest.SkipTest(f"could not download {url}: {error}") from error
-        tmp.replace(path)
-    if path.suffix == ".cram" and not Path(f"{path}.crai").is_file():
-        pysam.index(str(path))
-    return path
+
+def _download_file(dest: Path, url: str) -> Path:
+    if dest.is_file() and dest.stat().st_size > 0:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f"{dest.name}.tmp")
+    try:
+        with (
+            urllib.request.urlopen(url, timeout=120) as response,
+            tmp.open("wb") as handle,
+        ):
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+    except urllib.error.URLError as error:
+        tmp.unlink(missing_ok=True)
+        raise unittest.SkipTest(f"could not download {url}: {error}") from error
+    tmp.replace(dest)
+    return dest
+
+
+def ensure_testdata_file(
+    relpath: str,
+    *,
+    index_suffix: str | None = None,
+) -> Path:
+    """Resolve ``relpath`` from local ``copynumber-cnv-testdata`` or download and cache it."""
+    local_root = _local_testdata_root()
+    if local_root is not None:
+        local_file = local_root / relpath
+        if local_file.is_file():
+            return local_file
+
+    cached = EXTRACT_FIXTURES / "testdata" / relpath
+    _download_file(cached, f"{_TESTDATA_URL}{relpath}")
+
+    suffixes: tuple[str, ...] = (
+        (index_suffix,)
+        if index_suffix is not None
+        else _INDEX_SUFFIXES.get(cached.suffix.lower(), ())
+    )
+    for sfx in suffixes:
+        _download_file(
+            Path(f"{cached}{sfx}"),
+            f"{_TESTDATA_URL}{relpath}{sfx}",
+        )
+    return cached
+
+
+def load_testdata_truth(relpath: str) -> dict[str, object]:
+    """Load and decode a JSON ground-truth manifest from ``copynumber-cnv-testdata``."""
+    path = ensure_testdata_file(relpath)
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise TypeError(f"expected JSON object in {relpath}")
+    return loaded
 
 
 def ensure_published_fasta() -> Path:
-    """Return the cached chr21 FASTA, indexing it with pysam when needed."""
+    """Return the synthetic reference FASTA (with ``.fai`` index)."""
+    return ensure_testdata_file("extract/sample_data/synthetic_ref.fa")
 
-    fasta = ensure_published_file(PUBLISHED_FASTA, PUBLISHED_FASTA_URL)
-    if not Path(f"{fasta}.fai").is_file():
-        pysam.faidx(str(fasta))
-    return fasta
+
+def ensure_published_cram() -> Path:
+    """Return the synthetic paired-end CRAM (with ``.crai`` index)."""
+    return ensure_testdata_file("extract/sample_data/paired_end.cram")
+
+
+def ensure_published_bam() -> Path:
+    """Return the synthetic paired-end BAM (with ``.bai`` index)."""
+    return ensure_testdata_file(
+        "extract/sample_data/paired_end.bam", index_suffix=".bai"
+    )
 
 
 def extract_published_samples(root: Path) -> tuple[Path, Path]:
-    """Extract published CRAMs into sample Parquet under ``root``, reusing cache."""
-
-    import shutil
-
+    """Extract the synthetic paired-end CRAM and BAM into sample Parquets under ``root``."""
     fasta = ensure_published_fasta()
+    cram = ensure_published_cram()
+    bam = ensure_published_bam()
     cache_dir = EXTRACT_FIXTURES / ".cache_extracted"
     cache_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
-    for index, (cached, url) in enumerate(
-        (
-            (PUBLISHED_CRAM, PUBLISHED_CRAM_URL),
-            (PUBLISHED_CRAM2, PUBLISHED_CRAM2_URL),
-        ),
-        start=1,
+    for name, aln, ref_fa in (
+        ("synthetic_cram", cram, fasta),
+        ("synthetic_bam", bam, None),
     ):
-        cram = ensure_published_file(cached, url)
-        cached_sample = cache_dir / f"sample{index}.ccnv"
+        cached_sample = cache_dir / f"{name}.ccnv"
         valid = False
         if cached_sample.is_file() and cached_sample.stat().st_size > 0:
             try:
                 from ccnv.io.parquet import read_sample_buffers
                 from ccnv.models.exceptions import CcnvError
 
-                read_sample_buffers(cached_sample)
-                valid = True
+                bufs = read_sample_buffers(cached_sample)
+                valid = (
+                    bufs.meta.bin_size == PUBLISHED_BIN_SIZE
+                    and bufs.meta.contig_lengths == PUBLISHED_CANONICAL_CONTIGS
+                )
             except CcnvError, OSError:
                 valid = False
         if not valid:
             extract(
                 ExtractConfig(
-                    cram,
-                    cache_dir / f"sample{index}",
+                    aln,
+                    cache_dir / name,
                     PUBLISHED_BIN_SIZE,
-                    fasta=fasta,
+                    fasta=ref_fa,
                 )
             )
-        dest = root / f"sample{index}.ccnv"
+        dest = root / f"{name}.ccnv"
         if not dest.is_file() or dest.resolve() != cached_sample.resolve():
             root.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(cached_sample, dest)

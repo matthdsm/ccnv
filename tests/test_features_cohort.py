@@ -17,10 +17,9 @@ import pysam
 from helpers import make_sample_table, write_synthetic_sample
 from published_fixtures import (
     PUBLISHED_BIN_SIZE,
-    PUBLISHED_CRAM,
-    PUBLISHED_CRAM_URL,
+    PUBLISHED_CANONICAL_BINS,
+    ensure_published_cram,
     ensure_published_fasta,
-    ensure_published_file,
 )
 
 from ccnv.extract import extract_sample_table
@@ -754,12 +753,12 @@ class TestCohortDepthAndRebinning(unittest.TestCase):
             self.assertEqual(loaded.num_rows, table.num_rows)
             self.assertEqual(loaded.count.tolist(), [5, 10])
 
-        cram = ensure_published_file(PUBLISHED_CRAM, PUBLISHED_CRAM_URL)
+        cram = ensure_published_cram()
         fasta = ensure_published_fasta()
         cram_table = extract_sample_table(
             ExtractConfig(cram, Path("unused"), PUBLISHED_BIN_SIZE, fasta=fasta)
         )
-        self.assertEqual(cram_table.num_rows, 468)
+        self.assertEqual(cram_table.num_rows, PUBLISHED_CANONICAL_BINS)
         self.assertIn("frag_bands", cram_table.column_names)
         self.assertIn("endpoint_count", cram_table.column_names)
         self.assertIn("frag_gc_sum", cram_table.column_names)

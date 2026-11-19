@@ -13,12 +13,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pysam
 from published_fixtures import (
-    CHR21_LENGTH,
     PUBLISHED_BIN_SIZE,
-    PUBLISHED_CRAM,
-    PUBLISHED_CRAM_URL,
+    PUBLISHED_CANONICAL_CONTIGS,
+    ensure_published_bam,
+    ensure_published_cram,
     ensure_published_fasta,
-    ensure_published_file,
+    ensure_testdata_file,
+    load_testdata_truth,
 )
 from typer.testing import CliRunner
 
@@ -742,13 +743,30 @@ class TestEffectiveReadMetrics(unittest.TestCase):
 
 
 class TestExtractPublishedCram(unittest.TestCase):
-    def test_cli_extracts_published_chr21_cram(self) -> None:
-        cram = ensure_published_file(PUBLISHED_CRAM, PUBLISHED_CRAM_URL)
+    def test_cli_extracts_testdata_suite_with_format_and_filter_parity(self) -> None:
+        truth = load_testdata_truth("extract/sample_data/truth.json")
         fasta = ensure_published_fasta()
+        cram = ensure_published_cram()
+        bam = ensure_published_bam()
+        csi_bam = ensure_testdata_file(
+            "extract/sample_data/paired_end_csi.bam", index_suffix=".csi"
+        )
+        unidx_bam = ensure_testdata_file("extract/sample_data/paired_end_unindexed.bam")
+        se_bam = ensure_testdata_file(
+            "extract/sample_data/single_end.bam", index_suffix=".bai"
+        )
+        pf_bam = ensure_testdata_file(
+            "extract/sample_data/plain_contigs_filters.bam", index_suffix=".bai"
+        )
+        pe_exp = truth["paired_end_canonical"]
+        if not isinstance(pe_exp, dict):
+            self.fail("expected paired_end_canonical dict in truth.json")
 
+        runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmpdir:
-            prefix = Path(tmpdir) / "sample"
-            result = CliRunner().invoke(
+            root = Path(tmpdir)
+            cram_pfx = root / "pe_cram"
+            res = runner.invoke(
                 app,
                 [
                     "extract",
@@ -756,47 +774,95 @@ class TestExtractPublishedCram(unittest.TestCase):
                     "--fasta",
                     str(fasta),
                     "--prefix",
-                    str(prefix),
+                    str(cram_pfx),
                     "--bin-size",
                     str(PUBLISHED_BIN_SIZE),
+                    "-t",
+                    "2",
                 ],
             )
-            self.assertEqual(result.exit_code, 0, result.output)
-            table = _read_sample_table(parquet_path(prefix))
-            smeta = SampleMetadata.from_table(table)
+            self.assertEqual(res.exit_code, 0, res.output)
+            cram_tbl = _read_sample_table(parquet_path(cram_pfx))
+            smeta = SampleMetadata.from_table(cram_tbl)
             codes, names, starts, ends = reconstruct_sample_grid(smeta)
-            self.assertEqual(table.num_rows, 468)
-            self.assertEqual(names, ("chr21",))
-            self.assertEqual(int(codes.max()), 0)
+            self.assertEqual(cram_tbl.num_rows, pe_exp["num_rows"])
+            self.assertEqual(list(names), pe_exp["contig_order"])
             self.assertEqual(int(starts[0]), 0)
-            self.assertEqual(int(ends[-1]), CHR21_LENGTH)
-            self.assertGreater(sum(table.column("count").to_pylist()), 0)
-            self.assertEqual(smeta.contig_lengths, {"chr21": CHR21_LENGTH})
+            self.assertEqual(
+                int(ends[codes == 1][-1]), PUBLISHED_CANONICAL_CONTIGS["chr2"]
+            )
+            self.assertEqual(cram_tbl.column("count").to_pylist(), pe_exp["counts"])
+            self.assertEqual(smeta.contig_lengths, PUBLISHED_CANONICAL_CONTIGS)
             self.assertEqual(smeta.bin_size, PUBLISHED_BIN_SIZE)
-            self.assertEqual(smeta.qc["reads_kept"], 524_785)
-            self.assertEqual(smeta.qc["effective_reads_kept"], 524_785)
-            self.assertEqual(smeta.qc["autosomal_reads_kept"], 524_785)
-            self.assertEqual(smeta.qc["sex_reads_kept"], 0)
-
-            self.assertIn("frag_bands", table.column_names)
-            self.assertIn("paired_count", table.column_names)
-            self.assertIn("frag_len_sum", table.column_names)
-            self.assertIn("short_frag_count", table.column_names)
-            self.assertIn("endpoint_count", table.column_names)
-            self.assertIn("frag_gc_sum", table.column_names)
-            if table.schema.metadata is None:
-                self.fail("expected non-None table schema metadata")
-            self.assertIn(FRAGMENTOMICS_METADATA_KEY, table.schema.metadata)
+            self.assertEqual(smeta.qc, pe_exp["qc"])
+            self.assertIn(FRAGMENTOMICS_METADATA_KEY, cram_tbl.schema.metadata or {})
             frag_meta = FragmentomicsMetadata.from_dict(
                 json.loads(
-                    table.schema.metadata[FRAGMENTOMICS_METADATA_KEY].decode("utf-8")
+                    (cram_tbl.schema.metadata or {})[FRAGMENTOMICS_METADATA_KEY].decode(
+                        "utf-8"
+                    )
                 )
             )
             self.assertTrue(frag_meta.paired_end)
             self.assertGreater(frag_meta.total_paired_fragments, 0)
-            self.assertGreater(frag_meta.chromatosome_mode_bp, 50)
-            self.assertGreater(sum(table.column("endpoint_count").to_pylist()), 0)
-            self.assertGreater(sum(table.column("frag_gc_sum").to_pylist()), 0.0)
+            self.assertGreater(sum(cram_tbl.column("endpoint_count").to_pylist()), 0)
+            self.assertGreater(sum(cram_tbl.column("frag_gc_sum").to_pylist()), 0.0)
+
+            for path, thr in ((bam, 2), (csi_bam, 2), (unidx_bam, 1)):
+                other = extract_sample_table(
+                    ExtractConfig(
+                        path, root / "unused", PUBLISHED_BIN_SIZE, threads=thr
+                    )
+                )
+                self.assertTrue(cram_tbl.equals(other, check_metadata=False))
+                self.assertEqual(smeta, SampleMetadata.from_table(other))
+
+            with self.assertRaises(ExtractError):
+                extract_sample_table(
+                    ExtractConfig(
+                        unidx_bam, root / "unused", PUBLISHED_BIN_SIZE, threads=2
+                    )
+                )
+
+            se_tbl = extract_sample_table(
+                ExtractConfig(se_bam, root / "unused", PUBLISHED_BIN_SIZE, threads=2)
+            )
+            se_exp = truth["single_end_canonical"]
+            if not isinstance(se_exp, dict):
+                self.fail("expected single_end_canonical dict in truth.json")
+            self.assertFalse(SampleMetadata.from_table(se_tbl).paired_end)
+            self.assertEqual(se_tbl.column("count").to_pylist(), se_exp["counts"])
+            self.assertEqual(SampleMetadata.from_table(se_tbl).qc, se_exp["qc"])
+
+            pf_tbl = extract_sample_table(
+                ExtractConfig(pf_bam, root / "unused", PUBLISHED_BIN_SIZE, threads=2)
+            )
+            pf_exp = truth["plain_contigs_filters_default"]
+            if not isinstance(pf_exp, dict):
+                self.fail("expected plain_contigs_filters_default dict in truth.json")
+            self.assertEqual(
+                list(SampleMetadata.from_table(pf_tbl).contig_order),
+                pf_exp["contig_order"],
+            )
+            self.assertEqual(SampleMetadata.from_table(pf_tbl).qc, pf_exp["qc"])
+
+            pf_all = extract_sample_table(
+                ExtractConfig(
+                    pf_bam,
+                    root / "unused",
+                    PUBLISHED_BIN_SIZE,
+                    all_contigs=True,
+                    threads=2,
+                )
+            )
+            pf_all_exp = truth["plain_contigs_filters_all_contigs"]
+            if not isinstance(pf_all_exp, dict):
+                self.fail("expected plain_contigs_filters_all_contigs dict")
+            self.assertEqual(
+                list(SampleMetadata.from_table(pf_all).contig_order),
+                pf_all_exp["contig_order"],
+            )
+            self.assertEqual(SampleMetadata.from_table(pf_all).qc, pf_all_exp["qc"])
 
 
 if __name__ == "__main__":

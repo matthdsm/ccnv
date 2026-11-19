@@ -18,7 +18,8 @@ from helpers import (
     write_synthetic_sample,
 )
 from published_fixtures import (
-    PUBLISHED_CRAM,
+    PUBLISHED_BIN_SIZE,
+    ensure_published_cram,
     ensure_published_fasta,
     extract_published_samples,
 )
@@ -667,10 +668,11 @@ class TestPredictAlignmentInputs(unittest.TestCase):
                 ReferenceConfig(
                     entries=tuple(SamplesheetEntry(filepath=p) for p in (s1, s2)),
                     prefix=root / "cohort_ref",
-                    bin_size=100000,
+                    bin_size=PUBLISHED_BIN_SIZE,
                     min_cohort_size=2,
                 )
             )
+            cram = ensure_published_cram()
             fasta = ensure_published_fasta()
             with patch.object(
                 SampleBuffers,
@@ -678,7 +680,7 @@ class TestPredictAlignmentInputs(unittest.TestCase):
                 side_effect=AssertionError("must not materialize SAMPLE_SCHEMA table"),
             ):
                 inputs = load_inputs(
-                    PUBLISHED_CRAM,
+                    cram,
                     ref_path,
                     sex="autosomal",
                     mode="germline",
