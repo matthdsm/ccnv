@@ -54,9 +54,7 @@ def _sample_table(
     ends: list[int] | None = None,
     contig_lengths: dict[str, int] | None = None,
     bin_size: int = 100,
-    identity: object | None = None,
 ) -> pa.Table:
-    del identity
     return make_sample_table(
         counts,
         contigs=contigs,
@@ -77,13 +75,10 @@ def _make_sample_buffers(
     contig_lengths: dict[str, int],
     bin_size: int,
     counts: NDArray[np.uint32],
-    *,
-    sample_id: str = "S1",
 ) -> SampleBuffers:
     n = int(counts.size)
     z_u32 = np.zeros(n, dtype=np.uint32)
     total = int(np.sum(counts))
-    del sample_id
     meta = SampleMetadata(
         schema_version=SCHEMA_VERSION,
         coordinate_system=COORDINATE_SYSTEM,
@@ -295,9 +290,8 @@ class TestSexInference(unittest.TestCase):
                 starts=starts,
                 ends=ends,
                 contig_lengths=lengths,
-                identity={"id": f"s{index}"},
             )
-            for index, counts in enumerate(females + males)
+            for counts in females + males
         ]
         cohort = validate_cohort(tuple(tables))
         table = build_reference_table(
@@ -337,9 +331,8 @@ class TestSexInference(unittest.TestCase):
                 starts=[0, 0, 0],
                 ends=[100, 100, 100],
                 contig_lengths={"chr1": 100, "chrX": 100, "chrY": 100},
-                identity={"id": f"s{index}"},
             )
-            for index, counts in enumerate(females + males)
+            for counts in females + males
         ]
         table = build_reference_table(
             validate_cohort(tuple(tables)),
@@ -371,9 +364,8 @@ class TestSexInference(unittest.TestCase):
                 starts=[0, 0, 0],
                 ends=[100, 100, 100],
                 contig_lengths={"1": 100, "X": 100, "Y": 100},
-                identity={"id": f"s{index}"},
             )
-            for index, counts in enumerate(females + males)
+            for counts in females + males
         ]
         table = build_reference_table(
             validate_cohort(tuple(tables)),
@@ -403,9 +395,8 @@ class TestSexInference(unittest.TestCase):
                 starts=[0, 0],
                 ends=[100, 100],
                 contig_lengths={"chr1": 100, "scaffold": 100},
-                identity={"id": f"s{index}"},
             )
-            for index in range(4)
+            for _ in range(4)
         ]
         table = build_reference_table(
             validate_cohort(tuple(tables)),
@@ -435,9 +426,8 @@ class TestSexInference(unittest.TestCase):
                 starts=[0, 0],
                 ends=[100, 100],
                 contig_lengths={"chr1": 100, "chrY": 100},
-                identity={"id": f"s{index}"},
             )
-            for index in range(4)
+            for _ in range(4)
         ]
         cohort = validate_cohort(tuple(tables))
         config = ReferenceConfig(
@@ -460,9 +450,8 @@ class TestSexInference(unittest.TestCase):
                 starts=[0, 0],
                 ends=[100, 100],
                 contig_lengths={"chr1": 100, "chrY": 100},
-                identity={"id": f"s{index}"},
             )
-            for index in range(4)
+            for _ in range(4)
         ]
         config = ReferenceConfig(
             entries=tuple(
@@ -492,9 +481,8 @@ class TestSexInference(unittest.TestCase):
                 starts=[0, 0],
                 ends=[100, 100],
                 contig_lengths={"chr1": 100, "chrY": 100},
-                identity={"id": f"s{index}"},
             )
-            for index, values in enumerate(counts)
+            for values in counts
         ]
         table = build_reference_table(
             validate_cohort(tuple(tables)),
@@ -542,7 +530,6 @@ class TestSexInference(unittest.TestCase):
                         starts=starts,
                         ends=ends,
                         contig_lengths=lengths,
-                        identity={"id": f"s{index}"},
                     ),
                 )
                 for index, counts in enumerate(female_counts + male_counts)
@@ -634,11 +621,7 @@ class TestSexInference(unittest.TestCase):
                     rng.poisson(50 if is_male else 100, size=20).astype(np.uint32),
                 ]
             )
-            tables.append(
-                _make_sample_buffers(
-                    lengths, 5000, counts, sample_id=f"NX{idx}"
-                ).to_table()
-            )
+            tables.append(_make_sample_buffers(lengths, 5000, counts).to_table())
             entries.append(
                 SamplesheetEntry(
                     filepath=Path(f"nx_{idx}.ccnv"), sex="M" if is_male else "F"

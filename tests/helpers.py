@@ -191,7 +191,6 @@ def make_sample_buffers(
     endpoint_counts: Sequence[int] | NDArray[np.uint32] | None = None,
     frag_gc_sums: Sequence[float] | NDArray[np.float32] | None = None,
     fragmentomics: M.FragmentomicsMetadata | None = None,
-    sample_id: str = "synthetic_sample",
     qc: Mapping[str, object] | None = None,
     filters: Mapping[str, object] | None = None,
     kappa_frag: NDArray[np.float32] | None = None,

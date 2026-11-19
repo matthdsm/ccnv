@@ -137,7 +137,6 @@ def _make_sex_sample_buffers(
     bin_size: int,
     counts: NDArray[np.uint32],
     *,
-    sample_id: str = "S1",
     with_fragmentomics: bool = False,
     fetal_like: bool = False,
 ) -> SampleBuffers:
@@ -189,7 +188,6 @@ def _make_sex_sample_buffers(
             end_motif_counts=[10] * 256,
         )
 
-    del sample_id
     meta = SampleMetadata(
         schema_version=SCHEMA_VERSION,
         coordinate_system=COORDINATE_SYSTEM,
@@ -719,9 +717,7 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
                 counts = np.concatenate([c1, c2, cx, cy])
                 s_path = tmp / f"germ_{idx}.ccnv"
                 write_sample_parquet(
-                    _make_sex_sample_buffers(
-                        lengths, bin_size, counts, sample_id=f"G{idx}"
-                    ).to_table(),
+                    _make_sex_sample_buffers(lengths, bin_size, counts).to_table(),
                     s_path,
                 )
                 g_paths.append(s_path)
@@ -788,7 +784,6 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
                         lengths,
                         bin_size,
                         counts,
-                        sample_id=f"P{idx}",
                         with_fragmentomics=True,
                         fetal_like=is_male_fetus,
                     ).to_table(),

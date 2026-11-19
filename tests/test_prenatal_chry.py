@@ -91,9 +91,7 @@ class TestNormalizePrenatalChrYUnit(unittest.TestCase):
                 "chrY": 200.0 * (0.005 + 0.5 * (ff or 0.0)) if is_male else 1.0,
             }
             cls.sample_tables.append(
-                _build_synthetic_sample(
-                    cls.contig_lengths, counts, 5000, f"s{i}", 0.2, 100 + i
-                )
+                _build_synthetic_sample(cls.contig_lengths, counts, 5000, 0.2, 100 + i)
             )
             cls.entries.append(
                 SamplesheetEntry(
@@ -124,7 +122,7 @@ class TestNormalizePrenatalChrYUnit(unittest.TestCase):
         def _mk(cx: float, cy: float, s: int) -> SampleBuffers:
             c = {"chr1": 400.0, "chr2": 400.0, "chrX": cx, "chrY": cy}
             return SampleBuffers.from_table(
-                _build_synthetic_sample(self.contig_lengths, c, 5000, f"s{s}", 0.2, s)
+                _build_synthetic_sample(self.contig_lengths, c, 5000, 0.2, s)
             )
 
         ffy_ref = filter_reference_branches(ref_tbl, (BRANCH_PRENATAL_FFY,))
@@ -252,7 +250,7 @@ class TestNormalizePrenatalChrYUnit(unittest.TestCase):
                     rng.poisson(30.0 * (0.001 + 0.5 * ff) if is_m else 0.03, 1000),
                 ]
             ).astype(np.uint32)
-            cohort.append(_make_sample_buffers(lens, 5000, c, sample_id=f"c{i}"))
+            cohort.append(_make_sample_buffers(lens, 5000, c))
             entries.append(
                 SamplesheetEntry(
                     filepath=Path(f"c{i}.ccnv"),
@@ -275,7 +273,7 @@ class TestNormalizePrenatalChrYUnit(unittest.TestCase):
                 rng.poisson(66.0 * (0.001 + 0.051), 1000),
             ]
         ).astype(np.uint32)
-        sb = _make_sample_buffers(lens, 5000, c_test, sample_id="xy_jitter")
+        sb = _make_sample_buffers(lens, 5000, c_test)
         pr = FetalFractionResult(
             fetal_sex="M",
             ffy=0.102,
@@ -325,7 +323,7 @@ class TestNormalizePrenatalChrYUnit(unittest.TestCase):
                     rng.poisson(16.0 * (0.001 + 0.5 * ff) if is_m else 0.02, 800),
                 ]
             ).astype(np.uint32)
-            cohort.append(_make_sample_buffers(lens, 5000, c, sample_id=f"lp{i}"))
+            cohort.append(_make_sample_buffers(lens, 5000, c))
             entries.append(
                 SamplesheetEntry(
                     filepath=Path(f"lp{i}.ccnv"),
@@ -350,7 +348,7 @@ class TestNormalizePrenatalChrYUnit(unittest.TestCase):
                 rng.poisson(d_lp * (bg_ref + 0.05), 800),
             ]
         ).astype(np.uint32)
-        sb_xyy = _make_sample_buffers(lens, 5000, c_xyy, sample_id="lp_xyy")
+        sb_xyy = _make_sample_buffers(lens, 5000, c_xyy)
         pr_xyy = FetalFractionResult(
             fetal_sex="M",
             ffy=0.10,
@@ -403,7 +401,6 @@ class TestNormalizePrenatalChrYUnit(unittest.TestCase):
                     cy_yq,
                 ]
             ).astype(np.uint32),
-            sample_id="yq_del",
         )
         pr_yq = predict_prenatal(sb_yq, ref_tbl, pm)
         self.assertEqual(pr_yq.fetal_sex, "M")
@@ -430,7 +427,6 @@ class TestNormalizePrenatalChrYUnit(unittest.TestCase):
                     cy_az,
                 ]
             ).astype(np.uint32),
-            sample_id="azfa_lp",
         )
         pr_az = predict_prenatal(sb_az, ref_tbl, pm)
         br_az = normalize_prenatal_chry(sb_az, ref_tbl, pm, pr_az)
@@ -466,9 +462,7 @@ class TestNormalizePrenatalChrYUnit(unittest.TestCase):
                     rng.poisson(cy_r),
                 ]
             ).astype(np.uint32)
-            pal_tables.append(
-                _make_sample_buffers(self.contig_lengths, 5000, c, sample_id=f"p{i}")
-            )
+            pal_tables.append(_make_sample_buffers(self.contig_lengths, 5000, c))
 
         pm_pal, fits_pal, _ = fit_prenatal_models(
             pal_tables, self.entries, prenatal_bin_size=100_000, seed=42
@@ -499,9 +493,7 @@ class TestNormalizePrenatalChrYUnit(unittest.TestCase):
                 np.full(60, 11, dtype=np.uint32),
             ]
         )
-        sb_gc = _make_sample_buffers(
-            self.contig_lengths, 5000, flat_c, sample_id="gc_flat"
-        )
+        sb_gc = _make_sample_buffers(self.contig_lengths, 5000, flat_c)
         _, (auto_fit, ffy_fit), _ = fit_prenatal_models(
             self.sample_tables, self.entries, prenatal_bin_size=100_000, seed=42
         )
@@ -555,7 +547,7 @@ class TestPrenatalChrYDeliverables(unittest.TestCase):
         s_path = self.root / f"{name}.ccnv"
         counts = {"chr1": c_auto, "chr2": c_auto, "chrX": c_x, "chrY": c_y}
         tbl = _build_synthetic_sample(
-            self.contig_lengths, counts, 5000, name, 0.05, seed, cnv
+            self.contig_lengths, counts, 5000, 0.05, seed, cnv
         )
         write_sample_parquet(tbl, s_path)
         return run_predict(
@@ -656,7 +648,6 @@ class TestPrenatalChrYDeliverables(unittest.TestCase):
                 no_y_lens,
                 {"chr1": 100.0, "chr2": 100.0, "chrX": 95.0},
                 5000,
-                "no_y",
                 0.1,
                 701,
             ),
@@ -672,7 +663,6 @@ class TestPrenatalChrYDeliverables(unittest.TestCase):
                 bad_y_lens,
                 {"chr1": 100.0, "chr2": 100.0, "chrX": 95.0, "chrY": 6.0},
                 5000,
-                "bad_y",
                 0.1,
                 702,
             ),

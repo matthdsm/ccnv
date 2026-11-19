@@ -431,6 +431,28 @@ class TestCalibratedPeltAndCalling(unittest.TestCase):
         infl = estimate_dyadic_inflation(wavy_z, usable_all)
         self.assertGreater(float(infl[-1]), 8.0)
 
+        # Verify dyadic inflation suppresses spurious megabase wave calls in segment_and_score_genome
+        bin_size = 1_000
+        starts = np.arange(n_bins, dtype=np.int64) * bin_size
+        ends = starts + bin_size
+        ratios = 0.05 * wavy_z
+        weights = np.full(n_bins, 1.0 / (0.05**2), dtype=np.float64)
+        segs = segment_and_score_genome(
+            {
+                "chr1": ContigSegmentationInput(
+                    starts=starts,
+                    ends=ends,
+                    ratios=ratios,
+                    weights=weights,
+                    contig_length=n_bins * bin_size,
+                    zscores=wavy_z,
+                )
+            },
+            mode="germline",
+            z_threshold=3.0,
+        )
+        self.assertEqual([s for s in segs if s.call is not None], [])
+
     def test_germline_integer_cn_bayes_factor_rejects_cn_203_high_depth_ripple(
         self,
     ) -> None:

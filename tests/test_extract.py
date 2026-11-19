@@ -20,6 +20,7 @@ from published_fixtures import (
     ensure_published_fasta,
     ensure_testdata_file,
     load_testdata_truth,
+    require_dict,
 )
 from typer.testing import CliRunner
 
@@ -758,9 +759,7 @@ class TestExtractPublishedCram(unittest.TestCase):
         pf_bam = ensure_testdata_file(
             "extract/sample_data/plain_contigs_filters.bam", index_suffix=".bai"
         )
-        pe_exp = truth["paired_end_canonical"]
-        if not isinstance(pe_exp, dict):
-            self.fail("expected paired_end_canonical dict in truth.json")
+        pe_exp = require_dict(truth, "paired_end_canonical")
 
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -824,45 +823,57 @@ class TestExtractPublishedCram(unittest.TestCase):
                     )
                 )
 
-            se_tbl = extract_sample_table(
-                ExtractConfig(se_bam, root / "unused", PUBLISHED_BIN_SIZE, threads=2)
+            relaxed_filters = ReadFilters(
+                min_mapping_quality=0,
+                exclude_secondary=False,
+                exclude_supplementary=False,
+                exclude_duplicates=False,
+                require_proper_pair=False,
             )
-            se_exp = truth["single_end_canonical"]
-            if not isinstance(se_exp, dict):
-                self.fail("expected single_end_canonical dict in truth.json")
-            self.assertFalse(SampleMetadata.from_table(se_tbl).paired_end)
-            self.assertEqual(se_tbl.column("count").to_pylist(), se_exp["counts"])
-            self.assertEqual(SampleMetadata.from_table(se_tbl).qc, se_exp["qc"])
-
-            pf_tbl = extract_sample_table(
-                ExtractConfig(pf_bam, root / "unused", PUBLISHED_BIN_SIZE, threads=2)
-            )
-            pf_exp = truth["plain_contigs_filters_default"]
-            if not isinstance(pf_exp, dict):
-                self.fail("expected plain_contigs_filters_default dict in truth.json")
-            self.assertEqual(
-                list(SampleMetadata.from_table(pf_tbl).contig_order),
-                pf_exp["contig_order"],
-            )
-            self.assertEqual(SampleMetadata.from_table(pf_tbl).qc, pf_exp["qc"])
-
-            pf_all = extract_sample_table(
-                ExtractConfig(
+            filter_cases = (
+                ("paired_end_all_contigs", bam, True, ReadFilters(), True),
+                ("single_end_canonical", se_bam, False, ReadFilters(), False),
+                ("plain_contigs_filters_default", pf_bam, False, ReadFilters(), True),
+                (
+                    "plain_contigs_filters_all_contigs",
                     pf_bam,
-                    root / "unused",
-                    PUBLISHED_BIN_SIZE,
-                    all_contigs=True,
-                    threads=2,
-                )
+                    True,
+                    ReadFilters(),
+                    True,
+                ),
+                (
+                    "plain_contigs_filters_min_mapq_10",
+                    pf_bam,
+                    False,
+                    ReadFilters(min_mapping_quality=10),
+                    True,
+                ),
+                (
+                    "plain_contigs_filters_relaxed",
+                    pf_bam,
+                    False,
+                    relaxed_filters,
+                    True,
+                ),
             )
-            pf_all_exp = truth["plain_contigs_filters_all_contigs"]
-            if not isinstance(pf_all_exp, dict):
-                self.fail("expected plain_contigs_filters_all_contigs dict")
-            self.assertEqual(
-                list(SampleMetadata.from_table(pf_all).contig_order),
-                pf_all_exp["contig_order"],
-            )
-            self.assertEqual(SampleMetadata.from_table(pf_all).qc, pf_all_exp["qc"])
+            for key, aln_p, all_c, flt, exp_pe in filter_cases:
+                with self.subTest(case=key):
+                    exp = require_dict(truth, key)
+                    tbl = extract_sample_table(
+                        ExtractConfig(
+                            aln_p,
+                            root / "unused",
+                            PUBLISHED_BIN_SIZE,
+                            all_contigs=all_c,
+                            filters=flt,
+                            threads=2,
+                        )
+                    )
+                    meta = SampleMetadata.from_table(tbl)
+                    self.assertEqual(meta.paired_end, exp_pe)
+                    self.assertEqual(list(meta.contig_order), exp["contig_order"])
+                    self.assertEqual(tbl.column("count").to_pylist(), exp["counts"])
+                    self.assertEqual(meta.qc, exp["qc"])
 
 
 if __name__ == "__main__":

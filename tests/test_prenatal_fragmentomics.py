@@ -206,7 +206,6 @@ def _make_buffers(
     bands: NDArray[np.uint32] | None = None,
     *,
     frag_meta: FragmentomicsMetadata | None = None,
-    sample_id: str = "S1",
 ) -> SampleBuffers:
     n, n_kept = counts.size, max(1000, int(np.sum(counts)))
     qc = {
@@ -215,7 +214,6 @@ def _make_buffers(
         "autosomal_reads_kept": n_kept,
         "sex_reads_kept": 0,
     }
-    del sample_id
     meta = SampleMetadata(
         bin_size=bin_size,
         contig_order=tuple(contig_lengths.keys()),

@@ -437,10 +437,10 @@ class TestParquetIO(unittest.TestCase):
             tmp = Path(tmpdir)
             lengths = {"chr1": 10_000}
             bufs_v1 = make_sample_buffers(
-                lengths, 5000, np.array([100, 120], dtype=np.uint32), sample_id="V1"
+                lengths, 5000, np.array([100, 120], dtype=np.uint32)
             )
             bufs_v2 = make_sample_buffers(
-                lengths, 5000, np.array([999, 888], dtype=np.uint32), sample_id="V2"
+                lengths, 5000, np.array([999, 888], dtype=np.uint32)
             )
             s_path = tmp / "sample.ccnv"
             write_sample_parquet(bufs_v1.to_table(), s_path)

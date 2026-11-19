@@ -87,10 +87,8 @@ def _make_sample_buffers(
     bin_size: int,
     counts: NDArray[np.float64],
     bands: NDArray[np.uint32] | None,
-    sample_id: str = "S1",
     qc_reads: int = 10_000,
 ) -> SampleBuffers:
-    del sample_id
     meta = SampleMetadata(
         schema_version=SCHEMA_VERSION,
         coordinate_system=COORDINATE_SYSTEM,
@@ -420,7 +418,7 @@ class TestNormalization(unittest.TestCase):
                 )
                 counts = np.sum(bands, axis=1, dtype=np.float64)
                 sb = _make_sample_buffers(
-                    contig_lengths, 5000, counts, bands, f"s_{s_idx}", qc_reads=10_000
+                    contig_lengths, 5000, counts, bands, qc_reads=10_000
                 )
                 p = Path(tmp) / f"s_{s_idx}.ccnv"
                 write_sample_parquet(sb.to_table(), p)
@@ -510,9 +508,7 @@ class TestNormalization(unittest.TestCase):
                     bands[2:, 0] = 20
                     bands[2:, 1] = 20
                 cnt = np.sum(bands, axis=1).astype(np.float64)
-                bufs = _make_sample_buffers(
-                    lengths, 5000, cnt, bands, sample_id=f"S{idx}", qc_reads=1000
-                )
+                bufs = _make_sample_buffers(lengths, 5000, cnt, bands, qc_reads=1000)
                 p = tmp_dir / f"s{idx}.ccnv"
                 write_sample_parquet(bufs.to_table(), p)
                 entries.append(

@@ -8,7 +8,10 @@ import shutil
 import unittest
 import urllib.error
 import urllib.request
-from pathlib import Path
+from collections.abc import Mapping
+from pathlib import Path, PurePosixPath
+
+import yaml
 
 from ccnv.extract import run as extract
 from ccnv.models import ExtractConfig
@@ -99,6 +102,26 @@ def ensure_testdata_file(
     return cached
 
 
+def ensure_testdata_samplesheet(relpath: str) -> Path:
+    """Resolve a testdata YAML/JSON samplesheet and ensure every relative sample file."""
+    sheet_path = ensure_testdata_file(relpath)
+    raw = (
+        json.loads(sheet_path.read_text(encoding="utf-8"))
+        if sheet_path.suffix.lower() == ".json"
+        else yaml.safe_load(sheet_path.read_text(encoding="utf-8"))
+    )
+    if not isinstance(raw, list):
+        raise TypeError(f"expected list in samplesheet {relpath}")
+    parent = PurePosixPath(relpath).parent
+    for entry in raw:
+        if isinstance(entry, Mapping):
+            fp = entry.get("filepath")
+            if isinstance(fp, str) and fp:
+                rel_sample = str(parent / fp) if str(parent) != "." else fp
+                ensure_testdata_file(rel_sample)
+    return sheet_path
+
+
 def load_testdata_truth(relpath: str) -> dict[str, object]:
     """Load and decode a JSON ground-truth manifest from ``copynumber-cnv-testdata``."""
     path = ensure_testdata_file(relpath)
@@ -106,6 +129,30 @@ def load_testdata_truth(relpath: str) -> dict[str, object]:
     if not isinstance(loaded, dict):
         raise TypeError(f"expected JSON object in {relpath}")
     return loaded
+
+
+def require_dict(mapping: Mapping[str, object], key: str) -> dict[str, object]:
+    """Extract a required nested JSON object from ``mapping`` with strict type narrowing."""
+    value = mapping.get(key)
+    if not isinstance(value, dict):
+        raise TypeError(f"expected dict for key {key!r}, got {type(value).__name__}")
+    return value
+
+
+def require_float(mapping: Mapping[str, object], key: str) -> float:
+    """Extract a required numeric JSON field as ``float`` with strict type narrowing."""
+    value = mapping.get(key)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TypeError(f"expected number for key {key!r}, got {type(value).__name__}")
+    return float(value)
+
+
+def optional_str_list(mapping: Mapping[str, object], key: str) -> list[str]:
+    """Extract an optional JSON list of strings with strict type narrowing."""
+    value = mapping.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise TypeError(f"expected list[str] for key {key!r}, got {value!r}")
+    return list(value)
 
 
 def ensure_published_fasta() -> Path:

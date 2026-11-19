@@ -67,7 +67,6 @@ def _build_synthetic_sample(
     contig_lengths: dict[str, int],
     contig_mean_counts: dict[str, float],
     bin_size: int = 5000,
-    sample_id: str = "sample",
     noise_scale: float = 0.5,
     seed: int = 42,
     cnv_region: tuple[str, int, int, float] | None = None,
@@ -92,7 +91,6 @@ def _build_synthetic_sample(
         s_list.extend(starts.tolist())
         e_list.extend(ends.tolist())
         counts_list.extend(raw_c.tolist())
-    del sample_id
     return make_sample_table(
         counts_list,
         contigs=c_list,
@@ -108,9 +106,7 @@ def _make_sample_buffers(
     bin_size: int,
     counts: NDArray[np.uint32] | NDArray[np.float64],
     bands: NDArray[np.uint32] | None = None,
-    sample_id: str = "s",
 ) -> SampleBuffers:
-    del sample_id
     meta = SampleMetadata(
         schema_version=SCHEMA_VERSION,
         coordinate_system=COORDINATE_SYSTEM,
@@ -322,7 +318,6 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
                     self.contig_lengths,
                     counts,
                     bin_size=5000,
-                    sample_id=f"sample_{i}",
                     noise_scale=0.1,
                     seed=100 + i,
                 )
@@ -473,7 +468,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
             "chrY": 5.0,
         }
         sample_with_extra = _build_synthetic_sample(
-            sample_lengths, counts, bin_size=5000, sample_id="sample_extra"
+            sample_lengths, counts, bin_size=5000
         )
         res = predict_prenatal(sample_with_extra, ref_table, meta)
         self.assertEqual(res.fetal_sex, "M")
@@ -491,7 +486,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         sample_lengths = {k: 200_000 for k in ("chr1", "chr2", "chrX", "chrY")}
         counts = {"chr1": 100.0, "chr2": 100.0, "chrX": 95.0, "chrY": 5.0}
         sample_short_chry = _build_synthetic_sample(
-            sample_lengths, counts, bin_size=5000, sample_id="sample_short_chry"
+            sample_lengths, counts, bin_size=5000
         )
         res = predict_prenatal(sample_short_chry, ref_table, meta)
         self.assertEqual(res.fetal_sex, "M")
@@ -598,9 +593,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
             counts = np.sum(bands, axis=1, dtype=np.float64)
             if not is_m:
                 counts[120:] = 0.0
-            samples.append(
-                _make_sample_buffers(contig_lengths, 5000, counts, bands, f"p_{idx}")
-            )
+            samples.append(_make_sample_buffers(contig_lengths, 5000, counts, bands))
             entries.append(
                 SamplesheetEntry(
                     Path(f"p_{idx}.ccnv"),
@@ -611,12 +604,13 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         p_meta, p_fits, _ = fit_prenatal_models(
             samples, entries, prenatal_bin_size=100_000, seed=42
         )
-        linear_meta = replace(
-            p_meta,
-            ffa_logit_mode=False,
-            olm_weights=[0.0] * len(p_meta.olm_weights),
-            olm_bias=0.1234,
-        )
+        # Exercise linear (non-logit) FFA mode with non-zero weights and verify
+        # both linearity (scaling weights doubles deviation from bias) and clipping.
+        w_nz = [0.05] + [0.0] * (len(p_meta.olm_weights) - 1)
+        w_2x = [0.10] + [0.0] * (len(p_meta.olm_weights) - 1)
+        bias = 0.25
+        meta_1x = replace(p_meta, ffa_logit_mode=False, olm_weights=w_nz, olm_bias=bias)
+        meta_2x = replace(p_meta, ffa_logit_mode=False, olm_weights=w_2x, olm_bias=bias)
         ref_meta = ReferenceMetadata(
             bin_size=5000,
             contig_lengths=contig_lengths,
@@ -627,15 +621,19 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
             pca_components=1,
             mode="prenatal",
             prenatal_bin_size=100_000,
-            prenatal=linear_meta,
+            prenatal=meta_1x,
         )
         ref_tbl = assemble_reference_table(
             p_fits,
             contig_order=tuple(contig_lengths.keys()),
             metadata=ref_meta.build_arrow_metadata(),
         )
-        pred = predict_prenatal(samples[0], ref_tbl, linear_meta)
-        self.assertAlmostEqual(pred.ffa, 0.1234, places=6)
+        pred_1x = predict_prenatal(samples[0], ref_tbl, meta_1x)
+        pred_2x = predict_prenatal(samples[0], ref_tbl, meta_2x)
+        delta_1x = pred_1x.ffa - bias
+        delta_2x = pred_2x.ffa - bias
+        self.assertGreater(abs(delta_1x), 1e-4)
+        self.assertAlmostEqual(delta_2x, 2.0 * delta_1x, places=6)
 
     def test_predict_prenatal_twins_and_fm_chry_normalization(self) -> None:
         meta, (auto_fit, ffy_fit), _ = fit_prenatal_models(
@@ -667,9 +665,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
             "chrY": 400.0 * (0.005 + 0.5 * 0.08),
         }
         fm_bufs = SampleBuffers.from_table(
-            _build_synthetic_sample(
-                self.contig_lengths, fm_counts, 5000, "fm_twin", 0.05, 801
-            )
+            _build_synthetic_sample(self.contig_lengths, fm_counts, 5000, 0.05, 801)
         )
         res_fm_auto = predict_prenatal(fm_bufs, ref_tbl, fm_meta, twins=False)
         self.assertIsNotNone(res_fm_auto.twin)
@@ -756,9 +752,7 @@ class TestPrenatalModelTrainingAndInference(unittest.TestCase):
         )
         xo_counts = {"chr1": 400.0, "chr2": 400.0, "chrX": 380.0, "chrY": 0.5}
         xo_bufs = SampleBuffers.from_table(
-            _build_synthetic_sample(
-                self.contig_lengths, xo_counts, 5000, "xo_sample", 0.05, 902
-            )
+            _build_synthetic_sample(self.contig_lengths, xo_counts, 5000, 0.05, 902)
         )
         res_xo = predict_prenatal(
             xo_bufs,
@@ -859,9 +853,7 @@ def _setup_synthetic_cohort_and_references(
         }
         s_path = sample_dir / f"cohort_{i}.ccnv"
         write_sample_parquet(
-            _build_synthetic_sample(
-                contig_lengths, counts, 5000, f"cohort_{i}", 0.1, 200 + i
-            ),
+            _build_synthetic_sample(contig_lengths, counts, 5000, 0.1, 200 + i),
             s_path,
         )
         entries_data.append(
@@ -890,7 +882,6 @@ def _setup_synthetic_cohort_and_references(
         contig_lengths,
         {"chr1": 100.0, "chr2": 100.0, "chrX": 130.625, "chrY": 6.875},
         5000,
-        "test_male_sample",
         0.1,
         999,
         ("chr1", 100_000, 200_000, 2.5),
