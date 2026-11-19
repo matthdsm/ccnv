@@ -148,7 +148,6 @@ def _make_paired_cohort_files(
             ends=ends,
             contig_lengths=cl,
             bin_size=bin_size,
-            identity={"id": f"s_{idx:02d}"},
             fragment_lengths=frag_lens,
             endpoint_counts=ep,
         )
@@ -210,7 +209,6 @@ class TestRebin(unittest.TestCase):
             [5, 5, 10, 10],
             contig_lengths={"chr1": 200},
             bin_size=50,
-            identity={"id": "s1"},
         )
         rebinned_bufs = rebin_sample_buffers(
             SampleBuffers.from_table(table), target_bin_size=100
@@ -340,9 +338,8 @@ class TestCohortCompatibility(unittest.TestCase):
                 starts=starts,
                 ends=ends,
                 contig_lengths=lengths,
-                identity={"id": f"s{index}"},
             )
-            for index in range(3)
+            for _ in range(3)
         ]
         cohort = validate_cohort(tuple(tables))
         self.assertEqual(cohort.counts.shape, (3, 3))

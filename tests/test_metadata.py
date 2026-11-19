@@ -162,7 +162,6 @@ class TestMetadataContracts(unittest.TestCase):
                 contig_lengths={"chr1": 200},
                 values={
                     "schema_version": "9.9.9",
-                    "sample_identities": [],
                     "model": {"branches": ["autosomal"]},
                 },
             )
@@ -175,7 +174,6 @@ class TestMetadataContracts(unittest.TestCase):
                 contig_lengths={"chr1": 200},
                 values={
                     "schema_version": "1.0.0",
-                    "sample_identities": [],
                     "model": {"branches": ["autosomal"]},
                 },
             )
@@ -250,7 +248,6 @@ class TestMetadataContracts(unittest.TestCase):
                 contig_lengths={"chr1": 200},
                 values={
                     "schema_version": "2.0.0",
-                    "sample_identities": [],
                     "model": {"branches": ["autosomal"]},
                     "prenatal": {},
                 },
@@ -348,8 +345,6 @@ class TestMetadataContracts(unittest.TestCase):
                 bin_size=0,
                 contig_lengths={"chr1": 100},
                 contig_order=("chr1",),
-                source_identity={},
-                reference_identity={},
                 qc={},
                 filters={},
             )
@@ -368,8 +363,6 @@ class TestMetadataContracts(unittest.TestCase):
                 bin_size=0,
                 contig_lengths={"chr1": 10_000},
                 contig_order=("chr1",),
-                source_identity={},
-                reference_identity={},
                 qc={},
                 filters={},
             )
@@ -378,8 +371,6 @@ class TestMetadataContracts(unittest.TestCase):
                 bin_size=True,
                 contig_lengths={"chr1": 10_000},
                 contig_order=("chr1",),
-                source_identity={},
-                reference_identity={},
                 qc={},
                 filters={},
             )
@@ -388,8 +379,6 @@ class TestMetadataContracts(unittest.TestCase):
                 bin_size=5_000,
                 contig_lengths={"chr1": 0},
                 contig_order=("chr1",),
-                source_identity={},
-                reference_identity={},
                 qc={},
                 filters={},
             )
@@ -398,8 +387,6 @@ class TestMetadataContracts(unittest.TestCase):
                 bin_size=5_000,
                 contig_lengths={"chr1": 10_000},
                 contig_order=("chr2",),
-                source_identity={},
-                reference_identity={},
                 qc={},
                 filters={},
             )
@@ -410,8 +397,6 @@ class TestMetadataContracts(unittest.TestCase):
                 contig_lengths={"chr1": 5_000},
                 values={
                     "bin_size": 5_000,
-                    "source_identity": {},
-                    "reference_identity": {},
                     "qc": {},
                     "filters": asdict(ReadFilters()),
                 },
@@ -446,7 +431,7 @@ class TestMetadataContracts(unittest.TestCase):
                 "branches": ["autosomal"],
                 "pca_components": 1,
             },
-            sample_identities=["s1", "s2"],
+            sample_count=2,
         )
         ref_dict = decode_metadata(base_ref.schema.metadata)
         model_obj = ref_dict["model"]
@@ -456,6 +441,7 @@ class TestMetadataContracts(unittest.TestCase):
             ("pca_components", "five"),
             ("min_mappability", "high"),
             ("max_batch_memory_mb", "many"),
+            ("sample_count", "two"),
         ):
             corrupt_ref_dict = {
                 **ref_dict,
@@ -479,8 +465,6 @@ class TestMetadataContracts(unittest.TestCase):
                 bin_size=5000,
                 contig_order=("chr1",),
                 contig_lengths={"chr1": 5000},
-                source_identity={"id": "s"},
-                reference_identity={"name": "ref"},
                 filters={"min_mapping_quality": 1},
                 qc={"effective_reads_examined": 1, "effective_reads_kept": 1},
             )

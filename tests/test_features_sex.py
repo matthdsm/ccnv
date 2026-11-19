@@ -107,7 +107,6 @@ def _simulate_human_sex_cohort(
         ends=ends_arr,
         contig_lengths=contig_lengths,
         bin_size=bin_size,
-        identities=tuple({"id": f"s_{i}"} for i in range(n_samples)),
         paths=tuple(Path(f"s_{i}.ccnv") for i in range(n_samples)),
     )
     exposure = compute_bin_exposure(starts_arr, ends_arr, bin_size)
@@ -130,7 +129,6 @@ def _cohort_sample_table(cohort: Cohort, sample_idx: int) -> pa.Table:
         ends=cohort.ends.tolist(),
         contig_lengths=cohort.contig_lengths,
         bin_size=cohort.bin_size,
-        identity={"id": f"s_{sample_idx}"},
     )
 
 
@@ -191,14 +189,13 @@ def _make_sex_sample_buffers(
             end_motif_counts=[10] * 256,
         )
 
+    del sample_id
     meta = SampleMetadata(
         schema_version=SCHEMA_VERSION,
         coordinate_system=COORDINATE_SYSTEM,
         bin_size=bin_size,
         contig_order=tuple(contig_lengths.keys()),
         contig_lengths=contig_lengths,
-        source_identity={"id": sample_id},
-        reference_identity={"name": "ref"},
         filters={"min_mapping_quality": 1},
         qc={
             "effective_reads_examined": int(np.sum(counts)),
@@ -643,7 +640,6 @@ class TestSuperblockDepthAndSex(unittest.TestCase):
                 ends=cohort_ram.ends,
                 contig_lengths=cohort_ram.contig_lengths,
                 bin_size=cohort_ram.bin_size,
-                identities=cohort_ram.identities,
                 paths=cohort_ram.paths,
             )
             inf_ram = infer_germline_sex_2d(cohort_ram, usable, min_group_size=5)

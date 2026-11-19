@@ -92,6 +92,7 @@ def _build_synthetic_sample(
         s_list.extend(starts.tolist())
         e_list.extend(ends.tolist())
         counts_list.extend(raw_c.tolist())
+    del sample_id
     return make_sample_table(
         counts_list,
         contigs=c_list,
@@ -99,7 +100,6 @@ def _build_synthetic_sample(
         ends=e_list,
         contig_lengths=contig_lengths,
         bin_size=bin_size,
-        identity={"id": sample_id},
     )
 
 
@@ -110,14 +110,13 @@ def _make_sample_buffers(
     bands: NDArray[np.uint32] | None = None,
     sample_id: str = "s",
 ) -> SampleBuffers:
+    del sample_id
     meta = SampleMetadata(
         schema_version=SCHEMA_VERSION,
         coordinate_system=COORDINATE_SYSTEM,
         bin_size=bin_size,
         contig_order=tuple(contig_lengths.keys()),
         contig_lengths=contig_lengths,
-        source_identity={"id": sample_id},
-        reference_identity={"name": "ref"},
         filters={"min_mapping_quality": 1},
         qc={"effective_reads_examined": 10_000, "effective_reads_kept": 10_000},
     )

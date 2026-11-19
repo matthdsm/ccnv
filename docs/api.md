@@ -563,7 +563,7 @@ In-memory sample buffer rebinning across matching contig layouts.
 
 Cohort loading, rebinning harmonization, DESeq2 depth normalization, low-coverage contig masking, and Fisher-weighted cohort synthesis.
 
-- **`Cohort`** — Dataclass holding stacked `(N_bins, N_samples)` count and fragmentomics matrices, identities, layout, and optional paths/tracks.
+- **`Cohort`** — Dataclass holding stacked `(N_bins, N_samples)` count and fragmentomics matrices, layout, and optional paths/tracks.
 - **`estimate_size_factors(counts, mask, *, contigs, starts, ends, block_bp)`** — Computes DESeq2 median-of-ratios size factors across usable genomic 1 Mb super-blocks.
 - **`mask_low_coverage_per_contig(counts, contigs, exposure, *, min_fraction)`** — Flags per-sample/per-contig dropout bins with exposure-adjusted depth below `min_fraction` of positive contig medians.
 - **`alloc_cohort_counts(n_bins, n_samples, max_batch_memory_mb)`** — Allocates a Fortran-contiguous `float32` cohort matrix matching sample counts and memory budgets (spilling to disk memmap above budget).
@@ -571,7 +571,7 @@ Cohort loading, rebinning harmonization, DESeq2 depth normalization, low-coverag
 - **`build_fisher_weighted_cohort(cohort, band_weights_24, *, max_batch_memory_mb, threads)`** — Re-weights per-bin cohort matrices across 24 fragment bands using prenatal Fisher weights $w^{\ast}_{0.08}$ and attaches pooled compound-Poisson dispersion factors.
 - **`validate_cohort(tables, paths, target_bin_size)`** — Enforces homogeneous paired-end vs single-end layouts and target bin compatibility across in-memory cohort tables.
 - **`rebin_cohort(cohort, target_bin_size)`** — Coarsens an entire cohort in memory to a larger `target_bin_size` (e.g., 5 kb to 100 kb).
-- **`cohort_from_fasta(contigs_dict, bin_size, *, fasta_path)`** — Builds a uniform flat-depth synthetic 0-sample `Cohort` directly from FASTA contig dimensions.
+- **`cohort_from_fasta(contigs_dict, bin_size)`** — Builds a uniform flat-depth synthetic 0-sample `Cohort` directly from FASTA contig dimensions.
 - **Internal cohort helpers** — `_encode_contig_ids`, `_finalize_frag_covariates`, `_extract_streamed_sample`, `_read_cohort_sample`, `_read_and_extract_sample`, and `_weighted_sample_summary` handle streaming extraction, sample alignment, and per-sample summary moments.
 
 ### `ccnv.features.covariates` (`src/ccnv/features/covariates.py`)
@@ -689,7 +689,7 @@ Stage 2/3 reference branch quality auditing and `PASS`/`WARN`/`FAIL` verdict esc
 
 Stage 4 single-sample prediction QC payload assembly.
 
-- **`build_predict_qc_payload(mode, sample_table, segments, prenatal_result, bin_results, sex)`** — Aggregates predicted sample `sex` (`"female"`, `"male"`, or `None`), depth metrics, `lambda_gc`, call counts, prenatal `FetalFractionResult`, `SCAResult`, `PrenatalLoDMetrics`, fragmentomic metrics, and diagnostic warnings.
+- **`build_predict_qc_payload(mode, sample_table, segments, prenatal_result, bin_results, sex, sample_name)`** — Aggregates predicted sample `sex` (`"female"`, `"male"`, or `None`), depth metrics, `lambda_gc`, call counts, prenatal `FetalFractionResult`, `SCAResult`, `PrenatalLoDMetrics`, fragmentomic metrics, and diagnostic warnings.
 - **`write_predict_qc_json(path, payload)`** — Writes sanitized prediction QC JSON files atomically.
 - **`_int_metric(mapping, key, *, fallback_key)`** — Internal helper safely casting nullable integer counts for JSON serialization.
 

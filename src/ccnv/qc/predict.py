@@ -50,6 +50,7 @@ def build_predict_qc_payload(
     prenatal_result: FetalFractionResult | None = None,
     bin_results: Sequence[BinResult] | None = None,
     sex: Literal["female", "male"] | None = None,
+    sample_name: str | None = None,
 ) -> dict[str, object]:
     """Construct structured QC metrics for a prediction invocation."""
     resolved_sex: Literal["female", "male"] | None = None
@@ -70,7 +71,6 @@ def build_predict_qc_payload(
     bufs = SampleBuffers.coerce(sample_table)
     qc_meta: Mapping[str, object] = bufs.meta.qc or {}
     counts = np.asarray(bufs.count, dtype=np.float64)
-    source_identity: object = bufs.meta.source_identity
     frag_meta = bufs.meta.fragmentomics
 
     if bin_results is not None and len(bin_results) > 0:
@@ -130,13 +130,7 @@ def build_predict_qc_payload(
         "lambda_gc": lambda_gc,
     }
 
-    sample_name = "SAMPLE"
-    if isinstance(source_identity, Mapping):
-        sample_path = source_identity.get("path")
-        if isinstance(sample_path, str) and sample_path:
-            sample_name = Path(sample_path).stem
-        elif isinstance(source_identity.get("sample_name"), str):
-            sample_name = str(source_identity["sample_name"])
+    resolved_sample = sample_name or "SAMPLE"
 
     total_segments = len(segments)
     gain_calls = sum(1 for s in segments if s.call == "gain")
@@ -268,7 +262,7 @@ def build_predict_qc_payload(
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": str(mode),
-        "sample": sample_name,
+        "sample": resolved_sample,
         "sex": resolved_sex,
         "read_metrics": read_metrics,
         "cnv_summary": cnv_summary,

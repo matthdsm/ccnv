@@ -90,14 +90,13 @@ def _make_sample_buffers(
     sample_id: str = "S1",
     qc_reads: int = 10_000,
 ) -> SampleBuffers:
+    del sample_id
     meta = SampleMetadata(
         schema_version=SCHEMA_VERSION,
         coordinate_system=COORDINATE_SYSTEM,
         bin_size=bin_size,
         contig_order=tuple(contig_lengths.keys()),
         contig_lengths=contig_lengths,
-        source_identity={"id": sample_id},
-        reference_identity={"name": "ref"},
         filters={"min_mapping_quality": 1},
         qc={"effective_reads_examined": qc_reads, "effective_reads_kept": qc_reads},
     )
@@ -267,7 +266,6 @@ class TestNormalization(unittest.TestCase):
             starts=starts,
             ends=ends,
             counts=ref_counts,
-            identities=tuple(f"ref_{i}" for i in range(n_samples)),
             contig_lengths=contig_lengths,
             bin_size=bin_size,
         )
@@ -347,7 +345,6 @@ class TestNormalization(unittest.TestCase):
             starts=starts,
             ends=ends,
             counts=ref_counts,
-            identities=tuple(f"s_{i}" for i in range(24)),
             contig_lengths=contig_lengths,
             bin_size=bin_size,
         )
@@ -450,7 +447,6 @@ class TestNormalization(unittest.TestCase):
                 starts=np.tile(starts_1, 2),
                 ends=np.tile(ends_1, 2),
                 counts=np.column_stack([s.count for s in samples]).astype(np.float32),
-                identities=tuple({"path": str(p)} for p in paths),
                 bin_size=5000,
                 contig_lengths=contig_lengths,
                 paths=tuple(paths),

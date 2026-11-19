@@ -84,8 +84,6 @@ def _make_predict_sample_table(
         values={
             "bin_size": 100,
             "contig_order": list(lengths.keys()),
-            "source_identity": {"path": "/data/test_sample.bam", "format": "bam"},
-            "reference_identity": {"id": "genome"},
             "qc": default_qc if qc is None else qc,
             "filters": asdict(ReadFilters()),
         },
@@ -333,7 +331,7 @@ class TestQCReference(unittest.TestCase):
             mean_distance=o32,
             null_mean=z32,
             bio_dispersion=o32,
-            sample_identities=[{"path": "s1"}],
+            sample_count=1,
             model=mdl,
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -360,7 +358,7 @@ class TestQCReference(unittest.TestCase):
                 mean_distance=[0.55] * n_bins,
                 null_mean=[0.0] * n_bins,
                 null_std=[0.1] * n_bins,
-                sample_identities=[{"path": "s1.ccnv"}, {"path": "s2.ccnv"}],
+                sample_count=2,
                 model=_ref_model(),
             )
             outputs = run_reference_qc_on_table(
@@ -391,7 +389,7 @@ class TestQCReference(unittest.TestCase):
                 mean_distance=[0.15] * n_bins,
                 null_mean=[0.0] * n_bins,
                 null_std=[0.1] * n_bins,
-                sample_identities=[],
+                sample_count=0,
                 model=_ref_model(flat=True),
             )
             outputs = run_reference_qc_on_table(
@@ -461,7 +459,7 @@ class TestQCReference(unittest.TestCase):
                 mean_distance=[0.55] * n_total,
                 null_mean=[0.0] * n_total,
                 null_std=[0.1] * n_total,
-                sample_identities=[{"path": "s1.ccnv"}, {"path": "s2.ccnv"}],
+                sample_count=2,
                 model=model,
                 extra_metadata={"prenatal": prenatal_meta},
             )
@@ -516,7 +514,7 @@ class TestQCReference(unittest.TestCase):
                 null_mean=[0.0] * total,
                 bio_dispersion=[0.05] * total,
                 model=model,
-                sample_identities=[{"path": "s1.ccnv"}, {"path": "s2.ccnv"}],
+                sample_count=2,
             )
             verdict = run_reference_qc_on_table(
                 table, prefix=Path(tmpdir) / "ref", write_json=False, emit_stderr=False
@@ -650,7 +648,9 @@ class TestQCPredict(unittest.TestCase):
             SegmentResult("chr1", 100, 200, -0.5, -3.2, 1.0, 1, "loss"),
             SegmentResult("chr2", 0, 100, 0.0, 0.1, 1.0, 1, None),
         )
-        payload = build_predict_qc_payload("germline", table, segments)
+        payload = build_predict_qc_payload(
+            "germline", table, segments, sample_name="test_sample"
+        )
 
         self.assertEqual(payload["schema_version"], SCHEMA_VERSION)
         self.assertEqual(payload["mode"], "germline")
@@ -934,7 +934,9 @@ class TestQCPredict(unittest.TestCase):
 
     def test_write_predict_qc_json(self) -> None:
         table = _make_predict_sample_table()
-        payload = build_predict_qc_payload("germline", table, (), sex="female")
+        payload = build_predict_qc_payload(
+            "germline", table, (), sex="female", sample_name="test_sample"
+        )
         payload["float_val"] = np.float64(0.123456789)
         payload["int_val"] = np.int64(42)
         payload["bool_val"] = np.bool_(True)

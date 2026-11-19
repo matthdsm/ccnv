@@ -62,7 +62,6 @@ def _write_sample(path: Path) -> Path:
         ends=[100],
         contig_lengths={"chr1": 100},
         bin_size=100,
-        identity={"id": path.stem},
     )
     return path.resolve()
 
@@ -84,7 +83,7 @@ def _write_reference(path: Path) -> Path:
             "min_sex_group_size": 1,
             "mode": "germline",
         },
-        sample_identities=[{"path": "s1.ccnv"}],
+        sample_count=1,
     )
     write_synthetic_reference(path, table)
     return path.resolve()
@@ -100,8 +99,6 @@ class TestParquetIO(unittest.TestCase):
                 values={
                     "bin_size": 100,
                     "contig_order": ["chr1"],
-                    "source_identity": {"path": "test.bam"},
-                    "reference_identity": {"name": "test"},
                     "qc": {},
                     "filters": asdict(ReadFilters()),
                 },
@@ -142,12 +139,10 @@ class TestParquetIO(unittest.TestCase):
                 ArtifactKind.REFERENCE,
                 contig_lengths={"chr1": 100},
                 values={
-                    "cohort_samples": ["s1", "s2"],
-                    "sample_identities": [{"id": "s1"}, {"id": "s2"}],
-                    "n_samples": 2,
                     "model": {
                         "bin_size": 100,
                         "mode": "germline",
+                        "sample_count": 2,
                         "branches": [
                             BRANCH_AUTOSOMAL,
                             BRANCH_FEMALE_SEX,

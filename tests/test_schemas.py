@@ -38,15 +38,11 @@ def _sample_meta(
     contig_lengths: dict[str, int],
     bin_size: int,
     *,
-    source_identity: dict[str, object] | None = None,
-    reference_identity: dict[str, object] | None = None,
     qc: dict[str, object] | None = None,
     contig_order: list[str] | None = None,
 ) -> dict[bytes, bytes]:
     vals: dict[str, object] = {
         "bin_size": bin_size,
-        "source_identity": source_identity or {},
-        "reference_identity": reference_identity or {},
         "qc": qc or {},
         "filters": asdict(M.ReadFilters()),
     }
@@ -83,8 +79,12 @@ def _make_valid_reference_table(n_auto: int, n_fem: int, pca_rank: int = 3) -> p
         M.ArtifactKind.REFERENCE,
         contig_lengths=c_lens,
         values={
-            "sample_identities": ["s1", "s2"],
-            "model": {"bin_size": bs, "branches": b_names, "pca_components": pca_rank},
+            "model": {
+                "bin_size": bs,
+                "branches": b_names,
+                "pca_components": pca_rank,
+                "sample_count": 2,
+            },
         },
     )
     ld_col: pa.Array = (
@@ -179,8 +179,6 @@ class TestSchemaContracts(unittest.TestCase):
         meta = _sample_meta(
             {"chr1": 250_001, "scaffold-A": 99},
             100_000,
-            source_identity={"path": "sample.bam"},
-            reference_identity={"name": "GRCh-test"},
             qc={"mapped_reads": 42},
         )
         schema = M.SAMPLE_SCHEMA.with_metadata(meta)
@@ -309,7 +307,7 @@ class TestSchemaContracts(unittest.TestCase):
             ends=[5000, 10_000, 5000, 5000, 100_000, 200_000, 5000],
             contig_lengths={"chr1": 200_000, "chrX": 100_000, "chrY": 100_000},
             pca_loadings=[[0.1]] * len(branches_list),
-            sample_identities=["s1", "s2"],
+            sample_count=2,
             model={
                 "bin_size": 5000,
                 "prenatal_bin_size": 100_000,
@@ -406,7 +404,7 @@ class TestSchemaContracts(unittest.TestCase):
                 ends=ends,
                 contig_lengths={"chr1": n_bins * 5000},
                 pca_loadings=[[0.1]] * n_bins,
-                sample_identities=["s1"],
+                sample_count=1,
                 model={"bin_size": 5000, "branches": [M.BRANCH_AUTOSOMAL]},
             )
 
@@ -645,8 +643,6 @@ class TestSchemaContracts(unittest.TestCase):
                 {"chr2": 80_000},
                 5_000,
                 contig_order=["chr2"],
-                source_identity={"path": str(bam_path)},
-                reference_identity={"n_contigs": 1, "contig_order": ["chr2"]},
             )
             sliced_chr2 = full_5k.slice(20, 16).replace_schema_metadata(chr2_meta)
             self.assertEqual(sliced_chr2.column("frag_bands").chunk(0).offset, 20)
@@ -721,8 +717,6 @@ class TestSchemaContracts(unittest.TestCase):
                 bin_size=5000,
                 contig_order=names,
                 contig_lengths={c: 5000 for c in names},
-                source_identity={"id": str(count)},
-                reference_identity={"name": "ref"},
                 filters={},
                 qc={},
             )

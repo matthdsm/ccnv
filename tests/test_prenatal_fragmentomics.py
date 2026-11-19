@@ -215,12 +215,11 @@ def _make_buffers(
         "autosomal_reads_kept": n_kept,
         "sex_reads_kept": 0,
     }
+    del sample_id
     meta = SampleMetadata(
         bin_size=bin_size,
         contig_order=tuple(contig_lengths.keys()),
         contig_lengths=contig_lengths,
-        source_identity={"id": sample_id},
-        reference_identity={"name": "ref"},
         filters={"min_mapping_quality": 1},
         qc=qc,
         schema_version=SCHEMA_VERSION,

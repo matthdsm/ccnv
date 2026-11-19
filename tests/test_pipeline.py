@@ -248,10 +248,10 @@ class TestInstalledPipelineContract(unittest.TestCase):
             outputs = predict(pred_cfg)
 
             sample = pq.read_table(target_sample)
-            ref_identity = decode_metadata(sample.schema.metadata)["reference_identity"]
-            if not isinstance(ref_identity, dict):
-                self.fail("expected reference_identity dict")
-            self.assertEqual(ref_identity["contig_order"], [n for n, _ in CONTIGS])
+            sample_meta = decode_metadata(sample.schema.metadata)
+            self.assertEqual(sample_meta["contig_order"], [n for n, _ in CONTIGS])
+            self.assertNotIn("source_identity", sample_meta)
+            self.assertNotIn("reference_identity", sample_meta)
             s_meta = SampleMetadata.from_table(sample)
             codes, names, _starts, ends = reconstruct_sample_grid(s_meta)
             self.assertIn("chr10", names)
@@ -455,9 +455,9 @@ class TestReferencePublishedCrams(unittest.TestCase):
             validate_reference_table(table)
             metadata = decode_metadata(table.schema.metadata)
             model = metadata["model"]
-            sample_identities = metadata["sample_identities"]
-            if not isinstance(model, dict) or not isinstance(sample_identities, list):
-                self.fail("expected model dict and sample_identities list")
+            if not isinstance(model, dict):
+                self.fail("expected model dict")
+            self.assertNotIn("sample_identities", metadata)
             self.assertEqual(table.num_rows, samples[0].num_rows)
             self.assertEqual(set(table.column("contig").to_pylist()), {"chr21"})
             self.assertEqual(
@@ -468,7 +468,7 @@ class TestReferencePublishedCrams(unittest.TestCase):
             self.assertEqual(model["bin_size"], pf.PUBLISHED_BIN_SIZE)
             self.assertEqual(model["branches"], [BRANCH_AUTOSOMAL])
             self.assertEqual(model["autosomal_contigs"], ["chr21"])
-            self.assertEqual(len(sample_identities), 2)
+            self.assertEqual(model["sample_count"], 2)
             unmasked = sum(1 for masked in table.column("masked") if not masked)
             self.assertGreater(unmasked, 0)
 

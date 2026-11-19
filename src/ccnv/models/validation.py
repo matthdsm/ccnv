@@ -39,8 +39,6 @@ _KIND_METADATA: Final[Mapping[ArtifactKind, frozenset[str]]] = {
     ArtifactKind.SAMPLE: frozenset(
         {
             "bin_size",
-            "source_identity",
-            "reference_identity",
             "qc",
             "filters",
         }
@@ -48,7 +46,6 @@ _KIND_METADATA: Final[Mapping[ArtifactKind, frozenset[str]]] = {
     ArtifactKind.REFERENCE: frozenset(
         {
             "model",
-            "sample_identities",
         }
     ),
 }

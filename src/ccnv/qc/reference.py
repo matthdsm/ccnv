@@ -506,7 +506,7 @@ def run_reference_qc_on_table(
         messages,
     )
 
-    sample_count = len(ref_meta.sample_identities)
+    sample_count = ref_meta.sample_count
     mode = str(ref_meta.mode)
 
     prenatal_qc: dict[str, object] | None = None
@@ -564,7 +564,6 @@ def run_reference_qc_on_table(
         },
         "cohort": {
             "sample_count": sample_count,
-            "sample_identities": list(ref_meta.sample_identities),
             "sample_sexes": (
                 list(ref_meta.sample_sexes)
                 if ref_meta.sample_sexes is not None

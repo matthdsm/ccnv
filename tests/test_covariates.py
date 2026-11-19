@@ -95,7 +95,6 @@ def _write_sample_parquet(
         ends=ends,
         contig_lengths=contig_lengths,
         bin_size=bin_size,
-        identity={"id": path.stem},
     )
 
 

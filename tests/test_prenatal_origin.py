@@ -437,8 +437,6 @@ class TestPrenatalSelfReferencedOriginEngine(unittest.TestCase):
             bin_size=5000,
             contig_lengths=contig_lengths,
             contig_order=("chr1",),
-            source_identity={},
-            reference_identity={},
             qc={"effective_reads_kept": 10_149},
             filters={"min_mapping_quality": 1},
         )
@@ -692,8 +690,6 @@ class TestPrenatalSelfReferencedOriginEngine(unittest.TestCase):
             bin_size=20_000,
             contig_lengths={"chr18": 2_000_000, "chr21": 2_000_000},
             contig_order=("chr18", "chr21"),
-            source_identity={},
-            reference_identity={},
             qc={"effective_reads_kept": int(np.sum(sample_bands))},
             filters={"min_mapping_quality": 1},
         )
@@ -864,8 +860,6 @@ class TestPrenatalSelfReferencedOriginEngine(unittest.TestCase):
             bin_size=20_000,
             contig_lengths={"chr1": 80_000},
             contig_order=("chr1",),
-            source_identity={},
-            reference_identity={},
             qc={"effective_reads_kept": int(np.sum(sample_bands))},
             filters={"min_mapping_quality": 1},
             fragmentomics=frag_meta,

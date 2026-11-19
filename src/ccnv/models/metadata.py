@@ -491,8 +491,6 @@ class SampleMetadata:
     bin_size: int
     contig_lengths: dict[str, int]
     contig_order: tuple[str, ...]
-    source_identity: dict[str, object]
-    reference_identity: dict[str, object]
     qc: dict[str, object]
     filters: dict[str, object]
     schema_version: str = SCHEMA_VERSION
@@ -512,7 +510,7 @@ class SampleMetadata:
             self.contig_order
         ) != set(self.contig_lengths.keys()):
             raise SchemaError("contig_order does not match contig_lengths keys")
-        for attr in ("source_identity", "reference_identity", "qc", "filters"):
+        for attr in ("qc", "filters"):
             if not isinstance(getattr(self, attr), Mapping):
                 raise SchemaError(f"{attr} must be a mapping")
         if self.fragmentomics is not None and not isinstance(
@@ -544,8 +542,6 @@ class SampleMetadata:
             "contig_lengths": dict(self.contig_lengths),
             "contig_order": list(self.contig_order),
             "bin_size": int(self.bin_size),
-            "source_identity": dict(self.source_identity),
-            "reference_identity": dict(self.reference_identity),
             "qc": dict(self.qc),
             "filters": dict(self.filters),
         }
@@ -564,8 +560,7 @@ class SampleMetadata:
             schema_version = _parse_schema_version(data)
             coordinate_system = _parse_coordinate_system(data)
             contig_lengths = _parse_contig_lengths(data.get("contig_lengths"))
-            ref_id = _opt_obj_dict(data, "reference_identity")
-            raw_order = data.get("contig_order", ref_id.get("contig_order"))
+            raw_order = data.get("contig_order")
             contig_order = (
                 _as_str_tuple(raw_order, "contig_order")
                 if raw_order is not None
@@ -582,8 +577,6 @@ class SampleMetadata:
                 bin_size=_req_int(data, "bin_size"),
                 contig_lengths=contig_lengths,
                 contig_order=contig_order,
-                source_identity=_opt_obj_dict(data, "source_identity"),
-                reference_identity=ref_id,
                 qc=_opt_obj_dict(data, "qc"),
                 filters=_opt_obj_dict(data, "filters"),
                 schema_version=schema_version,
@@ -609,7 +602,6 @@ class SampleMetadata:
 _REF_TOP_KEYS: Final[frozenset[str]] = frozenset(
     {
         "contig_lengths",
-        "sample_identities",
         "schema_version",
         "coordinate_system",
         "prenatal",
@@ -629,7 +621,7 @@ class ReferenceMetadata:
     pca_components: int = 0
     mode: AnalysisMode = AnalysisMode.germline
     prenatal_bin_size: int | None = None
-    sample_identities: tuple[object, ...] = ()
+    sample_count: int = 0
     sex_signal_contig: str | None = None
     sex_cutoff: float | None = None
     sex_source: str | None = None
@@ -654,6 +646,7 @@ class ReferenceMetadata:
         if self.prenatal_bin_size is not None:
             _schema_pos_int(self.prenatal_bin_size, "prenatal_bin_size")
         _schema_nonneg_int(self.pca_components, "pca_components")
+        _schema_nonneg_int(self.sample_count, "sample_count")
         _schema_pos_int(self.max_batch_memory_mb, "max_batch_memory_mb")
         if self.branch_pca_ranks is not None:
             for b_name, b_rank in self.branch_pca_ranks.items():
@@ -691,7 +684,6 @@ class ReferenceMetadata:
             else:
                 model[f.name] = list(val) if isinstance(val, tuple) else val
         values: dict[str, object] = {
-            "sample_identities": list(self.sample_identities),
             "model": model,
         }
         if self.prenatal is not None:
@@ -718,12 +710,6 @@ class ReferenceMetadata:
             coordinate_system = _parse_coordinate_system(data)
             model = _opt_obj_dict(data, "model")
             contig_lengths = _parse_contig_lengths(data.get("contig_lengths"))
-            raw_ids = data.get("sample_identities", ())
-            if not isinstance(raw_ids, (list, tuple)):
-                raise TypeError("sample_identities must be a list or tuple")
-            sample_identities: tuple[object, ...] = tuple(
-                dict(x) if isinstance(x, Mapping) else str(x) for x in raw_ids
-            )
             prenatal_obj = data.get("prenatal")
             if prenatal_obj is not None and not isinstance(prenatal_obj, Mapping):
                 raise SchemaError("ccnv.prenatal metadata must be an object")
@@ -765,7 +751,7 @@ class ReferenceMetadata:
                 pca_components=_req_int(model, "pca_components", 0),
                 mode=AnalysisMode(raw_mode),
                 prenatal_bin_size=prenatal_bs,
-                sample_identities=sample_identities,
+                sample_count=_req_int(model, "sample_count", 0),
                 sex_signal_contig=_opt_str(model, "sex_signal_contig"),
                 sex_cutoff=_opt_float(model, "sex_cutoff"),
                 sex_source=_opt_str(model, "sex_source"),

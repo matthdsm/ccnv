@@ -72,7 +72,6 @@ class Cohort:
     ends: NDArray[np.int64]
     contig_lengths: dict[str, int]
     bin_size: int
-    identities: tuple[object, ...]
     paths: tuple[Path, ...]
     sample_metadata: tuple[dict[str, object], ...] = ()
     ref_frag_len: NDArray[np.float32] | None = None
@@ -317,7 +316,6 @@ class _CohortAccumulator:
         self.sum_flen = np.zeros(n_bins, dtype=np.float64)
         self.sum_ep = np.zeros(n_bins, dtype=np.float64)
         self.raw_metas: list[dict[str, object]] = [{} for _ in range(n_samples)]
-        self.identities: list[object] = [None for _ in range(n_samples)]
         self.is_paired: list[bool] = [False for _ in range(n_samples)]
         self.record(first)
 
@@ -349,9 +347,6 @@ class _CohortAccumulator:
         self.sum_flen += sample.frag_len_sum
         self.sum_ep += sample.endpoint_count
         self.raw_metas[idx] = sample.raw_meta
-        self.identities[idx] = sample.raw_meta.get(
-            "source_identity", {"path": str(sample.path)}
-        )
         self.is_paired[idx] = sample.is_paired
 
     def finalize(
@@ -411,7 +406,6 @@ class _CohortAccumulator:
             ends=ends_u32.astype(np.int64),
             contig_lengths=dict(self.first.sample_meta.contig_lengths),
             bin_size=self.first.sample_meta.bin_size,
-            identities=tuple(self.identities),
             paths=tuple(paths),
             sample_metadata=tuple(self.raw_metas),
             ref_frag_len=ref_frag_len,
@@ -706,7 +700,6 @@ def rebin_cohort(cohort: Cohort, target_bin_size: int) -> Cohort:
         *rebinned,
         cohort.contig_lengths,
         target_bin_size,
-        cohort.identities,
         cohort.paths,
         cohort.sample_metadata,
     )
@@ -715,18 +708,14 @@ def rebin_cohort(cohort: Cohort, target_bin_size: int) -> Cohort:
 def cohort_from_fasta(
     contigs_dict: Mapping[str, int],
     bin_size: int,
-    *,
-    fasta_path: Path | None = None,
 ) -> Cohort:
     """Build a 0-sample coordinate grid from FASTA contig lengths for flat reference models."""
     if bin_size <= 0:
         raise ReferenceError("bin_size must be a positive integer")
-    resolved = (fasta_path or Path("flat_fasta")).expanduser().resolve()
     contigs, starts, ends, contig_lengths = build_coordinate_grid(
         contigs_dict, bin_size
     )
     counts = np.empty((starts.size, 0), dtype=np.float32, order="F")
-    identities: tuple[object, ...] = ({"path": str(resolved), "format": "flat-fasta"},)
     return Cohort(
         counts=counts,
         contigs=contigs,
@@ -734,6 +723,5 @@ def cohort_from_fasta(
         ends=ends,
         contig_lengths=contig_lengths,
         bin_size=bin_size,
-        identities=identities,
         paths=(),
     )

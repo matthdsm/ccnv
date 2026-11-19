@@ -383,6 +383,7 @@ def run(config: PredictConfig) -> PredictionOutputs:
                 prenatal_result=prenatal_result,
                 bin_results=bin_results,
                 sex=inputs.sex,
+                sample_name=config.prefix.name or "SAMPLE",
             ),
         )
         return write_outputs(

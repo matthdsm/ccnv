@@ -215,10 +215,9 @@ class TestExtractAlignment(unittest.TestCase):
                 metadata["contig_lengths"],
                 {"chr1": 250, "scaffold-A": 99, "chrM": 50},
             )
-            ref_id = metadata["reference_identity"]
-            if not isinstance(ref_id, dict):
-                self.fail("expected reference_identity dict")
-            self.assertEqual(ref_id["contig_order"], ["chr1", "scaffold-A", "chrM"])
+            self.assertEqual(metadata["contig_order"], ["chr1", "scaffold-A", "chrM"])
+            self.assertNotIn("source_identity", metadata)
+            self.assertNotIn("reference_identity", metadata)
             qc = metadata["qc"]
             if not isinstance(qc, dict):
                 self.fail("expected qc dict")
@@ -774,7 +773,6 @@ class TestExtractPublishedCram(unittest.TestCase):
             self.assertGreater(sum(table.column("count").to_pylist()), 0)
             self.assertEqual(smeta.contig_lengths, {"chr21": CHR21_LENGTH})
             self.assertEqual(smeta.bin_size, PUBLISHED_BIN_SIZE)
-            self.assertEqual(smeta.source_identity["format"], "cram")
             self.assertEqual(smeta.qc["reads_kept"], 524_785)
             self.assertEqual(smeta.qc["effective_reads_kept"], 524_785)
             self.assertEqual(smeta.qc["autosomal_reads_kept"], 524_785)

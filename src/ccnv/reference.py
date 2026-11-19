@@ -95,11 +95,7 @@ def _load_cohort(config: ReferenceConfig) -> Cohort:
                 "bin_size must be a positive integer when using a FASTA"
             )
         contigs = read_fasta_contigs(config.fasta, all_contigs=config.all_contigs)
-        return cohort_from_fasta(
-            contigs,
-            config.bin_size,
-            fasta_path=config.fasta,
-        )
+        return cohort_from_fasta(contigs, config.bin_size)
     return load_and_assemble_cohort(
         config.entries,
         target_bin_size=config.bin_size,
@@ -186,7 +182,6 @@ def build_reference_table(
 
     bin_size = cohort.bin_size
     contig_lengths = dict(cohort.contig_lengths)
-    identities = cohort.identities
     first_filters: dict[str, object] | None = None
     if cohort.sample_metadata:
         raw_f = cohort.sample_metadata[0].get("filters")
@@ -324,7 +319,7 @@ def build_reference_table(
         prenatal_bin_size=(
             config.prenatal_bin_size if config.mode == "prenatal" else None
         ),
-        sample_identities=identities,
+        sample_count=n_samples,
         sex_signal_contig=signal,
         sex_cutoff=resolved_sex_cutoff,
         sex_source=sex_source,

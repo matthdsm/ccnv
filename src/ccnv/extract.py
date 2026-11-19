@@ -51,9 +51,6 @@ def _scan_to_buffers(
     selected: Sequence[tuple[str, int]],
     *,
     bin_size: int,
-    fmt: str,
-    resolved_alignment: Path,
-    resolved_fasta: Path | None,
     filters: ReadFilters,
 ) -> SampleBuffers:
     paired_end = bool(scan["paired_end"])
@@ -94,25 +91,10 @@ def _scan_to_buffers(
     )
     contig_order = [name for name, _ in selected]
     contig_lengths = dict(selected)
-    source_id: dict[str, object] = {
-        "path": str(resolved_alignment.resolve()),
-        "format": fmt,
-    }
-    ref_id: dict[str, object] = {
-        "n_contigs": len(contig_order),
-        "contig_order": contig_order,
-        **(
-            {"fasta": str(resolved_fasta.resolve())}
-            if resolved_fasta is not None
-            else {}
-        ),
-    }
     sample_meta = SampleMetadata(
         bin_size=bin_size,
         contig_order=tuple(contig_order),
         contig_lengths=contig_lengths,
-        source_identity=source_id,
-        reference_identity=ref_id,
         qc=dict(qc),
         filters=filters.to_dict(),
         fragmentomics=meta_frag,
@@ -139,7 +121,7 @@ def extract_for_predict(
 ) -> SampleBuffers:
     """Stream BAM/CRAM directly into reference-aligned SampleBuffers via ccnv._core."""
     try:
-        fmt, resolved_alignment, resolved_fasta = validate_alignment_inputs(
+        _, resolved_alignment, resolved_fasta = validate_alignment_inputs(
             alignment, fasta
         )
         header = read_alignment_header(resolved_alignment, resolved_fasta)
@@ -190,9 +172,6 @@ def extract_for_predict(
         scan,
         selected,
         bin_size=ref_meta.bin_size,
-        fmt=fmt,
-        resolved_alignment=resolved_alignment,
-        resolved_fasta=resolved_fasta,
         filters=filters,
     )
 
@@ -230,9 +209,6 @@ def extract_sample_table(config: ExtractConfig) -> pa.Table:
         scan,
         selected,
         bin_size=config.bin_size,
-        fmt=fmt,
-        resolved_alignment=resolved_alignment,
-        resolved_fasta=resolved_fasta,
         filters=config.filters,
     )
     qc = buffers.meta.qc

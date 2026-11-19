@@ -44,7 +44,6 @@ def _write_sample(path: Path) -> Path:
         [1],
         contig_lengths={"chr1": 100},
         bin_size=100,
-        identity={"id": path.stem},
     ).resolve()
 
 
@@ -60,7 +59,7 @@ def _write_reference(path: Path) -> Path:
         mean_distance=[0.5],
         null_mean=[0.0],
         bio_dispersion=[0.01],
-        sample_identities=[{"path": "s1.ccnv"}],
+        sample_count=1,
         model={
             "bin_size": 100,
             "branches": ["autosomal"],

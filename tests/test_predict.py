@@ -135,7 +135,6 @@ def _prenatal_reference_table() -> pa.Table:
                 "sex_cutoff": 0.005,
                 "sex_inference": {"cutoff": 0.005},
             },
-            "sample_identities": [],
         },
     )
     metadata[PRENATAL_METADATA_KEY] = prenatal_meta.encode()
@@ -188,7 +187,6 @@ def _prenatal_sample_table() -> pa.Table:
         ends=ends,
         contig_lengths=contig_lengths,
         bin_size=100_000,
-        identity={"path": "test_sample.ccnv"},
     )
     meta = metadata_for(
         ArtifactKind.SAMPLE,
@@ -196,8 +194,6 @@ def _prenatal_sample_table() -> pa.Table:
         values={
             "bin_size": 100_000,
             "contig_order": list(contig_lengths.keys()),
-            "source_identity": {"path": "test_sample.ccnv"},
-            "reference_identity": {"id": "genome"},
             "qc": {
                 "effective_reads_examined": 500,
                 "effective_reads_kept": 400,
@@ -465,8 +461,6 @@ class TestCoordinatesAndOutputs(unittest.TestCase):
                 bin_size=50,
                 contig_order=("chr1", "chr2"),
                 contig_lengths={"chr1": 100, "chr2": 80},
-                source_identity={},
-                reference_identity={},
                 qc={},
                 filters={},
             ),
@@ -761,7 +755,7 @@ class TestPredictAlignmentInputs(unittest.TestCase):
                 null_mean=[0.0, 0.0],
                 bio_dispersion=[0.0025, 0.0025],
                 model=model_dict,
-                sample_identities=["s1"],
+                sample_count=1,
             )
 
         legacy_ref = _make_ref({"bin_size": 10000})
@@ -835,7 +829,7 @@ class TestPredictAlignmentInputs(unittest.TestCase):
                 "fragmentomics_corrected": True,
                 "branch_pca_ranks": p_ranks,
             },
-            sample_identities=["s1"],
+            sample_count=1,
             extra_metadata={"prenatal": prenatal_meta.to_dict()},
         )
         pe_prenatal_sample = make_sample_table(

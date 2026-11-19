@@ -48,7 +48,7 @@ flowchart TD
 
 - **Read Filter Precedence**: Reads are checked in order: `filter_unmapped`, `filter_no_start`, `filter_secondary`, `filter_supplementary`, `filter_duplicate`, `filter_improper_pair`, `filter_mapq`. The first failing check increments its QC counter and drops the read.
 - **Thread Budget**: `-t/--threads` splits CPU cores across contig streaming and decompression tasks. Single-threaded extraction streams sequentially without requiring an index; multi-threaded extraction partitions contigs into bin-aligned $50\text{ Mb}$ tiles scheduled across worker threads using `.bai`/`.csi`/`.crai` indexes.
-- **Schema**: Coordinate-free per-bin columns `count: uint32`, `paired_count: uint32`, `frag_len_sum: uint64`, `short_frag_count: uint32`, `endpoint_count: uint32`, `frag_gc_sum: float32`, and `frag_bands: list<uint32>[24]`, with bin coordinates reconstructed implicitly from `ccnv.contig_order`, `ccnv.contig_lengths`, and `ccnv.bin_size`, alongside JSON-encoded `ccnv.*` metadata (`ccnv.artifact_kind`, `ccnv.schema_version`, `ccnv.coordinate_system`, `ccnv.source_identity`, `ccnv.reference_identity`, `ccnv.qc`, `ccnv.filters`, `ccnv.fragmentomics`).
+- **Schema**: Coordinate-free per-bin columns `count: uint32`, `paired_count: uint32`, `frag_len_sum: uint64`, `short_frag_count: uint32`, `endpoint_count: uint32`, `frag_gc_sum: float32`, and `frag_bands: list<uint32>[24]`, with bin coordinates reconstructed implicitly from `ccnv.contig_order`, `ccnv.contig_lengths`, and `ccnv.bin_size`, alongside JSON-encoded `ccnv.*` metadata (`ccnv.artifact_kind`, `ccnv.schema_version`, `ccnv.coordinate_system`, `ccnv.qc`, `ccnv.filters`, `ccnv.fragmentomics`).
 
 ## 2. `reference`
 

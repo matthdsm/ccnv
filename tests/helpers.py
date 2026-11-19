@@ -70,7 +70,6 @@ def make_sample_table(
     ends: Sequence[int] | np.ndarray | None = None,
     contig_lengths: Mapping[str, int] | None = None,
     bin_size: int = 100,
-    identity: object | None = None,
     fragment_lengths: Sequence[Sequence[int]] | None = None,
     endpoint_counts: Sequence[int] | np.ndarray | None = None,
     frag_gc_sums: Sequence[float] | np.ndarray | None = None,
@@ -100,20 +99,12 @@ def make_sample_table(
             else dict(contig_lengths)
         )
 
-    src = identity if identity is not None else {"id": "synthetic_sample"}
-    ref = {
-        "name": "synthetic_ref",
-        "n_contigs": len(contig_order),
-        "contig_order": contig_order,
-    }
     metadata = metadata_for(
         M.ArtifactKind.SAMPLE,
         contig_lengths=lengths_dict,
         values={
             "bin_size": bin_size,
             "contig_order": contig_order,
-            "source_identity": src,
-            "reference_identity": ref,
             "qc": {},
             "filters": asdict(M.ReadFilters()),
         },
@@ -166,7 +157,6 @@ def write_synthetic_sample(
     ends: Sequence[int] | np.ndarray | None = None,
     contig_lengths: Mapping[str, int] | None = None,
     bin_size: int = 100,
-    identity: object | None = None,
     fragment_lengths: Sequence[Sequence[int]] | None = None,
     endpoint_counts: Sequence[int] | np.ndarray | None = None,
     frag_gc_sums: Sequence[float] | np.ndarray | None = None,
@@ -180,7 +170,6 @@ def write_synthetic_sample(
             ends=ends,
             contig_lengths=contig_lengths,
             bin_size=bin_size,
-            identity=identity,
             fragment_lengths=fragment_lengths,
             endpoint_counts=endpoint_counts,
             frag_gc_sums=frag_gc_sums,
@@ -239,12 +228,6 @@ def make_sample_buffers(
         bin_size=bin_size,
         contig_order=c_order,
         contig_lengths=lengths_dict,
-        source_identity={"id": sample_id},
-        reference_identity={
-            "name": "synthetic_ref",
-            "n_contigs": len(c_order),
-            "contig_order": list(c_order),
-        },
         filters=dict(filters) if filters is not None else asdict(M.ReadFilters()),
         qc=dict(qc) if qc is not None else def_qc,
         fragmentomics=fragmentomics,
@@ -449,7 +432,7 @@ def make_reference_table(
     null_std: Sequence[float] | np.ndarray | None = None,
     metadata: dict[bytes, bytes] | None = None,
     model: Mapping[str, object] | None = None,
-    sample_identities: Sequence[object] = (),
+    sample_count: int = 0,
     extra_metadata: Mapping[str, object] | None = None,
 ) -> pa.Table:
     """Build a Schema v2.0.0 reference table from per-bin arrays."""
@@ -483,9 +466,10 @@ def make_reference_table(
     )
 
     if metadata is None:
+        model_dict = dict(model) if model is not None else {"branches": b_vocab}
+        model_dict.setdefault("sample_count", sample_count)
         vals_meta: dict[str, object] = {
-            "sample_identities": list(sample_identities),
-            "model": dict(model) if model is not None else {"branches": b_vocab},
+            "model": model_dict,
             **(extra_metadata or {}),
         }
         metadata = metadata_for(

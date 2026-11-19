@@ -56,6 +56,7 @@ def _sample_table(
     bin_size: int = 100,
     identity: object | None = None,
 ) -> pa.Table:
+    del identity
     return make_sample_table(
         counts,
         contigs=contigs,
@@ -63,7 +64,6 @@ def _sample_table(
         ends=ends,
         contig_lengths=contig_lengths,
         bin_size=bin_size,
-        identity=identity,
     )
 
 
@@ -83,14 +83,13 @@ def _make_sample_buffers(
     n = int(counts.size)
     z_u32 = np.zeros(n, dtype=np.uint32)
     total = int(np.sum(counts))
+    del sample_id
     meta = SampleMetadata(
         schema_version=SCHEMA_VERSION,
         coordinate_system=COORDINATE_SYSTEM,
         bin_size=bin_size,
         contig_order=tuple(contig_lengths.keys()),
         contig_lengths=contig_lengths,
-        source_identity={"id": sample_id},
-        reference_identity={"name": "ref"},
         filters={"min_mapping_quality": 1},
         qc={
             "effective_reads_examined": total,
@@ -210,8 +209,6 @@ class TestMaskingAndPca(unittest.TestCase):
                     bin_size=bin_size,
                     contig_lengths=contig_lengths,
                     contig_order=("chr1", "chr2"),
-                    source_identity={},
-                    reference_identity={},
                     qc={"effective_reads_kept": 80_000},
                     filters={"min_mapping_quality": 1},
                 )
@@ -687,7 +684,7 @@ class TestFlatFastaReference(unittest.TestCase):
                 (("chr1", 250), ("chr2", 150), ("chrX", 100)),
             )
             contigs_dict = read_fasta_contigs(fasta)
-            cohort = cohort_from_fasta(contigs_dict, 100, fasta_path=fasta)
+            cohort = cohort_from_fasta(contigs_dict, 100)
 
             self.assertEqual(cohort.bin_size, 100)
             self.assertEqual(
