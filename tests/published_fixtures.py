@@ -14,10 +14,11 @@ from ccnv.extract import run as extract
 from ccnv.models import ExtractConfig
 
 EXTRACT_FIXTURES = Path(__file__).parent / "fixtures" / "extract"
-_TESTDATA_URL = (
-    "https://raw.githubusercontent.com/matthdsm/copynumber-cnv-testdata/main/"
+_TESTDATA_URL = "https://raw.githubusercontent.com/matthdsm/ccnv-testdata/main/"
+_SIBLING_TESTDATA_DIRS = (
+    Path(__file__).resolve().parents[2] / "copynumber-cnv-testdata",
+    Path(__file__).resolve().parents[2] / "ccnv-testdata",
 )
-_SIBLING_TESTDATA = Path(__file__).resolve().parents[2] / "copynumber-cnv-testdata"
 
 PUBLISHED_BIN_SIZE = 5_000
 PUBLISHED_CANONICAL_BINS = 12
@@ -42,8 +43,9 @@ def _local_testdata_root() -> Path | None:
         candidate = Path(env_dir).expanduser()
         if candidate.is_dir():
             return candidate
-    if _SIBLING_TESTDATA.is_dir():
-        return _SIBLING_TESTDATA
+    for sibling in _SIBLING_TESTDATA_DIRS:
+        if sibling.is_dir():
+            return sibling
     return None
 
 
