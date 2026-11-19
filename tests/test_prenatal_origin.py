@@ -15,6 +15,7 @@ from ccnv._core import FRAG_BAND_EDGES
 from ccnv.features.prenatal_origin import (
     BandPrefixSums,
     PrenatalLoDMetrics,
+    _integrate_mosaic_state,
     annotate_prenatal_origin_and_lod,
     annotate_sample_prenatal_segments,
     classify_segment_origin_5state,
@@ -22,13 +23,19 @@ from ccnv.features.prenatal_origin import (
 from ccnv.models import (
     NUM_FRAG_BANDS,
     FetalFractionResult,
+    FragmentomicsMetadata,
     PrenatalModelMetadata,
     SampleBuffers,
     SampleMetadata,
     SCAResult,
     SegmentResult,
 )
-from ccnv.stats.fragmentomics import FRAG_MAX_LEN, FRAG_MIN_LEN
+from ccnv.stats.fragmentomics import (
+    FRAG_MAX_LEN,
+    FRAG_MIN_LEN,
+    FRAG_NUM_BINS,
+    align_histogram,
+)
 
 
 def _annotate_prenatal_segments(
@@ -294,7 +301,7 @@ class TestPrenatalSelfReferencedOriginEngine(unittest.TestCase):
         phi_mat = active_ff / r_mat
         p_mat = phi_mat * self.p_f_24 + (1.0 - phi_mat) * self.p_m_24
         for b in range(210, 260):
-            sample_bands[b] = np.round(510 * p_mat).astype(np.uint32)
+            sample_bands[b] = np.round(2000 * p_mat).astype(np.uint32)
         seg3 = SegmentResult(
             "chr3", 200000, 1200000, math.log2(r_mat), 3.5, 50.0, 50, "gain"
         )
@@ -378,7 +385,7 @@ class TestPrenatalSelfReferencedOriginEngine(unittest.TestCase):
         phi_mat = active_ff / r_mat
         p_mat = phi_mat * p_f_24 + (1.0 - phi_mat) * p_m_24
         for b in range(210, 260):
-            sample_bands[b] = np.round(510 * p_mat).astype(np.uint32)
+            sample_bands[b] = np.round(2000 * p_mat).astype(np.uint32)
         seg3 = SegmentResult(
             "chr3", 200_000, 1_200_000, math.log2(r_mat), 3.5, 50.0, 50, "gain"
         )
@@ -763,6 +770,159 @@ class TestPrenatalSelfReferencedOriginEngine(unittest.TestCase):
         self.assertEqual(ann_s[0].origin_call, "FETAL_CONSTITUTIONAL")
         self.assertEqual(ann_s[1].origin_call, "FETAL_CONSTITUTIONAL")
         self.assertEqual(ann_s[2].origin_call, "FETAL_CONSTITUTIONAL")
+
+    def test_mosaic_prior_uniform_normalization(self) -> None:
+        p_f_24, p_m_24 = _build_24band_densities()
+        active_ff = 0.10
+        p0 = active_ff * p_f_24 + (1.0 - active_ff) * p_m_24
+        for is_gain, r_obs, z_val in ((True, 1.025, 3.5), (False, 0.975, -3.5)):
+            delta_cn = 0.5 if is_gain else -0.5
+            m_cpm = 0.50
+            phi_cpm = ((1.0 + delta_cn * m_cpm) * active_ff) / r_obs
+            p_cpm = phi_cpm * p_f_24 + (1.0 - phi_cpm) * p_m_24
+            k_cpm = np.round(20_000.0 * p_cpm)
+            call, posteriors, m_hat, _ = classify_segment_origin_5state(
+                r_obs=r_obs,
+                k_band_counts=k_cpm,
+                p_fetal_24=p_f_24,
+                p_maternal_24=p_m_24,
+                p_plasma_0=p0,
+                active_ff=active_ff,
+                active_ff_se=0.01,
+                is_gain=is_gain,
+                sigma_r=0.008,
+            )
+            self.assertEqual(call, "PLACENTAL_MOSAIC", f"is_gain={is_gain}, z={z_val}")
+            self.assertGreater(posteriors["PLACENTAL_MOSAIC"], 0.80)
+            self.assertIsNotNone(m_hat)
+            self.assertAlmostEqual(float(m_hat or 0.0), 0.50, delta=0.10)
+
+        # Depth-only interior integration must match 1 / (|delta_cn| * f * (m_hi - m_lo)).
+        log_ev, _, _ = _integrate_mosaic_state(
+            0.05,
+            0.95,
+            0.5,
+            0.10,
+            0.10,
+            0.005,
+            is_fetal=True,
+            r_obs=1.025,
+            sigma_r=0.005,
+            k_band_counts=np.zeros(NUM_FRAG_BANDS, dtype=np.float64),
+            p_fetal_24=p_f_24,
+            p_maternal_24=p_m_24,
+            alpha_dm=10_000.0,
+        )
+        expected_depth_marginal = 1.0 / (0.5 * 0.10 * 0.90)
+        self.assertAlmostEqual(math.exp(log_ev), expected_depth_marginal, delta=1.5)
+
+    def test_origin_sizing_shift_alignment(self) -> None:
+        lengths = np.arange(FRAG_MIN_LEN, FRAG_MAX_LEN + 1, dtype=np.float64)
+        p_f_571 = norm.pdf(lengths, loc=143.0, scale=10.0)
+        p_f_571 /= np.sum(p_f_571)
+        p_m_571 = norm.pdf(lengths, loc=166.0, scale=12.0)
+        p_m_571 /= np.sum(p_m_571)
+
+        shift_bp = 6.0
+        active_ff = 0.10
+        r_cpm = 1.025
+        phi_cpm = (1.0 + 0.5 * 0.50) * active_ff / r_cpm
+        p_cpm_canon = phi_cpm * p_f_571 + (1.0 - phi_cpm) * p_m_571
+        p_cpm_shifted = align_histogram(p_cpm_canon, -shift_bp)
+        edges = np.asarray(FRAG_BAND_EDGES, dtype=np.int64) - FRAG_MIN_LEN
+        p_cpm_24_shifted = np.add.reduceat(p_cpm_shifted[: int(edges[-1])], edges[:-1])
+        p_cpm_24_shifted /= np.sum(p_cpm_24_shifted)
+
+        p0_shifted = align_histogram(
+            active_ff * p_f_571 + (1.0 - active_ff) * p_m_571, -shift_bp
+        )
+        p0_24_shifted = np.add.reduceat(p0_shifted[: int(edges[-1])], edges[:-1])
+        p0_24_shifted /= np.sum(p0_24_shifted)
+
+        sample_bands = np.zeros((4, NUM_FRAG_BANDS), dtype=np.uint32)
+        sample_bands[0] = np.round(40_000.0 * p_cpm_24_shifted).astype(np.uint32)
+        for idx in range(1, 4):
+            sample_bands[idx] = np.round(40_000.0 * p0_24_shifted).astype(np.uint32)
+        frag_meta = FragmentomicsMetadata(
+            paired_end=True,
+            total_paired_fragments=int(np.sum(sample_bands)),
+            chromatosome_mode_bp=166.0 + shift_bp,
+            core_shoulder_bp=143.0 + shift_bp,
+            sizing_shift_bp=shift_bp,
+            self_referenced_peak_ratio=0.5,
+            dinucleosome_fraction=0.05,
+            high_mw_fraction=0.02,
+            helical_10bp_amplitude=0.05,
+            helical_10bp_phase=0.0,
+            motif_diversity_score=0.95,
+            hist_autosomal=[0] * FRAG_NUM_BINS,
+            hist_chry=[0] * FRAG_NUM_BINS,
+            hist_chrx=[0] * FRAG_NUM_BINS,
+            end_motif_counts=[1] * 256,
+        )
+        meta = SampleMetadata(
+            bin_size=20_000,
+            contig_lengths={"chr1": 80_000},
+            contig_order=("chr1",),
+            source_identity={},
+            reference_identity={},
+            qc={"effective_reads_kept": int(np.sum(sample_bands))},
+            filters={"min_mapping_quality": 1},
+            fragmentomics=frag_meta,
+        )
+        counts_u32 = np.sum(sample_bands, axis=1, dtype=np.uint32)
+        z_u32 = np.zeros(4, dtype=np.uint32)
+        bufs = SampleBuffers(
+            meta=meta,
+            count=counts_u32,
+            paired_count=counts_u32,
+            frag_len_sum=np.zeros(4, dtype=np.uint64),
+            short_frag_count=z_u32,
+            endpoint_count=z_u32,
+            frag_gc_sum=np.zeros(4, dtype=np.float32),
+            frag_bands=sample_bands,
+        )
+        pm = PrenatalModelMetadata(
+            prenatal_bin_size=100_000,
+            yfrac_threshold=0.001,
+            ffy_slope=1.0,
+            olm_weights=[],
+            olm_bias=0.0,
+            female_chrx_ratio_mean=1.0,
+            female_chrx_ratio_std=0.01,
+            p_fetal_density=[float(x) for x in p_f_571],
+            p_maternal_density=[float(x) for x in p_m_571],
+        )
+        pr = FetalFractionResult(
+            fetal_sex="F",
+            active_ff=active_ff,
+            active_ff_source="FF_SIZE",
+            ffy=None,
+            ffx=0.0,
+            ffa=active_ff,
+            chrx_ratio=1.0,
+            chry_score=0.0001,
+            yfrac_threshold=0.001,
+            sca=SCAResult("XX", False, 0.99, 0.0),
+            active_ff_se=0.01,
+        )
+        seg = SegmentResult("chr1", 0, 20_000, math.log2(r_cpm), 4.0, 50.0, 1, "gain")
+        ann, _ = annotate_sample_prenatal_segments(
+            (seg,), bufs, prenatal_meta=pm, prenatal_result=pr
+        )
+        self.assertEqual(ann[0].origin_call, "PLACENTAL_MOSAIC")
+
+    def test_twin_lod_capped_at_one(self) -> None:
+        _, lod_extreme = annotate_prenatal_origin_and_lod(
+            segments=(),
+            active_ff=0.25,
+            sample_depth_per_mb=1500.0,
+            sys_var_per_mb=0.0001,
+            twin_min_ff=0.01,
+        )
+        self.assertGreater(lod_extreme.lod_ff_35mb, 0.0)
+        self.assertLessEqual(lod_extreme.lod_ff_35mb, lod_extreme.lod_ff_3mb)
+        self.assertLessEqual(lod_extreme.lod_ff_3mb, 1.0)
 
 
 if __name__ == "__main__":

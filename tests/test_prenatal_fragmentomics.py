@@ -471,7 +471,9 @@ class TestPrenatalFragmentomics(unittest.TestCase):
 
         w_counts = np.asarray(weighted_sample.count, dtype=np.float64)
         kappa = weighted_sample.kappa_frag.astype(np.float32)
-        self.assertTrue(np.all(kappa >= 1.0))
+        self.assertTrue(np.all(kappa > 0.0))
+        np.testing.assert_allclose(kappa[:4], w_counts[:4] / 50.0, rtol=1e-5)
+        np.testing.assert_allclose(kappa[4], w_counts[4] / 50.0, rtol=1e-5)
 
         pw = np.tile([1.0, 0.0, 0.0, 0.0], (5, 1)).astype(np.float16)
         branch_model = BranchModel(

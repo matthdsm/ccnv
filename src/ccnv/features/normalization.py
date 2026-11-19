@@ -71,7 +71,7 @@ def shrink_kish_kappa(
     *,
     eligible_mask: NDArray[np.bool_] | None = None,
 ) -> NDArray[np.float64]:
-    """Shrink per-bin Kish shot-noise inflation factors toward the branch median at low counts."""
+    """Shrink per-bin compound-Poisson variance dispersion factors toward the branch median at low counts."""
     counts_arr = np.asarray(counts, dtype=np.float64)
     n_bins = counts_arr.size
     if kappa_frag is None:
@@ -79,7 +79,7 @@ def shrink_kish_kappa(
     kap_raw = np.asarray(kappa_frag, dtype=np.float64)
     if kap_raw.shape != (n_bins,):
         raise PredictError(f"kappa_frag shape {kap_raw.shape} != ({n_bins},)")
-    kap_clean = np.where(np.isfinite(kap_raw), np.maximum(kap_raw, 1.0), 1.0)
+    kap_clean = np.where(np.isfinite(kap_raw) & (kap_raw > 0.0), kap_raw, 1.0)
     mask = (
         np.ones(n_bins, dtype=np.bool_)
         if eligible_mask is None

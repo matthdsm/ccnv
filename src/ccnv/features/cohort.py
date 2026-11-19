@@ -481,7 +481,6 @@ def _weighted_sample_summary(
     NDArray[np.float64],
     NDArray[np.float64],
     NDArray[np.float64],
-    NDArray[np.float64],
 ]:
     if bufs.meta.bin_size != target_bin_size:
         bufs = rebin_sample_buffers(bufs, target_bin_size)
@@ -499,7 +498,6 @@ def _weighted_sample_summary(
             np.asarray(bufs.endpoint_count, dtype=np.float64),
             zeros,
             zeros,
-            zeros,
         )
     bands_f64 = np.asarray(bufs.frag_bands, dtype=np.float64)
     raw_cnt = np.asarray(bufs.count, dtype=np.float64)
@@ -512,7 +510,6 @@ def _weighted_sample_summary(
     w_ep = np.asarray(bufs.endpoint_count, dtype=np.float64) * ep_scale
 
     has_p = paired_f64 > 0.0
-    n_tot_bin = np.where(has_p, raw_unpaired + paired_f64, 0.0)
     w_tot_bin = np.where(has_p, w_counts, 0.0)
     w_sq_bin = np.where(has_p, raw_unpaired + (bands_f64 @ w_sq_24), 0.0)
     return (
@@ -520,7 +517,6 @@ def _weighted_sample_summary(
         w_paired,
         w_flen,
         w_ep,
-        n_tot_bin,
         w_tot_bin,
         w_sq_bin,
     )
@@ -566,7 +562,6 @@ def build_fisher_weighted_cohort(
     sum_paired = np.zeros(n_bins, dtype=np.float64)
     sum_flen = np.zeros(n_bins, dtype=np.float64)
     sum_ep = np.zeros(n_bins, dtype=np.float64)
-    sum_n_tot = np.zeros(n_bins, dtype=np.float64)
     sum_w_tot = np.zeros(n_bins, dtype=np.float64)
     sum_w_sq = np.zeros(n_bins, dtype=np.float64)
 
@@ -576,18 +571,16 @@ def build_fisher_weighted_cohort(
         w_p: NDArray[np.float64],
         w_fl: NDArray[np.float64],
         w_e: NDArray[np.float64],
-        n_tot_b: NDArray[np.float64],
         w_tot_b: NDArray[np.float64],
         w_sq_b: NDArray[np.float64],
     ) -> None:
         nonlocal sum_count, sum_paired, sum_flen, sum_ep
-        nonlocal sum_n_tot, sum_w_tot, sum_w_sq
+        nonlocal sum_w_tot, sum_w_sq
         weighted[:, idx] = col
         sum_count += col
         sum_paired += w_p
         sum_flen += w_fl
         sum_ep += w_e
-        sum_n_tot += n_tot_b
         sum_w_tot += w_tot_b
         sum_w_sq += w_sq_b
 
@@ -604,7 +597,6 @@ def build_fisher_weighted_cohort(
         ) -> tuple[
             int,
             NDArray[np.float32],
-            NDArray[np.float64],
             NDArray[np.float64],
             NDArray[np.float64],
             NDArray[np.float64],
@@ -632,13 +624,11 @@ def build_fisher_weighted_cohort(
     ref_frag_len, ref_ep_rate = _finalize_frag_covariates(
         sum_count, sum_paired, sum_flen, sum_ep, is_paired=has_frag_covs
     )
-    has_paired = sum_n_tot > 0.0
+    has_paired = (sum_w_tot > 0.0) & (sum_paired > 0.0)
     ref_kappa = np.ones(n_bins, dtype=np.float32)
     ref_kappa[has_paired] = np.maximum(
-        sum_n_tot[has_paired]
-        * sum_w_sq[has_paired]
-        / np.maximum(np.square(sum_w_tot[has_paired]), 1e-12),
-        1.0,
+        sum_w_sq[has_paired] / np.maximum(sum_w_tot[has_paired], 1e-12),
+        1e-6,
     ).astype(np.float32)
     return replace(
         cohort,

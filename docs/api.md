@@ -71,8 +71,8 @@ flowchart LR
     O_PRD --> Q_PRD
     PQ_WS -. "sample .ccnv Parquet" .-> PR_IN
     PQ_WS -. "cohort .ccnv Parquet" .-> O_REF
-    PQ_WR -. "reference .ref.ccnv Parquet" .-> O_RQC
-    PQ_WR -. "reference .ref.ccnv Parquet" .-> PR_IN
+    PQ_WR -. "reference .ccnv Parquet" .-> O_RQC
+    PQ_WR -. "reference .ccnv Parquet" .-> PR_IN
 ```
 
 ### 1.3 Extraction, Track Ingestion & Parquet I/O Call DAG
@@ -206,7 +206,7 @@ Typer CLI application defining the four `ccnv` subcommands and runtime logging s
 - **`configure_logging(level: LogLevel) -> None`** — Configures stderr logging with timestamps and severity formatting at the requested level.
 - **`extract(alignment, prefix, bin_size, fasta, min_mapq, keep_duplicates, keep_secondary, keep_supplementary, allow_improper_pairs, all_contigs, threads, loglevel)`** — Typer command that builds an `ExtractConfig`, validates inputs, and invokes `ccnv.extract.run`.
 - **`reference(prefix, samplesheet, fasta, mode, prenatal_binsize, bin_size, all_contigs, autosomal_contig, sex_contig, sex_signal_contig, sex_cutoff, pca_components, max_batch_memory_mb, min_cohort_size, min_sex_group_size, qc_report, mappability, gc, min_mappability, threads, loglevel)`** — Typer command that validates CLI options, constructs a `ReferenceConfig`, and invokes `ccnv.reference.run`.
-- **`ref_qc(reference, prefix, loglevel)`** — Typer command that builds a `ReferenceQCConfig`, invokes `ccnv.ref_qc.run_reference_qc`, and exits with code 2 if any branch reports `FAIL`.
+- **`ref_qc(reference, prefix, loglevel)`** — Typer command that builds a `ReferenceQCConfig`, invokes `ccnv.ref_qc.run_reference_qc`, emits the verdict (`PASS`/`WARN`/`FAIL`) to `stderr`, and exits with code `0` even on `FAIL`.
 - **`predict(sample, reference, prefix, sex, penalty, z_threshold, ratio_threshold, min_reference_bins, mask_repeats, max_blacklist_gap, plot, cytobands, vcf, bins_vcf, threads, fasta, mappability, gc, min_mappability, mode, twins, loglevel)`** — Typer command that validates CLI options, constructs a `PredictConfig`, and invokes `ccnv.predict.run`.
 - **`_require_positive_float(value: float | None) -> float | None`** — Internal validator enforcing finite strictly positive numeric CLI options.
 - **`_require_finite_unit_float(value: float | None) -> float | None`** — Internal validator enforcing finite values within `[0.0, 1.0]`.
@@ -225,7 +225,7 @@ Stage 1 orchestrator for extracting per-bin read counts and fragmentomics from a
 
 Stage 2 orchestrator for building germline and prenatal CNV reference models.
 
-- **`run(config: ReferenceConfig) -> Path`** — Validates inputs, builds the reference PyArrow table, writes the `.ref.ccnv` Parquet file, and runs reference QC (re-exported as `run_reference`).
+- **`run(config: ReferenceConfig) -> Path`** — Validates inputs, builds the reference PyArrow table, writes `<prefix>.ccnv` Parquet, and runs reference QC (re-exported as `run_reference`).
 - **`build_reference_table(cohort: Cohort, config: ReferenceConfig) -> pa.Table`** — Coordinates track loading, contig-role and sex resolution, CNV branch fitting, optional prenatal calibration, and Schema v2.0.0 table assembly.
 - **Internal reference helpers** — `_load_cohort`, `_fit_cnv_branches`, `_validate_config`, `_resolve_contig_roles`, `_resolve_sexes`, `_resolve_sex_signal`, and `_fit_branch` load cohort/FASTA layouts, classify sex groups, and fit super-block scales, Poisson exogenous regressions, whitened SVHT PCA, Prototype Graph models, and moderated overdispersions.
 
@@ -272,7 +272,7 @@ Immutable configuration dataclasses for read filters and the four CLI stages.
 
 - **`AnalysisMode`** — `StrEnum` defining analysis execution modes (`"germline"`, `"prenatal"`).
 - **`SexBranch`** — `StrEnum` identifying sex-specific reference branches (`"female_sex"`, `"male_sex"`).
-- **`ReadFilters`** — Frozen dataclass specifying minimum MAPQ, proper-pair enforcement, duplicate/secondary/supplementary/unmapped read filtering, and synthetic single-end fragment length; validates bounds in `__post_init__()`.
+- **`ReadFilters`** — Frozen dataclass specifying minimum MAPQ, proper-pair enforcement, and duplicate/secondary/supplementary/unmapped read filtering; validates bounds in `__post_init__()`.
   - **`ReadFilters.to_dict()`** — Serializes read filter parameters to a JSON-compatible dictionary.
   - **`ReadFilters.from_dict(data, *, strict)`** — Classmethod reconstructing a validated `ReadFilters` instance from serialized metadata.
 - **`ExtractConfig`** — Dataclass holding input/output paths, bin size, thread budget, contig filtering, and `ReadFilters` for `extract`.
@@ -287,12 +287,12 @@ Immutable configuration dataclasses for read filters and the four CLI stages.
 
 Core biological domain entities and organism-agnostic chromosome naming utilities.
 
-- **`SamplesheetEntry`** — Dataclass representing a validated cohort samplesheet row (`filepath`, optional `fasta`, optional explicit `sex`, and optional `sample_id`).
+- **`SamplesheetEntry`** — Dataclass representing a validated cohort samplesheet row (`filepath`, optional explicit `sex`, and optional prenatal `ff`).
 - **`Cytoband`** — Dataclass representing a parsed cytogenetic band (`contig`, `start`, `end`, `name`, `stain`) in 0-based half-open coordinates.
 - **`ContigLookup`** — Case- and prefix-insensitive contig name resolver handling UCSC `chr` vs plain naming across heterogeneous references.
   - **`ContigLookup.from_names(available)`** — Classmethod indexing an ordered iterable of available contig names in $O(1)$.
   - **`ContigLookup.resolve(contig: str) -> str | None`** — Resolves a candidate contig name to the authoritative reference contig name or returns `None`.
-- **`normalize_chr(name: str) -> str`** — Returns a canonical lowercase contig key stripped of any leading `'chr'` prefix (`MT`/`chrM` normalized uniformly).
+- **`normalize_chr(name: str) -> str`** — Returns a canonical contig key stripped of any leading `'chr'` prefix (uppercasing `'X'`/`'Y'` while preserving autosome/auxiliary case).
 - **`is_autosome_name(name: str) -> bool`** — Returns `True` when a contig name matches canonical numbered autosomes ($\ge 1$, with or without `chr`).
 - **`is_canonical_contig(name: str) -> bool`** — Returns `True` for canonical primary chromosomes (`1`–`22`, `X`, `Y`, excluding MT, ALT, decoy, random, unplaced, and EBV).
 - **`natural_sort_key(name: str)`** — Computes a natural chromosome sort key placing autosomes numerically before `X`, `Y`, `MT`, and auxiliary contigs.
@@ -321,7 +321,7 @@ JSON-backed Arrow schema metadata envelopes (`ccnv.fragmentomics`, `ccnv.prenata
 - **`ArtifactKind`** — `StrEnum` identifying Arrow Parquet artifact types (`"sample"`, `"reference"`).
 - **`encode_metadata(values)`** — Serializes namespaced metadata payloads to deterministic RFC-8259 UTF-8 JSON bytes.
 - **`decode_metadata(metadata)`** — Decodes Arrow byte metadata mappings while rejecting malformed or non-finite (`NaN`/`Infinity`) constants.
-- **`FragmentomicsMetadata`** — Dataclass carrying sample-level fragment size landmarks (`q05`–`q95`, `mean`), short-fragment ratio, MDS, 10 bp helical periodicity, 571-bin length histogram, and 256-element 5' 4-mer motif counts.
+- **`FragmentomicsMetadata`** — Dataclass carrying sample-level fragmentomic landmarks (`chromatosome_mode_bp`, `core_shoulder_bp`, `sizing_shift_bp`, `self_referenced_peak_ratio`, `dinucleosome_fraction`, `high_mw_fraction`, `helical_10bp_amplitude`, `helical_10bp_phase`, `motif_diversity_score`), 571-bin autosomal/`chrX`/`chrY` length histograms, and 256-element 5' 4-mer motif counts.
   - **`FragmentomicsMetadata.to_dict()`** — Serializes fragmentomics metadata fields to a plain JSON-ready dictionary.
   - **`FragmentomicsMetadata.from_dict(data)`** — Classmethod constructing a validated `FragmentomicsMetadata` from a decoded dictionary.
 - **`PrenatalModelMetadata`** — Dataclass storing fitted prenatal hyperparameters (`prenatal_binsize`, `ffy_*`, `ffx_*`, `ffa_model`, `ff_size_model`, deconvolution priors, Fisher band weights, SCA covariance/means, and origin priors).
@@ -355,8 +355,8 @@ Structured output containers shared between statistical kernels, QC modules, and
 - **`ScanAlignmentResult`** — Dataclass encapsulating raw NumPy bin arrays, histograms, motif counts, and `ScanQcCounts` returned by alignment scanning.
 - **`BinResult`** — Dataclass holding per-bin prediction results (`contig`, `start`, `end`, log2 ratios, Z-scores, prototype distances, masked flags, and weights).
 - **`SegmentResult`** — Dataclass holding called genome segments with breakpoints, BLUE Z-scores, copy-number state (`cn`), Bayes factors, and optional prenatal origin annotations.
-- **`PrenatalLoDMetrics`** — Dataclass reporting prenatal limit-of-detection metrics (minimum detectable fetal fraction and achieved statistical power).
-- **`SCAResult`** — Dataclass holding 4D ray-marginalized sex-chromosome aneuploidy classification (`karyotype`, posteriors, log-likelihoods, and confidence margin).
+- **`PrenatalLoDMetrics`** — Dataclass reporting prenatal analytical Limit of Detection thresholds (`lod_ff_35mb` for chromosome-arm aneuploidies and `lod_ff_3mb` for focal 3 Mb events).
+- **`SCAResult`** — Dataclass holding 4D ray-marginalized sex-chromosome aneuploidy classification (`call`, `is_aneuploid`, `confidence`, `chrx_zscore`, and optional `ff_delta`).
 - **`TwinResult`** — Dataclass holding 2-fetus twin pregnancy stoichiometry predictions (`call` in `TwinSexPair`, `fetal_sexes`, `is_twin`, `twin_probability`, `confidence`, `posteriors`, `male_ff`, `female_ff`).
 - **`FetalFractionResult`** — Dataclass combining `FFY`, `FFX`, `FFA`, `FF_size`, Student-$t_4$ fused `active_ff`, `SCAResult`, `TwinResult`, `gestation` (`GestationType`), and per-estimator diagnostic statuses.
 - **`PredictionOutputs`** — Dataclass bundling paths of all generated BED, VCF, HTML, and QC JSON artifacts alongside summary statistics.
@@ -371,7 +371,7 @@ Structured output containers shared between statistical kernels, QC modules, and
 
 PyArrow schema constructors and coordinate-reconstruction utilities.
 
-- **`build_reference_schema(pca_rank)`** — Constructs the canonical 17-column Arrow schema for `.ref.ccnv` Parquet tables parameterized by retained PCA rank.
+- **`build_reference_schema(pca_rank)`** — Constructs the canonical 17-column Arrow schema for reference `.ccnv` Parquet tables parameterized by retained PCA rank.
 - **`reconstruct_sample_grid(meta)`** — Reconstructs authoritative 0-based half-open `(contig_codes, contig_names, starts, ends)` coordinate arrays deterministically from `SampleMetadata`.
 - **`canonical_dictionary_array(col, col_name, *, index_type)`** — Encodes, unifies, and deduplicates categorical contig or branch labels into one PyArrow `DictionaryArray`.
 - **`decode_dictionary_contigs(contig_col)`** — Decodes an Arrow dictionary-encoded or string contig column into an ordered tuple of names.
@@ -408,7 +408,7 @@ Version-checked Parquet persistence with atomic temporary staging and row-group 
 - **`read_sample_buffers(path: Path)`** — Reads a `.ccnv` Parquet file, validates schema/metadata, and returns `SampleBuffers`.
 - **`write_sample_parquet(table, path, *, compression_level)`** — Atomically writes a validated ZSTD-compressed sample PyArrow table via a sibling temporary file and replace.
 - **`filter_reference_branches(table, branches)`** — Filters an in-memory reference PyArrow table to selected branch names while preserving schema metadata.
-- **`read_reference_parquet(path, *, branches, check_rows)`** — Reads a `.ref.ccnv` Parquet file (optionally pruning row groups to `branches` via column statistics), validates the contract, and returns `(table, ReferenceMetadata)`.
+- **`read_reference_parquet(path, *, branches, check_rows)`** — Reads a reference `.ccnv` Parquet file (optionally pruning row groups to `branches` via column statistics), validates the contract, and returns `(table, ReferenceMetadata)`.
 - **`write_reference_parquet(table, path, *, compression_level)`** — Atomically writes a validated multi-branch reference PyArrow table partitioned by branch row group for predicate pushdown.
 - **Internal Parquet helpers** — `_sibling_tmp_path`, `_decode_stat_str`, `_select_matching_row_groups`, and `_is_string_or_string_dict` manage safe staging paths and Parquet row-group statistics filtering.
 
@@ -490,17 +490,17 @@ Gap-aware Pelt segmentation, multi-scale dyadic BLUE Z-scoring, and discrete int
 - **`WeightedL2Cost`** — Custom `ruptures.base.BaseCost` subclass implementing weighted $O(1)$ prefix-sum quadratic segmentation cost.
   - **`WeightedL2Cost.fit(signal)`** — Precomputes contiguous weighted prefix sums from an `(N, 2)` matrix of `(values, weights)`.
   - **`WeightedL2Cost.error(start, end)`** — Returns the weighted residual sum of squares for segment slice `[start, end)`.
-- **`estimate_dyadic_inflation(zscores, usable, *, scales)`** — Estimates scale-dependent autocorrelation inflation $\kappa(L)$ across dyadic window lengths on unmasked autosomal residuals.
+- **`estimate_dyadic_inflation(zscores, usable, *, scales)`** — Estimates scale-dependent autocorrelation inflation $\kappa(L)$ across dyadic window lengths on unmasked contig runs.
 - **`interpolate_dyadic_inflation(n_bins, inflation_values, *, scales)`** — Interpolates $\kappa(N)$ monotonically in $\log_2$ scale space across arbitrary segment bin spans.
-- **`segment_contig(*, contig, starts, ends, ratios, weights, contig_length, penalty, sensitivity, kappa_local, min_size, jump, max_blacklist_gap)`** — Splits euchromatic arms at masked gaps $\gt 2\text{ Mb}$, runs calibrated Pelt segmentation (`KernelCPD` when weights are uniform and `WeightedL2Cost` otherwise), and returns segmented intervals.
-- **`segment_and_score_genome(contigs, *, penalty, sensitivity, mode, z_threshold, ratio_threshold, min_size, jump, max_blacklist_gap, threads)`** — Estimates genome-wide dyadic autocorrelation inflation and segments all canonical and sex contigs with Gauss-Markov BLUE Z-scores and discrete `CN in {0, 1, 2, 3, 4+}` Bayes factors.
+- **`segment_contig(*, contig, starts, ends, ratios, weights, contig_length, penalty, sensitivity, kappa_local, min_size, jump, max_blacklist_gap)`** — Splits euchromatic arms at masked gaps $\gt 2\text{ Mb}$, runs calibrated Pelt segmentation (`KernelCPD` when weights are uniform and `jump == 1`, `WeightedL2Cost` otherwise), and returns segmented intervals.
+- **`segment_and_score_genome(contigs, *, penalty, sensitivity, mode, z_threshold, ratio_threshold, min_size, jump, max_blacklist_gap, threads)`** — Estimates per-contig dyadic autocorrelation inflation (after step-detrending significant segments) and segments all contigs with Gauss-Markov BLUE Z-scores and discrete integer copy-number Bayes factors ($CN_0 = 2$ in germline; $CN_0 = 1$ on haploid contigs including `male_sex` and prenatal male `prenatal_ffy`).
 - **Internal segmentation helpers** — `_segment_bin_spans`, `_reduce_segment_means`, `_evaluate_integer_cn_bf`, `_as_optional_1d_f64`, `_segment_and_prescore_contig`, `_cumulative`, `_find_breakpoints`, `_validate_inputs`, and `_split_blacklist_gaps` manage prefix sums, gap splitting, Pelt pruning, and Bayes-factor calculation.
 
 ### `ccnv.stats.prenatal_math` (`src/ccnv/stats/prenatal_math.py`)
 
 Low-level mathematical models for prenatal Y-chromosome estimation, forward FFX calibration, Student-$t_4$ fusion, and 4D SCA ray classification.
 
-- **`MSYSexModel`** — Dataclass storing bimodal Poisson-Gamma mixture parameters (`mu_female`, `mu_male`, priors) over `chrY` MSY counts.
+- **`MSYSexModel`** — Dataclass storing 2-component Poisson EM sex mixture parameters (`p_male`, `bg_rate`, `bimodal`) over `chrY` MSY counts.
 - **`PoissonFFYModel`** — Dataclass holding background maternal false-positive rate and male slope for `chrY` fetal-fraction MLE.
 - **`SCARayClassification`** — Dataclass storing 4D Gaussian mixture ray parameters across diploid and aneuploid karyotype classes (`XX`, `XY`, `XO`, `XXX`, `XXY`, `XYY`).
 - **`TwinClassification`** — Dataclass storing 2-fetus twin stoichiometry results (`TwinResult`, `gestation`, `fetal_sexes`, `male_ff`, `female_ff`, `twin_confidence`, and reconciled `active_ff`, `active_ff_se`, `active_ff_source`).
@@ -519,7 +519,7 @@ Low-level mathematical models for prenatal Y-chromosome estimation, forward FFX 
 
 Cell-free DNA fragment-size deconvolution, Fisher band weighting, end-motif diversity, and size-based fetal fraction estimation.
 
-- **`FragmentomicLandmarks`** — Dataclass holding per-sample fragment length quantiles (`q05`, `q10`, `q25`, `q50`, `q75`, `q90`, `q95`), `mean`, `short_ratio`, `mds`, and `periodicity`.
+- **`FragmentomicLandmarks`** — Dataclass holding per-sample fragmentomic landmarks (`paired_end`, `total_paired_fragments`, `chromatosome_mode_bp`, `core_shoulder_bp`, `sizing_shift_bp`, `self_referenced_peak_ratio`, `dinucleosome_fraction`, `high_mw_fraction`, `helical_10bp_amplitude`, `helical_10bp_phase`, `motif_diversity_score`, and `fetal_motif_ratio`).
 - **`encode_kmer_4(seq)`** — Encodes 4-mer 5' DNA sequences into canonical `[0, 255]` motif indices.
 - **`compute_motif_diversity_score(motif_counts)`** — Computes normalized Shannon entropy (`MDS`) across the 256 4-mer end motifs.
 - **`compute_helical_periodicity(hist)`** — Extracts the ~10 bp nucleosomal helical power ratio from fragment length spectra.
@@ -529,8 +529,8 @@ Cell-free DNA fragment-size deconvolution, Fisher band weighting, end-motif dive
 - **`predict_ff_kl_deconvolution(hist_sample, p_fetal, p_maternal)`** — Estimates sample fetal fraction by minimizing KL divergence against convex mixtures of $\hat{p}_F(L)$ and $\hat{p}_M(L)$.
 - **`compute_fragment_length_llr(hist, p_fetal, p_maternal, *, sizing_shift_bp, baseline_ff, is_gain)`** — Computes per-segment fragment-length log-likelihood ratios contrasting fetal-enriched vs maternal-enriched size profiles.
 - **`compute_band_fisher_weights(p_fetal_571, p_maternal_571, *, f0)`** — Solves Fisher optimal 24-band read weights $w^{\ast}_{0.08}$ maximizing fetal-fraction Fisher information across fragment size bands.
-- **`evaluate_band_weighted_counts(frag_bands, raw_counts, paired_counts, band_weights_24)`** — Applies a 24-band weight vector to per-bin fragment band matrices to synthesize Fisher-weighted coverage arrays and Kish design factors.
-- **`build_fragmentomic_feature_vector(hist_autosomal, motif_counts, chromatosome_mode_bp, sizing_shift_bp, helical_10bp_amp, motif_mds, fetal_motif_ratio, reference_maternal_571)`** — Builds the 36-dimensional mode-aligned feature vector combining size ratios, KL deconvolution estimate, quantiles, MDS, and helical periodicity.
+- **`evaluate_band_weighted_counts(frag_bands, raw_counts, paired_counts, band_weights_24)`** — Applies a 24-band weight vector to per-bin fragment band matrices to synthesize Fisher-weighted coverage arrays and compound-Poisson variance dispersion factors ($\sum w_j^2 / \sum w_j$).
+- **`build_fragmentomic_feature_vector(hist_autosomal, motif_counts, chromatosome_mode_bp, sizing_shift_bp, helical_10bp_amp, motif_mds, fetal_motif_ratio, reference_maternal_571)`** — Builds the 36-dimensional mode-aligned feature vector combining `chromatosome_mode_bp`, 27 5-bp log-band ratios, `self_referenced_peak_ratio`, 4 shoulder/flank ratios, helical periodicity, MDS, and `fetal_motif_ratio`.
 - **`fit_ff_fragmentomics_ensemble(features, ff_targets, *, seed)`** — Fits the standardized logit-link convex `RidgeCV` + `ElasticNetCV` 36-feature `FF_size` ensemble.
 - **`predict_ff_fragmentomics(hist_autosomal, motif_counts, *, paired_end, chromatosome_mode_bp, sizing_shift_bp, helical_10bp_amp, motif_mds, fetal_motif_ratio, p_fetal_density, p_maternal_density, ff_frag_weights, ff_frag_bias, ff_frag_feature_mean, ff_frag_feature_scale)`** — Evaluates mode-aligned KL MLE and the `FF_size` logit ensemble from raw fragmentomic arrays.
 - **`_compute_fetal_motif_ratio`** — Internal helper extracting fetal-associated 5' C-end/G-end motif enrichment ratios.
@@ -563,12 +563,12 @@ In-memory sample buffer rebinning across matching contig layouts.
 
 Cohort loading, rebinning harmonization, DESeq2 depth normalization, low-coverage contig masking, and Fisher-weighted cohort synthesis.
 
-- **`Cohort`** — Dataclass holding stacked `(N_samples, N_bins)` count and fragmentomics matrices, sample IDs, layout, and optional explicit sex annotations.
+- **`Cohort`** — Dataclass holding stacked `(N_bins, N_samples)` count and fragmentomics matrices, identities, layout, and optional paths/tracks.
 - **`estimate_size_factors(counts, mask, *, contigs, starts, ends, block_bp)`** — Computes DESeq2 median-of-ratios size factors across usable genomic 1 Mb super-blocks.
 - **`mask_low_coverage_per_contig(counts, contigs, exposure, *, min_fraction)`** — Flags per-sample/per-contig dropout bins with exposure-adjusted depth below `min_fraction` of positive contig medians.
 - **`alloc_cohort_counts(n_bins, n_samples, max_batch_memory_mb)`** — Allocates a Fortran-contiguous `float32` cohort matrix matching sample counts and memory budgets (spilling to disk memmap above budget).
 - **`load_and_assemble_cohort(entries, target_bin_size, *, threads, max_batch_memory_mb)`** — Reads or streams cohort samples (rebinning mismatched bin sizes on the fly when contig lengths agree) into a harmonized `Cohort`.
-- **`build_fisher_weighted_cohort(cohort, band_weights_24, *, max_batch_memory_mb, threads)`** — Re-weights per-bin cohort matrices across 24 fragment bands using prenatal Fisher weights $w^{\ast}_{0.08}$.
+- **`build_fisher_weighted_cohort(cohort, band_weights_24, *, max_batch_memory_mb, threads)`** — Re-weights per-bin cohort matrices across 24 fragment bands using prenatal Fisher weights $w^{\ast}_{0.08}$ and attaches pooled compound-Poisson dispersion factors.
 - **`validate_cohort(tables, paths, target_bin_size)`** — Enforces homogeneous paired-end vs single-end layouts and target bin compatibility across in-memory cohort tables.
 - **`rebin_cohort(cohort, target_bin_size)`** — Coarsens an entire cohort in memory to a larger `target_bin_size` (e.g., 5 kb to 100 kb).
 - **`cohort_from_fasta(contigs_dict, bin_size, *, fasta_path)`** — Builds a uniform flat-depth synthetic 0-sample `Cohort` directly from FASTA contig dimensions.
@@ -580,7 +580,7 @@ Covariate track validation, bin masking, and feature-matrix preparation.
 
 - **`validate_min_mappability(min_mappability)`** — Enforces finite `min_mappability` bounds within `[0.0, 1.0]`.
 - **`mask_covariates(usable, *, gc, mappability, n_mask, min_mappability)`** — Computes composite boolean bin mask combining low mappability (`< min_mappability`), high FASTA N-content, and zero exposure bins.
-- **`covariate_features(usable, gc, mappability, ref_frag_len, ref_ep_rate)`** — Assembles normalized GC, mappability, and reference fragmentomic covariate matrices for Poisson trend estimation.
+- **`covariate_features(usable, gc, mappability, ref_frag_len, ref_ep_rate)`** — Assembles standardized GC, mappability, and reference fragmentomic covariate matrices for Prototype Graph clustering.
 
 ### `ccnv.features.sex` (`src/ccnv/features/sex.py`)
 
@@ -599,7 +599,7 @@ Compiled branch models and single-sample within-sample prototype normalization.
 
 - **`BranchModel`** — Dataclass holding aligned reference tracks, whitened PCA matrices, off-contig Prototype Graph indices/weights, biological dispersions, and usable masks for one branch.
 - **`BranchNormalizationResult`** — Dataclass returning bin-level log2 ratios, precision weights, residuals, scale factors, and per-sample covariate predictions.
-- **`shrink_kish_kappa(counts, kappa_frag, *, eligible_mask)`** — Shrinks per-bin Kish shot-noise inflation factors toward the branch median at low effective read counts.
+- **`shrink_kish_kappa(counts, kappa_frag, *, eligible_mask)`** — Shrinks per-bin compound-Poisson variance dispersion factors toward the branch median at low effective read counts.
 - **`estimate_adjacent_dispersion_tau(valid_indices, contigs, centered_ratios, sig0_sq, *, tau_min, tau_max)`** — Estimates sample overdispersion scale $\hat{\tau}$ from MAD-scaled adjacent same-contig bin differences clamped to `[tau_min, tau_max]`.
 - **`align_reference_unmasked_bins(sample, reference)`** — Aligns unmasked reference branch intervals onto target sample bin coordinates.
 - **`build_branch_model_from_tables(ref_table, branch, *, sample, ref_meta)`** — Compiles a `BranchModel` from filtered reference Parquet rows and optional `SampleBuffers`.
@@ -614,7 +614,7 @@ Cohort-level fragmentomics compatibility checks and Fisher band weighting orches
 - **`CohortFragmentomicsFit`** — Dataclass bundling deconvolved fetal/maternal densities, optimal Fisher weights $w^{\ast}_{0.08}$, and fitted `FF_size` models.
 - **`extract_sample_fragmentomics(metadata)`** — Parses validated `FragmentomicsMetadata` from decoded or Arrow schema metadata mappings.
 - **`fit_cohort_fragmentomics_model(frag_metas, is_male_arr, ff_targets, *, quarantined, seed)`** — Fits cohort fetal/maternal density deconvolution, Fisher weights, and the 36-feature `FF_size` ensemble during prenatal reference training.
-- **`apply_prenatal_fisher_weighting(sample, prenatal_meta)`** — Re-weights raw sample 24-band matrices with reference Fisher weights $w^{\ast}_{0.08}$ and attaches per-bin Kish design factors during prenatal inference.
+- **`apply_prenatal_fisher_weighting(sample, prenatal_meta)`** — Re-weights raw sample 24-band matrices with reference Fisher weights $w^{\ast}_{0.08}$ and attaches per-bin compound-Poisson dispersion factors during prenatal inference.
 - **`resolve_fisher_moment_weights(sample, prenatal_meta)`** — Resolves exact moment adjustments matching Fisher-weighted Poisson variance estimation.
 - **`has_paired_fragmentomics(sample)`** — Returns whether a sample table or metadata payload carries paired-end fragmentomic observations.
 - **`resolve_fragmentomics_compatibility(sample, reference)`** — Validates sample vs reference fragmentomic compatibility and handles fallback rules when evaluating single-end or legacy profiles.
@@ -656,7 +656,7 @@ Five-state biological origin classifier for called prenatal CNV segments and LoD
   - **`BandPrefixSums.from_sample_table(sample, bin_usable)`** — Classmethod building contig-aligned prefix-sum arrays directly from `SampleBuffers` or Arrow tables.
   - **`BandPrefixSums.query(contig, start, end)`** — Sums fragment counts across the 24 size bands overlapping `[start, end)` on `contig`.
 - **`classify_segment_origin_5state(r_obs, k_band_counts, p_fetal_24, p_maternal_24, p_plasma_0, active_ff, active_ff_se, is_gain, *, depth_ff, twin_min_ff, alpha_dm, sigma_r)`** — Evaluates the coupled depth + Dirichlet-Multinomial 24-band likelihood across `FETAL_CONSTITUTIONAL` (both concordant-twin and single-fetus hypotheses when `twin_min_ff` is set), `PLACENTAL_MOSAIC`, `MATERNAL_UNINHERITED`, `MATERNAL_AND_FETAL_INHERITED`, and `MATERNAL_MOSAIC` states (assigning `INDETERMINATE` when max posterior $\lt 0.80$).
-- **`annotate_prenatal_origin_and_lod(segments, *, prefix_sums, sample_bands, bin_usable, p_fetal_density, p_maternal_density, mu_fetal_w, mu_maternal_w, active_ff, active_ff_se, sca_call, sample_depth_per_mb, sys_var_per_mb, z_threshold, twin_min_ff)`** — Computes expected ratios, implied fetal fraction, discordance flags (`SCA_DISCORDANT`, `SUB_FETAL_RATIO`, `SUPER_FETAL_RATIO`), `frag_short_ratio`, `frag_llr_size`, origin posteriors, and theoretical `PrenatalLoDMetrics`.
+- **`annotate_prenatal_origin_and_lod(segments, *, prefix_sums, sample_bands, bin_usable, p_fetal_density, p_maternal_density, mu_fetal_w, mu_maternal_w, active_ff, active_ff_se, sca_call, sample_depth_per_mb, sys_var_per_mb, z_threshold, twin_min_ff, sizing_shift_bp)`** — Computes expected ratios, implied fetal fraction, discordance flags (`SCA_DISCORDANT`, `SUB_FETAL_RATIO`, `SUPER_FETAL_RATIO`), `frag_short_ratio`, `frag_llr_size`, shift-aligned origin posteriors (handling normalized uniform mosaic priors), and theoretical `PrenatalLoDMetrics` (twin LoD capped at $\le 1.0$).
 - **`annotate_sample_prenatal_segments(segments, sample, *, bin_usable, prenatal_meta, prenatal_result, z_threshold)`** — Builds `BandPrefixSums` for the sample and annotates all called `SegmentResult` entries with origin calls and fragmentomic statistics.
 - **Internal origin helpers** — `_dirichlet_multinomial_logpmf`, `_gaussian_depth_loglik`, `_to_24_band_density`, and `_integrate_mosaic_state` evaluate marginal log-likelihoods over discrete/continuous mosaic grids.
 
@@ -678,7 +678,7 @@ Stage 1 extraction QC construction and strict JSON serialization.
 Stage 2/3 reference branch quality auditing and `PASS`/`WARN`/`FAIL` verdict escalation.
 
 - **`compute_signal_contig_metrics(contigs, signal_contig, mean_d, n_refs, cutoff_outlier, min_ref_bins, *, total_bins)`** — Computes masked fraction, residual dispersion, null bias, and effective prototype distance per contig group.
-- **`evaluate_autosomal_or_female_verdict(m, min_ref_bins, dist_scale)`** — Evaluates quality thresholds for `autosomal`, `female_sex`, `prenatal_autosomal`, and `prenatal_ffy` branches.
+- **`evaluate_autosomal_or_female_verdict(m, min_ref_bins, dist_scale)`** — Evaluates quality thresholds for `autosomal` and `female_sex` branches (prenatal summary metrics are audited separately in `run_reference_qc_on_table`).
 - **`evaluate_male_verdict(m, min_ref_bins, dist_scale)`** — Evaluates `male_sex` branch quality with sex-specific contig coverage rules.
 - **`compute_branch_qc(table, branch_name, signal_contig, min_ref_bins, dist_scale)`** — Computes a `BranchQCStatus` summary for a single reference branch table.
 - **`write_reference_qc_json(path, data)`** — Writes formatted reference QC payloads atomically to disk.
@@ -699,7 +699,7 @@ The `ccnv.report` package converts prediction results into indexed BED, VCFv4.2,
 
 ### `ccnv.report` (`src/ccnv/report/__init__.py`)
 
-- **`write_outputs(prefix, bins, segments, contig_lengths, plot, vcf, *, bins_vcf, threads, cytobands, z_threshold, ratio_threshold, prenatal_result, mode, qc_json_path)`** — Top-level report dispatcher orchestrating single-pass bgzipped/tabix BED export (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`), optional VCFv4.2 output (`_calls.vcf.gz`, plus `_bins.vcf.gz` with `--bins-vcf`), and interactive HTML rendering (`_plot.html`).
+- **`write_outputs(prefix, bins, segments, contig_lengths, plot, vcf, *, bins_vcf, threads, cytobands, z_threshold, ratio_threshold, prenatal_result, mode, qc_json_path)`** — Top-level report dispatcher orchestrating single-pass bgzipped/tabix BED export (`_bins.bed.gz`, `_segments.bed.gz`, `_calls.bed.gz`), optional VCFv4.2 output (`_segments.vcf.gz`, `_calls.vcf.gz`, plus `_bins.vcf.gz` with `--bins-vcf`), and interactive HTML rendering (`_plot.html`).
 
 ### `ccnv.report._common` (`src/ccnv/report/_common.py`)
 
@@ -736,7 +736,7 @@ VCFv4.2 header generation and streaming variant record serialization (`<DEL>`, `
 - **`build_vcf_header(contig_lengths, sample_name, record_type, extra_contigs, prenatal_result)`** — Constructs a VCFv4.2 header with `##contig` lengths, `INFO`/`FORMAT` tags, symbolic `ALT` alleles, and prenatal origin fields when applicable.
 - **`write_vcf_streaming(gz_path, header_lines, body_chunks, contig_names, max_contig_len, *, threads)`** — Streams naturally ordered variant records through `write_bgzf_atomic` with `vcf` preset indexing.
 - **`write_bins_vcf(gz_path, header, results, sample_name, *, contig_lengths, threads)`** — Emits opt-in bin-level VCFv4.2 output (`_bins.vcf.gz`) when `--bins-vcf` is set.
-- **`write_segments_vcf(gz_path, header, results, sample_name, *, calls_only, is_prenatal, contig_lengths, threads, segments_df)`** — Emits called CNV events (and optional neutral segments) into `_calls.vcf.gz`.
+- **`write_segments_vcf(gz_path, header, results, sample_name, *, calls_only, is_prenatal, contig_lengths, threads, segments_df)`** — Emits called CNV events (`_calls.vcf.gz`) or all segmented regions (`_segments.vcf.gz`) into VCFv4.2.
 - **Internal VCF helpers** — `_fmt_vcf_float_expr`, `_extract_header_contigs`, and `_merge_vcf_contig_bounds` format float expressions and merge VCF contig header lengths.
 
 ### `ccnv.report.html` (`src/ccnv/report/html.py`, `src/ccnv/report/templates/genome_plot.html.j2`)

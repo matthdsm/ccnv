@@ -307,7 +307,7 @@ class TestFragmentomicsKernels(unittest.TestCase):
         self.assertAlmostEqual(float(eff_cov[0]), 2.5)
         self.assertAlmostEqual(float(eff_cov[1]), 0.0)
         self.assertAlmostEqual(float(eff_cov[2]), 3.0)
-        self.assertTrue(bool(np.all(kappa >= 1.0)))
+        self.assertTrue(bool(np.all(kappa > 0.0)))
 
         table_se = make_sample_table(
             [5, 10, 15],
@@ -397,7 +397,7 @@ class TestFragmentomicsKernels(unittest.TestCase):
         self.assertIsNotNone(weighted_bufs.kappa_frag)
         if weighted_bufs.kappa_frag is None:
             self.fail("expected kappa_frag")
-        self.assertTrue(bool(np.all(weighted_bufs.kappa_frag >= 1.0)))
+        self.assertTrue(bool(np.all(weighted_bufs.kappa_frag > 0.0)))
 
     def test_fragmentomics_non_ascii_kmer_and_unpaired_kish_kappa(self) -> None:
         self.assertIsNone(encode_kmer_4("AC\u0100T"))
@@ -417,7 +417,7 @@ class TestFragmentomicsKernels(unittest.TestCase):
         w_counts, kappa = evaluate_band_weighted_counts(bands, counts, paired, weights)
         expected_w = 50.0 + 25.0 * 3.0 + 25.0 * 0.25
         expected_w2 = 50.0 * 1.0 + 25.0 * 9.0 + 25.0 * 0.0625
-        expected_kappa = (100.0 * expected_w2) / (expected_w * expected_w)
+        expected_kappa = expected_w2 / expected_w
         self.assertAlmostEqual(float(w_counts[0]), expected_w, places=6)
         self.assertAlmostEqual(float(kappa[0]), expected_kappa, places=6)
 
@@ -604,7 +604,7 @@ class TestFragmentomicsDeconvolutionAndFisher(unittest.TestCase):
 
         self.assertEqual(len(w_counts), n_bins)
         self.assertEqual(len(kappa_frag), n_bins)
-        self.assertTrue(bool(np.all(kappa_frag >= 1.0)))
+        self.assertTrue(bool(np.all(kappa_frag > 0.0)))
 
         zero_bands = np.zeros((1, 24), dtype=np.uint32)
         _, zero_kappa = evaluate_band_weighted_counts(
@@ -621,6 +621,18 @@ class TestFragmentomicsDeconvolutionAndFisher(unittest.TestCase):
         )
         np.testing.assert_allclose(flat_counts, raw_counts.astype(np.float64))
         np.testing.assert_allclose(flat_kappa, 1.0, atol=1e-6)
+
+    def test_compound_poisson_kappa_scale_invariance(self) -> None:
+        bands = np.zeros((3, NUM_FRAG_BANDS), dtype=np.uint32)
+        bands[:, 4] = 40
+        raw = np.array([40.0, 40.0, 40.0], dtype=np.float64)
+        paired = np.array([40, 40, 40], dtype=np.uint32)
+        for scale in (2.0, 0.5, 1.0):
+            w_vec = np.full(NUM_FRAG_BANDS, scale, dtype=np.float64)
+            eff_c, kappa_cp = evaluate_band_weighted_counts(bands, raw, paired, w_vec)
+            np.testing.assert_allclose(eff_c, 40.0 * scale, rtol=1e-6)
+            np.testing.assert_allclose(kappa_cp, scale, rtol=1e-6)
+            np.testing.assert_allclose(kappa_cp / eff_c, 1.0 / 40.0, rtol=1e-6)
 
 
 if __name__ == "__main__":

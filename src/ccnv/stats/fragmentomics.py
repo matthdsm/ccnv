@@ -541,7 +541,7 @@ def evaluate_band_weighted_counts(
     paired_counts: ArrayLike,
     band_weights_24: ArrayLike,
 ) -> tuple[NDArray[np.float64], NDArray[np.float32]]:
-    """Evaluate Fisher-weighted coverage and per-bin Kish design factor from 24 frag_bands."""
+    """Evaluate Fisher-weighted coverage and compound-Poisson variance dispersion factor from 24 frag_bands."""
     bands_f64 = np.asarray(frag_bands, dtype=np.float64)
     raw_f64 = np.asarray(raw_counts, dtype=np.float64)
     paired_f64 = np.asarray(paired_counts, dtype=np.float64)
@@ -551,16 +551,13 @@ def evaluate_band_weighted_counts(
     raw_unpaired = np.maximum(raw_f64 - paired_f64, 0.0)
     w_counts = raw_unpaired + w_paired
 
-    n_tot = raw_unpaired + paired_f64
     tot_w_sq = raw_unpaired + (bands_f64 @ np.square(w_24))
-    has_reads = (n_tot > 0.0) & (paired_f64 > 0.0)
+    has_reads = (w_counts > 0.0) & (paired_f64 > 0.0)
 
     kappa = np.ones(raw_f64.shape, dtype=np.float32)
     kappa[has_reads] = np.maximum(
-        n_tot[has_reads]
-        * tot_w_sq[has_reads]
-        / np.maximum(np.square(w_counts[has_reads]), 1e-12),
-        1.0,
+        tot_w_sq[has_reads] / np.maximum(w_counts[has_reads], 1e-12),
+        1e-6,
     ).astype(np.float32)
 
     return w_counts, kappa

@@ -30,7 +30,7 @@ from ccnv.models import (
     normalize_chr,
     reconstruct_sample_grid,
 )
-from ccnv.stats.fragmentomics import FRAG_MIN_LEN, FRAG_NUM_BINS
+from ccnv.stats.fragmentomics import FRAG_MIN_LEN, FRAG_NUM_BINS, align_histogram
 
 __all__ = [
     "BandPrefixSums",
@@ -150,6 +150,8 @@ def _gaussian_depth_loglik(
 
 def _to_24_band_density(
     density: Sequence[float] | NDArray[np.floating],
+    *,
+    sizing_shift_bp: float = 0.0,
 ) -> NDArray[np.float64]:
     """Convert a 24-band or 571-bin fragment length density into canonical 24 bands."""
     p_arr = np.asarray(density, dtype=np.float64).ravel()
@@ -162,6 +164,8 @@ def _to_24_band_density(
             f"elements, got {p_arr.size}"
         )
 
+    if abs(sizing_shift_bp) >= 1e-6:
+        p_arr = align_histogram(p_arr, -float(sizing_shift_bp))
     offsets = np.asarray(FRAG_BAND_EDGES, dtype=np.int64) - FRAG_MIN_LEN
     p_24 = np.add.reduceat(p_arr[: int(offsets[-1])], offsets[:-1])
     p_24 = np.clip(p_24, 1e-8, None)
@@ -228,7 +232,9 @@ def _integrate_mosaic_state(
     max_ll = float(np.max(ll_nodes))
     unnorm = np.exp(ll_nodes - max_ll)
     integral = float(np.sum(m_weights * unnorm))
-    log_ev = max_ll + math.log(max(integral, 1e-300)) + math.log(max(jacobian, 1e-6))
+    log_ev = (
+        max_ll + math.log(max(integral, 1e-300)) - math.log(max(m_high - m_low, 1e-9))
+    )
     m_hat = float(np.sum(m_weights * m_nodes * unnorm) / max(integral, 1e-300))
     var_m = float(
         np.sum(m_weights * np.square(m_nodes - m_hat) * unnorm) / max(integral, 1e-300)
@@ -390,6 +396,7 @@ def annotate_prenatal_origin_and_lod(
     sys_var_per_mb: float = 0.0001,
     z_threshold: float = 3.0,
     twin_min_ff: float | None = None,
+    sizing_shift_bp: float = 0.0,
 ) -> tuple[tuple[SegmentResult, ...], PrenatalLoDMetrics]:
     """Annotate segments with expected ratio, implied FF, discordance, 5-state origin, and LoD."""
     f_act = float(np.clip(active_ff, 0.0, 0.60))
@@ -405,18 +412,18 @@ def annotate_prenatal_origin_and_lod(
     sig_3mb = math.sqrt(1.0 / (d_mb * 3.0) + v_sys / 3.0)
     base_35mb = float(np.clip(2.0 * z_target * sig_35mb, 0.005, 0.49))
     base_3mb = float(np.clip(2.0 * z_target * sig_3mb, base_35mb + 0.001, 0.499))
-    lod_ff_35mb = base_35mb * lod_scale
-    lod_ff_3mb = base_3mb * lod_scale
+    lod_ff_35mb = min(base_35mb * lod_scale, 1.0)
+    lod_ff_3mb = min(max(base_3mb * lod_scale, lod_ff_35mb), 1.0)
     lod_metrics = PrenatalLoDMetrics(lod_ff_35mb=lod_ff_35mb, lod_ff_3mb=lod_ff_3mb)
 
     uniform_24 = np.full(NUM_FRAG_BANDS, 1.0 / NUM_FRAG_BANDS, dtype=np.float64)
     p_f24 = (
-        _to_24_band_density(p_fetal_density)
+        _to_24_band_density(p_fetal_density, sizing_shift_bp=sizing_shift_bp)
         if p_fetal_density is not None
         else uniform_24
     )
     if p_maternal_density is not None:
-        p_m24 = _to_24_band_density(p_maternal_density)
+        p_m24 = _to_24_band_density(p_maternal_density, sizing_shift_bp=sizing_shift_bp)
         p0_plasma = f_act * p_f24 + (1.0 - f_act) * p_m24
     elif sample_bands is not None and sample_bands.size > 0:
         usable_idx = (
@@ -619,4 +626,9 @@ def annotate_sample_prenatal_segments(
         sample_depth_per_mb=depth_per_mb,
         z_threshold=z_threshold,
         twin_min_ff=f_twin_min,
+        sizing_shift_bp=(
+            bufs.meta.fragmentomics.sizing_shift_bp
+            if bufs.meta.fragmentomics is not None
+            else 0.0
+        ),
     )

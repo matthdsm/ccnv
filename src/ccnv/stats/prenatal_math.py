@@ -265,6 +265,7 @@ def fit_msy_sex_mixture(
     t_male = math.log(max(pi_male, 1e-12)) + ll_male
     max_t = np.maximum(t_fem, t_male)
     log_sum = max_t + np.log(np.exp(t_fem - max_t) + np.exp(t_male - max_t))
+    p_male = np.exp(t_male - log_sum)
     l2 = float(np.sum(log_sum))
 
     delta_bic = 2.0 * (l2 - l1) - 2.0 * math.log(float(s_size))

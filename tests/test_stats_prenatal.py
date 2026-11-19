@@ -108,6 +108,26 @@ class TestMSYSexMixtureAndPoissonFFY(unittest.TestCase):
         self.assertFalse(mix_all_f.bimodal)
         self.assertTrue(bool(np.all(mix_all_f.p_male < 0.05)))
 
+    def test_msy_sex_mixture_final_estep_p_male_consistent(self) -> None:
+        # Overlapping rates force many EM iterations; verify returned p_male matches
+        # the final E-step evaluated at the final M-step parameters (res.bg_rate).
+        rng = np.random.default_rng(99)
+        exp = np.full(24, 500.0, dtype=np.float64)
+        cts = np.concatenate(
+            [rng.poisson(1.5, size=12), rng.poisson(12.0, size=12)]
+        ).astype(np.float64)
+        res = fit_msy_sex_mixture(cts, exp)
+        self.assertTrue(res.bimodal)
+        self.assertEqual(res.p_male.shape, (24,))
+        self.assertTrue(np.all(np.isfinite(res.p_male)))
+        self.assertLess(float(np.max(res.p_male[:12])), 0.05)
+        self.assertGreater(float(np.min(res.p_male[12:])), 0.95)
+        # Re-evaluate female-group rate weighted by (1 - p_male) -> matches bg_rate closely.
+        recomp_bg = float(
+            np.sum((1.0 - res.p_male) * cts) / np.sum((1.0 - res.p_male) * exp)
+        )
+        self.assertAlmostEqual(res.bg_rate, recomp_bg, delta=1e-4)
+
     def test_poisson_msy_ffy_clean_bins_and_analytical_se(self) -> None:
         rng = np.random.default_rng(456)
         n_bins = 100

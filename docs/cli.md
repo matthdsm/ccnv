@@ -6,7 +6,7 @@ Every command accepts `-h`/`--help` and `--loglevel` (`DEBUG`, `INFO`, `WARNING`
 
 ## `extract`
 
-Stream a BAM or CRAM alignment into binned sample Parquet sketches (`<prefix>.ccnv`) using the compiled Rust `ccnv._core` scanner, binning paired-end proper pairs by dyad midpoint (`TLEN > 0`) and single-end reads by 0-based `reference_start`. Populates per-bin `count`, `paired_count`, `frag_len_sum`, `short_frag_count`, `endpoint_count`, `frag_gc_sum`, and 24 fixed-width fragment length bands `frag_bands` along with `ccnv.qc` and `ccnv.fragmentomics` Parquet metadata. Single-threaded extraction streams sequentially without an index; multi-threaded tile extraction requires an existing `.bai`/`.csi`/`.crai` index.
+Stream a BAM or CRAM alignment into binned sample Parquet sketches (`<prefix>.ccnv`) using the compiled Rust `ccnv._core` scanner, binning paired-end proper pairs by dyad midpoint (`TLEN > 0`) and single-end reads by 0-based `reference_start`. Populates per-bin `count`, `paired_count`, `frag_len_sum`, `short_frag_count`, `endpoint_count`, `frag_gc_sum`, and 24 fixed-edge piecewise-uniform (variable-width: 20 bp, 10 bp, 50 bp, and 201 bp) fragment length bands `frag_bands` along with `ccnv.qc` and `ccnv.fragmentomics` Parquet metadata. Single-threaded extraction streams sequentially without an index; multi-threaded tile extraction requires an existing `.bai`/`.csi`/`.crai` index.
 
 ```console
 ccnv extract ALIGNMENT [--prefix PREFIX] [options]
@@ -126,7 +126,7 @@ ccnv predict SAMPLE REFERENCE [--prefix PREFIX] [options]
 | `--plot / --no-plot` | `--plot` | Write interactive genome-wide `<prefix>_plot.html`. |
 | `--cytobands` | bundled GRCh38 when matched | Cytoband BED/TSV file (`.txt`, `.bed`, or `.gz`) rendered above the genome plot, overriding bundled GRCh38 cytobands auto-loaded when canonical contig lengths match `hg38` (ignored with a warning when `--no-plot` is set). |
 | `--vcf / --no-vcf` | `--vcf` | Write bgzipped and tabix-indexed VCFv4.2 segment and call files. |
-| `--bins-vcf / --no-bins-vcf` | `--no-bins-vcf` | Opt-in generation of large per-bin VCFv4.2 file (`<prefix>_bins.vcf.gz`). |
+| `--bins-vcf / --no-bins-vcf` | `--no-bins-vcf` | Opt-in generation of large per-bin VCFv4.2 file (`<prefix>_bins.vcf.gz`; takes effect only when `--vcf` is enabled). |
 | `--loglevel` | `WARNING` | Logging verbosity. |
 
 Prediction outputs:
