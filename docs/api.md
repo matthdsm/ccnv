@@ -209,7 +209,8 @@ Typer CLI application defining the four `ccnv` subcommands and runtime logging s
 - **`reference(prefix, samplesheet, fasta, mode, prenatal_binsize, bin_size, all_contigs, autosomal_contig, sex_contig, sex_signal_contig, sex_cutoff, pca_components, max_batch_memory_mb, min_cohort_size, min_sex_group_size, qc_report, mappability, gc, min_mappability, threads, loglevel)`** — Typer command that validates CLI options, constructs a `ReferenceConfig`, and invokes `ccnv.reference.run`.
 - **`ref_qc(reference, prefix, loglevel)`** — Typer command that builds a `ReferenceQCConfig`, invokes `ccnv.ref_qc.run_reference_qc`, emits the verdict (`PASS`/`WARN`/`FAIL`) to `stderr`, and exits with code `0` even on `FAIL`.
 - **`predict(sample, reference, prefix, sex, penalty, z_threshold, ratio_threshold, min_reference_bins, mask_repeats, max_blacklist_gap, plot, cytobands, vcf, bins_vcf, threads, fasta, mappability, gc, min_mappability, mode, twins, loglevel)`** — Typer command that validates CLI options, constructs a `PredictConfig`, and invokes `ccnv.predict.run`.
-- **`_version_callback(ctx, _param, value)`** — Internal eager callback printing `ccnv <version>` to stdout and exiting cleanly before argument validation.
+- **`_version_callback(ctx, value)`** — Internal eager callback printing `ccnv <version>` to stdout and exiting cleanly before argument validation.
+- **`_build_version_option()`** — Internal factory compiling the eager `-v`/`--version` parameter through `typer.Option`.
 - **`_require_positive_float(value: float | None) -> float | None`** — Internal validator enforcing finite strictly positive numeric CLI options.
 - **`_require_finite_unit_float(value: float | None) -> float | None`** — Internal validator enforcing finite values within `[0.0, 1.0]`.
 - **`_fail(error: BaseException, code: int) -> NoReturn`** — Internal helper printing an error message to stderr and exiting with the requested CLI code.

@@ -11,6 +11,7 @@ from typing import Annotated, NoReturn
 
 import typer
 import typer.core
+import typer.main
 
 from ccnv import __version__
 from ccnv.extract import run as run_extract
@@ -31,9 +32,7 @@ from ccnv.ref_qc import run_reference_qc
 from ccnv.reference import run as run_reference
 
 
-def _version_callback(
-    ctx: typer.Context, _param: typer.CallbackParam, value: bool
-) -> None:
+def _version_callback(ctx: typer.Context, value: bool) -> None:
     """Print application version and exit eagerly before argument validation."""
     if not value or ctx.resilient_parsing:
         return
@@ -41,14 +40,31 @@ def _version_callback(
     raise typer.Exit()
 
 
-_VERSION_OPTION = typer.core.TyperOption(
-    param_decls=["-v", "--version"],
-    is_flag=True,
-    is_eager=True,
-    expose_value=False,
-    callback=_version_callback,
-    help="Show version and exit",
-)
+def _build_version_option() -> typer.CallbackParam:
+    """Compile an eager -v/--version option via Typer's public Option API."""
+    probe = typer.Typer()
+
+    @probe.command()
+    def _probe(
+        version: Annotated[
+            bool,
+            typer.Option(
+                "-v",
+                "--version",
+                callback=_version_callback,
+                is_eager=True,
+                help="Show version and exit",
+            ),
+        ] = False,
+    ) -> None:
+        pass
+
+    option = typer.main.get_command(probe).params[0]
+    option.expose_value = False
+    return option
+
+
+_VERSION_OPTION = _build_version_option()
 
 
 class _VersionCommand(typer.core.TyperCommand):

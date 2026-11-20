@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -319,6 +321,15 @@ class TestReferenceSampleExpansion(unittest.TestCase):
 
         escaped = CliRunner().invoke(app, ["extract", "--", "-v"])
         self.assertNotEqual(escaped.exit_code, 0)
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "ccnv.cli", "-v"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, expected)
 
     def test_help_uses_ccnv_executable_name(self) -> None:
         result = CliRunner().invoke(app, ["-h"])
