@@ -17,13 +17,15 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
     "jinja2",
     "jsonschema>=4.20.0",
-    "numpy>2.5,<3",
+    "numpy>=2.5,<3",
     "polars>=2,<3",
     "polars-runtime-compat",
     "pyarrow>=26,<27",
@@ -46,14 +48,14 @@ ccnv = "ccnv.cli:app"
 [tool.maturin]
 module-name = "ccnv._core"
 python-source = "src"
-features = ["pyo3/abi3-py314"]
+features = ["pyo3/abi3-py312"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 
 [tool.pixi.dependencies]
-numpy = ">2.5,<3"
+numpy = ">=2.5,<3"
 polars = ">=2,<3"
 polars-runtime-compat = "*"
 pyarrow = ">=26,<27"
@@ -111,6 +113,6 @@ addopts = "-ra"
 testpaths = ["tests"]
 
 [tool.ruff]
-target-version = "py314"
+target-version = "py312"
 
 [tool.ruff.lint]

@@ -8,8 +8,8 @@ This document provides project-specific instructions and architectural context f
 
 ### Core Stack
 
-- **Language:** Python 3.14+
-- **Compiled Extensions:** Rust PyO3 (`abi3-py314`) extension (`crates/ccnv-core`, `ccnv._core`) wrapping `noodles` (BAM/CRAM/FASTA/BGZF/Tabix/CSI) and `bigtools` (BigWig)
+- **Language:** Python 3.12+
+- **Compiled Extensions:** Rust PyO3 (`abi3-py312`) extension (`crates/ccnv-core`, `ccnv._core`) wrapping `noodles` (BAM/CRAM/FASTA/BGZF/Tabix/CSI) and `bigtools` (BigWig)
 - **CLI Framework:** Typer
 - **Data Science:** NumPy, SciPy, Polars, Scikit-learn, PyArrow, Ruptures
 - **Serialization & Validation:** PyYAML, jsonschema

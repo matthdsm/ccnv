@@ -181,6 +181,7 @@ flowchart TB
 Top-level package entry point exposing package metadata and lazy stage runners.
 
 - **`__getattr__(name: str)`** — Lazily resolves `run_extract`, `run_reference`, `run_reference_qc`, and `run_predict` on first access to keep module import overhead minimal.
+- **`_preload_aarch64_gomp()`** — Internal startup helper reserving `libgomp` static TLS on `linux-aarch64` before `pyarrow` or `polars` extensions load.
 - **`run_extract`** — Lazy alias for `ccnv.extract.run`.
 - **`run_reference`** — Lazy alias for `ccnv.reference.run`.
 - **`run_reference_qc`** — Lazy alias for `ccnv.ref_qc.run_reference_qc`.
@@ -188,7 +189,7 @@ Top-level package entry point exposing package metadata and lazy stage runners.
 
 ### `ccnv._core` (`src/ccnv/_core.pyi`, `crates/ccnv-core/src/lib.rs`)
 
-Compiled Rust PyO3 (`abi3-py314`) extension wrapping `noodles` and `bigtools` for streaming genomic I/O, FASTA scanning, BigWig aggregation, and BGZF index writing.
+Compiled Rust PyO3 (`abi3-py312`) extension wrapping `noodles` and `bigtools` for streaming genomic I/O, FASTA scanning, BigWig aggregation, and BGZF index writing.
 
 - **`FRAG_BAND_EDGES`** — Module constant tuple of 25 integer fragment-length boundaries defining the 24 bands covering `[30, 601)`.
 - **`GC_QUANTILE_EDGES`** — Module constant tuple of 9 breakpoints `(0.0, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.65, 1.0)` defining the 8 sub-bin GC quantile bands.
@@ -252,7 +253,13 @@ Stage 4 orchestrator for single-sample normalization, segmentation, CNV calling,
 
 ## 3. Domain Models & Schema Contracts (`ccnv.models`)
 
-The `ccnv.models` package (`src/ccnv/models/__init__.py` re-exports all public classes, functions, and exceptions) defines schema version `2.0.0` containers, typed configurations, metadata serializers, and structural validators.
+The `ccnv.models` package defines schema version `2.0.0` containers, typed configurations, metadata serializers, and structural validators.
+
+### `ccnv.models` (`src/ccnv/models/__init__.py`)
+
+Package re-export entry point eagerly exposing stdlib `config`, `domain`, and `exceptions` types while deferring Arrow- and NumPy-backed modules until first attribute access.
+
+- **`__getattr__(name: str)`** — Lazily resolves and caches symbols from `buffers`, `results`, `schemas`, and `validation` on first access.
 
 ### `ccnv.models.buffers` (`src/ccnv/models/buffers.py`)
 

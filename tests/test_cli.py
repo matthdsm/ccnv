@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pysam
@@ -217,7 +218,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.ccnv")
             sheet = _write_samplesheet(root / "samples.yaml", [sample])
-            with patch("ccnv.cli.run_reference") as run:
+            with patch("ccnv.reference.run") as run:
                 result = CliRunner().invoke(
                     app,
                     [
@@ -241,7 +242,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.ccnv")
             sheet = _write_samplesheet(root / "samples.yaml", [sample])
-            with patch("ccnv.cli.run_reference") as run:
+            with patch("ccnv.reference.run") as run:
                 result = CliRunner().invoke(
                     app,
                     [
@@ -331,6 +332,78 @@ class TestReferenceSampleExpansion(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, expected)
 
+    def test_cli_import_avoids_eager_heavy_extensions(self) -> None:
+        script = (
+            "import json, sys; "
+            "import ccnv, ccnv.cli; "
+            "heavy = ('numpy', 'pyarrow', 'polars', 'scipy', 'sklearn', 'ccnv._core'); "
+            "print(json.dumps([m for m in heavy if m in sys.modules]))"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "[]")
+
+    def test_preload_aarch64_gomp_reserves_static_tls_cleanly(self) -> None:
+        with (
+            patch.object(ccnv.sys, "platform", "darwin"),
+            patch.object(ccnv.ctypes, "CDLL") as cdll_noop,
+        ):
+            ccnv._preload_aarch64_gomp()
+        cdll_noop.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            site_pkgs = root / "lib" / "python3.13" / "site-packages"
+            sklearn_init = site_pkgs / "sklearn" / "__init__.py"
+            sklearn_init.parent.mkdir(parents=True)
+            sklearn_init.write_text("", encoding="utf-8")
+            wheel_libs = site_pkgs / "scikit_learn.libs"
+            wheel_libs.mkdir()
+            wheel_gomp = wheel_libs / "libgomp-abc123.so.1.0.0"
+            wheel_gomp.write_bytes(b"")
+            prefix_gomp = root / "lib" / "libgomp.so.1"
+            prefix_gomp.write_bytes(b"")
+
+            fake_spec = SimpleNamespace(origin=str(sklearn_init))
+            with (
+                patch.object(ccnv.sys, "platform", "linux"),
+                patch.object(
+                    ccnv.os, "uname", return_value=SimpleNamespace(machine="aarch64")
+                ),
+                patch.object(ccnv.sys, "prefix", str(root)),
+                patch.object(ccnv.sys, "base_prefix", str(root)),
+                patch.object(ccnv.importlib.util, "find_spec", return_value=fake_spec),
+                patch.object(ccnv.ctypes, "CDLL") as cdll_mock,
+            ):
+                ccnv._preload_aarch64_gomp()
+
+            loaded_paths = [call.args[0] for call in cdll_mock.call_args_list]
+            self.assertEqual(
+                loaded_paths,
+                [str(wheel_gomp.resolve()), str(prefix_gomp)],
+            )
+
+        with tempfile.TemporaryDirectory() as empty_dir:
+            with (
+                patch.object(ccnv.sys, "platform", "linux"),
+                patch.object(
+                    ccnv.os, "uname", return_value=SimpleNamespace(machine="aarch64")
+                ),
+                patch.object(ccnv.sys, "prefix", empty_dir),
+                patch.object(ccnv.sys, "base_prefix", empty_dir),
+                patch.object(ccnv.importlib.util, "find_spec", return_value=None),
+                patch.object(
+                    ccnv.ctypes, "CDLL", side_effect=OSError("missing")
+                ) as cdll_fallback,
+            ):
+                ccnv._preload_aarch64_gomp()
+            cdll_fallback.assert_called_once_with("libgomp.so.1")
+
     def test_help_uses_ccnv_executable_name(self) -> None:
         result = CliRunner().invoke(app, ["-h"])
         self.assertEqual(result.exit_code, 0, result.output)
@@ -363,7 +436,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.ccnv")
             sheet = _write_samplesheet(root / "samples.yaml", [sample])
-            with patch("ccnv.cli.run_reference") as run:
+            with patch("ccnv.reference.run") as run:
                 result = CliRunner().invoke(
                     app,
                     [
@@ -393,7 +466,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.ccnv")
             sheet = _write_samplesheet(root / "samples.yaml", [sample])
-            with patch("ccnv.cli.run_reference") as run:
+            with patch("ccnv.reference.run") as run:
                 result = CliRunner().invoke(
                     app,
                     [
@@ -435,7 +508,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.ccnv")
             sheet = _write_samplesheet(root / "samples.yaml", [sample])
-            with patch("ccnv.cli.run_reference") as run:
+            with patch("ccnv.reference.run") as run:
                 result = CliRunner().invoke(
                     app,
                     [
@@ -528,7 +601,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             root = Path(tmpdir)
             fasta = root / "genome.fa"
             fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
-            with patch("ccnv.cli.run_reference") as run:
+            with patch("ccnv.reference.run") as run:
                 result = CliRunner().invoke(
                     app,
                     [
@@ -549,7 +622,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             root = Path(tmpdir)
             sample = _write_sample(root / "s1.ccnv")
             sheet = _write_samplesheet(root / "samples.yaml", [sample])
-            with patch("ccnv.cli.run_reference") as run:
+            with patch("ccnv.reference.run") as run:
                 result = CliRunner().invoke(
                     app,
                     [
@@ -617,7 +690,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             sample = _write_sample(root / "s1.ccnv")
             reference = _write_reference(root / "ref.ccnv")
 
-            with patch("ccnv.cli.run_predict") as run:
+            with patch("ccnv.predict.run") as run:
                 result = CliRunner().invoke(
                     app, ["predict", str(sample), str(reference)]
                 )
@@ -626,7 +699,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 self.assertTrue(config.vcf)
                 self.assertFalse(config.bins_vcf)
 
-            with patch("ccnv.cli.run_predict") as run:
+            with patch("ccnv.predict.run") as run:
                 result = CliRunner().invoke(
                     app,
                     ["predict", str(sample), str(reference), "--bins-vcf", "-t", "3"],
@@ -637,7 +710,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 self.assertTrue(config.bins_vcf)
                 self.assertEqual(config.threads, 3)
 
-            with patch("ccnv.cli.run_predict") as run:
+            with patch("ccnv.predict.run") as run:
                 result = CliRunner().invoke(
                     app, ["predict", str(sample), str(reference), "--no-bins-vcf"]
                 )
@@ -645,7 +718,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 config = run.call_args.args[0]
                 self.assertFalse(config.bins_vcf)
 
-            with patch("ccnv.cli.run_predict") as run:
+            with patch("ccnv.predict.run") as run:
                 result = CliRunner().invoke(
                     app, ["predict", str(sample), str(reference), "--no-vcf"]
                 )
@@ -653,7 +726,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 config = run.call_args.args[0]
                 self.assertFalse(config.vcf)
 
-            with patch("ccnv.cli.run_predict") as run:
+            with patch("ccnv.predict.run") as run:
                 result = CliRunner().invoke(
                     app, ["predict", str(sample), str(reference), "--vcf"]
                 )
@@ -669,7 +742,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             cyto = root / "cytoBand.txt"
             cyto.write_text("chr1\t0\t50\tp11.1\tgneg\n", encoding="utf-8")
 
-            with patch("ccnv.cli.run_predict") as run:
+            with patch("ccnv.predict.run") as run:
                 result = CliRunner().invoke(
                     app,
                     [
@@ -707,7 +780,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
             sample = _write_sample(root / "s1.ccnv")
             reference = _write_reference(root / "ref.ccnv")
 
-            with patch("ccnv.cli.run_predict") as run:
+            with patch("ccnv.predict.run") as run:
                 result = CliRunner().invoke(
                     app, ["predict", str(sample), str(reference)]
                 )
@@ -715,7 +788,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 config = run.call_args.args[0]
                 self.assertEqual(config.mode, "germline")
 
-            with patch("ccnv.cli.run_predict") as run:
+            with patch("ccnv.predict.run") as run:
                 result = CliRunner().invoke(
                     app,
                     [
@@ -731,7 +804,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 self.assertEqual(config.mode, "prenatal")
                 self.assertFalse(config.twins)
 
-            with patch("ccnv.cli.run_predict") as run:
+            with patch("ccnv.predict.run") as run:
                 result = CliRunner().invoke(
                     app,
                     [
@@ -748,7 +821,7 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 self.assertEqual(config.mode, "prenatal")
                 self.assertTrue(config.twins)
 
-            with patch("ccnv.cli.run_predict") as run:
+            with patch("ccnv.predict.run") as run:
                 result = CliRunner().invoke(
                     app,
                     [

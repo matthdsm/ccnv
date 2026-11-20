@@ -1,10 +1,10 @@
 """Base domain models, configurations, results, schemas, buffers, and exceptions for ccnv."""
 
-from ccnv.models.buffers import (
-    BranchFitArrays,
-    SampleBuffers,
-    assemble_reference_table,
-)
+from __future__ import annotations
+
+import importlib
+from typing import TYPE_CHECKING, Final
+
 from ccnv.models.config import (
     DEFAULT_BIN_SIZE,
     DEFAULT_MIN_MAPPABILITY,
@@ -40,63 +40,139 @@ from ccnv.models.exceptions import (
     SchemaError,
     SchemaVersionError,
 )
-from ccnv.models.results import (
-    ActiveFFSource,
-    BinResult,
-    BranchQCStatus,
-    CallType,
-    FetalFractionResult,
-    FetalSex,
-    GestationType,
-    PredictionOutputs,
-    PrenatalLoDMetrics,
-    ReferenceQCOutputs,
-    SCACall,
-    ScanAlignmentResult,
-    ScanQcCounts,
-    SCAResult,
-    SegmentResult,
-    TwinResult,
-    TwinSexPair,
-)
-from ccnv.models.schemas import (
-    BRANCH_AUTOSOMAL,
-    BRANCH_FEMALE_SEX,
-    BRANCH_MALE_SEX,
-    BRANCH_PRENATAL_AUTOSOMAL,
-    BRANCH_PRENATAL_FFY,
-    COORDINATE_SYSTEM,
-    FRAGMENTOMICS_METADATA_KEY,
-    KNOWN_REFERENCE_BRANCHES,
-    METADATA_PREFIX,
-    NUM_FRAG_BANDS,
-    NUM_GC_QUANTILES,
-    NUM_PROTOTYPES_PER_BIN,
-    PRENATAL_METADATA_KEY,
-    REFERENCE_SCHEMA,
-    SAMPLE_SCHEMA,
-    SCHEMA_VERSION,
-    SUPPORTED_SCHEMA_VERSIONS,
-    ArtifactKind,
-    FragmentomicsMetadata,
-    PrenatalModelMetadata,
-    ReferenceMetadata,
-    SampleMetadata,
-    build_reference_schema,
-    canonical_dictionary_array,
-    decode_dictionary_contigs,
-    decode_metadata,
-    encode_metadata,
-    fixed_size_list_to_numpy,
-    reconstruct_sample_grid,
-    unique_dictionary_contigs,
-)
-from ccnv.models.validation import (
-    validate_metadata,
-    validate_reference_table,
-    validate_sample_table,
-    validate_schema,
-)
+
+if TYPE_CHECKING:
+    from ccnv.models.buffers import (
+        BranchFitArrays,
+        SampleBuffers,
+        assemble_reference_table,
+    )
+    from ccnv.models.results import (
+        ActiveFFSource,
+        BinResult,
+        BranchQCStatus,
+        CallType,
+        FetalFractionResult,
+        FetalSex,
+        GestationType,
+        PredictionOutputs,
+        PrenatalLoDMetrics,
+        ReferenceQCOutputs,
+        SCACall,
+        ScanAlignmentResult,
+        ScanQcCounts,
+        SCAResult,
+        SegmentResult,
+        TwinResult,
+        TwinSexPair,
+    )
+    from ccnv.models.schemas import (
+        BRANCH_AUTOSOMAL,
+        BRANCH_FEMALE_SEX,
+        BRANCH_MALE_SEX,
+        BRANCH_PRENATAL_AUTOSOMAL,
+        BRANCH_PRENATAL_FFY,
+        COORDINATE_SYSTEM,
+        FRAGMENTOMICS_METADATA_KEY,
+        KNOWN_REFERENCE_BRANCHES,
+        METADATA_PREFIX,
+        NUM_FRAG_BANDS,
+        NUM_GC_QUANTILES,
+        NUM_PROTOTYPES_PER_BIN,
+        PRENATAL_METADATA_KEY,
+        REFERENCE_SCHEMA,
+        SAMPLE_SCHEMA,
+        SCHEMA_VERSION,
+        SUPPORTED_SCHEMA_VERSIONS,
+        ArtifactKind,
+        FragmentomicsMetadata,
+        PrenatalModelMetadata,
+        ReferenceMetadata,
+        SampleMetadata,
+        build_reference_schema,
+        canonical_dictionary_array,
+        decode_dictionary_contigs,
+        decode_metadata,
+        encode_metadata,
+        fixed_size_list_to_numpy,
+        reconstruct_sample_grid,
+        unique_dictionary_contigs,
+    )
+    from ccnv.models.validation import (
+        validate_metadata,
+        validate_reference_table,
+        validate_sample_table,
+        validate_schema,
+    )
+
+_LAZY_EXPORTS: Final[dict[str, str]] = {
+    "BranchFitArrays": "buffers",
+    "SampleBuffers": "buffers",
+    "assemble_reference_table": "buffers",
+    "ActiveFFSource": "results",
+    "BinResult": "results",
+    "BranchQCStatus": "results",
+    "CallType": "results",
+    "FetalFractionResult": "results",
+    "FetalSex": "results",
+    "GestationType": "results",
+    "PredictionOutputs": "results",
+    "PrenatalLoDMetrics": "results",
+    "ReferenceQCOutputs": "results",
+    "SCACall": "results",
+    "ScanAlignmentResult": "results",
+    "ScanQcCounts": "results",
+    "SCAResult": "results",
+    "SegmentResult": "results",
+    "TwinResult": "results",
+    "TwinSexPair": "results",
+    "BRANCH_AUTOSOMAL": "schemas",
+    "BRANCH_FEMALE_SEX": "schemas",
+    "BRANCH_MALE_SEX": "schemas",
+    "BRANCH_PRENATAL_AUTOSOMAL": "schemas",
+    "BRANCH_PRENATAL_FFY": "schemas",
+    "COORDINATE_SYSTEM": "schemas",
+    "FRAGMENTOMICS_METADATA_KEY": "schemas",
+    "KNOWN_REFERENCE_BRANCHES": "schemas",
+    "METADATA_PREFIX": "schemas",
+    "NUM_FRAG_BANDS": "schemas",
+    "NUM_GC_QUANTILES": "schemas",
+    "NUM_PROTOTYPES_PER_BIN": "schemas",
+    "PRENATAL_METADATA_KEY": "schemas",
+    "REFERENCE_SCHEMA": "schemas",
+    "SAMPLE_SCHEMA": "schemas",
+    "SCHEMA_VERSION": "schemas",
+    "SUPPORTED_SCHEMA_VERSIONS": "schemas",
+    "ArtifactKind": "schemas",
+    "FragmentomicsMetadata": "schemas",
+    "PrenatalModelMetadata": "schemas",
+    "ReferenceMetadata": "schemas",
+    "SampleMetadata": "schemas",
+    "build_reference_schema": "schemas",
+    "canonical_dictionary_array": "schemas",
+    "decode_dictionary_contigs": "schemas",
+    "decode_metadata": "schemas",
+    "encode_metadata": "schemas",
+    "fixed_size_list_to_numpy": "schemas",
+    "reconstruct_sample_grid": "schemas",
+    "unique_dictionary_contigs": "schemas",
+    "validate_metadata": "validation",
+    "validate_reference_table": "validation",
+    "validate_sample_table": "validation",
+    "validate_schema": "validation",
+}
+
+
+def __getattr__(name: str) -> object:
+    """Lazily resolve Arrow- and NumPy-backed model symbols on first access."""
+    submod_name = _LAZY_EXPORTS.get(name)
+    if submod_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(f"ccnv.models.{submod_name}")
+    value: object = getattr(module, name)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
     "BRANCH_AUTOSOMAL",

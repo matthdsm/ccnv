@@ -2,20 +2,55 @@
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import importlib.util
+import os
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ccnv.models import (
-    AlignmentError,
+from ccnv.models.config import (
     ExtractConfig,
-    ExtractError,
     PredictConfig,
-    PredictError,
     ReadFilters,
     ReferenceConfig,
-    ReferenceError,
     ReferenceQCConfig,
+)
+from ccnv.models.exceptions import (
+    AlignmentError,
+    ExtractError,
+    PredictError,
+    ReferenceError,
     ReferenceQCError,
 )
+
+
+def _preload_aarch64_gomp() -> None:
+    """Reserve libgomp static TLS on linux-aarch64 before Arrow or Polars load."""
+    if sys.platform != "linux" or os.uname().machine != "aarch64":
+        return
+    loaded = False
+    spec = importlib.util.find_spec("sklearn")
+    if spec is not None and spec.origin is not None:
+        libs_dir = Path(spec.origin).resolve().parent.parent / "scikit_learn.libs"
+        if libs_dir.is_dir():
+            for candidate in sorted(libs_dir.glob("libgomp*.so*")):
+                with contextlib.suppress(OSError):
+                    ctypes.CDLL(str(candidate))
+                    loaded = True
+    for prefix in dict.fromkeys((sys.prefix, sys.base_prefix)):
+        candidate = Path(prefix) / "lib" / "libgomp.so.1"
+        if candidate.is_file():
+            with contextlib.suppress(OSError):
+                ctypes.CDLL(str(candidate))
+                loaded = True
+    if not loaded:
+        with contextlib.suppress(OSError):
+            ctypes.CDLL("libgomp.so.1")
+
+
+_preload_aarch64_gomp()
 
 if TYPE_CHECKING:
     from ccnv.extract import run_extract as run_extract

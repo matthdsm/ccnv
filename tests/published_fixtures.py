@@ -196,7 +196,7 @@ def extract_published_samples(root: Path) -> tuple[Path, Path]:
                     bufs.meta.bin_size == PUBLISHED_BIN_SIZE
                     and bufs.meta.contig_lengths == PUBLISHED_CANONICAL_CONTIGS
                 )
-            except CcnvError, OSError:
+            except (CcnvError, OSError):
                 valid = False
         if not valid:
             extract(

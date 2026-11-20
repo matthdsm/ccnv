@@ -8614,7 +8614,7 @@ packages:
   requires_dist:
   - jinja2
   - jsonschema>=4.20.0
-  - numpy>2.5,<3
+  - numpy>=2.5,<3
   - polars>=2,<3
   - polars-runtime-compat
   - pyarrow>=26,<27

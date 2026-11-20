@@ -1,6 +1,6 @@
 # `ccnv`
 
-`ccnv` is an independent Python 3.14+ bioinformatics toolkit for copy-number variation (CNV) detection in whole-genome sequencing (WGS) data at any coverage, building on published within-sample reference normalization methodology (Straver et al., *Nucleic Acids Research*, 2014; Raman et al., *Nucleic Acids Research*, 2019).
+`ccnv` is an independent Python 3.12+ bioinformatics toolkit for copy-number variation (CNV) detection in whole-genome sequencing (WGS) data at any coverage, building on published within-sample reference normalization methodology (Straver et al., *Nucleic Acids Research*, 2014; Raman et al., *Nucleic Acids Research*, 2019).
 
 Complete documentation, architecture diagrams, and methodology are available at [https://matthdsm.github.io/ccnv/](https://matthdsm.github.io/ccnv/).
 

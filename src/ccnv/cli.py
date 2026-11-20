@@ -14,12 +14,10 @@ import typer.core
 import typer.main
 
 from ccnv import __version__
-from ccnv.extract import run as run_extract
-from ccnv.models import (
+from ccnv.models.config import (
     DEFAULT_BIN_SIZE,
     DEFAULT_MIN_MAPPABILITY,
     AnalysisMode,
-    CcnvError,
     ExtractConfig,
     PredictConfig,
     ReadFilters,
@@ -27,9 +25,7 @@ from ccnv.models import (
     ReferenceQCConfig,
     SexBranch,
 )
-from ccnv.predict import run as run_predict
-from ccnv.ref_qc import run_reference_qc
-from ccnv.reference import run as run_reference
+from ccnv.models.exceptions import CcnvError
 
 
 def _version_callback(ctx: typer.Context, value: bool) -> None:
@@ -294,6 +290,8 @@ def extract(
             threads=threads,
             all_contigs=all_contigs,
         )
+        from ccnv.extract import run as run_extract
+
         run_extract(config)
         cli_logger.debug("extract completed in %.3f s", perf_counter() - started)
     except (CcnvError, ValueError, OSError) as error:
@@ -431,6 +429,8 @@ def reference(
     if samplesheet is not None and fasta is not None:
         _fail(ValueError("provide either --samplesheet or --fasta, not both"), 2)
     try:
+        from ccnv.reference import run as run_reference
+
         run_reference(
             ReferenceConfig(
                 all_contigs=all_contigs,
@@ -492,6 +492,8 @@ def ref_qc(
     cli_logger.debug("starting ref-qc: reference=%s", reference)
     started = perf_counter()
     try:
+        from ccnv.ref_qc import run_reference_qc
+
         run_reference_qc(ReferenceQCConfig(reference=reference, prefix=prefix))
         cli_logger.debug("ref-qc completed in %.3f s", perf_counter() - started)
     except (CcnvError, ValueError, OSError) as error:
@@ -647,6 +649,8 @@ def predict(
     )
     started = perf_counter()
     try:
+        from ccnv.predict import run as run_predict
+
         run_predict(
             PredictConfig(
                 sample=sample,
