@@ -73,7 +73,7 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 - `pixi run docker-build`: Build the local `linux/amd64` Docker image (`ghcr.io/matthdsm/ccnv:dev`).
 - `pixi run docs-build`: Build the documentation site in the `docs` environment with Zensical (`pixi run -e docs zensical build --clean --strict`).
 - `pixi run docs-serve`: Serve the documentation site locally in the `docs` environment with Zensical (`pixi run -e docs zensical serve`).
-- `pixi run bump-version <version> [--date YYYY-MM-DD] [--allow-empty]`: Bump application version across `pyproject.toml`, `src/ccnv/__init__.py`, `Cargo.toml`, `Cargo.lock`, pre-1.0 alpha banners (`README.md`, `CHANGELOG.md`, `docs/index.md`), and finalize `CHANGELOG.md`.
+- `pixi run bump-version <version> [--date YYYY-MM-DD] [--allow-empty]`: Bump application version across `pyproject.toml`, `src/ccnv/__init__.py`, `Cargo.toml`, `Cargo.lock`, `galaxy/macros.xml`, pre-1.0 alpha banners (`README.md`, `CHANGELOG.md`, `docs/index.md`), and finalize `CHANGELOG.md`.
 - `pixi run bump-schema <version|major|minor|patch> [--keep-previous]`: Bump Parquet `SCHEMA_VERSION` and `SUPPORTED_SCHEMA_VERSIONS` across `src/ccnv/models/metadata.py`, docstrings, Markdown documentation, and contract tests.
 
 ### Code Style
@@ -86,7 +86,7 @@ Use `pixi run` for all standard development tasks to ensure environment consiste
 
 - **Code Changes:** All changes should be made through a pull request. Each pull request needs to be recorded in `CHANGELOG.md`, following best practices found [here](https://keepachangelog.com/en/1.1.0/#how).
 - **API Reference Synchronization:** Any relevant code change under `src/ccnv/` or `crates/ccnv-core/`—adding, removing, moving, or renaming modules, classes, public or internal (`_`) functions, methods, properties, or `ccnv._core` bindings, altering parameter signatures or return/behavioral contracts, or modifying cross-module call-graph edges—must be reflected in `docs/api.md` (both the module symbol reference and the Section 1 Mermaid call-graph DAGs) in the same pull request.
-- **Versioning:** Follow semantic versioning for releases, using `pixi run bump-version <version>` to synchronize `pyproject.toml`, `src/ccnv/__init__.py`, `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`, and `pixi run bump-schema <version|major|minor|patch>` when evolving the Parquet storage schema.
+- **Versioning:** Follow semantic versioning for releases, using `pixi run bump-version <version>` to synchronize `pyproject.toml`, `src/ccnv/__init__.py`, `Cargo.toml`, `Cargo.lock`, `galaxy/macros.xml`, and `CHANGELOG.md`, and `pixi run bump-schema <version|major|minor|patch>` when evolving the Parquet storage schema.
 
 ### Testing Guidelines
 

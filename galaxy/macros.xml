@@ -1,0 +1,139 @@
+<macros>
+    <token name="@TOOL_VERSION@">0.1.0dev</token>
+    <token name="@VERSION_SUFFIX@">0</token>
+    <token name="@PROFILE@">24.1</token>
+
+    <xml name="biotools">
+        <xrefs>
+            <xref type="bio.tools">ccnv</xref>
+        </xrefs>
+    </xml>
+
+    <xml name="requirements">
+        <requirements>
+            <requirement type="package" version="@TOOL_VERSION@">ccnv</requirement>
+            <container type="docker">ghcr.io/matthdsm/ccnv:@TOOL_VERSION@</container>
+        </requirements>
+    </xml>
+
+    <xml name="version_command">
+        <version_command><![CDATA[python -c "import ccnv; print(ccnv.__version__)"]]></version_command>
+    </xml>
+
+    <xml name="stdio">
+        <stdio>
+            <exit_code range="1:" level="fatal"/>
+        </stdio>
+    </xml>
+
+    <xml name="loglevel_param">
+        <param argument="--loglevel" type="select" label="Logging verbosity">
+            <option value="DEBUG">DEBUG</option>
+            <option value="INFO">INFO</option>
+            <option value="WARNING" selected="true">WARNING</option>
+            <option value="ERROR">ERROR</option>
+            <option value="CRITICAL">CRITICAL</option>
+        </param>
+    </xml>
+
+    <xml name="optional_fasta_macro">
+        <conditional name="fasta_cond">
+            <param name="fasta_select" type="select" label="Reference FASTA (required for CRAM)">
+                <option value="none" selected="true">Do not provide reference FASTA</option>
+                <option value="cached">Use built-in reference genome</option>
+                <option value="history">Use FASTA dataset from history</option>
+            </param>
+            <when value="none"/>
+            <when value="cached">
+                <param name="fasta_cached" type="select" label="Built-in reference genome">
+                    <options from_data_table="all_fasta"/>
+                </param>
+            </when>
+            <when value="history">
+                <param name="fasta_history" type="data" format="fasta" label="Reference FASTA"/>
+            </when>
+        </conditional>
+    </xml>
+
+    <token name="@STAGE_OPTIONAL_FASTA@"><![CDATA[
+    #if $fasta_cond.fasta_select == "cached":
+        ln -s '$fasta_cond.fasta_cached.fields.path' reference.fa &&
+        if [ -e '${fasta_cond.fasta_cached.fields.path}.fai' ]; then
+            ln -s '${fasta_cond.fasta_cached.fields.path}.fai' reference.fa.fai;
+        fi &&
+    #elif $fasta_cond.fasta_select == "history":
+        ln -s '$fasta_cond.fasta_history' reference.fa &&
+    #end if
+    ]]></token>
+
+    <token name="@FASTA_ARG@"><![CDATA[
+    #if $fasta_cond.fasta_select != "none":
+        --fasta reference.fa
+    #end if
+    ]]></token>
+
+    <xml name="covariate_tracks_macro">
+        <section name="covariates" title="GC and mappability covariates" expanded="false">
+            <param argument="--mappability" type="data" format="bigwig" optional="true" label="Mappability BigWig track" help="K-mer mappability BigWig track (.bw/.bigWig) for low-mappability masking and bias normalization."/>
+            <param argument="--gc" type="data" format="bigwig,bed,bedgraph,wig,tabular,txt,fasta" optional="true" label="GC content track or FASTA" help="GC content track (BigWig, BED/bedGraph/WIG/TSV, or reference FASTA)."/>
+            <param argument="--min-mappability" type="float" value="0.5" min="0.0" max="1.0" label="Minimum bin mappability" help="Minimum mean mappability in [0, 1] required for a bin to remain unmasked."/>
+        </section>
+    </xml>
+
+    <token name="@STAGE_COVARIATE_TRACKS@"><![CDATA[
+    #if $covariates.mappability:
+        ln -s '$covariates.mappability' mappability.bw &&
+    #end if
+    #if $covariates.gc:
+        #if $covariates.gc.is_of_type("fasta"):
+            ln -s '$covariates.gc' gc.fa &&
+            #set $gc_track_path = "gc.fa"
+        #elif $covariates.gc.is_of_type("bigwig"):
+            ln -s '$covariates.gc' gc.bw &&
+            #set $gc_track_path = "gc.bw"
+        #else:
+            ln -s '$covariates.gc' gc.bed &&
+            #set $gc_track_path = "gc.bed"
+        #end if
+    #end if
+    ]]></token>
+
+    <token name="@COVARIATE_ARGS@"><![CDATA[
+    #if $covariates.mappability:
+        --mappability mappability.bw
+    #end if
+    #if $covariates.gc:
+        --gc '$gc_track_path'
+    #end if
+    --min-mappability '$covariates.min_mappability'
+    ]]></token>
+
+    <xml name="citations">
+        <citations>
+            <citation type="bibtex">
+                @article{Straver2014WISECONDOR,
+                    author = {Straver, Roy and Sistermans, Erik A. and Holstege, Henne and Visser, Allerdien and Oudejans, Cees B. M. and Reinders, Marcel J. T.},
+                    title = {WISECONDOR: detection of fetal aberrations from shallow sequencing maternal plasma based on a within-sample comparison scheme},
+                    journal = {Nucleic Acids Research},
+                    year = {2014},
+                    volume = {42},
+                    number = {5},
+                    pages = {e31},
+                    doi = {10.1093/nar/gkt992}
+                }
+            </citation>
+            <citation type="bibtex">
+                @article{Raman2019WisecondorX,
+                    author = {Raman, Lennart and Dheedene, Annelies and De Smet, Matthias and Van Dorpe, Jo and Menten, Björn},
+                    title = {WisecondorX: improved copy number detection for routine shallow whole-genome sequencing},
+                    journal = {Nucleic Acids Research},
+                    year = {2019},
+                    volume = {47},
+                    number = {4},
+                    pages = {1605--1614},
+                    doi = {10.1093/nar/gkz140}
+                }
+            </citation>
+        </citations>
+    </xml>
+</macros>

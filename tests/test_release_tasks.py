@@ -39,6 +39,7 @@ def _snapshot_repo_text_tree(repo_root: Path, dest_root: Path) -> None:
         "AGENTS.md",
         "CHANGELOG.md",
         "LICENSE.md",
+        "galaxy/macros.xml",
     )
     for rel in rel_files:
         src = repo_root / rel
@@ -146,6 +147,8 @@ class TestReleaseAndSchemaPixiTasks(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertIn('__version__ = "0.91.0"', init_py)
+            macros_091 = (root / "galaxy" / "macros.xml").read_text(encoding="utf-8")
+            self.assertIn('<token name="@TOOL_VERSION@">0.91.0</token>', macros_091)
 
             cl_091 = (root / "CHANGELOG.md").read_text(encoding="utf-8")
             self.assertIn("## [Unreleased]\n\n## [0.91.0] - 2026-11-18\n", cl_091)
@@ -174,6 +177,8 @@ class TestReleaseAndSchemaPixiTasks(unittest.TestCase):
             self.assertEqual(ver_dev, "0.92.0dev")
             cargo_dev = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
             self.assertEqual(cargo_dev["package"]["version"], "0.92.0-dev")
+            macros_dev = (root / "galaxy" / "macros.xml").read_text(encoding="utf-8")
+            self.assertIn('<token name="@TOOL_VERSION@">0.92.0dev</token>', macros_dev)
             self.assertNotIn(
                 "## [0.92.0dev]", (root / "CHANGELOG.md").read_text(encoding="utf-8")
             )
@@ -187,6 +192,8 @@ class TestReleaseAndSchemaPixiTasks(unittest.TestCase):
                 txt = (root / doc_rel).read_text(encoding="utf-8")
                 self.assertNotIn("active pre-1.0 alpha development", txt)
                 self.assertNotIn("\n\n\n", txt)
+            macros_stable = (root / "galaxy" / "macros.xml").read_text(encoding="utf-8")
+            self.assertIn('<token name="@TOOL_VERSION@">99.0.0</token>', macros_stable)
 
             cl_stable = (root / "CHANGELOG.md").read_text(encoding="utf-8")
             self.assertIn("## [99.0.0] - 2026-12-01\n\n### Changed", cl_stable)

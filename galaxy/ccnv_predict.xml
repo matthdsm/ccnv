@@ -1,0 +1,155 @@
+<tool id="ccnv_predict" name="ccnv predict" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>Normalize, segment, and call germline or prenatal copy-number variations</description>
+    <macros>
+        <import>macros.xml</import>
+    </macros>
+    <expand macro="biotools"/>
+    <expand macro="requirements"/>
+    <expand macro="stdio"/>
+    <expand macro="version_command"/>
+    <command detect_errors="exit_code"><![CDATA[
+    CCNV_THREADS="\${GALAXY_SLOTS:-1}" &&
+    #if $sample.is_of_type("cram"):
+        ln -s '$sample' sample.cram &&
+        #if $sample.metadata.cram_index and str($sample.metadata.cram_index) != 'None':
+            ln -s '$sample.metadata.cram_index' sample.cram.crai &&
+        #else:
+            CCNV_THREADS=1 &&
+        #end if
+        #set $sample_input = "sample.cram"
+    #elif $sample.is_of_type("bam"):
+        ln -s '$sample' sample.bam &&
+        #if $sample.metadata.bam_index and str($sample.metadata.bam_index) != 'None':
+            ln -s '$sample.metadata.bam_index' sample.bam.bai &&
+        #else:
+            CCNV_THREADS=1 &&
+        #end if
+        #set $sample_input = "sample.bam"
+    #else:
+        ln -s '$sample' sample.ccnv &&
+        #set $sample_input = "sample.ccnv"
+    #end if
+    ln -s '$reference' reference.ccnv &&
+    @STAGE_OPTIONAL_FASTA@
+    @STAGE_COVARIATE_TRACKS@
+    #if $deliverables.plot and $deliverables.cytobands:
+        if gzip -t '$deliverables.cytobands' 2>/dev/null; then
+            ln -s '$deliverables.cytobands' cytobands.bed.gz && CYTOBANDS_PATH=cytobands.bed.gz;
+        else
+            ln -s '$deliverables.cytobands' cytobands.bed && CYTOBANDS_PATH=cytobands.bed;
+        fi &&
+    #end if
+    ccnv predict '$sample_input' reference.ccnv
+        --prefix out_pred
+        --mode '$mode_cond.mode'
+        #if $mode_cond.mode == "prenatal":
+            $mode_cond.twins
+        #else:
+            --sex '$mode_cond.sex'
+        #end if
+        --penalty '$calling.penalty'
+        --z-threshold '$calling.z_threshold'
+        #if str($calling.ratio_threshold) not in ("", "None"):
+            --ratio-threshold '$calling.ratio_threshold'
+        #end if
+        --min-reference-bins '$calling.min_reference_bins'
+        --mask-repeats '$calling.mask_repeats'
+        --max-blacklist-gap '$calling.max_blacklist_gap'
+        $deliverables.plot
+        #if $deliverables.plot and $deliverables.cytobands:
+            --cytobands "\$CYTOBANDS_PATH"
+        #end if
+        $deliverables.vcf
+        $deliverables.bins_vcf
+        @FASTA_ARG@
+        @COVARIATE_ARGS@
+        --threads "\$CCNV_THREADS"
+        --loglevel '$loglevel'
+    && gzip -dc out_pred_bins.bed.gz > out_pred_bins.bed
+    && gzip -dc out_pred_segments.bed.gz > out_pred_segments.bed
+    && gzip -dc out_pred_calls.bed.gz > out_pred_calls.bed
+    ]]></command>
+    <inputs>
+        <param name="sample" type="data" format="parquet,bam,cram" label="Sample input (.ccnv, BAM, or CRAM)" help="Sample Parquet from ccnv extract, or a BAM/CRAM alignment streamed directly on the reference grid."/>
+        <param name="reference" type="data" format="parquet" label="Reference model (.ccnv)" help="Reference Parquet built by ccnv reference matching the selected analysis mode."/>
+        <conditional name="mode_cond">
+            <param argument="--mode" type="select" label="Analysis mode">
+                <option value="germline" selected="true">Germline constitutional CNV</option>
+                <option value="prenatal">Prenatal NIPS cfDNA</option>
+            </param>
+            <when value="germline">
+                <param argument="--sex" type="select" label="Sex branch selection" help="Leave 'autosomal' to infer sample sex automatically when sex branches exist.">
+                    <option value="autosomal" selected="true">Autosomal (auto-infer sex)</option>
+                    <option value="female">Female (XX)</option>
+                    <option value="male">Male (XY)</option>
+                </param>
+            </when>
+            <when value="prenatal">
+                <param argument="--twins" type="boolean" truevalue="--twins" falsevalue="--no-twins" checked="false" label="Known twin pregnancy" help="Force twin pregnancy modeling; leave unchecked for automatic singleton/twin stoichiometry evaluation."/>
+            </when>
+        </conditional>
+        <expand macro="optional_fasta_macro"/>
+        <expand macro="covariate_tracks_macro"/>
+        <section name="calling" title="Segmentation and calling options" expanded="false">
+            <param argument="--penalty" type="float" value="1.0" min="0.000001" label="Breakpoint penalty multiplier (gamma)" help="Multiplier on calibrated mBIC segmentation penalty."/>
+            <param argument="--z-threshold" type="float" value="3.0" min="0.000001" label="Absolute segment Z-score cutoff" help="Minimum |Z| threshold for calling gains and losses."/>
+            <param argument="--ratio-threshold" type="float" optional="true" value="" min="0.000001" label="Absolute log2-ratio cutoff (optional)" help="When set, overrides --z-threshold with an absolute log2-ratio threshold."/>
+            <param argument="--min-reference-bins" type="integer" value="3" min="1" label="Minimum within-sample reference prototypes"/>
+            <param argument="--mask-repeats" type="integer" value="3" min="1" label="Within-sample outlier masking iterations"/>
+            <param argument="--max-blacklist-gap" type="integer" value="2000000" min="0" label="Maximum masked gap (bp)" help="Contig gaps exceeding this span split segments into separate euchromatic arm blocks."/>
+        </section>
+        <section name="deliverables" title="Output deliverables" expanded="false">
+            <param argument="--plot" type="boolean" truevalue="--plot" falsevalue="--no-plot" checked="true" label="Generate interactive HTML genome plot"/>
+            <param argument="--cytobands" type="data" format="bed,tabular,txt" optional="true" label="Custom cytoband track (optional)" help="UCSC cytoband BED/TSV (plain or gzipped), overriding bundled GRCh38 cytobands when plotting."/>
+            <param argument="--vcf" type="boolean" truevalue="--vcf" falsevalue="--no-vcf" checked="true" label="Write VCFv4.2 segment and call outputs"/>
+            <param argument="--bins-vcf" type="boolean" truevalue="--bins-vcf" falsevalue="--no-bins-vcf" checked="false" label="Write per-bin VCFv4.2 output (requires VCF output)"/>
+        </section>
+        <expand macro="loglevel_param"/>
+    </inputs>
+    <outputs>
+        <data name="bins_bed" format="bed" from_work_dir="out_pred_bins.bed" label="${tool.name} on ${on_string}: Bins BED"/>
+        <data name="segments_bed" format="bed" from_work_dir="out_pred_segments.bed" label="${tool.name} on ${on_string}: Segments BED"/>
+        <data name="calls_bed" format="bed" from_work_dir="out_pred_calls.bed" label="${tool.name} on ${on_string}: Calls BED"/>
+        <data name="segments_vcf" format="vcf_bgzip" from_work_dir="out_pred_segments.vcf.gz" label="${tool.name} on ${on_string}: Segments VCF">
+            <filter>deliverables['vcf']</filter>
+        </data>
+        <data name="calls_vcf" format="vcf_bgzip" from_work_dir="out_pred_calls.vcf.gz" label="${tool.name} on ${on_string}: Calls VCF">
+            <filter>deliverables['vcf']</filter>
+        </data>
+        <data name="bins_vcf" format="vcf_bgzip" from_work_dir="out_pred_bins.vcf.gz" label="${tool.name} on ${on_string}: Bins VCF">
+            <filter>deliverables['vcf'] and deliverables['bins_vcf']</filter>
+        </data>
+        <data name="qc_json" format="json" from_work_dir="out_pred_qc.json" label="${tool.name} on ${on_string}: Prediction QC JSON"/>
+        <data name="plot_html" format="html" from_work_dir="out_pred_plot.html" label="${tool.name} on ${on_string}: Genome Plot HTML">
+            <filter>deliverables['plot']</filter>
+        </data>
+    </outputs>
+    <tests>
+        <test expect_num_outputs="7">
+            <param name="sample" value="sample.ccnv"/>
+            <param name="reference" value="reference.ccnv"/>
+            <output name="bins_bed" ftype="bed"/>
+            <output name="segments_bed" ftype="bed"/>
+            <output name="calls_bed" ftype="bed"/>
+            <output name="segments_vcf" ftype="vcf_bgzip"/>
+            <output name="calls_vcf" ftype="vcf_bgzip"/>
+            <output name="qc_json" ftype="json"/>
+            <output name="plot_html" ftype="html"/>
+        </test>
+    </tests>
+    <help><![CDATA[
+**What it does**
+
+``ccnv predict`` normalizes a test sample (``.ccnv``, BAM, or CRAM) against a reference model via robust Huber PCA projection and off-chromosome Prototype Graph medians, partitions chromosomes across euchromatic arm blocks using calibrated PELT segmentation, scores intervals with dyadic BLUE precision Z-scores, and calls discrete copy-number states (``CN in {0, 1, 2, 3, 4+}``).
+
+In ``prenatal`` mode, it additionally computes fused multi-modal fetal fraction (``FFY``, ``FFA``, ``FFX``, ``FF_size``), 4D sex-chromosome aneuploidy classification, twin stoichiometry (``FF``, ``FM``, ``MM``), male-fetus 5 kb ``chrY`` MSY normalization, segment discordance checks, and 5-state biological origin classification.
+
+**Outputs**
+
+- **Bins / Segments / Calls BED**: Decompressed 0-based half-open BED tables for downstream Galaxy workflows.
+- **Segments / Calls / Bins VCF**: Bgzipped VCFv4.2 deliverables when ``--vcf`` (and optionally ``--bins-vcf``) is enabled.
+- **Prediction QC JSON**: Sample QC, fragmentomics summary, and prenatal metrics.
+- **Genome Plot HTML**: Interactive Plotly WebGL CNV viewer with UCSC cytoband ideogram track.
+    ]]></help>
+    <expand macro="citations"/>
+</tool>

@@ -63,6 +63,10 @@ docker pull ghcr.io/matthdsm/ccnv:latest
 docker run --rm ghcr.io/matthdsm/ccnv:latest ccnv --help
 ```
 
+### Galaxy
+
+IUC-compatible Galaxy wrappers (`ccnv_extract`, `ccnv_reference`, `ccnv_ref_qc`, `ccnv_predict`) and ToolShed suite metadata live under [galaxy/](galaxy/). See the [CLI Reference](https://matthdsm.github.io/ccnv/cli/#galaxy-tool-suite) for dataset staging and workflow output details.
+
 ---
 
 ## Quickstart

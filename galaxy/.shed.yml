@@ -1,0 +1,22 @@
+name: ccnv
+owner: matthdsm
+description: Copy-number variation analysis for whole-genome sequencing (germline and prenatal cfDNA)
+long_description: |
+  ccnv is an independent Python/Rust bioinformatics toolkit for Copy Number Variation (CNV)
+  detection in whole-genome sequencing (WGS) data at any coverage, building on published
+  within-sample reference normalization methodology. This suite provides Galaxy wrappers for
+  ccnv extract, ccnv reference, ccnv ref-qc, and ccnv predict across germline and prenatal
+  cell-free DNA analysis modes.
+homepage_url: https://matthdsm.github.io/ccnv/
+remote_repository_url: https://github.com/matthdsm/ccnv
+type: unrestricted
+categories:
+  - Variant Analysis
+  - Sequence Analysis
+auto_tool_repositories:
+  name_template: "{{ tool_id }}"
+  description_template: "Galaxy wrapper for {{ tool_name }} ({{ tool_id }})"
+suite:
+  name: suite_ccnv
+  description: Complete ccnv pipeline suite for germline and prenatal WGS copy-number analysis.
+  type: repository_suite_definition

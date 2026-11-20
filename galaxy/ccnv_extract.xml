@@ -1,0 +1,84 @@
+<tool id="ccnv_extract" name="ccnv extract" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>Extract binned read counts and cfDNA fragmentomics into sample Parquet</description>
+    <macros>
+        <import>macros.xml</import>
+    </macros>
+    <expand macro="biotools"/>
+    <expand macro="requirements"/>
+    <expand macro="stdio"/>
+    <expand macro="version_command"/>
+    <command detect_errors="exit_code"><![CDATA[
+    CCNV_THREADS="\${GALAXY_SLOTS:-1}" &&
+    #if $alignment.is_of_type("cram"):
+        ln -s '$alignment' input.cram &&
+        #if $alignment.metadata.cram_index and str($alignment.metadata.cram_index) != 'None':
+            ln -s '$alignment.metadata.cram_index' input.cram.crai &&
+        #else:
+            CCNV_THREADS=1 &&
+        #end if
+        #set $align_input = "input.cram"
+    #else:
+        ln -s '$alignment' input.bam &&
+        #if $alignment.metadata.bam_index and str($alignment.metadata.bam_index) != 'None':
+            ln -s '$alignment.metadata.bam_index' input.bam.bai &&
+        #else:
+            CCNV_THREADS=1 &&
+        #end if
+        #set $align_input = "input.bam"
+    #end if
+    @STAGE_OPTIONAL_FASTA@
+    ccnv extract '$align_input'
+        --prefix out_sample
+        --bin-size '$bin_size'
+        @FASTA_ARG@
+        --min-mapq '$filters.min_mapq'
+        $filters.keep_duplicates
+        $filters.keep_secondary
+        $filters.keep_supplementary
+        $filters.allow_improper_pairs
+        $all_contigs
+        --threads "\$CCNV_THREADS"
+        --loglevel '$loglevel'
+    ]]></command>
+    <inputs>
+        <param name="alignment" type="data" format="bam,cram" label="Aligned reads (BAM or CRAM)" help="Coordinate-sorted BAM or CRAM alignment file. Multi-threaded tile streaming uses an attached .bai/.crai index automatically; unindexed inputs fall back to single-threaded streaming."/>
+        <param argument="--bin-size" type="integer" value="5000" min="1" label="Bin size (bp)" help="Target genomic bin width in base pairs."/>
+        <expand macro="optional_fasta_macro"/>
+        <section name="filters" title="Read filtering options" expanded="false">
+            <param argument="--min-mapq" type="integer" value="1" min="0" label="Minimum mapping quality" help="Minimum MAPQ required to retain an alignment record."/>
+            <param argument="--keep-duplicates" type="boolean" truevalue="--keep-duplicates" falsevalue="" checked="false" label="Keep SAM duplicate reads (0x400)"/>
+            <param argument="--keep-secondary" type="boolean" truevalue="--keep-secondary" falsevalue="" checked="false" label="Keep secondary alignments (0x100)"/>
+            <param argument="--keep-supplementary" type="boolean" truevalue="--keep-supplementary" falsevalue="" checked="false" label="Keep supplementary alignments (0x800)"/>
+            <param argument="--allow-improper-pairs" type="boolean" truevalue="--allow-improper-pairs" falsevalue="" checked="false" label="Keep improper pairs" help="Retain paired reads not flagged as proper pairs."/>
+        </section>
+        <param argument="--all-contigs" type="boolean" truevalue="--all-contigs" falsevalue="" checked="false" label="Bin all header contigs" help="By default only canonical chromosomes (1-22, X, Y) are binned; enable for non-human or custom assemblies."/>
+        <expand macro="loglevel_param"/>
+    </inputs>
+    <outputs>
+        <data name="sample_parquet" format="parquet" from_work_dir="out_sample.ccnv" label="${tool.name} on ${on_string}: Sample Parquet (.ccnv)"/>
+    </outputs>
+    <tests>
+        <test expect_num_outputs="1">
+            <param name="alignment" value="sample.bam"/>
+            <param name="bin_size" value="5000"/>
+            <output name="sample_parquet" ftype="parquet"/>
+        </test>
+    </tests>
+    <help><![CDATA[
+**What it does**
+
+``ccnv extract`` streams a BAM or CRAM alignment once using the compiled Rust ``ccnv._core`` scanner into a Zstandard-compressed Apache Arrow/Parquet sample sketch (``.ccnv``).
+
+Paired-end proper pairs are assigned by their fragment dyad midpoint (``TLEN > 0``) to prevent boundary double-counting, while single-end reads are binned by 0-based ``reference_start``. Alongside per-bin counts, the output stores 24 fragment-length bands, short-fragment counts (80-150 bp), endpoint counts, fragment GC sums, and sample-level fragment size histograms and 5' 4-mer end-motif spectra.
+
+**Inputs**
+
+- **Aligned reads**: Coordinate-sorted BAM or CRAM (CRAM requires selecting a matching reference FASTA).
+- **Reference FASTA**: Optional for BAM, required for CRAM inputs.
+
+**Outputs**
+
+- **Sample Parquet (.ccnv)**: Compact coordinate-free sample sketch ready for ``ccnv reference`` or ``ccnv predict``.
+    ]]></help>
+    <expand macro="citations"/>
+</tool>

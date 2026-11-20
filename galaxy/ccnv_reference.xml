@@ -1,0 +1,217 @@
+<tool id="ccnv_reference" name="ccnv reference" version="@TOOL_VERSION@+galaxy@VERSION_SUFFIX@" profile="@PROFILE@">
+    <description>Build a germline or prenatal CNV reference model from control samples or FASTA</description>
+    <macros>
+        <import>macros.xml</import>
+    </macros>
+    <expand macro="biotools"/>
+    <expand macro="requirements"/>
+    <expand macro="stdio"/>
+    <expand macro="version_command"/>
+    <command detect_errors="exit_code"><![CDATA[
+    #if $source_cond.source_type == "cohort_collection":
+        mkdir -p samples &&
+        #for $i, $s in enumerate($source_cond.samples):
+            ln -s '$s' 'samples/sample_${i}.ccnv' &&
+        #end for
+        cat > samplesheet.json <<'EOF' &&
+[
+#for $i, $s in enumerate($source_cond.samples):
+    #set $comma = "," if $i < len($source_cond.samples) - 1 else ""
+    {"filepath": "samples/sample_${i}.ccnv"}$comma
+#end for
+]
+EOF
+    #elif $source_cond.source_type == "cohort_annotated":
+        mkdir -p samples &&
+        #for $i, $entry in enumerate($source_cond.entries):
+            ln -s '${entry.sample}' 'samples/sample_${i}.ccnv' &&
+        #end for
+        cat > samplesheet.json <<'EOF' &&
+[
+#for $i, $entry in enumerate($source_cond.entries):
+    #set $comma = "," if $i < len($source_cond.entries) - 1 else ""
+    #set $sex_json = '"' + str($entry.sex) + '"' if str($entry.sex) in ("M", "F") else "null"
+    #set $ff_json = str($entry.ff) if str($entry.ff) not in ("", "None") else "null"
+    {"filepath": "samples/sample_${i}.ccnv", "sex": $sex_json, "ff": $ff_json}$comma
+#end for
+]
+EOF
+    #elif $source_cond.source_type == "flat_fasta":
+        #if $source_cond.fasta_source.fasta_select == "cached":
+            ln -s '$source_cond.fasta_source.fasta_cached.fields.path' reference.fa &&
+            if [ -e '${source_cond.fasta_source.fasta_cached.fields.path}.fai' ]; then
+                ln -s '${source_cond.fasta_source.fasta_cached.fields.path}.fai' reference.fa.fai;
+            fi &&
+        #else:
+            ln -s '$source_cond.fasta_source.fasta_history' reference.fa &&
+        #end if
+    #end if
+    @STAGE_COVARIATE_TRACKS@
+    ccnv reference
+        --prefix out_ref
+        #if $source_cond.source_type != "flat_fasta":
+            --samplesheet samplesheet.json
+        #else:
+            --fasta reference.fa
+            $source_cond.all_contigs
+        #end if
+        --mode '$mode_cond.mode'
+        #if $mode_cond.mode == "prenatal":
+            --prenatal-binsize '$mode_cond.prenatal_binsize'
+        #end if
+        --bin-size '$bin_size'
+        #if str($contigs.autosomal_contig).strip():
+            #for $contig in str($contigs.autosomal_contig).replace(",", " ").split():
+                --autosomal-contig '$contig'
+            #end for
+        #end if
+        #if str($contigs.sex_contig).strip():
+            #for $contig in str($contigs.sex_contig).replace(",", " ").split():
+                --sex-contig '$contig'
+            #end for
+        #end if
+        #if str($contigs.sex_signal_contig).strip():
+            --sex-signal-contig '$contigs.sex_signal_contig'
+        #end if
+        #if str($contigs.sex_cutoff) not in ("", "None"):
+            --sex-cutoff '$contigs.sex_cutoff'
+        #end if
+        #if str($advanced.pca_components) not in ("", "None"):
+            --pca-components '$advanced.pca_components'
+        #end if
+        --max-batch-memory-mb '$advanced.max_batch_memory_mb'
+        --min-cohort-size '$advanced.min_cohort_size'
+        --min-sex-group-size '$advanced.min_sex_group_size'
+        $advanced.qc_report
+        @COVARIATE_ARGS@
+        --threads "\${GALAXY_SLOTS:-1}"
+        --loglevel '$loglevel'
+    ]]></command>
+    <inputs>
+        <conditional name="source_cond">
+            <param name="source_type" type="select" label="Reference source">
+                <option value="cohort_collection" selected="true">Control sample Parquet collection (.ccnv)</option>
+                <option value="cohort_annotated">Control samples with per-sample sex / fetal fraction annotations</option>
+                <option value="flat_fasta">Flat uniform-depth reference from FASTA (germline only)</option>
+            </param>
+            <when value="cohort_collection">
+                <param name="samples" type="data" format="parquet" multiple="true" min="1" label="Control sample Parquet files (.ccnv)" help="Normal control sample Parquet files extracted by ccnv extract."/>
+            </when>
+            <when value="cohort_annotated">
+                <repeat name="entries" min="1" title="Control samples">
+                    <param name="sample" type="data" format="parquet" label="Sample Parquet (.ccnv)"/>
+                    <param name="sex" type="select" label="Known sample or fetal sex" help="Leave automatic to infer sex from X/Y coverage dosage.">
+                        <option value="" selected="true">Infer automatically</option>
+                        <option value="F">Female (F)</option>
+                        <option value="M">Male (M)</option>
+                    </param>
+                    <param name="ff" type="float" optional="true" value="" min="0.0" max="1.0" label="Known fetal fraction (optional, [0, 1])" help="Optional known fetal fraction for prenatal calibration."/>
+                </repeat>
+            </when>
+            <when value="flat_fasta">
+                <conditional name="fasta_source">
+                    <param name="fasta_select" type="select" label="FASTA source">
+                        <option value="cached">Use built-in reference genome</option>
+                        <option value="history" selected="true">Use FASTA dataset from history</option>
+                    </param>
+                    <when value="cached">
+                        <param name="fasta_cached" type="select" label="Built-in reference genome">
+                            <options from_data_table="all_fasta"/>
+                        </param>
+                    </when>
+                    <when value="history">
+                        <param name="fasta_history" type="data" format="fasta" label="Reference FASTA"/>
+                    </when>
+                </conditional>
+                <param argument="--all-contigs" type="boolean" truevalue="--all-contigs" falsevalue="" checked="false" label="Include all FASTA contigs" help="Include non-canonical contigs when building a flat reference."/>
+            </when>
+        </conditional>
+        <conditional name="mode_cond">
+            <param argument="--mode" type="select" label="Analysis mode">
+                <option value="germline" selected="true">Germline constitutional CNV</option>
+                <option value="prenatal">Prenatal NIPS cfDNA</option>
+            </param>
+            <when value="germline"/>
+            <when value="prenatal">
+                <param argument="--prenatal-binsize" type="integer" value="100000" min="1" label="Prenatal coarse bin size (bp)" help="Target bin size for coarsening autosomal and chrX counts for FFA and FFX models."/>
+            </when>
+        </conditional>
+        <param argument="--bin-size" type="integer" value="5000" min="1" label="Target bin size (bp)" help="Primary bin width for the reference model. Compatible sample Parquets are rebinned in memory if needed."/>
+        <expand macro="covariate_tracks_macro"/>
+        <section name="contigs" title="Contig and sex inference options" expanded="false">
+            <param argument="--autosomal-contig" type="text" optional="true" value="" label="Autosomal contigs (optional, comma- or space-separated)" help="Override default autosome detection (e.g. chr1,chr2,chr3).">
+                <sanitizer invalid_char="">
+                    <valid initial="string.ascii_letters,string.digits">
+                        <add value=","/>
+                        <add value=" "/>
+                        <add value="_"/>
+                        <add value="."/>
+                        <add value="-"/>
+                    </valid>
+                </sanitizer>
+            </param>
+            <param argument="--sex-contig" type="text" optional="true" value="" label="Sex contigs (optional, comma- or space-separated)" help="Override default sex contigs (default: X,Y,chrX,chrY).">
+                <sanitizer invalid_char="">
+                    <valid initial="string.ascii_letters,string.digits">
+                        <add value=","/>
+                        <add value=" "/>
+                        <add value="_"/>
+                        <add value="."/>
+                        <add value="-"/>
+                    </valid>
+                </sanitizer>
+            </param>
+            <param argument="--sex-signal-contig" type="text" optional="true" value="" label="Sex signal contig (optional)" help="Contig used to infer sample sex (default: chrY/Y).">
+                <sanitizer invalid_char="">
+                    <valid initial="string.ascii_letters,string.digits">
+                        <add value="_"/>
+                        <add value="."/>
+                        <add value="-"/>
+                    </valid>
+                </sanitizer>
+            </param>
+            <param argument="--sex-cutoff" type="float" optional="true" value="" min="0.0" max="1.0" label="Sex signal coverage cutoff (optional)" help="Coverage fraction threshold on the sex signal contig above which samples are classified as male."/>
+        </section>
+        <section name="advanced" title="Cohort modeling and QC options" expanded="false">
+            <param argument="--pca-components" type="integer" optional="true" value="" min="1" label="Maximum PCA components (optional)" help="Cap PCA rank per branch; leave empty to use automatic Gavish-Donoho SVHT rank selection."/>
+            <param argument="--max-batch-memory-mb" type="integer" value="256" min="1" label="Max batch memory (MiB)" help="Memory cap before cohort matrices spill to temporary memory-mapped arrays."/>
+            <param argument="--min-cohort-size" type="integer" value="10" min="1" label="Minimum cohort size" help="Minimum samples required to fit the autosomal branch."/>
+            <param argument="--min-sex-group-size" type="integer" value="5" min="1" label="Minimum sex group size" help="Minimum samples per sex required to fit a sex-specific branch."/>
+            <param argument="--qc-report" type="boolean" truevalue="--qc-report" falsevalue="--no-qc-report" checked="true" label="Generate reference QC JSON report"/>
+        </section>
+        <expand macro="loglevel_param"/>
+    </inputs>
+    <outputs>
+        <data name="reference_parquet" format="parquet" from_work_dir="out_ref.ccnv" label="${tool.name} on ${on_string}: Reference Parquet (.ccnv)"/>
+        <data name="qc_json" format="json" from_work_dir="out_ref_qc.json" label="${tool.name} on ${on_string}: Reference QC JSON">
+            <filter>advanced['qc_report']</filter>
+        </data>
+    </outputs>
+    <tests>
+        <test expect_num_outputs="2">
+            <conditional name="source_cond">
+                <param name="source_type" value="flat_fasta"/>
+                <conditional name="fasta_source">
+                    <param name="fasta_select" value="history"/>
+                    <param name="fasta_history" value="genome.fa"/>
+                </conditional>
+            </conditional>
+            <param name="bin_size" value="5000"/>
+            <output name="reference_parquet" ftype="parquet"/>
+            <output name="qc_json" ftype="json"/>
+        </test>
+    </tests>
+    <help><![CDATA[
+**What it does**
+
+``ccnv reference`` builds a reusable Schema v2.0.0 CNV reference model (``.ccnv``) from a cohort of control sample Parquets or a flat reference FASTA (germline mode only).
+
+In cohort mode, it performs 1 Mb super-block DESeq2 depth scaling, optional GC/mappability/fragmentomic Poisson bias regression, sex inference and outlier quarantine, Gavish-Donoho SVHT PCA denoising, off-chromosome Prototype Graph construction, and Smyth Empirical Bayes biological overdispersion shrinkage. In ``prenatal`` mode, it additionally fits closed-form Poisson MSY ``FFY``, 100 kb ``FFA`` and ``FFX`` regressions, fetal/maternal fragment-length density deconvolution, 24-band Fisher read weights, and the 36-feature ``FF_size`` ensemble.
+
+**Outputs**
+
+- **Reference Parquet (.ccnv)**: Reusable cohort or flat FASTA reference model.
+- **Reference QC JSON**: Diagnostic quality metrics and branch usability verdicts (emitted when ``--qc-report`` is enabled).
+    ]]></help>
+    <expand macro="citations"/>
+</tool>

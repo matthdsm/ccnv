@@ -286,6 +286,7 @@ def bump_version(
     changelog_path = repo_root / "CHANGELOG.md"
     readme_path = repo_root / "README.md"
     docs_index_path = repo_root / "docs" / "index.md"
+    galaxy_macros_path = repo_root / "galaxy" / "macros.xml"
 
     for req in (pyproject_path, init_path, cargo_toml_path, changelog_path):
         if not req.is_file():
@@ -339,6 +340,17 @@ def bump_version(
         writes[docs_index_path] = _update_alpha_banner(
             docs_index_path.read_text(encoding="utf-8"), parsed, zensical=True
         )
+    if galaxy_macros_path.is_file():
+        macros_text = galaxy_macros_path.read_text(encoding="utf-8")
+        new_macros, macros_count = re.subn(
+            r'(<token\s+name="@TOOL_VERSION@">)[^<]*(</token>)',
+            rf"\g<1>{parsed.raw}\g<2>",
+            macros_text,
+            count=1,
+        )
+        if macros_count != 1:
+            raise ValueError("missing @TOOL_VERSION@ token in galaxy/macros.xml")
+        writes[galaxy_macros_path] = new_macros
 
     repo_url = _resolve_repo_url(repo_root)
     writes[changelog_path] = _finalize_changelog(

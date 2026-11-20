@@ -148,6 +148,14 @@ flowchart LR
     G --> H["BED.gz, VCF.gz, QC.json & HTML via ccnv._core"]
 ```
 
+## Galaxy Tool Suite
+
+An IUC-compatible Galaxy tool suite under `galaxy/` (`galaxy/.shed.yml`, `galaxy/macros.xml`, `galaxy/ccnv_extract.xml`, `galaxy/ccnv_reference.xml`, `galaxy/ccnv_ref_qc.xml`, and `galaxy/ccnv_predict.xml`) wraps every CLI subcommand and flag for Galaxy workflows and ToolShed deployment (`suite_ccnv`).
+
+- Extensionless `.dat` symlink staging: Galaxy mounts history datasets with `.dat` paths while `ccnv` inspects file extensions and sidecar indexes, so each wrapper symlinks inputs to canonical names inside the job working directory (`input.bam`/`.bai`, `input.cram`/`.crai`, `reference.fa` plus cached `.fai` when present, `.ccnv` Parquets, `.bw`/`.fa`/`.bed` covariate tracks, and `gzip -t`-detected `cytobands.bed` or `cytobands.bed.gz`). For `ccnv extract` and `ccnv predict`, `--threads` uses `${GALAXY_SLOTS:-1}` when an alignment index is attached and falls back to `CCNV_THREADS=1` when index metadata is absent.
+- Automated `samplesheet.json` generation: `ccnv_reference.xml` accepts a control `.ccnv` collection (`cohort_collection`), per-sample annotated entries with optional `sex` (`F`/`M`) and `ff` overrides (`cohort_annotated`), or a single germline FASTA (`flat_fasta`), generating a schema-validated `samplesheet.json` inside cohort runs.
+- Galaxy output datatype mapping: `ccnv_predict.xml` decompresses `<prefix>_bins.bed.gz`, `<prefix>_segments.bed.gz`, and `<prefix>_calls.bed.gz` via `gzip -dc` into plain `format="bed"` datasets for downstream Galaxy tools while emitting `<prefix>_segments.vcf.gz`, `<prefix>_calls.vcf.gz`, and opt-in `<prefix>_bins.vcf.gz` as `format="vcf_bgzip"`, `<prefix>_qc.json` as `format="json"`, and `<prefix>_plot.html` as `format="html"` with conditional `<filter>` guards matching `--vcf`, `--bins-vcf`, and `--plot`.
+
 ## Exit Codes
 
 | Exit Code | Meaning |
