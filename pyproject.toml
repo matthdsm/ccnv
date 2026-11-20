@@ -7,7 +7,7 @@ name = "ccnv"
 version = "1.0.0"
 description = "Copy-number analysis for whole-genome sequencing"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE.md"]
 authors = [
@@ -23,10 +23,10 @@ classifiers = [
 dependencies = [
     "jinja2",
     "jsonschema>=4.20.0",
-    "numpy<2.5,<3",
+    "numpy>2.5,<3",
     "polars>=2,<3",
     "polars-runtime-compat",
-    "pyarrow<=26,<27",
+    "pyarrow>=26,<27",
     "pyyaml>=6.0",
     "ruptures>=1.1.10",
     "scikit-learn>=1.9,<2",
@@ -53,11 +53,11 @@ channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 
 [tool.pixi.dependencies]
-numpy = "<2.5,<3"
+numpy = ">2.5,<3"
 polars = ">=2,<3"
 polars-runtime-compat = "*"
-pyarrow = "<=26,<27"
-python = "3.14.*"
+pyarrow = ">=26,<27"
+python = ">=3.12,<4"
 scikit-learn = ">=1.9,<2"
 scipy = ">=1.18,<2"
 typer = ">=0.29,<0.30"
