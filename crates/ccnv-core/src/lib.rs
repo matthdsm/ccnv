@@ -1,5 +1,6 @@
 mod alignments;
 mod bgzf_index;
+mod pelt;
 mod tracks;
 
 use std::collections::HashMap;
@@ -35,6 +36,10 @@ pub(crate) fn alignment_error(msg: impl Into<String>) -> PyErr {
 
 pub(crate) fn covariate_error(msg: impl Into<String>) -> PyErr {
     py_domain_error("CovariateError", msg)
+}
+
+pub(crate) fn invalid_input_error(msg: impl Into<String>) -> PyErr {
+    py_domain_error("InvalidInputError", msg)
 }
 
 pub(crate) fn normalize_chr_name(name: &str) -> &str {
@@ -95,6 +100,7 @@ fn _core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(alignments::read_alignment_header, m)?)?;
     m.add_function(wrap_pyfunction!(alignments::scan_alignment_bins, m)?)?;
+    m.add_function(wrap_pyfunction!(pelt::pelt_weighted_l2, m)?)?;
     m.add_function(wrap_pyfunction!(tracks::read_fasta_contigs_core, m)?)?;
     m.add_function(wrap_pyfunction!(tracks::scan_fasta_gc_quantiles, m)?)?;
     m.add_function(wrap_pyfunction!(tracks::scan_bigwig_means, m)?)?;

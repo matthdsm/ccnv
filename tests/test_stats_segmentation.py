@@ -7,10 +7,13 @@ import math
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import numpy as np
+import ruptures as rpt
+from numpy.typing import NDArray
+from ruptures.base import BaseCost
 
+from ccnv._core import pelt_weighted_l2
 from ccnv.models import InvalidInputError, SegmentResult
 from ccnv.stats.segmentation import (
     ContigSegmentationInput,
@@ -21,6 +24,8 @@ from ccnv.stats.segmentation import (
     segment_and_score_genome,
     segment_contig,
 )
+
+BaseCost.register(WeightedL2Cost)
 
 FIXTURES = Path(__file__).parent / "fixtures" / "benchmark"
 
@@ -33,11 +38,16 @@ class TestWeightedL2Cost(unittest.TestCase):
 
         expected = np.sum(weights[:2] * np.square(values[:2] - 1.75))
         self.assertAlmostEqual(cost.error(0, 3), float(expected))
+        self.assertAlmostEqual(cost.sum_of_costs([2, 3]), float(expected))
 
     def test_zero_weight_slice_has_zero_cost(self) -> None:
         cost = WeightedL2Cost().fit(np.column_stack(([1.0, 2.0], [0.0, 0.0])))
 
         self.assertEqual(cost.error(0, 2), 0.0)
+        self.assertEqual(cost.sum_of_costs([]), 0.0)
+        self.assertEqual(cost.sum_of_costs([1, 2]), 0.0)
+        with self.assertRaises(InvalidInputError):
+            cost.sum_of_costs([2, 1])
 
     def test_weighted_l2_cost_and_segment_genome(self) -> None:
         values = np.array([1.0, 2.0, 10.0])
@@ -45,6 +55,7 @@ class TestWeightedL2Cost(unittest.TestCase):
         cost = WeightedL2Cost().fit(np.column_stack((values, weights)))
         expected = np.sum(weights[:2] * np.square(values[:2] - 1.75))
         self.assertAlmostEqual(cost.error(0, 3), float(expected))
+        self.assertAlmostEqual(cost.sum_of_costs([2, 3]), float(expected))
 
         starts = np.array([0, 100, 200, 300, 400], dtype=np.int64)
         ends = np.array([100, 200, 300, 400, 500], dtype=np.int64)
@@ -162,32 +173,28 @@ class TestSegmentContig(unittest.TestCase):
             [(200_000, 500_000, 0.0), (500_000, 800_000, 1.0)],
         )
 
-    def test_kernel_cpd_dispatched_when_available_and_uniform_weights(self) -> None:
-        mock_detector = MagicMock()
-        mock_detector.fit.return_value.predict.return_value = [5, 10]
+    def test_uniform_weights_segment_contig_matches_rust_pelt(self) -> None:
+        starts = np.arange(10, dtype=np.int64) * 100
+        ends = starts + 100
+        ratios = np.array([0.0] * 5 + [1.2] * 5, dtype=np.float64)
+        weights = np.full(10, 2.0, dtype=np.float64)
+        signal = np.column_stack((ratios, weights))
 
-        with patch(
-            "ruptures.KernelCPD", create=True, return_value=mock_detector
-        ) as mock_cls:
-            starts = np.arange(10) * 100
-            ends = starts + 100
-            ratios = np.zeros(10)
-            weights = np.ones(10) * 2.0
-
-            segments = segment_contig(
-                contig="chr1",
-                starts=starts,
-                ends=ends,
-                ratios=ratios,
-                weights=weights,
-                contig_length=1000,
-                penalty=4.0,
-            )
-            mock_cls.assert_called_once_with(kernel="linear", min_size=2, jump=1)
-            mock_detector.fit.return_value.predict.assert_called_once_with(pen=2.0)
-            self.assertEqual(len(segments), 2)
-            self.assertEqual((segments[0].start, segments[0].end), (0, 500))
-            self.assertEqual((segments[1].start, segments[1].end), (500, 1000))
+        segments = segment_contig(
+            contig="chr1",
+            starts=starts,
+            ends=ends,
+            ratios=ratios,
+            weights=weights,
+            contig_length=1000,
+            penalty=2.0,
+        )
+        rust_bkps = pelt_weighted_l2(signal, 2.0, 2, 1)
+        self.assertEqual(rust_bkps, [5, 10])
+        self.assertEqual(
+            [(seg.start, seg.end) for seg in segments],
+            [(0, 500), (500, 1000)],
+        )
 
     def test_long_blacklist_gap_splits_and_is_excluded(self) -> None:
         segments = segment_contig(
@@ -784,6 +791,201 @@ class TestBenchmarkConcordance(unittest.TestCase):
             kappa_s=4.0,
         )
         self.assertAlmostEqual(bf_mod_corr, 24.75, delta=0.5)
+
+
+class TestRustPeltRupturesParity(unittest.TestCase):
+    @staticmethod
+    def _oracle_bkps(
+        signal: NDArray[np.float64],
+        penalty: float,
+        min_size: int,
+        jump: int,
+    ) -> list[int]:
+        detector = rpt.Pelt(
+            custom_cost=WeightedL2Cost(), min_size=min_size, jump=jump
+        ).fit(signal)
+        return [int(bp) for bp in detector.predict(pen=penalty)]
+
+    def _assert_parity(
+        self,
+        signal: NDArray[np.float64],
+        penalty: float,
+        min_size: int,
+        jump: int,
+    ) -> list[int]:
+        expected = self._oracle_bkps(signal, penalty, min_size, jump)
+        rust_bkps = pelt_weighted_l2(signal, penalty, min_size, jump)
+        py_bkps = _find_breakpoints(
+            signal=signal, penalty=penalty, min_size=min_size, jump=jump
+        )
+        self.assertEqual(
+            rust_bkps,
+            expected,
+            f"Rust PELT mismatch (n={signal.shape[0]}, pen={penalty}, min_size={min_size}, jump={jump})",
+        )
+        self.assertEqual(py_bkps, expected)
+        return rust_bkps
+
+    def test_grid_min_size_jump_penalties_and_weight_regimes(self) -> None:
+        rng = np.random.default_rng(2026)
+        n = 48
+        base_vals = np.concatenate(
+            [
+                rng.normal(0.0, 0.15, 13),
+                rng.normal(1.2, 0.2, 11),
+                rng.normal(-0.8, 0.15, 14),
+                rng.normal(0.1, 0.1, 10),
+            ]
+        )
+        alt_weights = np.tile(np.array([1e-9, 1e6], dtype=np.float64), n // 2)
+        hetero_weights = rng.uniform(0.2, 25.0, size=n)
+        uniform_weights = np.full(n, 3.5, dtype=np.float64)
+        zero_slice_weights = hetero_weights.copy()
+        zero_slice_weights[8:12] = 0.0
+        zero_slice_weights[35:39] = 0.0
+
+        nan_inf_vals = base_vals.copy()
+        nan_inf_vals[[2, 19, 41]] = [math.nan, math.inf, -math.inf]
+        nan_inf_weights = hetero_weights.copy()
+        nan_inf_weights[[5, 24, 44]] = [math.nan, math.inf, -math.inf]
+
+        signals = [
+            np.column_stack((base_vals, uniform_weights)),
+            np.column_stack((base_vals, hetero_weights)),
+            np.column_stack((base_vals, alt_weights)),
+            np.column_stack((base_vals, zero_slice_weights)),
+            np.column_stack((nan_inf_vals, nan_inf_weights)),
+        ]
+        for sig in signals:
+            for min_size in (1, 2, 3, 5, 10):
+                for jump in (1, 2, 3, 5):
+                    for penalty in (0.01, 2.5, 1e9):
+                        self._assert_parity(sig, penalty, min_size, jump)
+
+    def test_short_blocks_and_empty_inputs(self) -> None:
+        empty = np.empty((0, 2), dtype=np.float64)
+        self.assertEqual(pelt_weighted_l2(empty, 1.0, 2, 1), [])
+        self.assertEqual(
+            _find_breakpoints(signal=empty, penalty=1.0, min_size=2, jump=1), []
+        )
+
+        for n in (1, 2, 3, 7, 9):
+            sig = np.column_stack(
+                (np.arange(n, dtype=np.float64), np.ones(n, dtype=np.float64))
+            )
+            for min_size in (2, 5, 10):
+                if n >= 2 * min_size:
+                    continue
+                for jump in (1, 2, 3):
+                    self.assertEqual(pelt_weighted_l2(sig, 1.0, min_size, jump), [n])
+                    self.assertEqual(
+                        _find_breakpoints(
+                            signal=sig, penalty=1.0, min_size=min_size, jump=jump
+                        ),
+                        [n],
+                    )
+                    if n >= min_size:
+                        self.assertEqual(
+                            self._oracle_bkps(sig, 1.0, min_size, jump), [n]
+                        )
+
+    def test_tie_breaking_and_strided_non_contiguous_arrays(self) -> None:
+        tie_signals = [
+            np.column_stack((np.zeros(12), np.ones(12))),
+            np.column_stack((np.array([0.0, 0.0, 1.0, 1.0, 0.0, 0.0]), np.ones(6))),
+            np.column_stack((np.array([0.0] * 3 + [2.0] * 3 + [0.0] * 3), np.ones(9))),
+        ]
+        for sig in tie_signals:
+            for min_size in (1, 2, 3):
+                for jump in (1, 2):
+                    for penalty in (0.1, 1.0, 5.0):
+                        self._assert_parity(sig, penalty, min_size, jump)
+
+        raw = np.zeros((24, 4), dtype=np.float64)
+        raw[::2, 0] = np.concatenate([np.zeros(6), np.full(6, 1.5)])
+        raw[::2, 2] = np.linspace(1.0, 5.0, 12)
+        strided = raw[::2, ::2]
+        self.assertFalse(strided.flags["C_CONTIGUOUS"])
+        self._assert_parity(strided, 1.0, 2, 1)
+
+        fortran = np.asfortranarray(strided)
+        self.assertFalse(fortran.flags["C_CONTIGUOUS"])
+        self._assert_parity(fortran, 1.0, 2, 1)
+
+        self._assert_parity(strided, 0.1, 2, 20)
+        self._assert_parity(np.full((8, 2), math.nan), 1.0, 2, 1)
+        single_w = np.column_stack(
+            (np.arange(8.0), [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        )
+        self._assert_parity(single_w, 0.5, 2, 1)
+        tiny = np.column_stack((strided[:, 0], np.full(12, 1e-12)))
+        self._assert_parity(tiny, 1e-12, 2, 1)
+        shifted = np.column_stack((strided[:, 0] + 1e6, strided[:, 1]))
+        self.assertEqual(self._assert_parity(shifted, 1.0, 2, 1), [6, 12])
+        for seed, ms, jp, pen in (
+            (18, 2, 2, 0.1),
+            (12, 1, 2, 1e-12),
+            (12, 2, 2, 1e-12),
+        ):
+            rng_s = np.random.default_rng(seed)
+            n_s = int(rng_s.integers(6, 55))
+            v_s, w_s = rng_s.normal(0.0, 1.0, n_s), rng_s.exponential(2.0, n_s)
+            v_s[rng_s.random(n_s) < 0.15] = math.nan
+            w_s[rng_s.random(n_s) < 0.15] = 0.0
+            self._assert_parity(np.column_stack((v_s, w_s)), pen, ms, jp)
+
+    def test_benchmark_fixtures_exact_parity(self) -> None:
+        synth_by_chr: dict[str, list[tuple[float, float]]] = {}
+        with (FIXTURES / "synthetic" / "normalized_bins.tsv").open() as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                synth_by_chr.setdefault(row["chr"], []).append(
+                    (float(row["ratio"]), float(row["weight"]))
+                )
+        for rows in synth_by_chr.values():
+            sig = np.asarray(rows, dtype=np.float64)
+            for min_size in (1, 2):
+                for jump in (1, 2):
+                    for penalty in (0.001, 0.01, 10.0):
+                        self._assert_parity(sig, penalty, min_size, jump)
+
+        real_by_chr: dict[str, list[tuple[float, float]]] = {}
+        with (FIXTURES / "real" / "ID_bins.bed").open() as handle:
+            for row in csv.DictReader(handle, delimiter="\t"):
+                ratio = float(row["ratio"])
+                real_by_chr.setdefault(row["chr"], []).append(
+                    (ratio, float(math.isfinite(ratio)))
+                )
+        for contig, rows in real_by_chr.items():
+            sig = np.asarray(rows, dtype=np.float64)
+            self._assert_parity(sig, 0.05, 2, 1)
+            if contig in ("1", "21"):
+                for min_size in (2, 5):
+                    for jump in (1, 3):
+                        self._assert_parity(sig, 0.5, min_size, jump)
+
+    def test_input_validation_raises_invalid_input_error(self) -> None:
+        valid = np.column_stack((np.zeros(6), np.ones(6)))
+        bad_cols_1 = np.zeros((6, 1), dtype=np.float64)
+        bad_cols_3 = np.zeros((6, 3), dtype=np.float64)
+        for bad_sig in (bad_cols_1, bad_cols_3):
+            with self.assertRaises(InvalidInputError):
+                pelt_weighted_l2(bad_sig, 1.0, 2, 1)
+
+        neg_weight = np.column_stack((np.array([0.0, 1.0]), np.array([1.0, -0.5])))
+        with self.assertRaises(InvalidInputError):
+            pelt_weighted_l2(neg_weight, 1.0, 2, 1)
+
+        for bad_min in (0, -1):
+            with self.assertRaises(InvalidInputError):
+                pelt_weighted_l2(valid, 1.0, bad_min, 1)
+
+        for bad_jump in (0, -2):
+            with self.assertRaises(InvalidInputError):
+                pelt_weighted_l2(valid, 1.0, 2, bad_jump)
+
+        for bad_pen in (0.0, -1.0, math.nan, math.inf, -math.inf):
+            with self.assertRaises(InvalidInputError):
+                pelt_weighted_l2(valid, bad_pen, 2, 1)
 
 
 if __name__ == "__main__":

@@ -161,11 +161,22 @@ class TestRepositoryCodebaseContracts(unittest.TestCase):
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom):
                     mod = node.module or ""
-                    if "pysam" in mod or "pyBigWig" in mod or "pybigwig" in mod.lower():
+                    if (
+                        "pysam" in mod
+                        or "pyBigWig" in mod
+                        or "pybigwig" in mod.lower()
+                        or mod == "ruptures"
+                        or mod.startswith("ruptures.")
+                    ):
                         forbidden_imports.append((rel_path, node.lineno, mod))
                 elif isinstance(node, ast.Import):
                     for alias in node.names:
-                        if alias.name in {"pysam", "pyBigWig", "pybigwig"}:
+                        if alias.name in {
+                            "pysam",
+                            "pyBigWig",
+                            "pybigwig",
+                            "ruptures",
+                        } or alias.name.startswith("ruptures."):
                             forbidden_imports.append(
                                 (rel_path, node.lineno, alias.name)
                             )
@@ -173,7 +184,7 @@ class TestRepositoryCodebaseContracts(unittest.TestCase):
         self.assertEqual(
             forbidden_imports,
             [],
-            f"Found forbidden pysam/pyBigWig imports in src/ccnv/: {forbidden_imports}",
+            f"Found forbidden pysam/pyBigWig/ruptures imports in src/ccnv/: {forbidden_imports}",
         )
 
     def test_test_suite_organization_invariants(self) -> None:

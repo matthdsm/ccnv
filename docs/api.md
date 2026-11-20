@@ -24,6 +24,7 @@ flowchart TB
     REP --> IO
     REP --> MOD
     STATS --> MOD
+    STATS --> CORE
     IO --> CORE["ccnv._core (Rust PyO3: noodles + bigtools)"]
     IO --> MOD
 ```
@@ -161,6 +162,7 @@ flowchart TB
     SEG_GEN --> SEG_PRE["_segment_and_prescore_contig"]
     SEG_PRE --> SEG_BP["_find_breakpoints"]
     SEG_CTG["segmentation.segment_contig"] --> SEG_BP
+    SEG_BP --> C_PELT["_core.pelt_weighted_l2"]
     R_PRD --> PO_ANN["prenatal_origin.annotate_sample_prenatal_segments"]
     PO_ANN --> PO_LOD["prenatal_origin.annotate_prenatal_origin_and_lod"]
     PO_LOD --> PO_5S["prenatal_origin.classify_segment_origin_5state"]
@@ -189,7 +191,7 @@ Top-level package entry point exposing package metadata and lazy stage runners.
 
 ### `ccnv._core` (`src/ccnv/_core.pyi`, `crates/ccnv-core/src/lib.rs`)
 
-Compiled Rust PyO3 (`abi3-py312`) extension wrapping `noodles` and `bigtools` for streaming genomic I/O, FASTA scanning, BigWig aggregation, and BGZF index writing.
+Compiled Rust PyO3 (`abi3-py312`) extension wrapping `noodles` and `bigtools` for streaming genomic I/O, FASTA scanning, BigWig aggregation, BGZF index writing, and weighted L2 PELT segmentation.
 
 - **`FRAG_BAND_EDGES`** — Module constant tuple of 25 integer fragment-length boundaries defining the 24 bands covering `[30, 601)`.
 - **`GC_QUANTILE_EDGES`** — Module constant tuple of 9 breakpoints `(0.0, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.65, 1.0)` defining the 8 sub-bin GC quantile bands.
@@ -199,6 +201,7 @@ Compiled Rust PyO3 (`abi3-py312`) extension wrapping `noodles` and `bigtools` fo
 - **`scan_fasta_gc_quantiles(fasta_path: str, contigs: Sequence[tuple[str, int]], bin_size: int) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]`** — Scans a FASTA file across target contigs and computes per-bin GC fraction, valid base fraction, and 8-quantile GC compositions using 200 bp sub-windows.
 - **`scan_bigwig_means(bw_path: str, contigs: Sequence[tuple[str, int]], bin_size: int, full_bin_denominator: bool = False) -> NDArray[np.float32]`** — Computes per-bin mean track values from a BigWig file across target contigs, resolving UCSC/plain contig aliases automatically.
 - **`write_bgzf_indexed(gz_path: str, preset: Literal["bed", "vcf"], contig_names: Sequence[str], max_contig_len: int, chunks: Iterable[bytes], threads: int = 1) -> str`** — Writes uncompressed byte chunks through a multi-threaded BGZF encoder while simultaneously building a `.tbi` or `.csi` index and returning the written index path.
+- **`pelt_weighted_l2(signal: NDArray[np.float64], penalty: float, min_size: int = 2, jump: int = 1) -> list[int]`** — Runs compiled Rust (`crates/ccnv-core/src/pelt.rs`) weighted L2 Pruned Exact Linear Time (PELT) change-point segmentation on an `(N, 2)` `(values, weights)` matrix using mean-shifted $O(1)$ prefix sums across uniform and heterogeneous weights, returning sorted right-endpoint breakpoints ending at `N` (or `[]` when `N == 0`).
 
 ### `ccnv.cli` (`src/ccnv/cli.py`)
 
@@ -495,17 +498,18 @@ Off-contig Prototype Graph construction, Kish LOCO calibration, and Smyth Empiri
 
 ### `ccnv.stats.segmentation` (`src/ccnv/stats/segmentation.py`)
 
-Gap-aware Pelt segmentation, multi-scale dyadic BLUE Z-scoring, and discrete integer copy-number Bayes factors.
+Gap-aware compiled Rust PELT segmentation, multi-scale dyadic BLUE Z-scoring, and discrete integer copy-number Bayes factors.
 
 - **`ContigSegmentationInput`** — Dataclass bundling bin coordinates, normalized ratios, precision weights, depths, and dispersions for one contig.
-- **`WeightedL2Cost`** — Custom `ruptures.base.BaseCost` subclass implementing weighted $O(1)$ prefix-sum quadratic segmentation cost.
+- **`WeightedL2Cost`** — Standalone weighted $O(1)$ prefix-sum quadratic segmentation cost model used for direct interval error evaluation and test-suite parity verification.
   - **`WeightedL2Cost.fit(signal)`** — Precomputes contiguous weighted prefix sums from an `(N, 2)` matrix of `(values, weights)`.
   - **`WeightedL2Cost.error(start, end)`** — Returns the weighted residual sum of squares for segment slice `[start, end)`.
+  - **`WeightedL2Cost.sum_of_costs(bkps)`** — Returns the total weighted residual sum of squares summed across breakpoint intervals defined by `bkps`.
 - **`estimate_dyadic_inflation(zscores, usable, *, scales)`** — Estimates scale-dependent autocorrelation inflation $\kappa(L)$ across dyadic window lengths on unmasked contig runs.
 - **`interpolate_dyadic_inflation(n_bins, inflation_values, *, scales)`** — Interpolates $\kappa(N)$ monotonically in $\log_2$ scale space across arbitrary segment bin spans.
-- **`segment_contig(*, contig, starts, ends, ratios, weights, contig_length, penalty, sensitivity, kappa_local, min_size, jump, max_blacklist_gap)`** — Splits euchromatic arms at masked gaps $\gt 2\text{ Mb}$, runs calibrated Pelt segmentation (`KernelCPD` when weights are uniform and `jump == 1`, `WeightedL2Cost` otherwise), and returns segmented intervals.
+- **`segment_contig(*, contig, starts, ends, ratios, weights, contig_length, penalty, sensitivity, kappa_local, min_size, jump, max_blacklist_gap)`** — Splits euchromatic arms at masked gaps $\gt 2\text{ Mb}$, dispatches calibrated PELT segmentation to `ccnv._core.pelt_weighted_l2`, and returns segmented intervals.
 - **`segment_and_score_genome(contigs, *, penalty, sensitivity, mode, z_threshold, ratio_threshold, min_size, jump, max_blacklist_gap, threads)`** — Estimates per-contig dyadic autocorrelation inflation (after step-detrending significant segments) and segments all contigs with Gauss-Markov BLUE Z-scores and cluster-deflated discrete integer copy-number Bayes factors ($CN_0 = 2$ in germline; $CN_0 = 1$ on haploid contigs including `male_sex` and prenatal male `prenatal_ffy`).
-- **Internal segmentation helpers** — `_segment_bin_spans`, `_reduce_segment_means`, `_evaluate_integer_cn_bf`, `_as_optional_1d_f64`, `_segment_and_prescore_contig`, `_cumulative`, `_find_breakpoints`, `_validate_inputs`, and `_split_blacklist_gaps` manage prefix sums, gap splitting, Pelt pruning, and $K_{\text{eff}}$-adjusted Negative-Binomial Bayes-factor calculation.
+- **Internal segmentation helpers** — `_segment_bin_spans`, `_reduce_segment_means`, `_evaluate_integer_cn_bf`, `_as_optional_1d_f64`, `_segment_and_prescore_contig`, `_cumulative`, `_find_breakpoints`, `_validate_inputs`, and `_split_blacklist_gaps` manage prefix sums, gap splitting, compiled Rust PELT dispatch via `ccnv._core.pelt_weighted_l2`, and $K_{\text{eff}}$-adjusted Negative-Binomial Bayes-factor calculation.
 
 ### `ccnv.stats.prenatal_math` (`src/ccnv/stats/prenatal_math.py`)
 

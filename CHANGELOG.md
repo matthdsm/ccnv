@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- **Compiled Rust PELT Segmentation (`ccnv._core.pelt_weighted_l2`)**: Replaced runtime `ruptures` segmentation dispatch with a native Rust PyO3 weighted L2 PELT kernel (`crates/ccnv-core/src/pelt.rs`, exposed as `ccnv._core.pelt_weighted_l2`) using mean-shifted $`O(1)`$ prefix sums across uniform and heterogeneous precision weights, detached `WeightedL2Cost` in `src/ccnv/stats/segmentation.py` from `ruptures.base.BaseCost` (adding `sum_of_costs(bkps)`), and moved `ruptures>=1.1.10` to `dev` optional dependencies solely for test-suite parity verification.
+
 ## [1.0.0] - 2026-11-20
 
 ### Added

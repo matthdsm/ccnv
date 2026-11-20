@@ -720,7 +720,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/zensical-ui-0.0.42-pyh5ded981_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.2-pyh5ded981_0.conda
       - pypi: ./
-      - pypi: https://files.pythonhosted.org/packages/64/32/3bcf5a62479b4d83187f872fc68b918b59285f560bee4f37c5d49b1d957a/ruptures-1.1.10.tar.gz
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aws-c-auth-1.0.0-h836f083_2.conda
@@ -882,7 +881,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/zensical-ui-0.0.42-pyh5ded981_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.2-pyh5ded981_0.conda
       - pypi: ./
-      - pypi: https://files.pythonhosted.org/packages/64/32/3bcf5a62479b4d83187f872fc68b918b59285f560bee4f37c5d49b1d957a/ruptures-1.1.10.tar.gz
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/annotated-doc-0.0.7-pyh5ded981_0.conda
@@ -1050,7 +1048,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zlib-1.3.2-h8088a28_3.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
       - pypi: ./
-      - pypi: https://files.pythonhosted.org/packages/64/32/3bcf5a62479b4d83187f872fc68b918b59285f560bee4f37c5d49b1d957a/ruptures-1.1.10.tar.gz
   prod:
     channels:
     - url: https://conda.anaconda.org/conda-forge/
@@ -1211,7 +1208,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/typing_extensions-4.16.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
       - pypi: ./
-      - pypi: https://files.pythonhosted.org/packages/64/32/3bcf5a62479b4d83187f872fc68b918b59285f560bee4f37c5d49b1d957a/ruptures-1.1.10.tar.gz
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aws-c-auth-1.0.0-h836f083_2.conda
@@ -1365,7 +1361,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/typing_extensions-4.16.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026e-h5d301ff_0.conda
       - pypi: ./
-      - pypi: https://files.pythonhosted.org/packages/64/32/3bcf5a62479b4d83187f872fc68b918b59285f560bee4f37c5d49b1d957a/ruptures-1.1.10.tar.gz
       osx-arm64:
       - conda: https://conda.anaconda.org/conda-forge/noarch/_python_abi3_support-1.0-hd8ed1ab_3.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/annotated-doc-0.0.7-pyh5ded981_0.conda
@@ -1525,7 +1520,6 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zlib-1.3.2-h8088a28_3.conda
       - conda: https://conda.anaconda.org/conda-forge/osx-arm64/zstd-1.5.7-hf451053_7.conda
       - pypi: ./
-      - pypi: https://files.pythonhosted.org/packages/64/32/3bcf5a62479b4d83187f872fc68b918b59285f560bee4f37c5d49b1d957a/ruptures-1.1.10.tar.gz
 packages:
 - conda: https://conda.anaconda.org/bioconda/linux-64/htslib-1.25-ha79157c_0.conda
   sha256: a7bbfece33fb2369856bcafad28630f60f4a3083b67ea81f3e1397eea12890d9
@@ -8619,12 +8613,12 @@ packages:
   - polars-runtime-compat
   - pyarrow>=26,<27
   - pyyaml>=6.0
-  - ruptures>=1.1.10
   - scikit-learn>=1.9,<2
   - scipy>=1.18,<2
   - typer>=0.29,<0.30
   - pybigwig ; extra == 'dev'
   - pysam ; extra == 'dev'
+  - ruptures>=1.1.10 ; extra == 'dev'
   requires_python: '>=3.12'
 - pypi: https://files.pythonhosted.org/packages/48/e6/df265ba6504499a93b98f35f62227c3db1f8eb27eec51105eb48973e35a0/pysam-0.24.1-cp314-cp314-macosx_11_0_arm64.whl
   name: pysam

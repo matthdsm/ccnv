@@ -15,11 +15,10 @@ from time import perf_counter
 from typing import Final
 
 import numpy as np
-import ruptures as rpt
 from numpy.typing import ArrayLike, NDArray
-from ruptures.base import BaseCost
 from scipy.special import erfc
 
+from ccnv._core import pelt_weighted_l2
 from ccnv.models import AnalysisMode, CallType
 from ccnv.models.exceptions import InvalidInputError
 from ccnv.models.results import SegmentResult
@@ -102,8 +101,8 @@ class _PreScoredSegment:
     log_bf: float | None
 
 
-class WeightedL2Cost(BaseCost):
-    """Ruptures-compatible weighted residual sum-of-squares cost."""
+class WeightedL2Cost:
+    """Weighted residual sum-of-squares segment cost."""
 
     model = "weighted_l2"
     min_size = 1
@@ -164,6 +163,15 @@ class WeightedL2Cost(BaseCost):
         weighted_sq = self._wsq_list[end] - self._wsq_list[start]
         rss = weighted_sq - (weighted_val * weighted_val) / weight
         return max(0.0, rss)
+
+    def sum_of_costs(self, bkps: Sequence[int]) -> float:
+        """Return sum of weighted segment errors across breakpoint end indices."""
+        total = 0.0
+        start = 0
+        for end in bkps:
+            total += self.error(start, end)
+            start = end
+        return total
 
 
 def estimate_dyadic_inflation(
@@ -867,27 +875,13 @@ def _find_breakpoints(
     min_size: int,
     jump: int,
 ) -> list[int]:
-    """Detect change-point indices in a euchromatic block via calibrated PELT."""
-    n_samples = int(signal.shape[0])
-    if n_samples < 2 * min_size:
-        return [n_samples]
-
-    values = signal[:, 0]
-    weights = signal[:, 1]
-
-    if (
-        jump == 1
-        and weights[0] > 0.0
-        and np.allclose(weights, weights[0], rtol=1e-5, atol=0.0)
-    ):
-        pos_w = float(weights[0])
-        if hasattr(rpt, "KernelCPD"):
-            contig_vals = np.ascontiguousarray(values, dtype=np.float64).reshape(-1, 1)
-            detector_l2 = rpt.KernelCPD(kernel="linear", min_size=min_size, jump=jump)
-            return list(detector_l2.fit(contig_vals).predict(pen=penalty / pos_w))
-
-    detector = rpt.Pelt(custom_cost=WeightedL2Cost(), min_size=min_size, jump=jump)
-    return list(detector.fit(signal).predict(pen=penalty))
+    """Detect change-point indices in a euchromatic block via compiled Rust PELT."""
+    return pelt_weighted_l2(
+        np.ascontiguousarray(signal, dtype=np.float64),
+        float(penalty),
+        int(min_size),
+        int(jump),
+    )
 
 
 def _validate_inputs(

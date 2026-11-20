@@ -14,6 +14,7 @@ GC_QUANTILE_EDGES: tuple[float, ...]
 __all__ = [
     "FRAG_BAND_EDGES",
     "GC_QUANTILE_EDGES",
+    "pelt_weighted_l2",
     "read_alignment_header",
     "read_fasta_contigs_core",
     "scan_alignment_bins",
@@ -22,6 +23,12 @@ __all__ = [
     "write_bgzf_indexed",
 ]
 
+def pelt_weighted_l2(
+    signal: NDArray[np.float64],
+    penalty: float,
+    min_size: int = 2,
+    jump: int = 1,
+) -> list[int]: ...
 def read_alignment_header(
     path: str,
     fasta_path: str | None = None,

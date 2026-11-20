@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `ccnv` package implements an organism-agnostic bioinformatics framework for copy-number variation (CNV) detection in whole-genome sequencing (WGS) data of any coverage across germline and cell-free DNA prenatal (NIPT) workflows. Building on published within-sample reference normalization methodology (Straver et al., 2014; Raman et al., 2019), the package spans compiled Rust tile streaming (`ccnv._core`), 24-band fragmentomics extraction, 1 Mb super-block DESeq2 median-of-ratios depth scaling, zero-inclusive `PoissonRegressor` covariate bias correction, variance-whitened Gavish-Donoho SVHT PCA, Prototype Graph ($`M \le 2{,}048`$) off-contig reference modeling, Smyth Empirical Bayes biological overdispersion modeling, pre-split euchromatic change-point segmentation with calibrated `ruptures.Pelt`, dyadic multi-scale BLUE Z-score aggregation, discrete integer copy-number Bayes factor calling, and single-pass tabix-indexed/HTML reporting.
+The `ccnv` package implements an organism-agnostic bioinformatics framework for copy-number variation (CNV) detection in whole-genome sequencing (WGS) data of any coverage across germline and cell-free DNA prenatal (NIPT) workflows. Building on published within-sample reference normalization methodology (Straver et al., 2014; Raman et al., 2019), the package spans compiled Rust tile streaming (`ccnv._core`), 24-band fragmentomics extraction, 1 Mb super-block DESeq2 median-of-ratios depth scaling, zero-inclusive `PoissonRegressor` covariate bias correction, variance-whitened Gavish-Donoho SVHT PCA, Prototype Graph ($`M \le 2{,}048`$) off-contig reference modeling, Smyth Empirical Bayes biological overdispersion modeling, pre-split euchromatic change-point segmentation via the compiled Rust PELT kernel `ccnv._core.pelt_weighted_l2`, dyadic multi-scale BLUE Z-score aggregation, discrete integer copy-number Bayes factor calling, and single-pass tabix-indexed/HTML reporting.
 
 ```mermaid
 flowchart TD
@@ -22,7 +22,7 @@ flowchart TD
         A -.-> J["ccnv.predict: extract_for_predict, normalize_branch & normalize_prenatal_chry"]
         I --> J
         C --> J
-        J --> K["ccnv.stats.segmentation: Pre-Split Euchromatic Segmentation (Calibrated Pelt + mBIC)"]
+        J --> K["ccnv.stats.segmentation: Pre-Split Euchromatic Segmentation (Compiled Rust PELT + mBIC)"]
         K --> L["ccnv.stats.segmentation: Dyadic BLUE Scoring & Integer CN Bayes Factor Calling"]
     end
     subgraph Reporting["Artifact Generation"]
@@ -51,7 +51,7 @@ In `--mode prenatal` with paired-end fragmentomics and deconvolved reference den
 
 #### 5. Pre-Split Euchromatic Pelt Segmentation, Dyadic BLUE Scoring & 5-State Origin Engine
 
-Contigs are pre-split at masked gaps $`\gt 2\text{ Mb}`$ into contiguous euchromatic arm blocks before change-point detection via calibrated `ruptures.Pelt(custom_cost=WeightedL2Cost())` (or `KernelCPD` when weights are uniform and `jump == 1`) with modified BIC (mBIC) penalty. Segments are scored using working-independence Gauss-Markov Best Linear Unbiased Estimator (BLUE) Z-scores adjusted for step-detrended multi-scale dyadic variance inflation. Germline and haploid (`prenatal_ffy`) calls are made using discrete integer copy-number Bayes factors ($`\ln \mathrm{BF}_{CN \ne CN_0} \gt 2.0`$) over $`CN \in \lbrace 0, 1, 2, 3, 4+\rbrace`$ ($`CN_0 = 2`$) or $`CN \in \lbrace 0, 1, 2, 3+\rbrace`$ ($`CN_0 = 1`$), detecting homozygous deletions ($`CN=0`$) down to $`0.1\times`$ sequencing depth. In `--mode prenatal`, `predict_prenatal` evaluates `FFY`, `FFA`, `FFX`, `FF_size`, 4D erfc ray-marginalized SCA calls, 2-fetus twin pregnancy stoichiometry (`FF`/`FM`/`MM`, `classify_twin_pregnancy`), Student-$`t_4`$ IRLS fused `active_ff`, and Fisher-weighted `effective_ff`, `normalize_prenatal_chry` normalizes male-fetus (`fetal_sex == "M"`) 5 kb clean MSY `chrY` bins from `prenatal_ffy` against an FF-calibrated 1-copy Poisson baseline for haploid ($`CN_0 = 1`$) segmentation, BED/VCF reporting, and HTML plotting (omitting `chrY` when `fetal_sex == "F"`), and `annotate_sample_prenatal_segments` annotates segment discordance and classifies biological origin via a 5-state coupled depth + Dirichlet-Multinomial origin engine (`FETAL_CONSTITUTIONAL`, `PLACENTAL_MOSAIC`, `MATERNAL_UNINHERITED`, `MATERNAL_AND_FETAL_INHERITED`, `MATERNAL_MOSAIC`, with `INDETERMINATE` when max posterior $`\lt 0.80`$, shift-aligning 571-bin reference densities to `sizing_shift_bp` and normalizing mosaic priors uniformly over `[m_low, m_high]`).
+Contigs are pre-split at masked gaps $`\gt 2\text{ Mb}`$ into contiguous euchromatic arm blocks before change-point detection via the compiled Rust PELT kernel `ccnv._core.pelt_weighted_l2` using mean-shifted $`O(1)`$ prefix-sum weighted L2 costs with modified BIC (mBIC) penalty. Segments are scored using working-independence Gauss-Markov Best Linear Unbiased Estimator (BLUE) Z-scores adjusted for step-detrended multi-scale dyadic variance inflation. Germline and haploid (`prenatal_ffy`) calls are made using discrete integer copy-number Bayes factors ($`\ln \mathrm{BF}_{CN \ne CN_0} \gt 2.0`$) over $`CN \in \lbrace 0, 1, 2, 3, 4+\rbrace`$ ($`CN_0 = 2`$) or $`CN \in \lbrace 0, 1, 2, 3+\rbrace`$ ($`CN_0 = 1`$), detecting homozygous deletions ($`CN=0`$) down to $`0.1\times`$ sequencing depth. In `--mode prenatal`, `predict_prenatal` evaluates `FFY`, `FFA`, `FFX`, `FF_size`, 4D erfc ray-marginalized SCA calls, 2-fetus twin pregnancy stoichiometry (`FF`/`FM`/`MM`, `classify_twin_pregnancy`), Student-$`t_4`$ IRLS fused `active_ff`, and Fisher-weighted `effective_ff`, `normalize_prenatal_chry` normalizes male-fetus (`fetal_sex == "M"`) 5 kb clean MSY `chrY` bins from `prenatal_ffy` against an FF-calibrated 1-copy Poisson baseline for haploid ($`CN_0 = 1`$) segmentation, BED/VCF reporting, and HTML plotting (omitting `chrY` when `fetal_sex == "F"`), and `annotate_sample_prenatal_segments` annotates segment discordance and classifies biological origin via a 5-state coupled depth + Dirichlet-Multinomial origin engine (`FETAL_CONSTITUTIONAL`, `PLACENTAL_MOSAIC`, `MATERNAL_UNINHERITED`, `MATERNAL_AND_FETAL_INHERITED`, `MATERNAL_MOSAIC`, with `INDETERMINATE` when max posterior $`\lt 0.80`$, shift-aligning 571-bin reference densities to `sizing_shift_bp` and normalizing mosaic priors uniformly over `[m_low, m_high]`).
 
 ## Interface
 
@@ -62,8 +62,8 @@ Contigs are pre-split at masked gaps $`\gt 2\text{ Mb}`$ into contiguous euchrom
 - `models`: [models/README.md](./models/README.md) - Domain types, configuration containers, result dataclasses, zero-copy `SampleBuffers` and `BranchFitArrays`, Arrow `2.0.0` schemas, metadata models, validation routines, and exceptions.
 - `qc`: [qc/README.md](./qc/README.md) - Sample read accounting, reference usability auditing (`PASS`/`WARN`/`FAIL`), and atomic JSON QC payload writers.
 - `report`: [report/README.md](./report/README.md) - Single-pass atomic bgzipped/tabix BED and VCFv4.2 serializers via `ccnv._core` and interactive Plotly HTML genome viewer.
-- `stats`: [stats/README.md](./stats/README.md) - Stateless numerical kernels for SVHT PCA, Prototype Graph search, `squeeze_var`, Poisson and Huber regression, calibrated Pelt segmentation, BLUE scoring, Bayes factor calling, prenatal estimators, and fragmentomics math.
-- `crates/ccnv-core`: Rust extension wrapping `noodles` and `bigtools` for BAM/CRAM scanning, FASTA GC quantile calculation, and single-pass BGZF/tabix/CSI writing.
+- `stats`: [stats/README.md](./stats/README.md) - Stateless numerical kernels for SVHT PCA, Prototype Graph search, `squeeze_var`, Poisson and Huber regression, Rust PELT dispatch, BLUE scoring, Bayes factor calling, prenatal estimators, and fragmentomics math.
+- `crates/ccnv-core`: Rust extension wrapping `noodles` and `bigtools` for BAM/CRAM scanning, FASTA GC quantile calculation, single-pass BGZF/tabix/CSI writing, and compiled weighted L2 PELT segmentation (`pelt_weighted_l2`).
 
 ### Package Symbols
 
@@ -72,7 +72,7 @@ Contigs are pre-split at masked gaps $`\gt 2\text{ Mb}`$ into contiguous euchrom
 - [`extract.py:run`](./extract.py) (`run_extract`): Streams BAM/CRAM alignments across contigs, accumulates 7-channel counts and fragmentomics, and writes sample `.ccnv` Parquet.
 - [`reference.py:run`](./reference.py) (`run_reference`): Builds cohort or flat FASTA germline and prenatal reference `.ccnv` Parquet tables and writes `<prefix>_qc.json`.
 - [`ref_qc.py:run_reference_qc`](./ref_qc.py): Audits reference `.ccnv` Parquet tables, prints usability verdicts to `stderr`, and writes `<prefix>_qc.json`.
-- [`predict.py:run`](./predict.py) (`run_predict`): Executes single-sample normalization, PCA projection, calibrated Pelt segmentation, BLUE scoring, Bayes factor calling, prenatal/fragmentomic annotation, BED/VCF/HTML reporting, and `<prefix>_qc.json` serialization.
+- [`predict.py:run`](./predict.py) (`run_predict`): Executes single-sample normalization, PCA projection, compiled Rust PELT segmentation, BLUE scoring, Bayes factor calling, prenatal/fragmentomic annotation, BED/VCF/HTML reporting, and `<prefix>_qc.json` serialization.
 
 ## Invariants
 
