@@ -17,7 +17,7 @@
     </xml>
 
     <xml name="version_command">
-        <version_command><![CDATA[python -c "import ccnv; print(ccnv.__version__)"]]></version_command>
+        <version_command>ccnv --version</version_command>
     </xml>
 
     <xml name="stdio">

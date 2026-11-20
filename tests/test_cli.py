@@ -18,6 +18,7 @@ from helpers import (
 )
 from typer.testing import CliRunner
 
+import ccnv
 from ccnv.cli import app
 from ccnv.models import parquet_path
 
@@ -283,6 +284,41 @@ class TestReferenceSampleExpansion(unittest.TestCase):
                 result = CliRunner().invoke(app, args)
                 self.assertEqual(result.exit_code, 0, result.output)
                 self.assertIn("Usage:", _cli_text(result.output))
+
+    def test_greedy_version_flag_works_on_root_and_subcommands(self) -> None:
+        expected = f"ccnv {ccnv.__version__}\n"
+        for args in (
+            ["-v"],
+            ["--version"],
+            ["-v", "extract"],
+            ["--version", "predict"],
+            ["extract", "-v"],
+            ["extract", "--version"],
+            ["extract", "/does/not/exist.bam", "-v"],
+            ["reference", "-v"],
+            ["ref-qc", "-v"],
+            ["predict", "-v"],
+            [
+                "predict",
+                "/does/not/exist.ccnv",
+                "/does/not/exist_ref.ccnv",
+                "--version",
+            ],
+        ):
+            with self.subTest(args=args):
+                result = CliRunner().invoke(app, args)
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(result.output, expected)
+
+        for help_args in (["-h"], ["extract", "-h"], ["predict", "-h"]):
+            with self.subTest(help_args=help_args):
+                help_res = CliRunner().invoke(app, help_args)
+                self.assertEqual(help_res.exit_code, 0, help_res.output)
+                self.assertIn("--version", _cli_text(help_res.output))
+                self.assertIn("-v", _cli_text(help_res.output))
+
+        escaped = CliRunner().invoke(app, ["extract", "--", "-v"])
+        self.assertNotEqual(escaped.exit_code, 0)
 
     def test_help_uses_ccnv_executable_name(self) -> None:
         result = CliRunner().invoke(app, ["-h"])

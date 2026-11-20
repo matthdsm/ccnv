@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **CLI Version Flag (`-v`/`--version`)**: Added an eager `-v`/`--version` flag across `ccnv` and all subcommands (`extract`, `reference`, `ref-qc`, `predict`) that prints `ccnv <version>` and exits immediately without requiring positional inputs, and updated Galaxy's `<version_command>` macro to invoke `ccnv --version`.
+
 ## [1.0.0] - 2026-11-20
 
 ### Added

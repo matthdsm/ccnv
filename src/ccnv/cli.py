@@ -10,7 +10,9 @@ from time import perf_counter
 from typing import Annotated, NoReturn
 
 import typer
+import typer.core
 
+from ccnv import __version__
 from ccnv.extract import run as run_extract
 from ccnv.models import (
     DEFAULT_BIN_SIZE,
@@ -28,8 +30,44 @@ from ccnv.predict import run as run_predict
 from ccnv.ref_qc import run_reference_qc
 from ccnv.reference import run as run_reference
 
+
+def _version_callback(
+    ctx: typer.Context, _param: typer.CallbackParam, value: bool
+) -> None:
+    """Print application version and exit eagerly before argument validation."""
+    if not value or ctx.resilient_parsing:
+        return
+    typer.echo(f"ccnv {__version__}")
+    raise typer.Exit()
+
+
+_VERSION_OPTION = typer.core.TyperOption(
+    param_decls=["-v", "--version"],
+    is_flag=True,
+    is_eager=True,
+    expose_value=False,
+    callback=_version_callback,
+    help="Show version and exit",
+)
+
+
+class _VersionCommand(typer.core.TyperCommand):
+    """Typer command injecting eager -v/--version handling."""
+
+    def get_params(self, ctx: typer.Context) -> list[typer.CallbackParam]:
+        return [*super().get_params(ctx), _VERSION_OPTION]
+
+
+class _VersionGroup(typer.core.TyperGroup):
+    """Typer group injecting eager -v/--version handling."""
+
+    def get_params(self, ctx: typer.Context) -> list[typer.CallbackParam]:
+        return [*super().get_params(ctx), _VERSION_OPTION]
+
+
 app = typer.Typer(
     name="ccnv",
+    cls=_VersionGroup,
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
@@ -149,7 +187,7 @@ FastaOption = Annotated[
 ]
 
 
-@app.command()
+@app.command(cls=_VersionCommand)
 def extract(
     alignment: Annotated[
         Path,
@@ -246,7 +284,7 @@ def extract(
         _fail(error, 1)
 
 
-@app.command()
+@app.command(cls=_VersionCommand)
 def reference(
     prefix: Annotated[
         Path,
@@ -408,7 +446,7 @@ def reference(
         _fail(error, 1)
 
 
-@app.command(name="ref-qc")
+@app.command(name="ref-qc", cls=_VersionCommand)
 def ref_qc(
     reference: Annotated[
         Path,
@@ -444,7 +482,7 @@ def ref_qc(
         _fail(error, 1)
 
 
-@app.command()
+@app.command(cls=_VersionCommand)
 def predict(
     sample: Annotated[
         Path,
