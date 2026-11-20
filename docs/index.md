@@ -1,5 +1,7 @@
 # `ccnv`
 
+[![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/ccnv/README.html) [![Bioconda Version](https://img.shields.io/conda/vn/bioconda/ccnv.svg)](https://anaconda.org/bioconda/ccnv)
+
 `ccnv` is an independent Python 3.12+ bioinformatics toolkit for copy-number variation (CNV) detection in whole-genome sequencing (WGS) data at any coverage, building on published within-sample reference normalization methodology (Straver et al., *Nucleic Acids Research*, 2014; Raman et al., *Nucleic Acids Research*, 2019).
 
 ---
@@ -55,6 +57,47 @@ flowchart LR
 - [Visualization Overview](visualization.md): Interactive HTML genome viewer tracks, controls, icons, and color legends.
 - [API Reference](api.md): Module-by-module function reference and architectural call-graph DAGs.
 - [Mathematical Methodology](methodology.md): Mathematical formulations, statistical assumptions, model selections, and constant provenance.
+
+---
+
+## Installation
+
+### Bioconda
+
+```console
+conda install -c conda-forge -c bioconda ccnv
+# or using mamba / pixi global:
+mamba install -c conda-forge -c bioconda ccnv
+pixi global install -c conda-forge -c bioconda ccnv
+ccnv --help
+```
+
+### pip (from source)
+
+```console
+python -m pip install .
+ccnv --help
+```
+
+### Pixi (from source)
+
+```console
+pixi install
+pixi run ccnv --help
+```
+
+### Docker
+
+Multi-platform container images (`linux/amd64` and `linux/arm64`) are published to GHCR:
+
+```console
+docker pull ghcr.io/matthdsm/ccnv:latest
+docker run --rm ghcr.io/matthdsm/ccnv:latest ccnv --help
+```
+
+### Galaxy
+
+IUC-compatible Galaxy wrappers (`ccnv_extract`, `ccnv_reference`, `ccnv_ref_qc`, `ccnv_predict`) and ToolShed suite metadata live under `galaxy/`. See the [CLI Reference](cli.md#galaxy-tool-suite) for dataset staging and workflow output details.
 
 ---
 

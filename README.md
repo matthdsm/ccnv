@@ -1,5 +1,7 @@
 # `ccnv`
 
+[![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/ccnv/README.html) [![Bioconda Version](https://img.shields.io/conda/vn/bioconda/ccnv.svg)](https://anaconda.org/bioconda/ccnv)
+
 `ccnv` is an independent Python 3.12+ bioinformatics toolkit for copy-number variation (CNV) detection in whole-genome sequencing (WGS) data at any coverage, building on published within-sample reference normalization methodology (Straver et al., *Nucleic Acids Research*, 2014; Raman et al., *Nucleic Acids Research*, 2019).
 
 Complete documentation, architecture diagrams, and methodology are available at [https://matthdsm.github.io/ccnv/](https://matthdsm.github.io/ccnv/).
@@ -37,14 +39,24 @@ flowchart LR
 
 ## Installation
 
-### pip
+### Bioconda
+
+```console
+conda install -c conda-forge -c bioconda ccnv
+# or using mamba / pixi global:
+mamba install -c conda-forge -c bioconda ccnv
+pixi global install -c conda-forge -c bioconda ccnv
+ccnv --help
+```
+
+### pip (from source)
 
 ```console
 python -m pip install .
 ccnv --help
 ```
 
-### Pixi
+### Pixi (from source)
 
 ```console
 pixi install
