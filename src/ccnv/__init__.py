@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from ccnv.ref_qc import run_reference_qc as run_reference_qc
     from ccnv.reference import run_reference as run_reference
 
-__version__ = "0.1.0dev"
+__version__ = "1.0.0"
 
 __all__ = [
     "AlignmentError",
