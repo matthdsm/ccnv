@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-23
+
+### Added
+
+- **Bioconda Distribution & Installation Documentation**: Added Bioconda installation badges and `conda`/`mamba`/`pixi global` installation instructions to [README.md](README.md) and [docs/index.md](docs/index.md), along with expanded source, Docker, and Galaxy installation sections.
+
 ### Changed
 
 - **Compiled Rust PELT Segmentation (`ccnv._core.pelt_weighted_l2`)**: Replaced runtime `ruptures` segmentation dispatch with a native Rust PyO3 weighted L2 PELT kernel (`crates/ccnv-core/src/pelt.rs`, exposed as `ccnv._core.pelt_weighted_l2`) using mean-shifted $`O(1)`$ prefix sums across uniform and heterogeneous precision weights, detached `WeightedL2Cost` in `src/ccnv/stats/segmentation.py` from `ruptures.base.BaseCost` (adding `sum_of_costs(bkps)`), and moved `ruptures>=1.1.10` to `dev` optional dependencies solely for test-suite parity verification.
@@ -24,5 +30,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Galaxy Tool Suite (`galaxy/`)**: IUC-compatible 4-tool Galaxy suite (`ccnv_extract`, `ccnv_reference`, `ccnv_ref_qc`, `ccnv_predict`, shared `macros.xml` with `ccnv --version` `<version_command>`, and `.shed.yml` for `suite_ccnv`) providing extensionless `.dat` symlink staging, index-aware thread fallback, automated cohort `samplesheet.json` creation, decompressed `bed` and `vcf_bgzip` output mappings, `pixi run bump-version` `@TOOL_VERSION@` synchronization, and contract tests.
 - **Documentation, Packaging & CI/CD**: Zensical documentation site covering [Pipeline Architecture](docs/pipeline.md), [CLI Reference](docs/cli.md), [Visualization Overview](docs/visualization.md), [API Reference](docs/api.md) (with AST-verified module/signature tables and Mermaid call-graph DAGs), and [Mathematical Methodology](docs/methodology.md), Pixi maintenance tasks (`bump-version`, `bump-schema`), multi-platform Python `abi3` wheel builds (`linux/x86_64`, `linux/aarch64`, `macos/arm64`), and multi-architecture GHCR Docker images.
 
-[Unreleased]: https://github.com/matthdsm/ccnv/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/matthdsm/ccnv/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/matthdsm/ccnv/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/matthdsm/ccnv/releases/tag/v1.0.0
